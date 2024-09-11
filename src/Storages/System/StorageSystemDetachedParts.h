@@ -18,13 +18,14 @@ class StorageSystemDetachedParts final :
     friend struct shared_ptr_helper<StorageSystemDetachedParts>;
 public:
     std::string getName() const override { return "SystemDetachedParts"; }
+    bool isSystemStorage() const override { return true; }
 
 protected:
     explicit StorageSystemDetachedParts(const StorageID & table_id_);
 
     Pipe read(
             const Names & /* column_names */,
-            const StorageMetadataPtr & metadata_snapshot,
+            const StorageSnapshotPtr & storage_snapshot,
             SelectQueryInfo & query_info,
             ContextPtr context,
             QueryProcessingStage::Enum /*processed_stage*/,

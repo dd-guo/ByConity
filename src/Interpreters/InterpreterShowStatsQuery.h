@@ -17,11 +17,13 @@
 
 #include <Interpreters/IInterpreter.h>
 #include <Parsers/IAST_fwd.h>
+#include <Statistics/CollectorSettings.h>
 #include <Statistics/StatisticsCommon.h>
 
 namespace DB
 {
 class Context;
+
 
 class InterpreterShowStatsQuery : public IInterpreter, WithContext
 {
@@ -33,10 +35,13 @@ public:
 
 private:
     BlockIO executeTable();
+    BlockIO executeAll();
     BlockIO executeColumn();
-    void executeSpecial();
+    BlockIO executeSpecial();
 
     ASTPtr query_ptr;
+    // currently only cache_policy is useful
+    Statistics::CollectorSettings collector_settings;
 };
 
 }

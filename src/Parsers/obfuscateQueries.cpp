@@ -613,6 +613,8 @@ std::string_view obfuscateWord(std::string_view src, WordMap & obfuscate_map, Wo
     /// Prevent collisions
     while (!used_nouns.insert(noun).second)
     {
+        // checked update implementation, no apparent out of bounds
+        // coverity[overrun-buffer-val]
         hash_func.update('\0');
         noun = nouns.begin()[hash_func.get64() % nouns.size()];
     }
@@ -900,7 +902,7 @@ void obfuscateQueries(
                 obfuscateIdentifier(whole_token, result, obfuscate_map, used_nouns, hash_func);
             }
         }
-        else if (token.type == TokenType::QuotedIdentifier)
+        else if (token.type == TokenType::DoubleQuotedIdentifier || token.type == TokenType::BackQuotedIdentifier)
         {
             assert(token.size() >= 2);
 

@@ -59,6 +59,8 @@ public:
         return std::make_shared<DataTypeFloat64>();
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & /*result_type*/, size_t input_rows_count) const override
     {
         auto res_column = ColumnFloat64::create();
@@ -98,7 +100,7 @@ template <>
 const char * FunctionPolygonArea<SphericalPoint>::name = "polygonAreaSpherical";
 
 
-void registerFunctionPolygonArea(FunctionFactory & factory)
+REGISTER_FUNCTION(PolygonArea)
 {
     factory.registerFunction<FunctionPolygonArea<CartesianPoint>>();
     factory.registerFunction<FunctionPolygonArea<SphericalPoint>>();

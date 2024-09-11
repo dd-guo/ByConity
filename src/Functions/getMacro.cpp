@@ -44,6 +44,8 @@ public:
 
     bool isDeterministic() const override { return false; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     bool isDeterministicInScopeOfQuery() const override
     {
         return false;
@@ -79,7 +81,7 @@ public:
 
 }
 
-void registerFunctionGetMacro(FunctionFactory & factory)
+REGISTER_FUNCTION(GetMacro)
 {
     factory.registerFunction<FunctionGetMacro>();
 }

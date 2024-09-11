@@ -26,6 +26,8 @@
 #include <Parsers/ASTTEALimit.h>
 #include <QueryPlan/PlanSerDerHelper.h>
 #include <Common/typeid_cast.h>
+#include "Parsers/ASTQueryWithOutput.h"
+#include <Parsers/SelectUnionMode.h>
 #include <IO/Operators.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
@@ -65,22 +67,24 @@ void ASTSelectWithUnionQuery::formatQueryImpl(const FormatSettings & settings, F
 
     auto mode_to_str = [&](auto mode)
     {
-        if (mode == Mode::ALL)
+        if (mode == SelectUnionMode::UNION_DEFAULT)
+            return "UNION";
+        else if (mode == SelectUnionMode::UNION_ALL)
             return "UNION ALL";
-        else if (mode == Mode::DISTINCT)
+        else if (mode == SelectUnionMode::UNION_DISTINCT)
             return "UNION DISTINCT";
-        else if (mode == Mode::INTERSECT_UNSPECIFIED)
-            return "INTERSECT";
-        else if (mode == Mode::INTERSECT_ALL)
-            return "INTERSECT ALL";
-        else if (mode == Mode::INTERSECT_DISTINCT)
-            return "INTERSECT DISTINCT";
-        else if (mode == Mode::EXCEPT_UNSPECIFIED)
+        else if (mode == SelectUnionMode::EXCEPT_DEFAULT)
             return "EXCEPT";
-        else if (mode == Mode::EXCEPT_ALL)
+        else if (mode == SelectUnionMode::EXCEPT_ALL)
             return "EXCEPT ALL";
-        else if (mode == Mode::EXCEPT_DISTINCT)
+        else if (mode == SelectUnionMode::EXCEPT_DISTINCT)
             return "EXCEPT DISTINCT";
+        else if (mode == SelectUnionMode::INTERSECT_DEFAULT)
+            return "INTERSECT";
+        else if (mode == SelectUnionMode::INTERSECT_ALL)
+            return "INTERSECT ALL";
+        else if (mode == SelectUnionMode::INTERSECT_DISTINCT)
+            return "INTERSECT DISTINCT";
         return "";
     };
 
@@ -121,13 +125,13 @@ void ASTSelectWithUnionQuery::formatQueryImpl(const FormatSettings & settings, F
     }
 }
 
-void ASTSelectWithUnionQuery::collectAllTables(std::vector<ASTPtr>& all_tables, bool & has_table_functions) const
+String ASTSelectWithUnionQuery::formatOutputTree()
 {
-    for (auto & child : list_of_selects->children)
-    {
-        auto& select = typeid_cast<ASTSelectQuery&>(*child);
-        select.collectAllTables(all_tables, has_table_functions);
-    }
+    WriteBufferFromOwnString buf;
+    IAST::FormatSettings settings(buf, true);
+    FormatState state;
+    ASTQueryWithOutput::formatOutput(settings, state, FormatStateStacked());
+    return buf.str();
 }
 
 void ASTSelectWithUnionQuery::resetTEALimit()
@@ -145,7 +149,8 @@ void ASTSelectWithUnionQuery::resetTEALimit()
 
 bool ASTSelectWithUnionQuery::hasNonDefaultUnionMode() const
 {
-    return set_of_modes.contains(Mode::DISTINCT);
+    return set_of_modes.contains(SelectUnionMode::UNION_DISTINCT) || set_of_modes.contains(SelectUnionMode::INTERSECT_DISTINCT)
+        || set_of_modes.contains(SelectUnionMode::EXCEPT_DISTINCT);
 }
 
 void ASTSelectWithUnionQuery::serialize(WriteBuffer & buf) const

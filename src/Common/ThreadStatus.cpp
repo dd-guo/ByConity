@@ -41,27 +41,31 @@ namespace
 ///
 /// Also we should not use getStackSize() (pthread_attr_getstack()) since it
 /// will return 8MB, and this is too huge for signal stack.
+static const int page_size = getPageSize();
 struct ThreadStack
 {
     ThreadStack()
-        : data(aligned_alloc(getPageSize(), size))
+        : data(aligned_alloc(page_size > 0 ? page_size : 4096, getSize()))
     {
         /// Add a guard page
         /// (and since the stack grows downward, we need to protect the first page).
-        mprotect(data, getPageSize(), PROT_NONE);
+        if (page_size > 0) {
+            mprotect(data, page_size, PROT_NONE);
+        }
     }
     ~ThreadStack()
     {
-        mprotect(data, getPageSize(), PROT_WRITE|PROT_READ);
+        if (page_size > 0) {
+            mprotect(data, page_size, PROT_WRITE|PROT_READ);
+        }
         free(data);
     }
 
-    static size_t getSize() { return size; }
+    static size_t getSize() { return std::max<size_t>(16 << 10, MINSIGSTKSZ); }
     void * getData() const { return data; }
 
 private:
     /// 16 KiB - not too big but enough to handle error.
-    static constexpr size_t size = std::max<size_t>(16 << 10, MINSIGSTKSZ);
     void * data;
 };
 
@@ -217,7 +221,6 @@ MainThreadStatus & MainThreadStatus::getInstance()
     return thread_status;
 }
 MainThreadStatus::MainThreadStatus()
-    : ThreadStatus()
 {
     main_thread = current_thread;
 }

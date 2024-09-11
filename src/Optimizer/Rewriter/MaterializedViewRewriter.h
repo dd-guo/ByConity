@@ -15,9 +15,10 @@
 
 #pragma once
 
-#include <Optimizer/Equivalences.h>
 #include <Optimizer/JoinGraph.h>
 #include <Optimizer/MaterializedView/MaterializedViewStructure.h>
+#include <Optimizer/MaterializedView/PartitionConsistencyChecker.h>
+#include <Optimizer/Property/Equivalences.h>
 #include <Optimizer/Rewriter/Rewriter.h>
 #include <Optimizer/SymbolTransformMap.h>
 #include <Optimizer/Utils.h>
@@ -33,11 +34,17 @@ namespace DB
 class MaterializedViewRewriter : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "MaterializedViewRewriter"; }
 
 private:
-    static std::map<String, std::vector<MaterializedViewStructurePtr>>
-    getRelatedMaterializedViews(QueryPlan & plan, ContextMutablePtr context);
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override
+    {
+        return context->getSettingsRef().enable_materialized_view_rewrite || context->getSettingsRef().enable_view_based_query_rewrite;
+    }
+    LinkedHashMap<MaterializedViewStructurePtr, PartitionCheckResult>
+    getRelatedMaterializedViews(QueryPlan & plan, ContextMutablePtr context) const;
+
+    Poco::Logger * log = &Poco::Logger::get("MaterializedViewRewriter");
 };
 }

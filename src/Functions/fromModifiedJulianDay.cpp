@@ -127,6 +127,11 @@ namespace DB
             return true;
         }
 
+        bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override
+        {
+            return true;
+        }
+
         bool hasInformationAboutMonotonicity() const override
         {
             return true;
@@ -230,7 +235,7 @@ namespace DB
         static constexpr auto name = "fromModifiedJulianDayOrNull";
     };
 
-    void registerFunctionFromModifiedJulianDay(FunctionFactory & factory)
+    REGISTER_FUNCTION(FromModifiedJulianDay)
     {
         factory.registerFunction<FromModifiedJulianDayOverloadResolver<NameFromModifiedJulianDay, false>>();
         factory.registerFunction<FromModifiedJulianDayOverloadResolver<NameFromModifiedJulianDayOrNull, true>>();

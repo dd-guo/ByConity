@@ -58,8 +58,8 @@ bool LockRequest::lock(const Context & context)
     {
         if (wait())
         {
-            // status has changed to OK before timeout
-            return true;
+            // status has changed to OK/CANCELLED before timeout
+            return getStatus() != LockStatus::LOCK_CANCELLED;
         }
         else
         {
@@ -89,7 +89,7 @@ void LockRequest::unlock()
     }
     else
     {
-        throw Exception("Invalid unlock operator " + toString(to_underlying(status)), ErrorCodes::LOGICAL_ERROR);
+        // nothing to do
     }
 }
 
@@ -138,17 +138,17 @@ void LockRequest::notify()
 bool LockRequest::wait()
 {
     std::unique_lock lk(mutex);
-    return cv.wait_for(lk, std::chrono::milliseconds(timeout), [this]() { return status == LockStatus::LOCK_OK; });
+    return cv.wait_for(lk, std::chrono::milliseconds(timeout), [this]() { return status == LockStatus::LOCK_OK || status == LockStatus::LOCK_CANCELLED; });
 }
 
 LockLevel LockInfo::getLockLevel() const {
-    if (hasPartition())
-    {
-        return LockLevel::PARTITION;
-    }
-    else if (hasBucket())
+    if (hasBucket())
     {
         return LockLevel::BUCKET;
+    }
+    else if (hasPartition())
+    {
+        return LockLevel::PARTITION;
     }
     else
     {
@@ -174,18 +174,18 @@ const LockRequestPtrs & LockInfo::getLockRequests()
     Strings entities(LockLevelSize);
     Protos::DataModelLockField field_model;
     {
-        RPCHelpers::fillUUID(table_uuid, *(field_model.mutable_uuid()));
+        field_model.set_table_prefix(table_uuid_with_prefix);
         field_model.SerializeToString(&entities[to_underlying(LockLevel::TABLE)]);
-    }
-    if (hasBucket())
-    {
-        field_model.set_bucket(bucket);
-        field_model.SerializeToString(&entities[to_underlying(LockLevel::BUCKET)]);
     }
     if (hasPartition())
     {
         field_model.set_partition(partition);
         field_model.SerializeToString(&entities[to_underlying(LockLevel::PARTITION)]);
+    }
+    if (hasBucket())
+    {
+        field_model.set_bucket(bucket);
+        field_model.SerializeToString(&entities[to_underlying(LockLevel::BUCKET)]);
     }
 
     for (size_t i = 0; i <= to_underlying(level); i++)
@@ -204,7 +204,7 @@ String LockInfo::toDebugString() const
 {
     WriteBufferFromOwnString buf;
     buf << "LockInfo{txn_id: " << txn_id.toString() << ", lock_id: " << lock_id << ", level: " << toString(getLockLevel())
-        << ", mode: " << toString(lock_mode) << ", timeout: " << timeout << ", uuid: " << table_uuid;
+        << ", mode: " << toString(lock_mode) << ", timeout: " << timeout << ", uuid: " << table_uuid_with_prefix;
     if (hasBucket())
     {
         buf << ", bucket: " << bucket;

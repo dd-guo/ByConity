@@ -27,6 +27,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
 #include <common/getFQDNOrHostName.h>
+#include "Transaction/TxnTimestamp.h"
 #include <Interpreters/Context.h>
 // #include <MergeTreeCommon/CnchWorkerClientPools.h>
 
@@ -100,31 +101,38 @@ TransactionCnchPtr TransactionCoordinatorRcCnch::createTransaction(const CreateT
     txn->force_clean_by_dm = opt.force_clean_by_dm;
     txn->async_post_commit = opt.async_post_commit;
 
-    ProfileEvents::increment((opt.read_only ? ProfileEvents::CnchTxnReadTxnCreated : ProfileEvents::CnchTxnWriteTxnCreated));
-    LOG_DEBUG(log, "Created txn {}\n", txn->getTransactionRecord().toString());
+    if (opt.read_only)
+    {
+        ProfileEvents::increment(ProfileEvents::CnchTxnReadTxnCreated);
+        LOG_DEBUG(log, "Created read-only txn {}", txn->getTransactionRecord().toString());
+    }
+    else
+    {
+        ProfileEvents::increment(ProfileEvents::CnchTxnWriteTxnCreated);
+        LOG_DEBUG(log, "Created write txn {}", txn->getTransactionRecord().toString());
+    }
     return txn;
 }
 
 ProxyTransactionPtr TransactionCoordinatorRcCnch::createProxyTransaction(
-    const HostWithPorts & host_ports,
-    TxnTimestamp primary_txn_id)
+    const HostWithPorts & host_ports, TxnTimestamp primary_txn_id, bool read_only)
+{
+    /// Get the rpc client of target server
+    auto server_cli = getContext()->getCnchServerClient(host_ports);
+    auto txn = std::make_shared<CnchProxyTransaction>(getContext(), server_cli, primary_txn_id, read_only);
+    auto txn_id = txn->getTransactionID();
+    /// add to active txn list
     {
-        /// Get the rpc client of target server
-        auto server_cli = getContext()->getCnchServerClient(host_ports);
-        auto txn = std::make_shared<CnchProxyTransaction>(getContext(), server_cli, primary_txn_id);
-        auto txn_id = txn->getTransactionID();
-        /// add to active txn list
-        {
-            std::lock_guard<std::mutex> lock(list_mutex);
-            if (!active_txn_list.emplace(txn_id, txn).second)
-                throw Exception("Transaction (txn_id: " + txn_id.toString() + ") has been created", ErrorCodes::LOGICAL_ERROR);
-        }
-        /// add txn to its primary txn's secondary txn list
-        auto *primary_txn = getTransaction(txn->getPrimaryTransactionID())->as<CnchExplicitTransaction>();
-        if (primary_txn) primary_txn->addSecondaryTransaction(txn);
-        LOG_DEBUG(log, "Created proxy txn {}\n", txn->getTransactionRecord().toString());
-        return txn;
+        std::lock_guard<std::mutex> lock(list_mutex);
+        if (!active_txn_list.emplace(txn_id, txn).second)
+            throw Exception("Transaction (txn_id: " + txn_id.toString() + ") has been created", ErrorCodes::LOGICAL_ERROR);
     }
+    /// add txn to its primary txn's secondary txn list
+    auto *primary_txn = getTransaction(txn->getPrimaryTransactionID())->as<CnchExplicitTransaction>();
+    if (primary_txn) primary_txn->addSecondaryTransaction(txn);
+    LOG_DEBUG(log, "Created proxy txn {}", txn->getTransactionRecord().toString());
+    return txn;
+}
 
 TransactionCnchPtr TransactionCoordinatorRcCnch::getTransaction(const TxnTimestamp & txnID) const
 {
@@ -159,7 +167,7 @@ void TransactionCoordinatorRcCnch::finishTransaction(const TransactionCnchPtr & 
             if (auto it = active_txn_list.find(cur->getTransactionID()); it != active_txn_list.end())
             {
                 active_txn_list.erase(it);
-                LOG_DEBUG(log, "Deleted txn {}\n", cur->getTransactionID());
+                LOG_DEBUG(log, "Deleted txn {}", cur->getTransactionID());
             }
         }
         eraseActiveTimestamp(cur);
@@ -241,7 +249,7 @@ void TransactionCoordinatorRcCnch::eraseActiveTimestamp(const TransactionCnchPtr
     auto tables_it = timestamp_to_tables.find(ts);
     if (tables_it == timestamp_to_tables.end())
     {
-        LOG_TRACE(log, "No need to erase active timestamp for txn {}\n", txn->getTransactionID().toUInt64());
+        LOG_TRACE(log, "No need to erase active timestamp for txn {}", txn->getTransactionID().toUInt64());
         return;
     }
 
@@ -265,26 +273,21 @@ void TransactionCoordinatorRcCnch::eraseActiveTimestamp(const TransactionCnchPtr
 std::optional<TxnTimestamp> TransactionCoordinatorRcCnch::getMinActiveTimestamp(const StorageID & storage_id)
 {
     const UInt64 expired_interval = getContext()->getRootConfig().cnch_transaction_ts_expire_time; // default 2h
-    auto now = UInt64(time(nullptr)) * 1000;
 
     std::lock_guard<std::mutex> lock(min_ts_mutex);
     auto timestamps_it = table_to_timestamps.find(storage_id.uuid);
     if (timestamps_it == table_to_timestamps.end() || timestamps_it->second.empty())
         return std::nullopt;
 
-    if (now - last_time_clean_timestamps < expired_interval)
-        return *(timestamps_it->second.begin());
-
     try
     {
         /// Try to clean all outdated Txns.
-        last_time_clean_timestamps = now;
-        TxnTimestamp cur_ts = getContext()->getTimestamp();
+        TxnTimestamp cur_ts = TxnTimestamp::fromUnixTimestamp(static_cast<UInt64>(time(nullptr)));
         for (auto it = timestamps_it->second.begin(); it != timestamps_it->second.end();)
         {
             if ((cur_ts.toMillisecond() - it->toMillisecond()) > expired_interval)
             {
-                LOG_TRACE(log, "Clean outdated timestamp {}\n", *it);
+                LOG_TRACE(log, "Clean outdated timestamp {}", *it);
                 timestamp_to_tables.erase(*it);
                 it = timestamps_it->second.erase(it);
             }
@@ -296,7 +299,7 @@ std::optional<TxnTimestamp> TransactionCoordinatorRcCnch::getMinActiveTimestamp(
     }
     catch (const Exception & e)
     {
-        LOG_WARNING(log, "Failed to clean outdated timestamps for {} {}\n", storage_id.getNameForLogs(), e.displayText());
+        LOG_WARNING(log, "Failed to clean outdated timestamps for {} {}", storage_id.getNameForLogs(), e.displayText());
     }
 
     if (timestamps_it->second.empty())
@@ -328,7 +331,7 @@ void TransactionCoordinatorRcCnch::scanActiveTransactions()
             }
         }
 
-        LOG_INFO(log, "Background txn scanner expires {} transactions\n", deleted_txn_list.size());
+        LOG_INFO(log, "Background txn scanner expires {} transactions", deleted_txn_list.size());
         ProfileEvents::increment(ProfileEvents::CnchTxnExpired, deleted_txn_list.size());
 
         for (const auto & txn : deleted_txn_list)
@@ -350,4 +353,13 @@ void TransactionCoordinatorRcCnch::scanActiveTransactions()
         scan_active_txns_task->scheduleAfter(scan_interval);
     }
 }
+
+void TransactionCoordinatorRcCnch::addTransaction(const TransactionCnchPtr & txn)
+{
+    std::lock_guard<std::mutex> lock(list_mutex);
+    const auto & txn_id = txn->getTransactionID();
+    if (!active_txn_list.emplace(txn_id, txn).second)
+        throw Exception("Transaction (txn_id: " + txn_id.toString() + ") has been created", ErrorCodes::LOGICAL_ERROR);
+}
+
 }

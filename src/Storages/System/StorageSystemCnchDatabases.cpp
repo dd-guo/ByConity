@@ -13,13 +13,16 @@
  * limitations under the License.
  */
 
+#include <Access/ContextAccess.h>
 #include <Catalog/Catalog.h>
 #include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeNullable.h>
 #include <Interpreters/Context.h>
+#include <Storages/System/StorageSystemCnchCommon.h>
 #include <Storages/System/StorageSystemCnchDatabases.h>
+#include <Transaction/TxnTimestamp.h>
 #include <Common/Status.h>
 
 namespace DB
@@ -38,19 +41,29 @@ NamesAndTypesList StorageSystemCnchDatabases::getNamesAndTypes()
 
 void StorageSystemCnchDatabases::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo & ) const
 {
-    Catalog::CatalogPtr cnch_catalog = context->getCnchCatalog();
-
+    auto cnch_catalog = context->tryGetCnchCatalog();
+    const auto access = context->getAccess();
+    const bool check_access_for_databases = !access->isGranted(AccessType::SHOW_DATABASES);
     if (context->getServerType() == ServerType::cnch_server && cnch_catalog)
     {
         //get CNCH databases
         Catalog::Catalog::DataModelDBs res;
         res = cnch_catalog->getAllDataBases();
+        const String & tenant_id = context->getTenantId();
+
         for (size_t i = 0, size = res.size(); i != size; ++i)
         {
             if (!Status::isDeleted(res[i].status()))
             {
                 size_t col_num = 0;
-                res_columns[col_num++]->insert(res[i].name());
+                std::optional<String> stripped_database_name = filterAndStripDatabaseNameIfTenanted(tenant_id, res[i].name());
+                if (!stripped_database_name.has_value())
+                    continue;
+
+                if (check_access_for_databases && !access->isGranted(AccessType::SHOW_DATABASES, res[i].name()))
+                    continue;
+
+                res_columns[col_num++]->insert(*std::move(stripped_database_name));
                 /// fill database uuid if it exists, otherwise the field will be NULL
                 if (res[i].has_uuid())
                     res_columns[col_num++]->insert(RPCHelpers::createUUID(res[i].uuid()));
@@ -58,8 +71,7 @@ void StorageSystemCnchDatabases::fillData(MutableColumns & res_columns, ContextP
                     res_columns[col_num++]->insertDefault();
                 res_columns[col_num++]->insert(res[i].txnid());
                 res_columns[col_num++]->insert(res[i].previous_version());
-                auto commit_time = (res[i].commit_time() >> 18) ; // first 48 bits represent times
-                res_columns[col_num++]->insert(commit_time/1000) ;// convert to seconds
+                res_columns[col_num++]->insert(TxnTimestamp(res[i].commit_time()).toSecond());
             }
         }
     }

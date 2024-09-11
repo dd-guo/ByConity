@@ -19,6 +19,7 @@
 #include <Disks/IVolume.h>
 #include <Processors/Transforms/PartitionTopNTransform.h>
 #include <QueryPlan/ITransformingStep.h>
+#include <QueryPlan/TopNModel.h>
 
 namespace DB
 {
@@ -26,7 +27,7 @@ namespace DB
 class PartitionTopNStep : public ITransformingStep
 {
 public:
-    explicit PartitionTopNStep(const DataStream & input_stream_, const Names & partition_, const Names & order_by_, UInt64 limit_, PartitionTopNModel model_);
+    explicit PartitionTopNStep(const DataStream & input_stream_, const Names & partition_, const Names & order_by_, UInt64 limit_, TopNModel model_);
 
     String getName() const override { return "PartitionTopN"; }
 
@@ -34,15 +35,16 @@ public:
     const Names & getPartition() const { return partition; }
     const Names & getOrderBy() const { return order_by; }
     UInt64 getLimit() const { return limit; }
-    PartitionTopNModel getModel() const { return model; }
+    TopNModel getModel() const { return model; }
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
     void describeActions(JSONBuilder::JSONMap & map) const override;
     void describeActions(FormatSettings & settings) const override;
 
-    void serialize(WriteBuffer &) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer &, ContextPtr context_ = nullptr);
+    void toProto(Protos::PartitionTopNStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<PartitionTopNStep> fromProto(const Protos::PartitionTopNStep & proto, ContextPtr context);
+
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 
@@ -50,7 +52,7 @@ private:
     Names partition;
     Names order_by;
     UInt64 limit;
-    PartitionTopNModel model;
+    TopNModel model;
 };
 
 }

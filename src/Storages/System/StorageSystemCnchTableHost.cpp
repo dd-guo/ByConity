@@ -24,6 +24,7 @@
 #include <Storages/System/CollectWhereClausePredicate.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
 #include <common/logger_useful.h>
+#include <Protos/DataModelHelpers.h>
 
 namespace DB
 {
@@ -33,6 +34,7 @@ NamesAndTypesList StorageSystemCnchTableHost::getNamesAndTypes()
         {"database", std::make_shared<DataTypeString>()},
         {"name", std::make_shared<DataTypeString>()},
         {"uuid", std::make_shared<DataTypeString>()},
+        {"server_vw_name", std::make_shared<DataTypeString>()},
         {"host", std::make_shared<DataTypeString>()},
         {"tcp_port", std::make_shared<DataTypeUInt16>()},
         {"http_port", std::make_shared<DataTypeUInt16>()},
@@ -45,7 +47,7 @@ void StorageSystemCnchTableHost::fillData(MutableColumns & res_columns, ContextP
     ASTPtr where_expression = query_info.query->as<ASTSelectQuery>()->where();
     std::map<String, String> columnToValue;
 
-    const std::vector<std::map<String,String>> value_by_column_names = DB::collectWhereORClausePredicate(where_expression, context);
+    const std::vector<std::map<String,Field>> value_by_column_names = DB::collectWhereORClausePredicate(where_expression, context);
     bool enable_filter_by_db = false;
     bool enable_filter_by_database_and_table = false;
     String only_selected_database;
@@ -60,8 +62,8 @@ void StorageSystemCnchTableHost::fillData(MutableColumns & res_columns, ContextP
             (table_it != value_by_column_name.end())
             )
         {
-            only_selected_database = db_it->second;
-            only_selected_table = table_it->second;
+            only_selected_database = db_it->second.getType() == Field::Types::String ? db_it->second.get<String>() : "";
+            only_selected_table = table_it->second.getType() == Field::Types::String ? table_it->second.get<String>() : "";
             enable_filter_by_database_and_table = true;
             LOG_TRACE(&Poco::Logger::get("StorageSystemCnchTableHost"),
                     "filtering by db and table with db name {} and table name {}",
@@ -69,7 +71,7 @@ void StorageSystemCnchTableHost::fillData(MutableColumns & res_columns, ContextP
         }
         else if (db_it != value_by_column_name.end())
         {
-            only_selected_database = db_it->second;
+            only_selected_database = db_it->second.getType() == Field::Types::String ? db_it->second.get<String>() : "";
             enable_filter_by_db = true;
             LOG_TRACE(&Poco::Logger::get("StorageSystemCnchTableHost"),
                     "filtering by db with db name {}", only_selected_database);
@@ -94,16 +96,23 @@ void StorageSystemCnchTableHost::fillData(MutableColumns & res_columns, ContextP
     else
         table_ids = cnch_catalog->getAllTablesID();
 
-    UInt64 ts = context->tryGetTimestamp(__PRETTY_FUNCTION__);
-    for (const auto & table_id : table_ids)
+    UInt64 ts = 0;
+    static constexpr size_t TSO_BATCH_SIZE = 100;
+    for (size_t i = 0; i < table_ids.size(); ++i)
     {
+        /// Get latest timestamp from TSO every TSO_BATCH_SIZE to avoid ts is too old when there are too many table_ids
+        if ((i % TSO_BATCH_SIZE) == 0)
+            ts = context->tryGetTimestamp(__PRETTY_FUNCTION__);
+        const auto & table_id = table_ids[i];
         if (table_id)
         {
             size_t col_num = 0;
+            auto server_vw_name = getServerVwNameFrom(*table_id);
             res_columns[col_num++]->insert(table_id->database());
             res_columns[col_num++]->insert(table_id->name());
             res_columns[col_num++]->insert(table_id->uuid());
-            auto target_server = context->getCnchTopologyMaster()->getTargetServer(table_id->uuid(), ts, true, true);
+            res_columns[col_num++]->insert(server_vw_name);
+            auto target_server = context->getCnchTopologyMaster()->getTargetServer(table_id->uuid(), server_vw_name, ts, true, true);
             res_columns[col_num++]->insert(target_server.getHost());
             res_columns[col_num++]->insert(target_server.getTCPPort());
             res_columns[col_num++]->insert(target_server.getHTTPPort());

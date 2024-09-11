@@ -11,6 +11,7 @@ struct AbsImpl
 {
     using ResultType = std::conditional_t<IsDecimalNumber<A>, A, typename NumberTraits::ResultOfAbs<A>::Type>;
     static const constexpr bool allow_fixed_string = false;
+    static const constexpr ArgType default_arg_type = ArgType::NUMBERS;
 
     static inline NO_SANITIZE_UNDEFINED ResultType apply(A a)
     {
@@ -49,7 +50,7 @@ template <> struct FunctionUnaryArithmeticMonotonicity<NameAbs>
     }
 };
 
-void registerFunctionAbs(FunctionFactory & factory)
+REGISTER_FUNCTION(Abs)
 {
     factory.registerFunction<FunctionAbs>(FunctionFactory::CaseInsensitive);
 }

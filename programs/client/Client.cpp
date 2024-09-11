@@ -53,35 +53,34 @@
 #include <Processors/QueryPipeline.h>
 #include <Columns/ColumnString.h>
 #include <common/find_symbols.h>
-#include <common/LineReader.h>
 #include <Common/ClickHouseRevision.h>
+#include <Common/Config/configReadClient.h>
 #include <Common/Exception.h>
-#include <Common/ShellCommand.h>
-#include <Common/UnicodeBar.h>
-#include <Common/formatReadable.h>
-#include <Common/NetException.h>
-#include <Common/Throttler.h>
-#include <Common/StringUtils/StringUtils.h>
-#include <Common/typeid_cast.h>
-#include <Common/clearPasswordFromCommandLine.h>
 #include <Common/Config/ConfigProcessor.h>
-#include <Common/PODArray.h>
 #include <Core/Types.h>
 #include <Core/QueryProcessingStage.h>
 #include <Core/ExternalTable.h>
+#include <DataStreams/InternalTextLogsRowOutputStream.h>
+#include <Processors/Formats/Impl/NullFormat.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/registerFormats.h>
+#include <Functions/registerFunctions.h>
+#include <IO/OSSCommon.h>
+#include <IO/Operators.h>
+#include <IO/OutfileCommon.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromFileDescriptor.h>
-#include <IO/WriteBufferFromFileDescriptor.h>
-#include <IO/WriteBufferFromFile.h>
-#include <Storages/HDFS/WriteBufferFromHDFS.h>
+#include <IO/OutfileCommon.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadBufferFromString.h>
-#include <IO/ZlibDeflatingWriteBuffer.h>
 #include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
-#include <IO/Operators.h>
 #include <IO/UseSSL.h>
+#include <IO/VETosCommon.h>
+#include <IO/WriteBufferFromFileDescriptor.h>
 #include <IO/WriteBufferFromOStream.h>
+#include <IO/WriteHelpers.h>
+#include <IO/ZlibDeflatingWriteBuffer.h>
+#include <IO/Operators.h>
 #include <Processors/Transforms/AddingDefaultsTransform.h>
 #include <DataStreams/InternalTextLogsRowOutputStream.h>
 #include <DataStreams/NullBlockOutputStream.h>
@@ -103,25 +102,30 @@
 #include <Interpreters/ReplaceQueryParameterVisitor.h>
 #include <Client/Connection.h>
 #include <Common/InterruptListener.h>
-#include <Functions/registerFunctions.h>
-#include <AggregateFunctions/registerAggregateFunctions.h>
-#include <Formats/registerFormats.h>
-#include <Formats/FormatFactory.h>
-#include <Common/Config/configReadClient.h>
-#include <Storages/ColumnsDescription.h>
-#include <common/argsToConfig.h>
-#include <Common/TerminalSize.h>
-#include <Common/UTF8Helpers.h>
+#include <Common/NetException.h>
+#include <Common/PODArray.h>
 #include <Common/ProgressIndication.h>
-#include <filesystem>
+#include <Common/ShellCommand.h>
+#include <Common/StringUtils/StringUtils.h>
+#include <Common/TerminalSize.h>
+#include <Common/Throttler.h>
+#include <Common/UTF8Helpers.h>
+#include <Common/UnicodeBar.h>
+#include <Common/clearPasswordFromCommandLine.h>
 #include <Common/filesystemHelpers.h>
+#include <Common/formatReadable.h>
+#include <Common/typeid_cast.h>
+#include <common/LineReader.h>
+#include <common/argsToConfig.h>
+#include <filesystem>
+#include <AggregateFunctions/registerAggregateFunctions.h>
 
 #if !defined(ARCADIA_BUILD)
 #    include <Common/config_version.h>
 #endif
 
 #ifndef __clang__
-#pragma GCC optimize("-fno-var-tracking-assignments")
+#    pragma GCC optimize("-fno-var-tracking-assignments")
 #endif
 
 #ifndef VERSION_MAJOR
@@ -145,7 +149,7 @@ namespace ErrorCodes
     extern const int UNRECOGNIZED_ARGUMENTS;
     extern const int SYNTAX_ERROR;
     extern const int TOO_DEEP_RECURSION;
-    extern const int ILLEGAL_OUTPUT_PATH;
+    extern const int CANNOT_PARSE_DOMAIN_VALUE_FROM_STRING;
 }
 
 
@@ -183,10 +187,11 @@ public:
 
 private:
     using StringSet = std::unordered_set<String>;
-    StringSet exit_strings{"exit", "quit", "logout", "учше", "йгше", "дщпщге", "exit;", "quit;", "logout;", "учшеж",
-                           "йгшеж", "дщпщгеж", "q", "й", "\\q", "\\Q", "\\й", "\\Й", ":q", "Жй"};
+    StringSet exit_strings{"exit",  "quit",    "logout", "учше", "йгше", "дщпщге", "exit;", "quit;", "logout;", "учшеж",
+                           "йгшеж", "дщпщгеж", "q",      "й",    "\\q",  "\\Q",    "\\й",   "\\Й",   ":q",      "Жй"};
     bool is_interactive = true; /// Use either interactive line editing interface or batch mode.
     bool echo_queries = false; /// Print queries before execution in batch mode.
+    bool echo_pretty = false; /// Print queries with indention
     bool ignore_error
         = false; /// In case of errors, don't print error message, continue to next query. Only applicable for non-interactive mode.
     bool print_time_to_stderr = false; /// Output execution time to stderr in batch mode.
@@ -227,14 +232,9 @@ private:
 
     std::optional<String> out_path;
     /// The user can specify to redirect query output to a file.
-    std::optional<WriteBufferFromFile> out_file_buf;
-    BlockOutputStreamPtr block_out_stream;
-#if USE_HDFS
-    /// The user can specify to redirect query output to local file.
-    std::unique_ptr<WriteBufferFromHDFS> out_hdfs_raw;
-    std::optional<ZlibDeflatingWriteBuffer> out_hdfs_buf;
-#endif
+    OutfileTargetPtr outfile_target;
 
+    std::shared_ptr<IOutputFormat> output_format;
     /// The user could specify special file for server logs (stderr by default)
     std::unique_ptr<WriteBuffer> out_logs_buf;
     String server_logs_file;
@@ -342,6 +342,10 @@ private:
         HDFSConnectionParams hdfs_params = HDFSConnectionParams::parseHdfsFromConfig(context->getCnchConfigRef());
         context->setHdfsConnectionParams(hdfs_params);
 #endif
+        auto vetos_params = VETosConnectionParams::parseVeTosFromConfig(config());
+        context->setVETosConnectParams(vetos_params);
+        auto oss_params = OSSConnectionParams::parseOSSFromConfig(config());
+        context->setOSSConnectParams(oss_params);
     }
 
 
@@ -444,10 +448,9 @@ private:
         time_t current_time = time(nullptr);
 
         if (chineseNewYearTimeZoneIndicators + M
-            == std::find_if(chineseNewYearTimeZoneIndicators, chineseNewYearTimeZoneIndicators + M, [&local_tz](const char * tz)
-                            {
-                                return tz == local_tz;
-                            }))
+            == std::find_if(chineseNewYearTimeZoneIndicators, chineseNewYearTimeZoneIndicators + M, [&local_tz](const char * tz) {
+                   return tz == local_tz;
+               }))
             return false;
 
         /// It's bad to be intrusive.
@@ -477,7 +480,8 @@ private:
                {TokenType::BareWord, Replxx::Color::DEFAULT},
                {TokenType::Number, Replxx::Color::GREEN},
                {TokenType::StringLiteral, Replxx::Color::CYAN},
-               {TokenType::QuotedIdentifier, Replxx::Color::MAGENTA},
+               {TokenType::BackQuotedIdentifier, Replxx::Color::MAGENTA},
+               {TokenType::DoubleQuotedIdentifier, Replxx::Color::MAGENTA},
                {TokenType::OpeningRoundBracket, Replxx::Color::BROWN},
                {TokenType::ClosingRoundBracket, Replxx::Color::BROWN},
                {TokenType::OpeningSquareBracket, Replxx::Color::BROWN},
@@ -489,15 +493,22 @@ private:
                {TokenType::Semicolon, Replxx::Color::INTENSE},
                {TokenType::Dot, Replxx::Color::INTENSE},
                {TokenType::Asterisk, Replxx::Color::INTENSE},
+               {TokenType::HereDoc, Replxx::Color::CYAN},
                {TokenType::Plus, Replxx::Color::INTENSE},
                {TokenType::Minus, Replxx::Color::INTENSE},
                {TokenType::Slash, Replxx::Color::INTENSE},
                {TokenType::Percent, Replxx::Color::INTENSE},
+               {TokenType::BitLeftShift, Replxx::Color::INTENSE},
+               {TokenType::BitRightShift, Replxx::Color::INTENSE},
                {TokenType::Arrow, Replxx::Color::INTENSE},
                {TokenType::QuestionMark, Replxx::Color::INTENSE},
                {TokenType::Colon, Replxx::Color::INTENSE},
                {TokenType::Equals, Replxx::Color::INTENSE},
                {TokenType::NotEquals, Replxx::Color::INTENSE},
+               {TokenType::BitEquals, Replxx::Color::INTENSE},
+               {TokenType::BitOr, Replxx::Color::INTENSE},
+               {TokenType::BitAnd, Replxx::Color::INTENSE},
+               {TokenType::BitXor, Replxx::Color::INTENSE},
                {TokenType::Less, Replxx::Color::INTENSE},
                {TokenType::Greater, Replxx::Color::INTENSE},
                {TokenType::LessOrEquals, Replxx::Color::INTENSE},
@@ -512,8 +523,8 @@ private:
                {TokenType::ErrorMultilineCommentIsNotClosed, Replxx::Color::RED},
                {TokenType::ErrorSingleQuoteIsNotClosed, Replxx::Color::RED},
                {TokenType::ErrorDoubleQuoteIsNotClosed, Replxx::Color::RED},
-               {TokenType::ErrorSinglePipeMark, Replxx::Color::RED},
                {TokenType::ErrorWrongNumber, Replxx::Color::RED},
+               {TokenType::ErrorMaxQuerySizeExceeded, Replxx::Color::RED},
                { TokenType::ErrorMaxQuerySizeExceeded,
                  Replxx::Color::RED }};
 
@@ -590,6 +601,7 @@ private:
         {
             need_render_progress = config().getBool("progress", false);
             echo_queries = config().getBool("echo", false);
+            echo_pretty = config().getBool("echo-pretty", false);
             ignore_error = config().getBool("ignore-error", false);
         }
 
@@ -884,8 +896,7 @@ private:
 
         if (!queries_files.empty())
         {
-            auto process_file = [&](const std::string & file)
-            {
+            auto process_file = [&](const std::string & file) {
                 connection->setDefaultDatabase(connection_parameters.default_database);
                 ReadBufferFromFile in(file);
                 readStringUntilEOF(text, in);
@@ -1331,8 +1342,7 @@ private:
         }
         catch (const Exception & e)
         {
-            if (e.code() != ErrorCodes::SYNTAX_ERROR &&
-                e.code() != ErrorCodes::TOO_DEEP_RECURSION)
+            if (e.code() != ErrorCodes::SYNTAX_ERROR && e.code() != ErrorCodes::TOO_DEEP_RECURSION)
                 throw;
         }
 
@@ -1404,7 +1414,9 @@ private:
 
                     fmt::print(
                         stderr,
-                        "Found error: IAST::clone() is broken for some AST node. This is a bug. The original AST ('dump before fuzz') and its cloned copy ('dump of cloned AST') refer to the same nodes, which must never happen. This means that their parent node doesn't implement clone() correctly.");
+                        "Found error: IAST::clone() is broken for some AST node. This is a bug. The original AST ('dump before fuzz') and "
+                        "its cloned copy ('dump of cloned AST') refer to the same nodes, which must never happen. This means that their "
+                        "parent node doesn't implement clone() correctly.");
 
                     exit(1);
                 }
@@ -1445,7 +1457,9 @@ private:
 
             if (have_error)
             {
-                fmt::print(stderr, "Error on processing query '{}': {}\n", ast_to_process->formatForErrorMessage(), exception->message());
+                if (likely(ast_to_process))
+                    fmt::print(
+                        stderr, "Error on processing query '{}': {}\n", ast_to_process->formatForErrorMessage(), exception->message());
 
                 // Try to reconnect after errors, for two reasons:
                 // 1. We might not have realized that the server died, e.g. if
@@ -1460,7 +1474,8 @@ private:
                 catch (...)
                 {
                     // Just report it, we'll terminate below.
-                    fmt::print(stderr,
+                    fmt::print(
+                        stderr,
                         "Error while reconnecting to the server: Code: {}: {}\n",
                         getCurrentExceptionCode(),
                         getCurrentExceptionMessage(true));
@@ -1519,13 +1534,11 @@ private:
                 {
                     const auto * tmp_pos = query_to_send.c_str();
 
-                    ast_2 = parseQuery(tmp_pos, tmp_pos + query_to_send.size(),
-                        false /* allow_multi_statements */);
+                    ast_2 = parseQuery(tmp_pos, tmp_pos + query_to_send.size(), false /* allow_multi_statements */);
                 }
                 catch (Exception & e)
                 {
-                    if (e.code() != ErrorCodes::SYNTAX_ERROR &&
-                        e.code() != ErrorCodes::TOO_DEEP_RECURSION)
+                    if (e.code() != ErrorCodes::SYNTAX_ERROR && e.code() != ErrorCodes::TOO_DEEP_RECURSION)
                         throw;
                 }
 
@@ -1533,8 +1546,7 @@ private:
                 {
                     const auto text_2 = ast_2->formatForErrorMessage();
                     const auto * tmp_pos = text_2.c_str();
-                    const auto ast_3 = parseQuery(tmp_pos, tmp_pos + text_2.size(),
-                        false /* allow_multi_statements */);
+                    const auto ast_3 = parseQuery(tmp_pos, tmp_pos + text_2.size(), false /* allow_multi_statements */);
                     const auto text_3 = ast_3->formatForErrorMessage();
                     if (text_3 != text_2)
                     {
@@ -1542,9 +1554,12 @@ private:
 
                         printChangedSettings();
 
-                        fmt::print(stderr,
-                            "Got the following (different) text after formatting the fuzzed query and parsing it back:\n'{}'\n, expected:\n'{}'\n",
-                            text_3, text_2);
+                        fmt::print(
+                            stderr,
+                            "Got the following (different) text after formatting the fuzzed query and parsing it back:\n'{}'\n, "
+                            "expected:\n'{}'\n",
+                            text_3,
+                            text_2);
                         fmt::print(stderr, "In more detail:\n");
                         fmt::print(stderr, "AST-1 (generated by fuzzer):\n'{}'\n", parsed_query->dumpTree());
                         fmt::print(stderr, "Text-1 (AST-1 formatted):\n'{}'\n", query_to_send);
@@ -1633,7 +1648,10 @@ private:
 
         if (echo_query.value_or(echo_queries))
         {
-            writeString(full_query, std_out);
+            if (echo_pretty)
+                writeString(serializeAST(*parsed_query, false), std_out);
+            else
+                writeString(full_query, std_out);
             writeChar('\n', std_out);
             std_out.next();
         }
@@ -1662,8 +1680,7 @@ private:
                 if (old_settings)
                     context->setSettings(*old_settings);
             });
-            auto apply_query_settings = [&](const IAST & settings_ast)
-            {
+            auto apply_query_settings = [&](const IAST & settings_ast) {
                 if (!old_settings)
                     old_settings.emplace(context->getSettingsRef());
                 context->applySettingsChanges(settings_ast.as<ASTSetQuery>()->changes);
@@ -1840,7 +1857,7 @@ private:
     ASTPtr parseQuery(const char *& pos, const char * end, bool allow_multi_statements)
     {
         const auto & settings = context->getSettingsRef();
-        ParserQuery parser(end, ParserSettings::valueOf(settings.dialect_type));
+        ParserQuery parser(end, ParserSettings::valueOf(settings));
         ASTPtr res;
 
         size_t max_length = 0;
@@ -1909,7 +1926,7 @@ private:
                 if (need_render_progress)
                 {
                     /// Set total_bytes_to_read for current fd.
-                    FileProgress file_progress(0, std_in.size());
+                    FileProgress file_progress(0, std_in.getFileSize());
                     progress_indication.updateProgress(Progress(file_progress));
 
                     /// Set callback to be called on file progress.
@@ -1948,8 +1965,7 @@ private:
 
         if (columns_description.hasDefaults())
         {
-            pipe.addSimpleTransform([&](const Block & header)
-            {
+            pipe.addSimpleTransform([&](const Block & header) {
                 return std::make_shared<AddingDefaultsTransform>(header, columns_description, *source, context);
             });
         }
@@ -1990,8 +2006,9 @@ private:
     /// Flush all buffers.
     void resetOutput()
     {
-        block_out_stream.reset();
+        output_format.reset();
         logs_out_stream.reset();
+        outfile_target.reset();
 
         if (pager_cmd)
         {
@@ -2000,18 +2017,6 @@ private:
         }
         pager_cmd = nullptr;
 
-        if (out_file_buf)
-        {
-            out_file_buf->next();
-            out_file_buf.reset();
-        }
-#if USE_HDFS
-        if (out_hdfs_buf)
-        {
-            out_hdfs_buf->finalize();
-            out_hdfs_buf.reset();
-        }
-#endif
         if (out_logs_buf)
         {
             out_logs_buf->next();
@@ -2228,14 +2233,19 @@ private:
         }
     }
 
+    bool isOutfileInOtherPlace(const Settings & settings) const
+    {
+        return settings.outfile_in_server_with_tcp || settings.enable_distributed_output;
+    }
+
     void initBlockOutputStream(const Block & block)
     {
-        if (!block_out_stream)
+        if (!output_format)
         {
             /// Ignore all results when fuzzing as they can be huge.
             if (query_fuzzer_runs)
             {
-                block_out_stream = std::make_shared<NullBlockOutputStream>(block);
+                output_format = std::make_shared<NullOutputFormat>(block);
                 return;
             }
 
@@ -2256,47 +2266,51 @@ private:
 
             /// The query can specify output format or output file.
             /// FIXME: try to prettify this cast using `as<>()`
-            if (const auto * query_with_output = dynamic_cast<const ASTQueryWithOutput *>(parsed_query.get()))
+
+            if (const auto * query_with_output = dynamic_cast<const ASTQueryWithOutput *>(parsed_query.get()); query_with_output)
             {
                 if (query_with_output->out_file)
                 {
-                    // const auto & out_file_node = query_with_output->out_file->as<ASTLiteral &>();
-                    // const auto & out_file = out_file_node.value.safeGet<std::string>();
-
                     out_path.emplace(typeid_cast<const ASTLiteral &>(*query_with_output->out_file).value.safeGet<std::string>());
-                    const Poco::URI out_uri(*out_path);
-                    const String & scheme = out_uri.getScheme();
-
-                    if(scheme.empty())
-                    {
-                        out_file_buf.emplace(*out_path, DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_EXCL | O_CREAT);
-                        out_buf = &*out_file_buf;
-                    }
-#if USE_HDFS
-                    else if(isHdfsOrCfsScheme(scheme))
-                    {
-                        out_hdfs_raw = std::make_unique<WriteBufferFromHDFS>(*out_path,
-                            context->getHdfsConnectionParams(),
-                            context->getSettingsRef().max_hdfs_write_buffer_size);
-                        int compression_level = Z_DEFAULT_COMPRESSION;
-                        out_hdfs_buf.emplace(std::move(out_hdfs_raw), DB::CompressionMethod::Gzip, compression_level);
-                        out_buf = &*out_hdfs_buf;
-                    }
-#endif
-                    else
-                    {
-                        throw Exception("Path: " + *out_path + " is illegal, only support write query result to local file or tos", ErrorCodes::ILLEGAL_OUTPUT_PATH);
-                    }
-                    // We are writing to file, so default format is the same as in non-interactive mode.
-                    if (is_interactive && is_default_format)
-                        current_format = "TabSeparated";
+                    // If outfile to remote and is tenant user, set outfile_in_server_with_tcp true
+                    if (!Poco::URI(*out_path).getScheme().empty() && context->is_tenant_user())
+                        context->applySettingChange({"outfile_in_server_with_tcp", true});
                 }
-                if (query_with_output->format != nullptr)
+
+                if (!isOutfileInOtherPlace(context->getSettingsRef()))
                 {
-                    if (has_vertical_output_suffix)
-                        throw Exception("Output format already specified", ErrorCodes::CLIENT_OUTPUT_FORMAT_SPECIFIED);
-                    const auto & id = query_with_output->format->as<ASTIdentifier &>();
-                    current_format = id.name();
+                    if (query_with_output->format != nullptr)
+                    {
+                        if (has_vertical_output_suffix)
+                            throw Exception("Output format already specified", ErrorCodes::CLIENT_OUTPUT_FORMAT_SPECIFIED);
+                        current_format = query_with_output->format->as<ASTIdentifier &>().name();
+                    }
+
+                    if (query_with_output->out_file)
+                    {
+                        // const auto & out_file_node = query_with_output->out_file->as<ASTLiteral &>();
+                        // const auto & out_file = out_file_node.value.safeGet<std::string>();
+                        if (context->getSettingsRef().enable_async_execution)
+                        {
+                            throw Exception(
+                                "If you enable async execution on select query, please set outfile_in_server_with_tcp to 1 and make sure "
+                                "the "
+                                "outfile path is not local",
+                                ErrorCodes::BAD_ARGUMENTS);
+                        }
+
+                        // We are writing to file, so default format is the same as in non-interactive mode.
+                        if (is_interactive && query_with_output->format == nullptr && is_default_format)
+                            current_format = "TabSeparated";
+
+                        String compression_method_str;
+                        UInt64 compression_level = 1;
+                        OutfileTarget::setOutfileCompression(query_with_output, compression_method_str, compression_level);
+
+                        outfile_target = std::make_shared<OutfileTarget>(
+                            context, *out_path, current_format, compression_method_str, compression_level);
+                        out_buf = outfile_target->getOutfileBuffer(true).get();
+                    }
                 }
             }
 
@@ -2305,11 +2319,15 @@ private:
 
             /// It is not clear how to write progress with parallel formatting. It may increase code complexity significantly.
             if (!need_render_progress)
-                block_out_stream = context->getOutputStreamParallelIfPossible(current_format, *out_buf, block);
+                output_format = context->getOutputFormatParallelIfPossible(
+                    current_format, *out_buf, block, outfile_target ? outfile_target->outToMultiFile() : false);
             else
-                block_out_stream = context->getOutputStream(current_format, *out_buf, block);
+                output_format = context->getOutputFormat(current_format, *out_buf, block);
 
-            block_out_stream->writePrefix();
+            if (outfile_target)
+                output_format->setOutFileTarget(outfile_target);
+
+            output_format->doWritePrefix();
         }
     }
 
@@ -2358,7 +2376,7 @@ private:
         initBlockOutputStream(block);
 
         /// The header block containing zero rows was used to initialize
-        /// block_out_stream, do not output it.
+        /// output_format, do not output it.
         /// Also do not output too much data if we're fuzzing.
         if (block.rows() == 0 || (query_fuzzer_runs != 0 && processed_rows >= 100))
             return;
@@ -2366,12 +2384,12 @@ private:
         if (need_render_progress)
             progress_indication.clearProgressOutput();
 
-        block_out_stream->write(block);
+        output_format->write(block);
         written_first_block = true;
 
         /// If does not upload result to local file/hdfs, then received data block is immediately displayed to the user.
-        if(!out_path)
-            block_out_stream->flush();
+        if (!out_path)
+            output_format->flush();
 
         /// Restore progress bar after data block.
         if (need_render_progress)
@@ -2391,13 +2409,13 @@ private:
     void onTotals(Block & block)
     {
         initBlockOutputStream(block);
-        block_out_stream->setTotals(block);
+        output_format->setTotals(block);
     }
 
     void onExtremes(Block & block)
     {
         initBlockOutputStream(block);
-        block_out_stream->setExtremes(block);
+        output_format->setExtremes(block);
     }
 
 
@@ -2409,18 +2427,15 @@ private:
             return;
         }
 
-        if (block_out_stream)
-            block_out_stream->onProgress(value);
+        if (output_format)
+            output_format->onProgress(value);
 
         if (need_render_progress)
             progress_indication.writeProgress();
     }
 
 
-    void writeFinalProgress()
-    {
-        progress_indication.writeFinalProgress();
-    }
+    void writeFinalProgress() { progress_indication.writeFinalProgress(); }
 
 
     void onReceiveExceptionFromServer(std::unique_ptr<Exception> && e)
@@ -2433,8 +2448,8 @@ private:
 
     void onProfileInfo(const BlockStreamProfileInfo & profile_info)
     {
-        if (profile_info.hasAppliedLimit() && block_out_stream)
-            block_out_stream->setRowsBeforeLimit(profile_info.getRowsBeforeLimit());
+        if (profile_info.hasAppliedLimit() && output_format)
+            output_format->setRowsBeforeLimit(profile_info.getRowsBeforeLimit());
     }
 
 
@@ -2442,8 +2457,18 @@ private:
     {
         progress_indication.clearProgressOutput();
 
-        if (block_out_stream)
-            block_out_stream->writeSuffix();
+        if (output_format)
+        {
+            output_format->doWriteSuffix();
+
+            if (outfile_target)
+            {
+                if (outfile_target->outToFile())
+                    outfile_target->flushFile();
+                if (outfile_target->outToMultiFile())
+                    outfile_target->resetCounter();
+            }
+        }
 
         if (logs_out_stream)
             logs_out_stream->writeSuffix();
@@ -2459,7 +2484,21 @@ private:
 
     static void showClientVersion()
     {
-        std::cout << DBMS_NAME << " client version " << VERSION_STRING << VERSION_OFFICIAL << "." << std::endl;
+        #define RESET_   "\033[0m"
+        #define LIGHT_CYAN_ "\033[96m"
+
+        std::cout << LIGHT_CYAN_ << R"(
+            ______       _       _   _
+            | ___ \     | |     | | | |
+            | |_/ /_   _| |_ ___| |_| | ___  _   _ ___  ___
+            | ___ \ | | | __/ _ \  _  |/ _ \| | | / __|/ _ \
+            | |_/ / |_| | ||  __/ | | | (_) | |_| \__ \  __/
+            \____/ \__, |\__\___\_| |_/\___/ \__,_|___/\___|
+                    __/ |
+                    |___/
+            )" << RESET_ << std::endl;
+
+        std::cout << VERSION_NAME << " client version " << VERSION_STRING << VERSION_OFFICIAL << "." << std::endl;
     }
 
     static void clearTerminal()
@@ -2592,7 +2631,7 @@ public:
             ("database,d", po::value<std::string>(), "database")
             ("pager", po::value<std::string>(), "pager")
             ("disable_suggestion,A", "Disable loading suggestion data. Note that suggestion data is loaded asynchronously through a second connection to ClickHouse server. Also it is reasonable to disable suggestion if you want to paste a query with TAB characters. Shorthand option -A is for those who get used to mysql client.")
-            ("suggestion_limit", po::value<int>()->default_value(10000),
+            ("suggestion_limit", po::value<int>()->default_value(0),
                 "Suggestion limit for how many databases, tables and columns to fetch.")
             ("multiline,m", "multiline")
             ("multiquery,n", "multiquery")
@@ -2608,6 +2647,7 @@ public:
             ("version,V", "print version information and exit")
             ("version-clean", "print version in machine-readable format and exit")
             ("echo", "in batch mode, print query before execution")
+            ("echo-pretty", "in batch mode, print queries with indention")
             ("max_client_network_bandwidth", po::value<int>(), "the maximum speed of data exchange over the network for the client in bytes per second.")
             ("compression", po::value<bool>(), "enable or disable compression")
             ("highlight", po::value<bool>()->default_value(true), "enable or disable basic syntax highlight in interactive command line")
@@ -2626,10 +2666,11 @@ public:
 
         /// Commandline options related to external tables.
         po::options_description external_description = createOptionsDescription("External tables options", terminal_width);
-        external_description.add_options()("file", po::value<std::string>(), "data file or - for stdin")(
-            "name",
-            po::value<std::string>()->default_value("_data"),
-            "name of the table")("format", po::value<std::string>()->default_value("TabSeparated"), "data format")("structure", po::value<std::string>(), "structure")("types", po::value<std::string>(), "types");
+        external_description.add_options()
+            ("file", po::value<std::string>(), "data file or - for stdin")
+            ("name", po::value<std::string>()->default_value("_data"), "name of the table")
+            ("format", po::value<std::string>()->default_value("TabSeparated"), "data format")
+            ("structure", po::value<std::string>(), "structure")("types", po::value<std::string>(), "types");
 
         /// Parse main commandline options.
         po::parsed_options parsed = po::command_line_parser(common_arguments).options(main_description).run();
@@ -2700,6 +2741,9 @@ public:
         context->makeGlobalContext();
         context->applySettingsChanges(cmd_settings.changes());
 
+        auto & client_info = context->getClientInfo();
+        client_info.initial_user = options["user"].as<std::string>();
+
         /// Copy settings-related program options to config.
         /// TODO: Is this code necessary?
         for (const auto & setting : context->getSettingsRef().all())
@@ -2763,6 +2807,8 @@ public:
             config().setBool("progress", true);
         if (options.count("echo"))
             config().setBool("echo", true);
+        if (options.count("echo-pretty"))
+            config().setBool("echo-pretty", true);
         if (options.count("time"))
             print_time_to_stderr = true;
         if (options.count("max_client_network_bandwidth"))

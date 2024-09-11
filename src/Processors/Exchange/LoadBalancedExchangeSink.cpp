@@ -26,11 +26,6 @@
 
 namespace DB
 {
-namespace ErrorCodes
-{
-    extern const int EXCHANGE_DATA_TRANS_EXCEPTION;
-}
-
 class RoundRobinSelector : public LoadBalancedExchangeSink::LoadBalanceSelector
 {
 public:
@@ -41,8 +36,9 @@ private:
     UInt32 count = rand(); // NOLINT
 };
 
-LoadBalancedExchangeSink::LoadBalancedExchangeSink(Block header_, BroadcastSenderPtrs senders_)
+LoadBalancedExchangeSink::LoadBalancedExchangeSink(Block header_, BroadcastSenderPtrs senders_, const String &name_)
     : IExchangeSink(std::move(header_))
+    , name(name_)
     , senders(std::move(senders_))
     , partition_selector(std::make_unique<RoundRobinSelector>(senders.size()))
     , logger(&Poco::Logger::get("LoadBalancedExchangeSink"))
@@ -54,6 +50,11 @@ LoadBalancedExchangeSink::~LoadBalancedExchangeSink() = default;
 
 void LoadBalancedExchangeSink::consume(Chunk chunk)
 {
+    if (!has_input)
+    {
+        finish();
+        return;
+    }
     auto status = ExchangeUtils::sendAndCheckReturnStatus(*senders[partition_selector->selectNext()], std::move(chunk));
     if (status.code != BroadcastStatusCode::RUNNING)
         finish();

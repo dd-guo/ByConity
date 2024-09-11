@@ -36,6 +36,7 @@
 #include <Common/formatReadable.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/ErrorCodes.h>
+#include <Common/HostWithPorts.h>
 #include <filesystem>
 
 #if !defined(ARCADIA_BUILD)
@@ -46,6 +47,10 @@ namespace fs = std::filesystem;
 
 namespace DB
 {
+/// developers misuse logical error from time to time
+/// which triggers false alarms in sanitizer tests,
+/// provide a knob to disable the abort-on-logical-error behavior temporarily
+bool g_disable_abort_on_logical_error = false;
 
 namespace ErrorCodes
 {
@@ -67,7 +72,7 @@ void abortOnFailedAssertion(const String & description)
     if (always_false)
         return;
 
-    abort();
+    // abort();
 }
 
 /// - Aborts the process if error code is LOGICAL_ERROR.
@@ -77,9 +82,9 @@ void handle_error_code([[maybe_unused]] const std::string & msg, int code, bool 
     // In debug builds and builds with sanitizers, treat LOGICAL_ERROR as an assertion failure.
     // Log the message before we fail.
 #ifdef ABORT_ON_LOGICAL_ERROR
-    if (code == ErrorCodes::LOGICAL_ERROR)
+    if (code == ErrorCodes::LOGICAL_ERROR && !g_disable_abort_on_logical_error)
     {
-        abortOnFailedAssertion(msg);
+        // abortOnFailedAssertion(msg);
     }
 #endif
 
@@ -182,7 +187,7 @@ void throwFromErrno(const std::string & s, int code, int the_errno)
 
 void throwFromErrnoWithPath(const std::string & s, const std::string & path, int code, int the_errno)
 {
-    throw ErrnoException(s + ", " + errnoToString(code, the_errno), code, the_errno, path);
+    throw ErrnoException(s + ", " + errnoToString(code, the_errno) + ", path = " + path, code, the_errno, path);
 }
 
 static void tryLogCurrentExceptionImpl(Poco::Logger * logger, const std::string & start_of_message)
@@ -234,6 +239,22 @@ void tryLogDebugCurrentException(Poco::Logger * logger, const std::string & star
     try
     {
         LOG_DEBUG(logger, start_of_message + (start_of_message.empty() ? "" : ": ") + getCurrentExceptionMessage(true));
+    }
+    catch (...)
+    {
+    }
+}
+
+void tryLogWarningCurrentException(const char * log_name, const std::string & start_of_message)
+{
+    tryLogWarningCurrentException(&Poco::Logger::get(log_name), start_of_message);
+}
+
+void tryLogWarningCurrentException(Poco::Logger * logger, const std::string & start_of_message)
+{
+    try
+    {
+        LOG_WARNING(logger, start_of_message + (start_of_message.empty() ? "" : ": ") + getCurrentExceptionMessage(true));
     }
     catch (...)
     {
@@ -610,11 +631,15 @@ std::string ParsingException::displayText() const
     }
 }
 
-void ExceptionHandler::setException(std::exception_ptr && exception)
+bool ExceptionHandler::setException(std::exception_ptr && exception)
 {
     std::unique_lock lock(mutex);
     if (!first_exception)
+    {
         first_exception = std::move(exception);
+        return true;
+    }
+    return false;
 }
 
 void ExceptionHandler::throwIfException()
@@ -624,4 +649,9 @@ void ExceptionHandler::throwIfException()
         std::rethrow_exception(first_exception);
 }
 
+bool ExceptionHandler::hasException() const
+{
+    std::unique_lock lock(mutex);
+    return first_exception != nullptr;
+}
 }

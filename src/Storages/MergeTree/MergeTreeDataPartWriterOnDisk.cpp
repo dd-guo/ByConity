@@ -20,18 +20,25 @@
  */
 
 #include <Storages/MergeTree/MergeTreeDataPartWriterOnDisk.h>
+#include <Storages/MergeTree/Index/MergeTreeBitmapIndex.h>
+#include <Storages/MergeTree/Index/MergeTreeSegmentBitmapIndex.h>
 
-#include <Columns/ColumnByteMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/Serializations/ISerialization.h>
 #include <DataTypes/Serializations/SerializationNullable.h>
-#include <DataTypes/DataTypeByteMap.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/MapHelpers.h>
+#include <Storages/MergeTree/GinIndexDataPartHelper.h>
+#include <Storages/MergeTree/GinIndexStore.h>
+#include <Storages/MergeTree/MergeTreeIndexInverted.h>
+#include <Storages/DiskCache/DiskCacheFactory.h>
 #include <Common/escapeForFileName.h>
-#include <Columns/ColumnByteMap.h>
+#include <Columns/ColumnMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/FieldVisitorToString.h>
 #include <utility>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
 
 namespace DB
 {
@@ -49,6 +56,11 @@ void MergeTreeDataPartWriterOnDisk::Stream::finalize()
 
     plain_file->finalize();
     marks_file->finalize();
+
+    if (compressed_idx != nullptr)
+    {
+        compressed_idx->finalize();
+    }
 }
 
 void MergeTreeDataPartWriterOnDisk::Stream::sync() const
@@ -66,18 +78,33 @@ MergeTreeDataPartWriterOnDisk::Stream::Stream(
     const std::string & marks_file_extension_,
     const CompressionCodecPtr & compression_codec_,
     size_t max_compress_block_size_,
-    bool is_compact_map) :
+    bool write_append,
+    bool is_compact_map,
+    bool write_compressed_index) :
     escaped_column_name(escaped_column_name_),
     data_file_extension{data_file_extension_},
     marks_file_extension{marks_file_extension_},
-    plain_file(disk_->writeFile(data_path_ + data_file_extension, {.buffer_size = max_compress_block_size_, .mode = is_compact_map ? WriteMode::Append: WriteMode::Rewrite})),
+    plain_file(disk_->writeFile(data_path_ + data_file_extension, {.buffer_size = max_compress_block_size_, .mode = write_append ? WriteMode::Append: WriteMode::Rewrite})),
     plain_hashing(*plain_file),
     compressed_buf(plain_hashing, compression_codec_, max_compress_block_size_),
     compressed(compressed_buf),
-    marks_file(disk_->writeFile(marks_path_ + marks_file_extension, {.buffer_size = 4096, .mode = is_compact_map ? WriteMode::Append: WriteMode::Rewrite})), marks(*marks_file),
+    marks_file(disk_->writeFile(marks_path_ + marks_file_extension, {.buffer_size = 4096, .mode = write_append ? WriteMode::Append: WriteMode::Rewrite})), marks(*marks_file),
     data_file_offset(is_compact_map ? disk_->getFileSize(data_path_ + data_file_extension): 0),
     marks_file_offset(is_compact_map ? disk_->getFileSize(marks_path_ + marks_file_extension): 0)
 {
+    if (is_compact_map && !write_append)
+        throw Exception("Compact map must use append write mode. This is is bug.", ErrorCodes::LOGICAL_ERROR);
+
+    if (write_compressed_index)
+    {
+        compressed_idx_file = disk_->writeFile(data_path_ + data_file_extension
+            + COMPRESSED_DATA_INDEX_EXTENSION);
+        compressed_idx_hash = std::make_unique<HashingWriteBuffer>(*compressed_idx_file);
+        compressed_idx = CompressedDataIndex::openForWrite(
+            compressed_idx_hash.get());
+
+        compressed_buf.setStatisticsCollector(compressed_idx.get());
+    }
 }
 
 void MergeTreeDataPartWriterOnDisk::Stream::addToChecksums(MergeTreeData::DataPart::Checksums & checksums)
@@ -94,6 +121,13 @@ void MergeTreeDataPartWriterOnDisk::Stream::addToChecksums(MergeTreeData::DataPa
     checksums.files[name + marks_file_extension].file_size = marks.count();
     checksums.files[name + marks_file_extension].file_hash = marks.getHash();
     checksums.files[name + marks_file_extension].file_offset = marks_file_offset;
+
+    if (compressed_idx != nullptr)
+    {
+        checksums.files[name + data_file_extension + COMPRESSED_DATA_INDEX_EXTENSION].file_hash = compressed_idx_hash->getHash();
+        checksums.files[name + data_file_extension + COMPRESSED_DATA_INDEX_EXTENSION].file_offset = 0;
+        checksums.files[name + data_file_extension + COMPRESSED_DATA_INDEX_EXTENSION].file_size = compressed_idx_file->count();
+    }
 }
 
 void MergeTreeDataPartWriterOnDisk::Stream::deepCopyTo(Stream& target)
@@ -137,7 +171,8 @@ MergeTreeDataPartWriterOnDisk::MergeTreeDataPartWriterOnDisk(
     const String & marks_file_extension_,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & settings_,
-    const MergeTreeIndexGranularity & index_granularity_)
+    const MergeTreeIndexGranularity & index_granularity_,
+    const BitmapBuildInfo & bitmap_build_info_)
     : IMergeTreeDataPartWriter(data_part_,
         columns_list_, metadata_snapshot_, settings_, index_granularity_)
     , skip_indices(indices_to_recalc_)
@@ -145,6 +180,7 @@ MergeTreeDataPartWriterOnDisk::MergeTreeDataPartWriterOnDisk(
     , marks_file_extension(marks_file_extension_)
     , default_codec(default_codec_)
     , compute_granularity(index_granularity.empty())
+    , bitmap_build_info(bitmap_build_info_)
 {
     if (settings.blocks_are_granules_size && !index_granularity.empty())
         throw Exception("Can't take information about index granularity from blocks, when non empty index_granularity array specified", ErrorCodes::LOGICAL_ERROR);
@@ -161,8 +197,12 @@ MergeTreeDataPartWriterOnDisk::MergeTreeDataPartWriterOnDisk(
     if (settings.rewrite_primary_key)
         initPrimaryIndex();
     initSkipIndices();
+    initBitmapIndices();
+    initSegmentBitmapIndices();
 
     optimize_map_column_serialization = settings.optimize_map_column_serialization;
+
+    loadColumnCompressInfoFromSetting();
 }
 
 // Implementation is split into static functions for ability
@@ -225,9 +265,9 @@ void MergeTreeDataPartWriterOnDisk::initPrimaryIndex()
 
 void MergeTreeDataPartWriterOnDisk::initSkipIndices()
 {
-    for (const auto & index_helper : skip_indices)
+    for (const auto & skip_index : skip_indices)
     {
-        String stream_name = index_helper->getFileName();
+        String stream_name = skip_index->getFileName();
         skip_indices_streams.emplace_back(
                 std::make_unique<MergeTreeDataPartWriterOnDisk::Stream>(
                         stream_name,
@@ -235,8 +275,165 @@ void MergeTreeDataPartWriterOnDisk::initSkipIndices()
                         part_path + stream_name, INDEX_FILE_EXTENSION,
                         part_path + stream_name, marks_file_extension,
                         default_codec, settings.max_compress_block_size));
-        skip_indices_aggregators.push_back(index_helper->createIndexAggregator());
+
+        GinIndexStorePtr store = nullptr;
+        if (typeid_cast<const MergeTreeIndexInverted *>(&*skip_index) != nullptr)
+        {
+            std::unique_ptr<IGinDataPartHelper> gin_part_helper = nullptr;
+            if (data_part->getType() == IMergeTreeDataPart::Type::CNCH)
+            {
+                gin_part_helper = std::make_unique<GinDataCNCHPartHelper>(data_part,
+                    DiskCacheFactory::instance().get(DiskCacheType::MergeTree));
+            }
+            else
+            {
+                gin_part_helper = std::make_unique<GinDataLocalPartHelper>(*data_part);
+            }
+            store = std::make_shared<GinIndexStore>(
+                stream_name, std::move(gin_part_helper), storage.getSettings()->max_digestion_size_per_segment);
+            gin_index_stores[stream_name] = store;
+        }
+
+        skip_indices_aggregators.push_back(skip_index->createIndexAggregatorForPart(store));
         skip_index_accumulated_marks.push_back(0);
+    }
+}
+
+/**
+  * Bitmap indices can be built from :
+  * 1. build in insert / merge: 
+  *   - enable build : 
+  *       build_all_bitmap_index && !only_bitmap_index: 
+  *   - not enable build (insert: enable_build_ab_index; merge: build_bitmap_index_in_merge):
+  *       (!build_all_bitmap_index) with empty bitmap_index_columns
+  * 2. alter table build bitmap of partition:
+  *   - build_all_bitmap_index && only_bitmap_index
+  * 3. other mutation: 
+  *   - not_build_bitmap_index
+  * 4. build with dependent columns changed:
+  *   - (!build_all_bitmap_index && !only_bitmap_index) with dependent columns in bitmap_index_columns
+  */
+void MergeTreeDataPartWriterOnDisk::initBitmapIndices()
+{
+    if (bitmap_build_info.not_build_bitmap_index)
+        return;
+
+    auto get_all_bitmap_columns = [&](const auto & all_columns) 
+    {
+        bitmap_build_info.bitmap_index_columns.clear();
+        for (const auto & column : all_columns)
+        {
+            if (MergeTreeBitmapIndex::isBitmapIndexColumn(column.type))
+                bitmap_build_info.bitmap_index_columns.emplace_back(column.name, column.type);
+        }
+    };
+
+    if (bitmap_build_info.build_all_bitmap_index)
+    {
+        bitmap_build_info.bitmap_index_columns.clear();
+        if (bitmap_build_info.only_bitmap_index)
+            get_all_bitmap_columns(metadata_snapshot->getColumns());
+        else
+            get_all_bitmap_columns(columns_list);
+    }
+    
+    for (const auto & it : bitmap_build_info.bitmap_index_columns)
+    {
+        if (MergeTreeBitmapIndex::isBitmapIndexColumn(it.type) && MergeTreeBitmapIndex::needBuildIndex(data_part->getFullPath(), it.name))
+        {
+            IndexParams bitmap_params(storage.getSettings()->enable_build_ab_index,
+                                      bitmap_build_info.only_bitmap_index,
+                                      storage.getSettings()->enable_run_optimization,
+                                      storage.getSettings()->max_parallel_threads_for_bitmap,
+                                      storage.getSettings()->index_granularity);
+            addBitmapIndexes(data_part->volume->getDisk()->getPath() + "/" + part_path, it.name, *it.type, bitmap_params);
+        }
+    }
+}
+
+void MergeTreeDataPartWriterOnDisk::initSegmentBitmapIndices()
+{
+    if (bitmap_build_info.not_build_segment_bitmap_index)
+        return;
+
+    auto get_all_indexed_columns = [&](const auto & all_columns) 
+    {
+        bitmap_build_info.segment_bitmap_index_columns.clear();
+        for (const auto & column : all_columns)
+        {
+            if (MergeTreeSegmentBitmapIndex::isSegmentBitmapIndexColumn(column.type))
+                bitmap_build_info.segment_bitmap_index_columns.emplace_back(column.name, column.type);
+        }
+    };
+
+    if (bitmap_build_info.build_all_segment_bitmap_index)
+    {
+        bitmap_build_info.segment_bitmap_index_columns.clear();
+        if (bitmap_build_info.only_segment_bitmap_index)
+            get_all_indexed_columns(metadata_snapshot->getColumns());
+        else
+            get_all_indexed_columns(columns_list);
+    }
+    
+    for (const auto & it : bitmap_build_info.segment_bitmap_index_columns)
+    {
+        if (MergeTreeSegmentBitmapIndex::isSegmentBitmapIndexColumn(it.type) && MergeTreeSegmentBitmapIndex::needBuildSegmentIndex(data_part->getFullPath(), it.name))
+        {
+            IndexParams bitmap_params(
+                // enable sync build, this logic is bounded with original bitmap index
+                storage.getSettings()->enable_build_ab_index,
+                bitmap_build_info.only_segment_bitmap_index,
+                storage.getSettings()->enable_run_optimization,
+                storage.getSettings()->max_parallel_threads_for_bitmap,
+                storage.getSettings()->index_granularity,
+                storage.getSettings()->bitmap_index_segment_granularity,
+                storage.getSettings()->bitmap_index_serializing_granularity
+                );
+            addSegmentBitmapIndexes(data_part->volume->getDisk()->getPath() + "/" + part_path, it.name, *it.type, bitmap_params);
+        }
+    }
+}
+
+void MergeTreeDataPartWriterOnDisk::writeBitmapIndexColumns(const Block & block)
+{
+    if (column_bitmap_indexes.empty())
+        return;
+
+    for (const auto & column : bitmap_build_info.bitmap_index_columns)
+    {
+        // Assume that if current column has a bitmap index, it won't have other index optimizations
+        String index_name = ISerialization::getFileNameForStream(column.name, {});
+        if (column_bitmap_indexes.count(index_name))
+        {
+            auto * index = column_bitmap_indexes[index_name].get();
+            if (index && index->bitmap_index)
+            {
+                index->bitmap_index->asyncAppendColumnData(block.getByName(column.name).column);
+                data_part->bitmap_index_checker->emplace(column.name, true);
+            }
+        }
+    }
+}
+
+
+void MergeTreeDataPartWriterOnDisk::writeSegmentBitmapIndexColumns(const Block & block)
+{
+    if (column_segment_bitmap_indexes.empty())
+        return;
+
+    for (const auto & column : bitmap_build_info.segment_bitmap_index_columns)
+    {
+        // Assume that if current column has a segment bitmap index, it won't have other index optimizations
+        String index_name = ISerialization::getFileNameForStream(column.name, {});
+        if (column_segment_bitmap_indexes.count(index_name))
+        {
+            auto * index = column_segment_bitmap_indexes[index_name].get();
+            if (index && index->bitmap_index)
+            {
+                index->bitmap_index->asyncAppendColumnData(block.getByName(column.name).column);
+                data_part->bitmap_index_checker->emplace(column.name, true);
+            }
+        }
     }
 }
 
@@ -288,6 +485,17 @@ void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(const Block
     {
         const auto index_helper = skip_indices[i];
         auto & stream = *skip_indices_streams[i];
+
+        GinIndexStorePtr store;
+        if (typeid_cast<const MergeTreeIndexInverted *>(&*index_helper) != nullptr)
+        {
+            String stream_name = index_helper->getFileName();
+            auto it = gin_index_stores.find(stream_name);
+            if (it == gin_index_stores.end())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Index '{}' does not exist", stream_name);
+            store = it->second;
+        }
+
         for (const auto & granule : granules_to_write)
         {
             if (skip_index_accumulated_marks[i] == index_helper->index.granularity)
@@ -298,7 +506,7 @@ void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(const Block
 
             if (skip_indices_aggregators[i]->empty() && granule.mark_on_start)
             {
-                skip_indices_aggregators[i] = index_helper->createIndexAggregator();
+                skip_indices_aggregators[i] = index_helper->createIndexAggregatorForPart(store);
 
                 if (stream.compressed.offset() >= settings.min_compress_block_size)
                     stream.compressed.next();
@@ -359,7 +567,12 @@ void MergeTreeDataPartWriterOnDisk::finishSkipIndicesSerialization(
         if (!skip_indices_aggregators[i]->empty())
             skip_indices_aggregators[i]->getGranuleAndReset()->serializeBinary(stream.compressed);
     }
-
+    for (auto & store : gin_index_stores)
+    {
+        store.second->finalize();
+        store.second->addToChecksums(checksums);
+    }
+    
     for (auto & stream : skip_indices_streams)
     {
         stream->finalize();
@@ -368,9 +581,46 @@ void MergeTreeDataPartWriterOnDisk::finishSkipIndicesSerialization(
             stream->sync();
     }
 
+    gin_index_stores.clear();
     skip_indices_streams.clear();
     skip_indices_aggregators.clear();
     skip_index_accumulated_marks.clear();
+}
+
+void MergeTreeDataPartWriterOnDisk::finishBitmapIndexSerialization(MergeTreeData::DataPart::Checksums & checksums)
+{
+    for (auto & column_bitmap_index : column_bitmap_indexes)
+    {
+        if (column_bitmap_index.second->only_write_bitmap_index)
+        {
+            if (column_bitmap_index.second->bitmap_index)
+            {
+                column_bitmap_index.second->bitmap_index->finalize();
+                column_bitmap_index.second->bitmap_index->addToChecksums(checksums);
+                continue;
+            }
+        }
+        column_bitmap_index.second->finalize();
+        column_bitmap_index.second->addToChecksums(checksums);
+    }
+}
+
+void MergeTreeDataPartWriterOnDisk::finishSegmentBitmapIndexSerialization(MergeTreeData::DataPart::Checksums & checksums)
+{
+    for (auto & column_segment_bitmap_index : column_segment_bitmap_indexes)
+    {
+        if (column_segment_bitmap_index.second->only_write_bitmap_index)
+        {
+            if (column_segment_bitmap_index.second->bitmap_index)
+            {
+                column_segment_bitmap_index.second->bitmap_index->finalize();
+                column_segment_bitmap_index.second->bitmap_index->addToChecksums(checksums);
+                continue;
+            }
+        }
+        column_segment_bitmap_index.second->finalize();
+        column_segment_bitmap_index.second->addToChecksums(checksums);
+    }
 }
 
 Names MergeTreeDataPartWriterOnDisk::getSkipIndicesColumns() const
@@ -386,6 +636,12 @@ void MergeTreeDataPartWriterOnDisk::addStreams(
     const NameAndTypePair & column,
     const ASTPtr & effective_codec_desc)
 {
+    size_t max_compress_block_size = settings.max_compress_block_size;
+    if (auto iter = column_compress_settings.find(column.name); iter != column_compress_settings.end() && iter->second.max_compress_block_size != 0)
+    {
+        max_compress_block_size = iter->second.max_compress_block_size;
+    }
+
     IDataType::StreamCallbackWithType callback = [&] (const ISerialization::SubstreamPath & substream_path, const IDataType & substream_type)
     {
         String stream_name = ISerialization::getFileNameForStream(column, substream_path);
@@ -400,13 +656,19 @@ void MergeTreeDataPartWriterOnDisk::addStreams(
         else /// otherwise return only generic codecs and don't use info about the` data_type
             compression_codec = CompressionCodecFactory::instance().get(effective_codec_desc, nullptr, default_codec, true);
 
+        bool write_compressed_index = !substream_path.empty()
+            && (substream_path.back().type == ISerialization::Substream::StringElements);
+
         column_streams[stream_name] = std::make_unique<Stream>(
             stream_name,
             data_part->volume->getDisk(),
             part_path + stream_name, DATA_FILE_EXTENSION,
             part_path + stream_name, marks_file_extension,
             compression_codec,
-            settings.max_compress_block_size);
+            max_compress_block_size,
+            /*write_append*/ false,
+            /*is_compact_map*/ false,
+            write_compressed_index);
     };
 
     column.type->enumerateStreams(serializations[column.name], callback);
@@ -435,6 +697,7 @@ void MergeTreeDataPartWriterOnDisk::addByteMapStreams(
         if (data_part->versions->enable_compact_map_data)
             col_stream_name = ISerialization::getFileNameForStream(col_name, substream_path);
 
+        // TODO(shiyuze): support big string in map
         column_streams[stream_name] = std::make_unique<Stream>(
             stream_name,
             data_part->volume->getDisk(),
@@ -442,7 +705,8 @@ void MergeTreeDataPartWriterOnDisk::addByteMapStreams(
             part_path + col_stream_name, marks_file_extension,
             compression_codec,
             settings.max_compress_block_size,
-            data_part->versions->enable_compact_map_data);
+            /* write_append = */data_part->versions->enable_compact_map_data,
+            /* is_compact_map = */data_part->versions->enable_compact_map_data);
     };
 
     column.type->enumerateStreams(serializations[column.name], callback);
@@ -456,12 +720,14 @@ void MergeTreeDataPartWriterOnDisk::writeUncompactedByteMapColumn(
     const Granules & granules)
 {
     const auto & [name, type] = name_and_type;
+    if (!type->isByteMap())
+        throw Exception("Data whose type is not ByteMap is processed in method `writeUncompactedByteMapColumn`", ErrorCodes::LOGICAL_ERROR);
 
     // I would like to move map type serialize (expanded) logic from DataTypeMap.cpp to here because it
     // tightly bind to MergeTree storage model.
 
-    const ColumnByteMap & column_map = typeid_cast<const ColumnByteMap &>(column);
-    const auto type_map = std::dynamic_pointer_cast<const DataTypeByteMap>(type);
+    const auto & column_map = typeid_cast<const ColumnMap &>(column);
+    const auto type_map = std::dynamic_pointer_cast<const DataTypeMap>(type);
 
     String map_base_stream_name = getBaseNameForMapCol(name);
 
@@ -524,12 +790,12 @@ void MergeTreeDataPartWriterOnDisk::writeUncompactedByteMapColumn(
         }
     }
 
-    //TODO: patch MAP KEY # check feature idependently
-    // checkMapKey(name, key_name_map);
     ISerialization::SerializeBinaryBulkSettings serialize_settings;
 
     auto null_val_serial = null_val_type_ptr->getDefaultSerialization();
 
+    const auto & storage_columns = metadata_snapshot->getColumns();
+    auto map_effective_codec_desc = storage_columns.getCodecDescOrDefault(name, default_codec);
     // We should construct or build WriteBuffer(ColumnStream) based on unique keys
     for (auto & k_n : key_name_map)
     {
@@ -553,11 +819,11 @@ void MergeTreeDataPartWriterOnDisk::writeUncompactedByteMapColumn(
 
         if (need_fix_new_key)
         {
-            this->deepCopyAndAdd(map_base_stream_name, implicit_stream_name, *null_val_type_ptr);
+            this->deepCopyAndAdd(map_base_stream_name, implicit_stream_name, *null_val_type_ptr, map_effective_codec_desc);
         }
         else
         {
-            this->addStreams(implicit_column, default_codec->getFullCodecDesc());
+            this->addByteMapStreams(implicit_column, name, map_effective_codec_desc);
         }
 
 
@@ -590,7 +856,7 @@ void MergeTreeDataPartWriterOnDisk::writeUncompactedByteMapColumn(
             serializations.emplace(stream_name, null_val_serial);
 
             NameAndTypePair implicit_column{stream_name, null_val_type_ptr};
-            this->addStreams(implicit_column, default_codec->getFullCodecDesc());
+            this->addByteMapStreams(implicit_column, name, map_effective_codec_desc);
             this->writeColumn(implicit_column, *fake_col, offset_columns, granules);
         }
     }
@@ -602,7 +868,7 @@ void MergeTreeDataPartWriterOnDisk::writeUncompactedByteMapColumn(
     if (!map_base_stream_exist)
         implicit_columns_list.emplace_back(base_column);
 
-    this->addStreams(base_column, default_codec->getFullCodecDesc());
+    this->addByteMapStreams(base_column, name, map_effective_codec_desc);
     this->writeColumn(base_column, *fake_col, offset_columns, granules);
 
     // after write this map column, update exist keys for next block check
@@ -647,13 +913,13 @@ void MergeTreeDataPartWriterOnDisk::writeCompactedByteMapColumn(
      *
      ********************************************************************************************************/
     const auto & [name, type] = name_and_type;
-    if (!type->isMap())
+    if (!type->isByteMap())
     {
-        throw Exception("Data whose type is not map is processed in method `writeCompactedByteMapColumn`", ErrorCodes::LOGICAL_ERROR);
+        throw Exception("Data whose type is not ByteMap is processed in method `writeCompactedByteMapColumn`", ErrorCodes::LOGICAL_ERROR);
     }
 
-    const ColumnByteMap & column_map = typeid_cast<const ColumnByteMap &>(column);
-    const auto type_map = std::dynamic_pointer_cast<const DataTypeByteMap>(type);
+    const auto & column_map = typeid_cast<const ColumnMap &>(column);
+    const auto type_map = std::dynamic_pointer_cast<const DataTypeMap>(type);
 
     // NOTE: for business reason, LC is considered not very useful
     DataTypePtr null_val_type_ptr = type_map->getValueTypeForImplicitColumn();
@@ -678,11 +944,12 @@ void MergeTreeDataPartWriterOnDisk::writeCompactedByteMapColumn(
         }
     }
 
-    //TODO: patch MAP KEY # check feature idependently
-    // checkMapKey(name, key_name_map);
     ISerialization::SerializeBinaryBulkSettings serialize_settings;
 
 	auto null_val_serial = null_val_type_ptr->getDefaultSerialization();
+
+    const auto & storage_columns = metadata_snapshot->getColumns();
+    auto map_effective_codec_desc = storage_columns.getCodecDescOrDefault(name, default_codec);
 
     for (auto & k_n : key_name_map)
     {
@@ -700,7 +967,7 @@ void MergeTreeDataPartWriterOnDisk::writeCompactedByteMapColumn(
 		serializations.emplace(implicit_stream_name, null_val_serial);
 
         // All implicit column data store in the same file
-        this->addByteMapStreams({implicit_stream_name, null_val_type_ptr}, name, default_codec->getFullCodecDesc());
+        this->addByteMapStreams({implicit_stream_name, null_val_type_ptr}, name, map_effective_codec_desc);
 
         ColumnPtr implicit_value_col;
         if (optimize_map_column_serialization)
@@ -737,7 +1004,7 @@ void MergeTreeDataPartWriterOnDisk::writeColumn(
     const auto & [name, type] = name_and_type;
 
     // special code path for ByteMap data type in flatten model
-    if (type->isMap() && column.size() > 0 && !type->isMapKVStore())
+    if (column.size() > 0 && type->isByteMap())
     {
         if (data_part->versions->enable_compact_map_data)
             writeCompactedByteMapColumn(name_and_type, column, offset_columns, granules);
@@ -752,7 +1019,7 @@ void MergeTreeDataPartWriterOnDisk::writeColumn(
     {
         ISerialization::SerializeBinaryBulkSettings serialize_settings;
         serialize_settings.getter = createStreamGetter(name_and_type, offset_columns);
-        serializations[name]->serializeBinaryBulkStatePrefix(serialize_settings, it->second);
+        serializations[name]->serializeBinaryBulkStatePrefix(column, serialize_settings, it->second);
     }
 
     const auto & global_settings = storage.getContext()->getSettingsRef();
@@ -776,7 +1043,7 @@ void MergeTreeDataPartWriterOnDisk::writeColumn(
                     getRowsWrittenInLastMark());
             last_non_written_marks[name] = getCurrentMarksForColumn(name_and_type, offset_columns, serialize_settings.path);
         }
-        else if (isMapImplicitKeyNotKV(name) && !last_non_written_marks.count(name))
+        else if (isMapImplicitKey(name) && !last_non_written_marks.count(name))
         {
             /// This case maybe happen when writing uncompact map data during merging.
             /// For uncompacted map, we need to handle new key implicit column(more detail see method @writeUncompactedByteMapColumn), which will deep and clone base stream.
@@ -840,7 +1107,8 @@ void MergeTreeDataPartWriterOnDisk::writeColumn(
 
         if (write_final_mark)
             writeFinalMark(name_and_type, offset_columns, serialize_settings.path);
-
+        
+                
         serializations[name]->enumerateStreams(finalizeStreams(name), serialize_settings.path);
     }
 
@@ -866,7 +1134,7 @@ ISerialization::StreamCallback MergeTreeDataPartWriterOnDisk::finalizeStreams(co
     };
 }
 
-void MergeTreeDataPartWriterOnDisk::deepCopyAndAdd(const String & source_name, const String & target_name, const IDataType & type)
+void MergeTreeDataPartWriterOnDisk::deepCopyAndAdd(const String & source_name, const String & target_name, const IDataType & type, const ASTPtr & effective_codec_desc)
 {
     // This is done in three steps:
     // 1. copy synced data in file
@@ -884,26 +1152,38 @@ void MergeTreeDataPartWriterOnDisk::deepCopyAndAdd(const String & source_name, c
                         "Prerequist is not matched while calling MergeTreeDataPartWriterOnDisk::deepCopyAndAdd", ErrorCodes::LOGICAL_ERROR);
                 }
 
+                CompressionCodecPtr compression_codec;
+                /// If we can use special codec then just get it
+                if (ISerialization::isSpecialCompressionAllowed(substream_path))
+                    compression_codec = CompressionCodecFactory::instance().get(effective_codec_desc, substream_path.back().data.type, default_codec);
+                else /// otherwise return only generic codecs and don't use info about the` data_type
+                    compression_codec = CompressionCodecFactory::instance().get(effective_codec_desc, nullptr, default_codec, true);
+
                 column_streams[source_stream_name]->sync();
 
                 // copy flushed files
-                if (Poco::File(part_path + source_stream_name + DATA_FILE_EXTENSION).exists())
-                    Poco::File(part_path + source_stream_name + DATA_FILE_EXTENSION)
-                        .copyTo(part_path + target_stream_name + DATA_FILE_EXTENSION);
-                if (Poco::File(part_path + source_stream_name + marks_file_extension).exists())
-                    Poco::File(part_path + source_stream_name + marks_file_extension)
-                        .copyTo(part_path + target_stream_name + marks_file_extension);
+                const auto & disk = data_part->volume->getDisk();
+                std::vector<std::pair<std::string, std::string>> files_to_copy;
 
+                if (disk->exists(part_path + source_stream_name + DATA_FILE_EXTENSION))
+                    files_to_copy.emplace_back(part_path + source_stream_name + DATA_FILE_EXTENSION, part_path + target_stream_name + DATA_FILE_EXTENSION);
+                if (disk->exists(part_path + source_stream_name + marks_file_extension))
+                    files_to_copy.emplace_back(part_path + source_stream_name + marks_file_extension, part_path + target_stream_name + marks_file_extension);
+                disk->copyFiles(files_to_copy, disk);
+
+                // TODO(shiyuze): support big string in map
                 // addStreams
                 column_streams[target_stream_name] = std::make_unique<Stream>(
                     target_stream_name,
-                    data_part->volume->getDisk(),
+                    disk,
                     part_path + target_stream_name,
                     DATA_FILE_EXTENSION,
                     part_path + target_stream_name,
                     marks_file_extension,
-                    default_codec,
-                    settings.max_compress_block_size);
+                    compression_codec,
+                    settings.max_compress_block_size,
+                    /* write_append = */true,
+                    /* is_compact_map = */false);
 
                 // copy buffered stream and its info
                 column_streams[source_stream_name]->deepCopyTo(*column_streams[target_stream_name]);
@@ -1068,6 +1348,39 @@ void MergeTreeDataPartWriterOnDisk::writeFinalMark(
             offset_columns.insert(stream_name);
         }
     }, path);
+}
+
+void MergeTreeDataPartWriterOnDisk::ColumnCompressionSetting::load(const Poco::JSON::Object::Ptr& json)
+{
+    max_compress_block_size = json->getValue<UInt64>("max_compress_block_size");
+}
+
+void MergeTreeDataPartWriterOnDisk::loadColumnCompressInfoFromSetting()
+{
+    if (MergeTreeSettingsPtr merge_tree_settings = data_part->storage.getSettings(); merge_tree_settings != nullptr)
+    {
+        const String& settings = merge_tree_settings->column_compress_block_settings.toString();
+        if (!settings.empty())
+        {
+            try
+            {
+                Poco::JSON::Parser parser;
+                Poco::JSON::Object::Ptr parsed_obj = parser.parse(settings).extract<Poco::JSON::Object::Ptr>();
+                Strings keys;
+                parsed_obj->getNames(keys);
+                for (const auto& key : keys)
+                {
+                    column_compress_settings[key].load(parsed_obj->getObject(key));
+                }
+            }
+            catch (...)
+            {
+                column_compress_settings.clear();
+                LOG_ERROR(&Poco::Logger::get("MergeTreeDataPartWriterOnDisk"),
+                    "Failed to parse column compress settings from {}", settings);
+            }
+        }
+    }
 }
 
 }

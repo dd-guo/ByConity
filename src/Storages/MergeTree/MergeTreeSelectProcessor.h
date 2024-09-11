@@ -37,23 +37,17 @@ namespace DB
 class MergeTreeSelectProcessor : public MergeTreeBaseSelectProcessor
 {
 public:
+
     MergeTreeSelectProcessor(
         const MergeTreeMetaBase & storage,
-        const StorageMetadataPtr & metadata_snapshot,
-        const MergeTreeMetaBase::DataPartPtr & owned_data_part,
-        ImmutableDeleteBitmapPtr delete_bitmap,
-        UInt64 max_block_size_rows,
-        size_t preferred_block_size_bytes,
-        size_t preferred_max_column_in_block_size_bytes,
+        const StorageSnapshotPtr & storage_snapshot_,
+        const RangesInDataPart & part_detail_,
+        MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter_,
         Names required_columns_,
-        MarkRanges mark_ranges,
-        bool use_uncompressed_cache,
-        const PrewhereInfoPtr & prewhere_info,
-        ExpressionActionsSettings actions_settings,
-        bool check_columns,
-        const MergeTreeReaderSettings & reader_settings,
-        const Names & virt_column_names = {},
-        size_t part_index_in_query = 0,
+        const SelectQueryInfo & query_info_,
+        bool check_columns_,
+        const MergeTreeStreamSettings & stream_settings_,
+        const Names & virt_column_names_ = {},
         bool quiet = false);
 
     ~MergeTreeSelectProcessor() override;
@@ -67,7 +61,7 @@ protected:
 
     bool getNewTask() override;
 
-private:
+    ImmutableDeleteBitmapPtr getDeleteBitmap();
 
     /// Used by Task
     Names required_columns;
@@ -78,15 +72,14 @@ private:
     MergeTreeReadTaskColumns task_columns;
 
     /// Data part will not be removed if the pointer owns it
-    MergeTreeMetaBase::DataPartPtr data_part;
+    RangesInDataPart part_detail;
+    MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter;
+    /// Lazy init, need to use getDeleteBitmap() interface rather than use delete_bitmap directly
     ImmutableDeleteBitmapPtr delete_bitmap;
+    bool delete_bitmap_initialized = false;
 
-    /// Mark ranges we should read (in ascending order)
-    MarkRanges all_mark_ranges;
     /// Total number of marks we should read
     size_t total_marks_count = 0;
-    /// Value of _part_index virtual column (used only in SelectExecutor)
-    size_t part_index_in_query = 0;
 
     bool check_columns;
     bool is_first_task = true;

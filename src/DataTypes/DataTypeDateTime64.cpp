@@ -4,7 +4,7 @@
 #include <Columns/ColumnVector.h>
 #include <Common/assert_cast.h>
 #include <Common/typeid_cast.h>
-#include <common/DateLUT.h>
+#include <Common/DateLUT.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <Formats/FormatSettings.h>
 #include <IO/Operators.h>
@@ -24,6 +24,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ARGUMENT_OUT_OF_BOUND;
+    extern const int LOGICAL_ERROR;
 }
 
 static constexpr UInt32 max_scale = 9;
@@ -66,6 +67,16 @@ bool DataTypeDateTime64::equals(const IDataType & rhs) const
 SerializationPtr DataTypeDateTime64::doGetDefaultSerialization() const
 {
     return std::make_shared<SerializationDateTime64>(time_zone, utc_time_zone, scale);
+}
+
+std::string getDateTimeTimezone(const IDataType & data_type)
+{
+    if (const auto * type = typeid_cast<const DataTypeDateTime *>(&data_type))
+        return type->hasExplicitTimeZone() ? type->getTimeZone().getTimeZone() : std::string();
+    if (const auto * type = typeid_cast<const DataTypeDateTime64 *>(&data_type))
+        return type->hasExplicitTimeZone() ? type->getTimeZone().getTimeZone() : std::string();
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot get time zone from type {}", data_type.getName());
 }
 
 }

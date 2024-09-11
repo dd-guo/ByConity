@@ -24,6 +24,7 @@
 #include <Parsers/ASTWindowDefinition.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTTableColumnReference.h>
+#include <Parsers/ASTClusterByElement.h>
 #include <Common/SipHash.h>
 
 namespace DB::ASTEquality
@@ -57,6 +58,13 @@ bool compareNode(const ASTWindowDefinition & left, const ASTWindowDefinition & r
         left.frame_end_preceding == right.frame_end_preceding;
 }
 
+bool compareNode(const ASTClusterByElement & left, const ASTClusterByElement & right)
+{
+    return left.split_number == right.split_number &&
+        left.is_with_range == right.is_with_range &&
+        left.is_user_defined_expression == right.is_user_defined_expression;
+}
+
 bool compareNode(const ASTSubquery & left, const ASTSubquery & right)
 {
     return left.cte_name == right.cte_name && left.database_of_view == right.database_of_view;
@@ -83,9 +91,13 @@ bool compareNode(const ASTSetQuery & left, const ASTSetQuery & right)
 
 bool compareNode(const ASTTableColumnReference & left, const ASTTableColumnReference & right)
 {
-    return left.storage == right.storage && left.column_name == right.column_name;
+    return left.storage == right.storage && left.unique_id == right.unique_id && left.column_name == right.column_name;
 }
 
+bool compareNode(const ASTTableIdentifier & left, const ASTTableIdentifier & right)
+{
+    return left.getTableId() == right.getTableId();
+}
 
 bool compareTree(const ASTPtr & left, const ASTPtr & right, const SubtreeComparator & comparator)
 {
@@ -137,8 +149,14 @@ bool compareTree(const ASTPtr & left, const ASTPtr & right, const SubtreeCompara
         case ASTType::ASTTableColumnReference:
             node_equals = compareNode(left->as<ASTTableColumnReference &>(), right->as<ASTTableColumnReference &>());
             break;
+        case ASTType::ASTTableIdentifier:
+            node_equals = compareNode(left->as<ASTTableIdentifier &>(), right->as<ASTTableIdentifier &>());
+            break;
+        case ASTType::ASTClusterByElement:
+            node_equals = compareNode(left->as<ASTClusterByElement &>(), right->as<ASTClusterByElement &>());
+            break;
         default:
-            node_equals = true;
+            node_equals = left->getID() == right->getID(); // align with ScopeAwareHash
     }
 
     if (!node_equals)

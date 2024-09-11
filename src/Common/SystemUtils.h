@@ -14,40 +14,24 @@
  */
 
 #pragma once
-#include <Common/Exception.h>
-#include <IO/ReadBufferFromFile.h>
-#include <IO/WriteBufferFromFile.h>
-#include <IO/HashingWriteBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <dirent.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <unordered_set>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <iostream>
-#include <fstream>
-#include <unordered_set>
-#include <sys/syscall.h>
-#include <common/logger_useful.h>
+#include <IO/HashingWriteBuffer.h>
+#include <IO/ReadBufferFromFile.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromFile.h>
+#include <IO/ReadBufferFromFile.h>
 #include <boost/algorithm/string.hpp>
-
-#if defined(__linux__)
-    #ifdef __clang__
-        #pragma clang diagnostic push
-        #pragma clang diagnostic ignored "-Wreserved-id-macro"
-        #pragma clang diagnostic ignored "-Wold-style-cast"
-        #pragma clang diagnostic ignored "-Wcast-qual"
-    #endif
-
-    #include <numa.h>
-
-    #ifdef __clang__
-        #pragma clang diagnostic pop
-    #endif
-#endif
-
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <Common/Exception.h>
+#include <common/logger_useful.h>
 
 namespace DB
 {
@@ -57,7 +41,10 @@ namespace ErrorCodes
     extern const int CANNOT_OPEN_FILE;
     extern const int CANNOT_WRITE_TO_FILE_DESCRIPTOR;
     extern const int CANNOT_READ_ALL_DATA;
+    extern const int FILE_DOESNT_EXIST;
 }
+
+extern size_t max_numa_node;
 
 struct CpuUsageInfo
 {
@@ -70,19 +57,17 @@ struct CpuUsageInfo
     size_t irq;
     size_t softirq;
 
-    size_t total()
-    {
-        return user + nice + system + idle + iowait + irq + softirq;
-    }
+    size_t total() { return user + nice + system + idle + iowait + irq + softirq; }
 };
+
+size_t buffer_to_number(const std::string & buffer);
+
+void init_numa_nodes_cpu_mask();
 
 class SystemUtils
 {
 public:
-    static size_t getSystemCpuNum()
-    {
-        return sysconf(_SC_NPROCESSORS_ONLN);
-    }
+    static size_t getSystemCpuNum() { return sysconf(_SC_NPROCESSORS_ONLN); }
 
     /**
      * for remove cgroup dir
@@ -90,19 +75,19 @@ public:
      * @param path path
      * @return 0 for success
      */
-    static int rmdirAll(const char* path)
+    static int rmdirAll(const char * path)
     {
-        DIR *d = opendir(path);
+        DIR * d = opendir(path);
         size_t path_len = strlen(path);
         int r = -1;
         if (d)
         {
-            struct dirent *p;
+            struct dirent * p;
             r = 0;
             while (!r && (p = readdir(d)))
             {
                 int r2 = -1;
-                char *buf;
+                char * buf;
                 size_t len;
 
                 /* Skip the names "." and ".." as we don't want to recurse on them. */
@@ -137,8 +122,11 @@ public:
     {
         if (trunc)
         {
-            if (::open(filename.c_str(), O_TRUNC) < 0)
+            auto fd = ::open(filename.c_str(), O_TRUNC);
+            if (fd < 0)
                 throwFromErrno("open file error, file: " + filename, ErrorCodes::CANNOT_OPEN_FILE);
+            if (0 != ::close(fd))
+                throwFromErrno("close file error, file: " + filename, ErrorCodes::CANNOT_CLOSE_FILE);
         }
 
         WriteBufferFromFile file_writer(filename);
@@ -148,21 +136,33 @@ public:
         file_writer.close();
     }
 
+    static int ReadFileToString(const String & filename, String & content)
+    {
+        if (!std::filesystem::exists(filename))
+            throw  Exception("file " + filename + " not exists", ErrorCodes::FILE_DOESNT_EXIST);
+
+        ReadBufferFromFile file_reader(filename);
+        readStringUntilEOF(content, file_reader);
+        return 0;
+    }
+
     static size_t gettid()
     {
-        #if defined(__linux__)
+#if defined(__linux__)
         return static_cast<size_t>(syscall(SYS_gettid));
-        #endif
+#endif
         return 0;
     }
 
     static size_t getMaxNumaNode()
     {
-        #if defined(__linux__)
-        return numa_max_node();
-        #endif
+#if defined(__linux__)
+        return max_numa_node;
+#endif
         return 0;
     }
+
+    static std::vector<cpu_set_t> getNumaNodesCpuMask();
 
     static void getCpuUsageInfo(const std::unordered_set<size_t> & cpu_nodes, std::vector<CpuUsageInfo> & cpu_usage_info_vec)
     {
@@ -175,7 +175,7 @@ public:
         skipWhitespaceIfAny(file_reader);
 
         size_t cpu_num = getSystemCpuNum();
-        size_t idx=0;
+        size_t idx = 0;
         for (size_t i = 0; i < cpu_num; ++i)
         {
             readString(line, file_reader);
@@ -198,4 +198,7 @@ public:
 #endif
     }
 };
+
+std::vector<size_t> parse_cpu_list(const std::string & cpu_list_str);
+
 }

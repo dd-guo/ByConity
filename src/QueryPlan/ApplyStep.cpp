@@ -13,19 +13,33 @@
  * limitations under the License.
  */
 
+#include <type_traits>
 #include <QueryPlan/ApplyStep.h>
 
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <Interpreters/join_common.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Core/Block.h>
+#include <Core/Names.h>
 
 namespace DB
 {
 ApplyStep::ApplyStep(
-    DataStreams input_streams_, Names correlation_, ApplyType apply_type_, SubqueryType subquery_type_, Assignment assignment_)
-    : correlation(std::move(correlation_)), apply_type(apply_type_), subquery_type(subquery_type_), assignment(std::move(assignment_))
+    DataStreams input_streams_,
+    Names correlation_,
+    ApplyType apply_type_,
+    SubqueryType subquery_type_,
+    Assignment assignment_,
+    NameSet outer_columns_,
+    bool support_semi_anti_)
+    : correlation(std::move(correlation_))
+    , apply_type(apply_type_)
+    , subquery_type(subquery_type_)
+    , assignment(std::move(assignment_))
+    , outer_columns(std::move(outer_columns_))
+    , support_semi_anti(support_semi_anti_)
 {
     setInputStreams(input_streams_);
 }
@@ -48,7 +62,7 @@ DataTypePtr ApplyStep::getAssignmentDataType() const
             auto argument_name = arguments->children[0]->as<ASTIdentifier>()->name();
             for (const auto & column : input_streams[0].header)
                 if (column.name == argument_name)
-                    return column.type->isNullable() ? makeNullable(std::make_shared<DataTypeUInt8>()) : std::make_shared<DataTypeUInt8>();
+                    return column.type->isNullable() ? JoinCommon::tryConvertTypeToNullable(std::make_shared<DataTypeUInt8>()) : std::make_shared<DataTypeUInt8>();
             throw Exception("Unknown data type for column " + argument_name, ErrorCodes::LOGICAL_ERROR);
         }
         case ApplyStep::SubqueryType::EXISTS: {
@@ -57,27 +71,17 @@ DataTypePtr ApplyStep::getAssignmentDataType() const
         case ApplyStep::SubqueryType::SCALAR: {
             for (const auto & column : input_streams[1].header)
                 if (column.name == assignment.first)
-                    return column.type->canBeInsideNullable() ? makeNullable(column.type) : column.type;
+                    return JoinCommon::canBecomeNullable(column.type) ? JoinCommon::tryConvertTypeToNullable(column.type) : column.type;
             throw Exception("Unknown data type for column " + assignment.first, ErrorCodes::LOGICAL_ERROR);
         }
         case ApplyStep::SubqueryType::QUANTIFIED_COMPARISON: {
             auto argument_name = assignment.second->children[0]->as<ASTIdentifier>()->name();
             for (const auto & column : input_streams[0].header)
                 if (column.name == argument_name)
-                    return column.type->isNullable() ? makeNullable(std::make_shared<DataTypeUInt8>()) : std::make_shared<DataTypeUInt8>();
+                    return column.type->isNullable() ? JoinCommon::tryConvertTypeToNullable(std::make_shared<DataTypeUInt8>()) : std::make_shared<DataTypeUInt8>();
             throw Exception("Unknown data type for column " + argument_name, ErrorCodes::LOGICAL_ERROR);
         }
     }
-}
-
-void ApplyStep::serialize(WriteBuffer &) const
-{
-    throw Exception("ApplyStep should be rewritten into JoinStep", ErrorCodes::NOT_IMPLEMENTED);
-}
-
-QueryPlanStepPtr ApplyStep::deserialize(ReadBuffer &, ContextPtr)
-{
-    throw Exception("ApplyStep should be rewritten into JoinStep", ErrorCodes::NOT_IMPLEMENTED);
 }
 
 QueryPipelinePtr ApplyStep::updatePipeline(QueryPipelines, const BuildQueryPipelineSettings &)
@@ -87,6 +91,6 @@ QueryPipelinePtr ApplyStep::updatePipeline(QueryPipelines, const BuildQueryPipel
 
 std::shared_ptr<IQueryPlanStep> ApplyStep::copy(ContextPtr) const
 {
-    return std::make_shared<ApplyStep>(input_streams, correlation, apply_type, subquery_type, assignment);
+    return std::make_shared<ApplyStep>(input_streams, correlation, apply_type, subquery_type, assignment, outer_columns, support_semi_anti);
 }
 }

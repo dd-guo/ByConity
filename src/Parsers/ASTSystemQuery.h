@@ -31,7 +31,6 @@
 
 namespace DB
 {
-
 enum class MetastoreOperation
 {
     UNKNOWN,
@@ -47,13 +46,12 @@ const char * metaOptToString(MetastoreOperation opt);
 struct MetastoreOptions
 {
     MetastoreOperation operation = MetastoreOperation::UNKNOWN;
-    String drop_key {};
+    String drop_key{};
 };
 
 class ASTSystemQuery : public IAST, public ASTQueryWithOnCluster
 {
 public:
-
     enum class Type
     {
         UNKNOWN,
@@ -63,9 +61,13 @@ public:
         DROP_DNS_CACHE,
         DROP_MARK_CACHE,
         DROP_UNCOMPRESSED_CACHE,
+        DROP_NVM_CACHE,
         DROP_MMAP_CACHE,
+        DROP_QUERY_CACHE,
         DROP_CHECKSUMS_CACHE,
+        DROP_CNCH_META_CACHE,
         DROP_CNCH_PART_CACHE,
+        DROP_CNCH_DELETE_BITMAP_CACHE,
 #if USE_EMBEDDED_COMPILER
         DROP_COMPILED_EXPRESSION_CACHE,
 #endif
@@ -90,9 +92,15 @@ public:
         STOP_MERGES,
         START_MERGES,
         REMOVE_MERGES,
+        RESUME_ALL_MERGES,
+        SUSPEND_ALL_MERGES,
+        GC, // gc db.table [partition partition_expr]
+        MANIFEST_CHECKPOINT, // system checkpoint db.table
         STOP_GC,
         START_GC,
         FORCE_GC,
+        RESUME_ALL_GC,
+        SUSPEND_ALL_GC,
         STOP_TTL_MERGES,
         START_TTL_MERGES,
         STOP_FETCHES,
@@ -112,15 +120,35 @@ public:
         START_DISTRIBUTED_SENDS,
         START_CONSUME,
         STOP_CONSUME,
+        DROP_CONSUME,
         RESTART_CONSUME,
+        RESET_CONSUME_OFFSET,
         FETCH_PARTS,
         METASTORE,
         CLEAR_BROKEN_TABLES,
+        DEDUP_WITH_HIGH_PRIORITY, // dedup with high priority db.table [partition partition_expr]
         DEDUP, // dedup db.table [partition partition_expr] for repair
         SYNC_DEDUP_WORKER,
+        SYNC_REPAIR_TASK, // sync repair task db.table
         START_DEDUP_WORKER,
         STOP_DEDUP_WORKER,
+        START_CLUSTER,
+        STOP_CLUSTER,
         DUMP_SERVER_STATUS,
+        CLEAN_TRANSACTION,
+        CLEAN_TRASH_TABLE,
+        CLEAN_FILESYSTEM_LOCK,
+        JEPROF_DUMP,
+        LOCK_MEMORY_LOCK,
+        START_MATERIALIZEDMYSQL,
+        STOP_MATERIALIZEDMYSQL,
+        RESYNC_MATERIALIZEDMYSQL_TABLE,
+        RECALCULATE_METRICS,
+        START_VIEW,
+        STOP_VIEW,
+        DROP_VIEW_META,
+        RELEASE_MEMORY_LOCK, /// RELEASE MEMORY LOCK [db.tb]/[OF TXN xxx]
+        DROP_SCHEMA_CACHE,
         END
     };
 
@@ -131,6 +159,8 @@ public:
     String target_model;
     String database;
     String table;
+    // optional for clean trash table
+    UUID table_uuid = UUIDHelpers::Nil;
     String replica;
     String replica_zk_path;
     bool is_drop_whole_replica{};
@@ -138,6 +168,9 @@ public:
     String volume;
     String disk;
     UInt64 seconds{};
+
+    /// Some parameters may need deeply parsed, such as json parameter string for ResetConsumeOffset
+    String string_data;
 
     // For execute/reload mutation
     String mutation_id;
@@ -149,8 +182,18 @@ public:
 
     ASTPtr target_path;
 
-    // For DEDUP
+    // For GC and DEDUP
     ASTPtr partition; // The value or ID of the partition is stored here.
+
+    // For DEDUP
+    bool specify_bucket = false;
+    UInt64 bucket_number;
+
+    /// for CLEAN TRANSACTION txn_id
+    bool specify_txn = false;
+    UInt64 txn_id;
+
+    String schema_cache_storage;
 
     String getID(char) const override { return "SYSTEM query"; }
 
@@ -164,7 +207,6 @@ public:
     }
 
 protected:
-
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 

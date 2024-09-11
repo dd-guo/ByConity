@@ -1,8 +1,9 @@
 #include <Parsers/ASTCreateRoleQuery.h>
 #include <Parsers/ASTSettingsProfileElement.h>
+#include <Parsers/formatTenantDatabaseName.h>
 #include <Common/quoteString.h>
 #include <IO/Operators.h>
-
+#include <Interpreters/Context.h>
 
 namespace DB
 {
@@ -66,13 +67,29 @@ void ASTCreateRoleQuery::formatImpl(const FormatSettings & format, FormatState &
         format.ostr << (format.hilite ? hilite_keyword : "") << " OR REPLACE" << (format.hilite ? hilite_none : "");
 
     formatNames(names, format);
-    formatOnCluster(format);
+    // formatOnCluster(format);
 
     if (!new_name.empty())
         formatRenameTo(new_name, format);
 
     if (settings && (!settings->empty() || alter))
         formatSettings(*settings, format);
+}
+
+void ASTCreateRoleQuery::rewriteRoleNameWithTenant(const Context *)
+{
+    if (!tenant_rewritten)
+    {
+        if (!new_name.empty())
+            new_name = formatTenantEntityName(new_name);
+        if (!attach)
+        {
+            for (auto & name : names)   
+                name = formatTenantEntityName(name);
+        }
+
+        tenant_rewritten = true;
+    }  
 }
 
 }

@@ -26,8 +26,9 @@
 
 namespace DB
 {
-BroadcastExchangeSink::BroadcastExchangeSink(Block header_, BroadcastSenderPtrs senders_, ExchangeOptions options_)
+BroadcastExchangeSink::BroadcastExchangeSink(Block header_, BroadcastSenderPtrs senders_, ExchangeOptions options_, const String &name_)
     : IExchangeSink(std::move(header_))
+    , name(name_)
     , senders(std::move(senders_))
     , options(std::move(options_))
     , buffer_chunk(getPort().getHeader(), options.send_threshold_in_bytes, options.send_threshold_in_row_num)
@@ -42,6 +43,23 @@ BroadcastExchangeSink::~BroadcastExchangeSink() = default;
 
 void BroadcastExchangeSink::consume(Chunk chunk)
 {
+    if (!has_input)
+    {
+        if (options.force_use_buffer)
+        {
+            auto chunk_to_send = buffer_chunk.flush(true);
+            if (chunk_to_send)
+            {
+                for (auto & sender : senders)
+                {
+                    ExchangeUtils::sendAndCheckReturnStatus(*sender, chunk_to_send.clone());
+                }
+            }
+        }
+        finish();
+        return;
+    }
+
     Chunk chunk_to_send;
     if (options.force_use_buffer)
     {
@@ -74,16 +92,6 @@ void BroadcastExchangeSink::consume(Chunk chunk)
 void BroadcastExchangeSink::onFinish()
 {
     LOG_TRACE(logger, "BroadcastExchangeSink finish");
-    if (!options.force_use_buffer)
-        return;
-
-    auto chunk = buffer_chunk.flush(true);
-    if (!chunk)
-        return;
-    for (auto & sender : senders)
-    {
-        ExchangeUtils::sendAndCheckReturnStatus(*sender, chunk.clone());
-    }
 }
 
 void BroadcastExchangeSink::onCancel()

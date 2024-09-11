@@ -53,6 +53,9 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.detach = command_ast->detach;
         res.cascading = command_ast->cascading;
         res.part = command_ast->part;
+        res.staging_area = command_ast->staging_area;
+        res.specify_bucket = command_ast->specify_bucket;
+        res.bucket_number = command_ast->bucket_number;
         return res;
     }
     else if (command_ast->type == ASTAlterCommand::DROP_DETACHED_PARTITION)
@@ -72,6 +75,22 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.detach = command_ast->detach;
         return res;
     }
+    else if (command_ast->type == ASTAlterCommand::RECLUSTER_PARTITION_WHERE)
+    {
+        PartitionCommand res;
+        if (command_ast->predicate)
+        {
+            res.type = RECLUSTER_PARTITION_WHERE;
+            res.partition = command_ast->predicate;
+        }
+        else
+        {
+            res.type = RECLUSTER_PARTITION;
+            res.partition = command_ast->partition;
+        }
+        res.ast = command_ast->clone();
+        return res;
+    }
     else if (command_ast->type == ASTAlterCommand::ATTACH_PARTITION)
     {
         PartitionCommand res;
@@ -81,6 +100,8 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.parts = command_ast->parts;
         res.replace = command_ast->replace;
         res.from_zookeeper_path = command_ast->from;
+        res.specify_bucket = command_ast->specify_bucket;
+        res.bucket_number = command_ast->bucket_number;
         return res;
     }
     else if (command_ast->type == ASTAlterCommand::ATTACH_DETACHED_PARTITION)
@@ -108,6 +129,9 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
                 break;
             case DataDestinationType::VOLUME:
                 res.move_destination_type = PartitionCommand::MoveDestinationType::VOLUME;
+                break;
+            case DataDestinationType::BYTECOOL:
+                res.move_destination_type = PartitionCommand::MoveDestinationType::BYTECOOL;
                 break;
             case DataDestinationType::TABLE:
                 res.move_destination_type = PartitionCommand::MoveDestinationType::TABLE;
@@ -208,6 +232,22 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
                     res.key_names.push_back(identifier->name());
                 else
                     throw Exception("Illegal key: " + child->getColumnName(), ErrorCodes::BAD_ARGUMENTS);
+            }
+        }
+        if (command_ast->buckets)
+        {   
+            const auto & bucket_expr_list = command_ast->buckets->as<ASTExpressionList &>();
+            for (const auto &  child : bucket_expr_list.children)
+            {
+                if ( auto * literal = child->as<ASTLiteral>())
+                {   
+                    Int64 bucket_num = literal->value.safeGet<UInt64>();
+                    res.bucket_nums.push_back(bucket_num);
+                }
+                else
+                {
+                    throw Exception("Illegal Bucket number need Literal", ErrorCodes::BAD_ARGUMENTS);
+                }   
             }
         }
 
@@ -333,6 +373,10 @@ std::string PartitionCommand::typeToString() const
         return "REPLACE PARTITION";
     case PartitionCommand::Type::INGEST_PARTITION:
         return "INGEST PARTITION";
+    case PartitionCommand::Type::RECLUSTER_PARTITION:
+        return "RECLUSTER PARTITION";
+    case PartitionCommand::Type::RECLUSTER_PARTITION_WHERE:
+        return "RECLUSTER PARTITION WHERE";
     default:
         throw Exception("Uninitialized partition command", ErrorCodes::LOGICAL_ERROR);
     }
@@ -396,6 +440,7 @@ Pipe convertCommandsResultToSource(const PartitionCommandsResultInfo & commands_
 bool partitionCommandHasWhere(const PartitionCommand & command)
 {
     return command.type == PartitionCommand::Type::DROP_PARTITION_WHERE || command.type == PartitionCommand::Type::FETCH_PARTITION_WHERE
-        || command.type == PartitionCommand::Type::REPLACE_PARTITION_WHERE || command.type == PartitionCommand::Type::SAMPLE_PARTITION_WHERE;
+        || command.type == PartitionCommand::Type::REPLACE_PARTITION_WHERE || command.type == PartitionCommand::Type::SAMPLE_PARTITION_WHERE
+        || command.type == PartitionCommand::Type::RECLUSTER_PARTITION_WHERE;
 }
 }

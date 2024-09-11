@@ -17,6 +17,7 @@
 
 #include <Storages/DiskCache/IDiskCache.h>
 #include <Storages/DiskCache/IDiskCacheStrategy.h>
+#include "Storages/DiskCache/IDiskCache.h"
 
 #include <mutex>
 #include <unordered_map>
@@ -26,7 +27,7 @@ namespace DB
 class DiskCacheSimpleStrategy : public IDiskCacheStrategy
 {
 public:
-    explicit DiskCacheSimpleStrategy(const DiskCacheStrategySettings & settings_)
+    explicit DiskCacheSimpleStrategy(const DiskCacheSettings & settings_)
         : IDiskCacheStrategy(settings_)
         , cache_statistics(settings_.stats_bucket_size)
         , segment_hits_to_cache(settings_.hits_to_cache)
@@ -34,7 +35,7 @@ public:
     {
     }
 
-    virtual IDiskCacheSegmentsVector getCacheSegments(const IDiskCacheSegmentsVector & segments) override;
+    virtual IDiskCacheSegmentsVector getCacheSegments(const IDiskCachePtr & disk_cache, const IDiskCacheSegmentsVector & segments) override;
 
 private:
     struct AccessStatistics

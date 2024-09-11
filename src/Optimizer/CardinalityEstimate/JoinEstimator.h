@@ -16,7 +16,9 @@
 #pragma once
 #include <Optimizer/CardinalityEstimate/PlanNodeStatistics.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/IAST_fwd.h>
 #include <QueryPlan/JoinStep.h>
+#include <Optimizer/DataDependency/InclusionDependency.h>
 
 namespace DB
 {
@@ -45,9 +47,11 @@ public:
         PlanNodeStatisticsPtr & left_stats,
         PlanNodeStatisticsPtr & right_stats,
         const JoinStep & join_step,
-        bool enable_pk_fk,
+        ContextMutablePtr & context,
         bool is_left_base_table = false,
-        bool is_right_base_table = false);
+        bool is_right_base_table = false,
+        const std::vector<double> & children_filter_selectivity = {},
+        const InclusionDependency & inclusion_dependency = {});
 
     static PlanNodeStatisticsPtr computeCardinality(
         PlanNodeStatistics & left_stats,
@@ -55,9 +59,13 @@ public:
         const Names & left_keys,
         const Names & right_keys,
         ASTTableJoin::Kind kind,
-        bool enable_pk_fk,
+        ASTTableJoin::Strictness strictness,
+        Context & context,
         bool is_left_base_table = false,
-        bool is_right_base_table = false);
+        bool is_right_base_table = false,
+        const std::vector<double> & children_filter_selectivity = {},
+        const InclusionDependency & inclusion_dependency = {},
+        bool only_cardinality = false);
 
 private:
     static bool matchPKFK(UInt64 left_rows, UInt64 right_rows, UInt64 left_ndv, UInt64 right_ndv);
@@ -67,6 +75,7 @@ private:
         UInt64 fk_rows,
         UInt64 fk_ndv,
         UInt64 pk_ndv,
+        double pk_selectivity,
         PlanNodeStatistics & fk_stats,
         PlanNodeStatistics & pk_stats,
         SymbolStatistics & fk_key_stats,
@@ -75,7 +84,9 @@ private:
         String pk_key,
         bool is_left_base_table,
         bool is_right_base_table,
-        std::unordered_map<String, SymbolStatisticsPtr> & join_output_statistics);
+        double pk_filter_selectivity,
+        std::unordered_map<String, SymbolStatisticsPtr> & join_output_statistics,
+        bool only_cardinality = false);
 
     static UInt64 computeCardinalityByHistogram(
         PlanNodeStatistics & left_stats,
@@ -83,9 +94,11 @@ private:
         SymbolStatistics & left_key_stats,
         SymbolStatistics & right_key_stats,
         ASTTableJoin::Kind kind,
+        ASTTableJoin::Strictness strictness,
         String left_key,
         String right_key,
-        std::unordered_map<String, SymbolStatisticsPtr> & join_output_statistics);
+        std::unordered_map<String, SymbolStatisticsPtr> & join_output_statistics,
+        bool only_cardinality = false);
 
     static UInt64 computeCardinalityByNDV(
         PlanNodeStatistics & left_stats,
@@ -93,9 +106,11 @@ private:
         SymbolStatistics & left_key_stats,
         SymbolStatistics & right_key_stats,
         ASTTableJoin::Kind kind,
+        ASTTableJoin::Strictness strictness,
         String left_key,
         String right_key,
-        std::unordered_map<String, SymbolStatisticsPtr> & join_output_statistics);
+        std::unordered_map<String, SymbolStatisticsPtr> & join_output_statistics,
+        bool only_cardinality = false);
 };
 
 }

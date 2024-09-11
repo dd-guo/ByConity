@@ -30,6 +30,8 @@
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/ObjectUtils.h>
+#include <DataTypes/NestedUtils.h>
 
 #include <Storages/Distributed/DistributedBlockOutputStream.h>
 #include <Storages/StorageFactory.h>
@@ -40,10 +42,11 @@
 #include <Common/Macros.h>
 #include <Common/ProfileEvents.h>
 #include <Common/escapeForFileName.h>
-#include <Common/typeid_cast.h>
+#include <Common/formatReadable.h>
 #include <Common/quoteString.h>
 #include <Common/randomSeed.h>
-#include <Common/formatReadable.h>
+#include <Common/typeid_cast.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 
 #include <Parsers/ASTDropQuery.h>
 #include <Parsers/ASTExpressionList.h>
@@ -73,6 +76,7 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/getClusterName.h>
 #include <Interpreters/getTableExpressions.h>
+#include <Interpreters/RequiredSourceColumnsVisitor.h>
 #include <Functions/IFunction.h>
 
 #include <QueryPlan/BuildQueryPipelineSettings.h>
@@ -304,9 +308,9 @@ void replaceConstantExpressions(
     ContextPtr context,
     const NamesAndTypesList & columns,
     ConstStoragePtr storage,
-    const StorageMetadataPtr & metadata_snapshot)
+    const StorageSnapshotPtr & storage_snapshot)
 {
-    auto syntax_result = TreeRewriter(context).analyze(node, columns, storage, metadata_snapshot);
+    auto syntax_result = TreeRewriter(context).analyze(node, columns, storage, storage_snapshot);
     Block block_with_constants = KeyCondition::getBlockWithConstants(node, syntax_result, context);
 
     InDepthNodeVisitor<ReplacingConstantExpressionsMatcher, true> visitor(block_with_constants);
@@ -393,6 +397,31 @@ std::optional<QueryProcessingStage::Enum> getOptimizedQueryProcessingStage(const
     return QueryProcessingStage::Complete;
 }
 
+static bool requiresObjectColumns(const StorageMetadataPtr & metadata_snapshot, ASTPtr query)
+{
+    if (!metadata_snapshot->hasDynamicSubcolumns())
+        return false;
+
+    if (!query)
+        return true;
+
+    RequiredSourceColumnsVisitor::Data columns_context;
+    RequiredSourceColumnsVisitor(columns_context).visit(query);
+
+    auto required_columns = columns_context.requiredColumns();
+    const auto & all_columns = metadata_snapshot->getColumns();
+    for (const auto & required_column : required_columns)
+    {
+        auto name_in_storage = Nested::splitName(required_column).first;
+        auto column_in_storage = all_columns.tryGetPhysical(name_in_storage);
+
+        if (column_in_storage && column_in_storage->type->hasDynamicSubcolumns())
+            return true;
+    }
+
+    return false;
+}
+
 size_t getClusterQueriedNodes(const Settings & settings, const ClusterPtr & cluster)
 {
     size_t num_local_shards = cluster->getLocalShardCount();
@@ -418,6 +447,8 @@ NamesAndTypesList StorageDistributed::getVirtuals() const
             NameAndTypePair("_part_uuid", std::make_shared<DataTypeUUID>()),
             NameAndTypePair("_partition_id", std::make_shared<DataTypeString>()),
             NameAndTypePair("_sample_factor", std::make_shared<DataTypeFloat64>()),
+            NameAndTypePair("_part_row_number", std::make_shared<DataTypeUInt64>()),
+            NameAndTypePair("_part_offset", std::make_shared<DataTypeUInt64>()),
             NameAndTypePair("_shard_num", std::make_shared<DataTypeUInt32>()),
     };
 }
@@ -426,6 +457,8 @@ StorageDistributed::StorageDistributed(
     const StorageID & id_,
     const ColumnsDescription & columns_,
     const ConstraintsDescription & constraints_,
+    const ForeignKeysDescription & foreign_keys_,
+    const UniqueNotEnforcedDescription & unique_,
     const String & comment,
     const String & remote_database_,
     const String & remote_table_,
@@ -455,6 +488,8 @@ StorageDistributed::StorageDistributed(
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(columns_);
     storage_metadata.setConstraints(constraints_);
+    storage_metadata.setForeignKeys(foreign_keys_);
+    storage_metadata.setUniqueNotEnforced(unique_);
     storage_metadata.setComment(comment);
     setInMemoryMetadata(storage_metadata);
 
@@ -491,6 +526,8 @@ StorageDistributed::StorageDistributed(
     const StorageID & id_,
     const ColumnsDescription & columns_,
     const ConstraintsDescription & constraints_,
+    const ForeignKeysDescription & foreign_keys_,
+    const UniqueNotEnforcedDescription & unique_,
     ASTPtr remote_table_function_ptr_,
     const String & cluster_name_,
     ContextPtr context_,
@@ -504,6 +541,8 @@ StorageDistributed::StorageDistributed(
         id_,
         columns_,
         constraints_,
+        foreign_keys_,
+        unique_,
         String{},
         String{},
         String{},
@@ -522,7 +561,7 @@ StorageDistributed::StorageDistributed(
 QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
     ContextPtr local_context,
     QueryProcessingStage::Enum to_stage,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info) const
 {
     const auto & settings = local_context->getSettingsRef();
@@ -534,7 +573,7 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
     /// (Anyway it will be calculated in the read())
     if (getClusterQueriedNodes(settings, cluster) > 1 && settings.optimize_skip_unused_shards)
     {
-        ClusterPtr optimized_cluster = getOptimizedCluster(local_context, metadata_snapshot, query_info.query);
+        ClusterPtr optimized_cluster = getOptimizedCluster(local_context, storage_snapshot, query_info.query);
         if (optimized_cluster)
         {
             LOG_DEBUG(log, "Skipping irrelevant shards - the query will be sent to the following shards of the cluster (shard numbers): {}",
@@ -597,7 +636,7 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
 
 Pipe StorageDistributed::read(
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr local_context,
     QueryProcessingStage::Enum processed_stage,
@@ -605,7 +644,7 @@ Pipe StorageDistributed::read(
     const unsigned num_streams)
 {
     QueryPlan plan;
-    read(plan, column_names, metadata_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+    read(plan, column_names, storage_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
     return plan.convertToPipe(
         QueryPlanOptimizationSettings::fromContext(local_context),
         BuildQueryPipelineSettings::fromContext(local_context));
@@ -614,7 +653,7 @@ Pipe StorageDistributed::read(
 void StorageDistributed::read(
     QueryPlan & query_plan,
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr local_context,
     QueryProcessingStage::Enum processed_stage,
@@ -641,19 +680,29 @@ void StorageDistributed::read(
     const Scalars & scalars = local_context->hasQueryContext() ? local_context->getQueryContext()->getScalars() : Scalars{};
 
     bool has_virtual_shard_num_column = std::find(column_names.begin(), column_names.end(), "_shard_num") != column_names.end();
-    if (has_virtual_shard_num_column && !isVirtualColumn("_shard_num", metadata_snapshot))
+    if (has_virtual_shard_num_column && !isVirtualColumn("_shard_num", storage_snapshot->metadata))
         has_virtual_shard_num_column = false;
 
-    ClusterProxy::SelectStreamFactory select_stream_factory = remote_table_function_ptr
-        ? ClusterProxy::SelectStreamFactory(
-            header, processed_stage, remote_table_function_ptr, scalars, has_virtual_shard_num_column, local_context->getExternalTables())
-        : ClusterProxy::SelectStreamFactory(
-            header,
-            processed_stage,
-            StorageID{remote_database, remote_table},
-            scalars,
-            has_virtual_shard_num_column,
-            local_context->getExternalTables());
+    const auto & snapshot_data = assert_cast<const SnapshotData &>(*storage_snapshot->data);
+
+    ClusterProxy::SelectStreamFactory select_stream_factory = remote_table_function_ptr ? ClusterProxy::SelectStreamFactory(
+                                                                  header,
+                                                                  snapshot_data.objects_by_shard,
+                                                                  storage_snapshot,
+                                                                  processed_stage,
+                                                                  remote_table_function_ptr,
+                                                                  scalars,
+                                                                  has_virtual_shard_num_column,
+                                                                  local_context->getExternalTables())
+                                                                                        : ClusterProxy::SelectStreamFactory(
+                                                                                            header,
+                                                                                            snapshot_data.objects_by_shard,
+                                                                                            storage_snapshot,
+                                                                                            processed_stage,
+                                                                                            StorageID{remote_database, remote_table},
+                                                                                            scalars,
+                                                                                            has_virtual_shard_num_column,
+                                                                                            local_context->getExternalTables());
 
     ClusterProxy::executeQuery(query_plan, select_stream_factory, log,
         modified_query_ast, local_context, query_info,
@@ -801,7 +850,11 @@ void StorageDistributed::checkAlterIsPossible(const AlterCommands & commands, Co
             && command.type != AlterCommand::Type::MODIFY_COLUMN
             && command.type != AlterCommand::Type::DROP_COLUMN
             && command.type != AlterCommand::Type::COMMENT_COLUMN
-            && command.type != AlterCommand::Type::RENAME_COLUMN)
+            && command.type != AlterCommand::Type::RENAME_COLUMN
+            && command.type != AlterCommand::Type::ADD_FOREIGN_KEY
+            && command.type != AlterCommand::Type::DROP_FOREIGN_KEY
+            && command.type != AlterCommand::Type::ADD_UNIQUE_NOT_ENFORCED
+            && command.type != AlterCommand::Type::DROP_UNIQUE_NOT_ENFORCED)
 
             throw Exception("Alter of type '" + alterTypeToString(command.type) + "' is not supported by storage " + getName(),
                 ErrorCodes::NOT_IMPLEMENTED);
@@ -826,7 +879,7 @@ void StorageDistributed::alter(const AlterCommands & params, ContextPtr local_co
     checkAlterIsPossible(params, local_context);
     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
     params.apply(new_metadata, local_context);
-    DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
+    DatabaseCatalog::instance().getDatabase(table_id.database_name, local_context)->alterTable(local_context, table_id, new_metadata);
     setInMemoryMetadata(new_metadata);
 }
 
@@ -1044,7 +1097,7 @@ ClusterPtr StorageDistributed::getCluster() const
 }
 
 ClusterPtr StorageDistributed::getOptimizedCluster(
-    ContextPtr local_context, const StorageMetadataPtr & metadata_snapshot, const ASTPtr & query_ptr) const
+    ContextPtr local_context, const StorageSnapshotPtr & storage_snapshot, const ASTPtr & query_ptr) const
 {
     ClusterPtr cluster = getCluster();
     const Settings & settings = local_context->getSettingsRef();
@@ -1053,7 +1106,7 @@ ClusterPtr StorageDistributed::getOptimizedCluster(
 
     if (has_sharding_key && sharding_key_is_usable)
     {
-        ClusterPtr optimized = skipUnusedShards(cluster, query_ptr, metadata_snapshot, local_context);
+        ClusterPtr optimized = skipUnusedShards(cluster, query_ptr, storage_snapshot, local_context);
         if (optimized)
             return optimized;
     }
@@ -1109,7 +1162,7 @@ IColumn::Selector StorageDistributed::createSelector(const ClusterPtr cluster, c
 ClusterPtr StorageDistributed::skipUnusedShards(
     ClusterPtr cluster,
     const ASTPtr & query_ptr,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     ContextPtr local_context) const
 {
     const auto & select = query_ptr->as<ASTSelectQuery &>();
@@ -1129,7 +1182,7 @@ ClusterPtr StorageDistributed::skipUnusedShards(
         condition_ast = select.prewhere() ? select.prewhere()->clone() : select.where()->clone();
     }
 
-    replaceConstantExpressions(condition_ast, local_context, metadata_snapshot->getColumns().getAll(), shared_from_this(), metadata_snapshot);
+    replaceConstantExpressions(condition_ast, local_context, storage_snapshot->metadata->getColumns().getAll(), shared_from_this(), storage_snapshot);
 
     size_t limit = local_context->getSettingsRef().optimize_skip_unused_shards_limit;
     if (!limit || limit > SSIZE_MAX)
@@ -1300,6 +1353,44 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
     }
 }
 
+StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
+{
+    return getStorageSnapshotForQuery(metadata_snapshot, nullptr, query_context);
+}
+
+StorageSnapshotPtr StorageDistributed::getStorageSnapshotForQuery(
+    const StorageMetadataPtr & metadata_snapshot, const ASTPtr & query, ContextPtr /*query_context*/) const
+{
+    /// If query doesn't use columns of type Object, don't deduce
+    /// concrete types for them, because it required extra round trip.
+    auto snapshot_data = std::make_unique<SnapshotData>();
+    if (!requiresObjectColumns(metadata_snapshot, query))
+        return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, ColumnsDescription{}, std::move(snapshot_data));
+
+    snapshot_data->objects_by_shard = getExtendedObjectsOfRemoteTables(
+        *getCluster(),
+        StorageID{remote_database, remote_table},
+        metadata_snapshot->getColumns(),
+        getContext());
+
+    auto object_columns = DB::getConcreteObjectColumns(
+        snapshot_data->objects_by_shard.begin(),
+        snapshot_data->objects_by_shard.end(),
+        metadata_snapshot->getColumns(),
+        [](const auto & shard_num_and_columns) -> const auto & { return shard_num_and_columns.second; });
+
+    return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, object_columns, std::move(snapshot_data));
+}
+
+ASTPtr
+StorageDistributed::applyFilter(ASTPtr query_filter, SelectQueryInfo & query_info, ContextPtr query_context, PlanNodeStatisticsPtr stats) const
+{
+    auto remote_db = getRemoteDatabaseName();
+    auto remote_table_name = getRemoteTableName();
+    auto local_storage = DatabaseCatalog::instance().getTable(StorageID{remote_db, remote_table}, query_context);
+    return local_storage->applyFilter(query_filter, query_info, query_context, stats);
+}
+
 void registerStorageDistributed(StorageFactory & factory)
 {
     factory.registerStorage("Distributed", [](const StorageFactory::Arguments & args)
@@ -1360,7 +1451,7 @@ void registerStorageDistributed(StorageFactory & factory)
             auto type = block.getByPosition(0).type;
 
             if (!type->isValueRepresentedByInteger())
-                throw Exception("Sharding expression has type " + type->getName() +
+                throw Exception("Sharding expression " + block.getNames()[0] + " has type " + type->getName() +
                     ", but should be one of integer type", ErrorCodes::TYPE_MISMATCH);
         }
 
@@ -1386,6 +1477,8 @@ void registerStorageDistributed(StorageFactory & factory)
             args.table_id,
             args.columns,
             args.constraints,
+            args.foreign_keys,
+            args.unique,
             args.comment,
             remote_database,
             remote_table,

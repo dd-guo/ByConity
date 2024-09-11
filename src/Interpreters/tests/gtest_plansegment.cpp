@@ -19,6 +19,7 @@
 #include <IO/ReadBufferFromString.h>
 
 #include <gtest/gtest.h>
+#include <QueryPlan/ReadNothingStep.h>
 
 using namespace DB;
 
@@ -32,9 +33,12 @@ PlanSegmentPtr createPlanSegment()
 
     plan_segment->appendPlanSegmentInput(left);
     plan_segment->appendPlanSegmentInput(right);
-    plan_segment->setPlanSegmentOutput(output);
+    plan_segment->appendPlanSegmentOutput(output);
 
     QueryPlan query_plan;
+    auto step = std::make_shared<ReadNothingStep>(Block{});
+    QueryPlan::Node remote_node{.step = std::move(step), .children = {}};
+    query_plan.addRoot(std::move(remote_node));
     plan_segment->setQueryPlan(std::move(query_plan));
 
     return plan_segment;
@@ -55,5 +59,5 @@ TEST(PlanSegmentTest, PlanSegmentSerDer)
      */
     ReadBufferFromString read_buffer(write_buffer.str());
     PlanSegmentPtr new_plan_segment = std::make_unique<PlanSegment>();
-    new_plan_segment->deserialize(read_buffer);
+    new_plan_segment->deserialize(read_buffer, ContextMutablePtr());
 }

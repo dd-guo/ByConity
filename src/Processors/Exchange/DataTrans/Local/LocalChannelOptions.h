@@ -19,6 +19,7 @@ namespace DB {
 
 struct LocalChannelOptions{
     size_t queue_size;
-    UInt32 max_timeout_ms;
+    timespec max_timeout_ts;
+    bool enable_metrics;
 };
 }

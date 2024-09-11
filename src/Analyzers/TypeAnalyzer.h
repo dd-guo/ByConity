@@ -25,6 +25,8 @@
 namespace DB
 {
 
+class TypeAnalyzer;
+using TypeAnalyzerPtr = std::shared_ptr<TypeAnalyzer>;
 using ExpressionTypes = std::unordered_map<ASTPtr, DataTypePtr>;
 
 /**
@@ -32,7 +34,7 @@ using ExpressionTypes = std::unordered_map<ASTPtr, DataTypePtr>;
  *
  * Analyze and return the type of given expression.
  */
-class TypeAnalyzer : boost::noncopyable
+class TypeAnalyzer
 {
 public:
     // WARNING: this can be slow
@@ -42,17 +44,22 @@ public:
     // auto analyzer = TypeAnalyzer::create(context, input_types);
     // for (...) {...; analyzer.getType(expr); ...;}
     // ```
-    static DataTypePtr getType(const ConstASTPtr & expr, ContextMutablePtr context, const NamesAndTypes & input_types);
+    static DataTypePtr getType(const ConstASTPtr & expr, ContextPtr context, const NamesAndTypes & input_types);
 
-    static TypeAnalyzer create(ContextMutablePtr context, const NameToType & input_types);
-    static TypeAnalyzer create(ContextMutablePtr context, const NamesAndTypes & input_types);
+    static TypeAnalyzer create(ContextPtr context, const NameToType & input_types);
+    static TypeAnalyzer create(ContextPtr context, const NamesAndTypes & input_types);
     DataTypePtr getType(const ConstASTPtr & expr) const;
+    DataTypePtr getTypeWithoutCheck(const ConstASTPtr & expr) const;
     ExpressionTypes getExpressionTypes(const ConstASTPtr & expr) const;
 
-private:
-    TypeAnalyzer(ContextMutablePtr context_, Scope && scope_) : context(std::move(context_)), scope(std::move(scope_)) { }
+    TypeAnalyzer(TypeAnalyzer && other) = default;
 
-    ContextMutablePtr context;
+private:
+    TypeAnalyzer(ContextPtr context_, Scope && scope_) : context(std::move(context_)), scope(std::move(scope_))
+    {
+    }
+
+    ContextPtr context;
     Scope scope;
 };
 

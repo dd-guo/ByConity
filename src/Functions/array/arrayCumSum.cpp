@@ -1,9 +1,10 @@
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypesDecimal.h>
-#include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnDecimal.h>
-#include "FunctionArrayMapped.h"
+#include <Columns/ColumnsNumber.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
+
+#include "FunctionArrayMapped.h"
 
 
 namespace DB
@@ -17,6 +18,9 @@ namespace ErrorCodes
 
 struct ArrayCumSumImpl
 {
+    using column_type = ColumnArray;
+    using data_type = DataTypeArray;
+
     static bool needBoolean() { return false; }
     static bool needExpression() { return false; }
     static bool needOneArray() { return false; }
@@ -37,7 +41,11 @@ struct ArrayCumSumImpl
         if (which.isDecimal())
         {
             UInt32 scale = getDecimalScale(*expression_return);
-            DataTypePtr nested = std::make_shared<DataTypeDecimal<Decimal128>>(DecimalUtils::max_precision<Decimal128>, scale);
+            DataTypePtr nested;
+            if (which.isDecimal256())
+                nested = std::make_shared<DataTypeDecimal<Decimal256>>(DecimalUtils::max_precision<Decimal256>, scale);
+            else
+                nested = std::make_shared<DataTypeDecimal<Decimal128>>(DecimalUtils::max_precision<Decimal128>, scale);
             return std::make_shared<DataTypeArray>(nested);
         }
 
@@ -148,7 +156,8 @@ struct ArrayCumSumImpl
             executeType<Float64,Float64>(mapped, array, res) ||
             executeType<Decimal32, Decimal128>(mapped, array, res) ||
             executeType<Decimal64, Decimal128>(mapped, array, res) ||
-            executeType<Decimal128, Decimal128>(mapped, array, res))
+            executeType<Decimal128, Decimal128>(mapped, array, res) ||
+            executeType<Decimal256, Decimal256>(mapped, array, res))
             return res;
         else
             throw Exception("Unexpected column for arrayCumSum: " + mapped->getName(), ErrorCodes::ILLEGAL_COLUMN);
@@ -159,7 +168,7 @@ struct ArrayCumSumImpl
 struct NameArrayCumSum { static constexpr auto name = "arrayCumSum"; };
 using FunctionArrayCumSum = FunctionArrayMapped<ArrayCumSumImpl, NameArrayCumSum>;
 
-void registerFunctionArrayCumSum(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayCumSum)
 {
     factory.registerFunction<FunctionArrayCumSum>();
 }

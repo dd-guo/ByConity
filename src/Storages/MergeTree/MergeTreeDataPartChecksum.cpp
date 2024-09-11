@@ -93,12 +93,38 @@ void MergeTreeDataPartChecksums::checkEqual(const MergeTreeDataPartChecksums & r
     {
         const String & name = it.first;
 
+        /// Exclude files written by inverted index from check. No correct checksums are available for them currently.
+        if (name.ends_with(".gin_dict") || name.ends_with(".gin_post") || name.ends_with(".gin_seg") || name.ends_with(".gin_sid"))
+            continue;
+
         auto jt = rhs.files.find(name);
         if (jt == rhs.files.end())
             throw Exception("No file " + name + " in data part", ErrorCodes::NO_FILE_IN_DATA_PART);
 
         it.second.checkEqual(jt->second, have_uncompressed, name);
     }
+}
+
+bool MergeTreeDataPartChecksums::adjustDiffImplicitKeyOffset(const MergeTreeDataPartChecksums & rhs)
+{
+    if (!versions->enable_compact_map_data)
+        return false;
+    bool has_diff = false;
+    for (auto & it: files)
+    {
+        const String & name = it.first;
+
+        auto jt = rhs.files.find(name);
+        if (jt == rhs.files.end())
+            throw Exception("No file " + name + " in data part", ErrorCodes::NO_FILE_IN_DATA_PART);
+
+        if (isMapImplicitKey(name) && it.second.file_offset != jt->second.file_offset)
+        {
+            has_diff = true;
+            it.second.file_offset = jt->second.file_offset;
+        }
+    }
+    return has_diff;
 }
 
 bool MergeTreeDataPartChecksums::isEqual(const MergeTreeDataPartChecksums & rhs, const String & col_name) const
@@ -111,10 +137,14 @@ bool MergeTreeDataPartChecksums::isEqual(const MergeTreeDataPartChecksums & rhs,
 
 void MergeTreeDataPartChecksums::checkSizes(const DiskPtr & disk, const String & path) const
 {
+    /// Skip inverted index files, these have a default MergeTreeDataPartChecksum with file_size == 0
+    if (path.ends_with(".gin_dict") || path.ends_with(".gin_post") || path.ends_with(".gin_seg") || path.ends_with(".gin_sid"))
+        return;
+
     for (const auto & it : files)
     {
         const String & name = it.first;
-        if (versions->enable_compact_map_data && isMapImplicitKeyNotKV(name))
+        if (versions->enable_compact_map_data && isMapImplicitKey(name))
             continue;
         it.second.checkSize(disk, path + name);
     }
@@ -131,7 +161,7 @@ UInt64 MergeTreeDataPartChecksums::getTotalSizeOnDisk() const
 /// Returns names of all the files for the given map column.
 /// For compact map, both checksum's filename and disk's filename are returned in order for
 /// MergeTreeDataMergerMutator to remove related files from disk and checksums when the column is dropped.
-Strings MergeTreeDataPartChecksums::collectFilesForMapColumnNotKV(const String & map_column) const
+Strings MergeTreeDataPartChecksums::collectImplicitColumnFilesForByteMap(const String & map_column) const
 {
     auto map_key_prefix = genMapKeyFilePrefix(map_column);
     auto map_base_prefix = genMapBaseFilePrefix(map_column);
@@ -394,6 +424,35 @@ bool MergeTreeDataPartChecksums::readV7(ReadBuffer & from)
     return true;
 }
 
+void MergeTreeDataPartChecksums::writeLocal(WriteBuffer & to) const
+{
+    writeString("checksums format version: 4\n", to);
+
+    CompressedWriteBuffer out{to, CompressionCodecFactory::instance().getDefaultCodec(), 1 << 16};
+
+    writeVarUInt(files.size(), out);
+
+    for (const auto & it : files)
+    {
+        const String & name = it.first;
+        const Checksum & sum = it.second;
+
+        writeBinary(name, out);
+        if (storage_type != StorageType::Local || versions->enable_compact_map_data)
+            writeVarUInt(sum.file_offset, out);
+        writeVarUInt(sum.file_size, out);
+        writePODBinary(sum.file_hash, out);
+        writeBinary(sum.is_compressed, out);
+
+        if (sum.is_compressed)
+        {
+            writeVarUInt(sum.uncompressed_size, out);
+            writePODBinary(sum.uncompressed_hash, out);
+        }
+    }
+    out.finalize();
+}
+
 void MergeTreeDataPartChecksums::write(WriteBuffer & to) const
 {
     writeString("checksums format version: 6\n", to);
@@ -425,11 +484,18 @@ void MergeTreeDataPartChecksums::write(WriteBuffer & to) const
         // writeBinary(sum.is_encrypted, out);
         writeBinary(sum.is_deleted, out);
     }
+    out.finalize();
 }
 
 void MergeTreeDataPartChecksums::addFile(const String & file_name, UInt64 file_size, MergeTreeDataPartChecksum::uint128 file_hash)
 {
     files[file_name] = Checksum(file_size, file_hash);
+}
+
+void MergeTreeDataPartChecksums::addFile(
+    const String & file_name, UInt64 file_offset, UInt64 file_size, MergeTreeDataPartChecksum::uint128 file_hash)
+{
+    files[file_name] = Checksum(file_offset, file_size, file_hash);
 }
 
 void MergeTreeDataPartChecksums::add(MergeTreeDataPartChecksums && rhs_checksums)

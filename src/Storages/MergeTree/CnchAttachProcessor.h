@@ -23,6 +23,8 @@
 #include <Catalog/Catalog.h>
 #include <Storages/StorageCnchMergeTree.h>
 #include <Storages/PartitionCommands.h>
+#include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
+#include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
 #include <Transaction/TxnTimestamp.h>
 
 namespace DB
@@ -86,7 +88,7 @@ private:
 
 // Single source of parts collection, will calcVisibleParts for each source.
 // For example, a table's detached directory is a single source. For attach
-// from path, if it may contains multiple subdirectory, each subdirectory have 
+// from path, if it may contains multiple subdirectory, each subdirectory have
 // it's own parts, then each subdirectory will consider as a single source
 class CollectSource
 {
@@ -121,8 +123,10 @@ public:
         max_worker_threads(max_thds), new_txn(nullptr), logger(log) {}
 
     void writeRenameRecord(const DiskPtr& disk, const String& from, const String& to);
-    // Persist rename map to kv in form of undo-buffer
-    void writeRenameMapToKV(Catalog::Catalog & catalog, const String& uuid, const TxnTimestamp& txn_id);
+    // Persist rename map and other temporary resource to kv in form of undo-buffer
+    void writeRenameMapToKV(Catalog::Catalog & catalog, const StorageID & storage_id, const TxnTimestamp & txn_id);
+    // Record delete Meta files name to delete for attaching unique table parts
+    void writeMetaFilesNameRecord(const DiskPtr& disk, const String& meta_file_name);
 
     void commit();
     void rollback();
@@ -137,18 +141,26 @@ public:
         new_txn = txn;
     }
 
+
+    void setSourceDirectory(const String& dir)
+    {
+        src_directory = dir;
+    }
+
 private:
     const Context& query_ctx;
     const int expand_thread_pool_threshold;
     const int max_worker_threads;
 
     TransactionCnchPtr new_txn;
+    String src_directory;
 
     std::unique_ptr<ThreadPool> worker_pool;
 
     std::mutex mu;
-    /// Temporary resource created during ATTACH, including temp dictionary, file movement records... 
+    /// Temporary resource created during ATTACH, including temp dictionary, file movement records...
     std::map<String, TempResource> resources;
+    std::map<String, TempResource> meta_files_to_delete;
 
     Poco::Logger* logger;
 };
@@ -172,8 +184,13 @@ public:
 
     void exec();
 
+    std::vector<MutableMergeTreeDataPartsCNCHVector> getDetachedParts(const AttachFilter& filter);
+
+
 private:
     using PartsFromSources = std::vector<MutableMergeTreeDataPartsCNCHVector>;
+    // Origin part and new parts
+    using PartsWithHistory = std::pair<IMergeTreeDataPartsVector, MutableMergeTreeDataPartsCNCHVector>;
 
     static String trimPathPostSlash(const String& path);
     static String relativePathTo(const String& source, const String& target);
@@ -195,6 +212,8 @@ private:
     PartsFromSources collectPartsFromSources(const StorageCnchMergeTree& tbl,
         const std::vector<CollectSource>& sources, const AttachFilter& filter,
         int max_drill_down_level, AttachContext& attach_ctx);
+    PartsFromSources collectPartsFromS3TaskMeta(StorageCnchMergeTree& tbl,
+        const String& task_id, const AttachFilter& filter, AttachContext& attach_ctx);
     void collectPartsFromUnit(const StorageCnchMergeTree& tbl,
         const DiskPtr& disk, String& path, int max_drill_down_level,
         const AttachFilter& filter, MutableMergeTreeDataPartsCNCHVector& founded_parts);
@@ -203,25 +222,37 @@ private:
     std::pair<String, DiskPtr> findBestDiskForHDFSPath(const String& from_path);
 
     // Rename parts to attach to destination with new part name
-    MutableMergeTreeDataPartsCNCHVector prepareParts(const PartsFromSources& parts_from_sources,
-        AttachContext& attach_ctx);
+    PartsWithHistory prepareParts(const PartsFromSources & parts_from_sources, AttachContext & attach_ctx);
+    void commitPartsFromS3(const PartsWithHistory & prepared_parts, NameSet & staged_parts_name);
+    void genPartsDeleteMark(PartsWithHistory & prepared_parts);
 
     void genPartsDeleteMark(MutableMergeTreeDataPartsCNCHVector& parts_to_write);
-    void waitingForDedup(const String& partition_id, const NameSet& staged_parts_name);
-    void refreshView();
+    void refreshView(const std::vector<ASTPtr>& attached_partitions, AttachContext& attach_ctx);
 
     void verifyPartsNum(size_t total_parts_num) const;
     inline void injectFailure(AttachFailurePoint point) const;
 
+    void commitParts(MutableMergeTreeDataPartsCNCHVector & prepared_parts, NameSet & staged_parts_name, std::vector<ASTPtr> & attached_partitions);
+    void loadUniqueDeleteMeta(IMergeTreeDataPartPtr & part, const MergeTreePartInfo & info);
+    void waitingForDedup(const NameSet & partitions_filter, const NameSet & staged_parts_name);
+
+    void tryPreload(MutableMergeTreeDataPartsCNCHVector & preload_parts);
+
     UInt64 failure_injection_knob;
 
     StorageCnchMergeTree& target_tbl;
-    StoragePtr from_storage; /// If attach.from_table is not empty
+    // If attach from self/other table, set to source storage
+    StoragePtr from_storage;
     const bool is_unique_tbl;
     const PartitionCommand& command;
     ContextMutablePtr query_ctx;
 
     Poco::Logger* logger;
+
+    // For unique table
+    std::mutex unique_table_info_mutex;
+    std::unordered_map<String, String> part_delete_file_relative_paths;  // part_name -> relative path(related to path of target_tbl)
+    std::unordered_map<String, DataModelDeleteBitmapPtr> attach_metas;   // part_name -> attach meta of delete bitmap
 };
 
 }

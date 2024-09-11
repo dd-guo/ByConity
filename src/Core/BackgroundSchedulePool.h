@@ -136,6 +136,9 @@ public:
     /// Atomically activate task and schedule it for execution.
     bool activateAndSchedule();
 
+    /// Check if the current task is active.
+    bool taskIsActive() const { return !deactivated; }
+
     /// get Coordination::WatchCallback needed for notifications from ZooKeeper watches.
     Coordination::WatchCallback getWatchCallback();
 
@@ -194,6 +197,28 @@ public:
 
 private:
     BackgroundSchedulePoolTaskInfoPtr task_info;
+};
+
+class RepeatedTimerTask {
+public:
+    RepeatedTimerTask(BackgroundSchedulePool &pool_, UInt64 interval_, const std::string& name_);
+
+    virtual ~RepeatedTimerTask() = default;
+
+    void start()
+    {
+        task->activateAndSchedule();
+    }
+
+    void stop()
+    {
+        task->deactivate();
+    }
+
+protected:
+    virtual void run() = 0;
+    UInt64 interval; /// in seconds;
+    BackgroundSchedulePool::TaskHolder task;
 };
 
 }

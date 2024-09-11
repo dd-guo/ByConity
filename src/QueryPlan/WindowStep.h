@@ -32,9 +32,10 @@ public:
     explicit WindowStep(const DataStream & input_stream_,
             const WindowDescription & window_description_,
             const std::vector<WindowFunctionDescription> & window_functions_,
-            bool need_sort_);
+            bool need_sort_,
+            SortDescription prefix_description_ = {});
 
-    WindowStep(const DataStream & input_stream_, const WindowDescription & window_description_, bool need_sort_);
+    WindowStep(const DataStream & input_stream_, const WindowDescription & window_description_, bool need_sort_, SortDescription prefix_description_);
 
     String getName() const override { return "Window"; }
 
@@ -48,15 +49,20 @@ public:
     void describeActions(JSONBuilder::JSONMap & map) const override;
     void describeActions(FormatSettings & settings) const override;
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
-    void serialize(WriteBuffer & buffer) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
+    void toProto(Protos::WindowStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<WindowStep> fromProto(const Protos::WindowStep & proto, ContextPtr context);
     void setInputStreams(const DataStreams & input_streams_) override;
+
+    const WindowDescription & getWindowDescription() const { return window_description; }
+    const SortDescription & getPrefixDescription() const { return prefix_description; }
+    void setPrefixDescription(const SortDescription & prefix_description_) { prefix_description = prefix_description_; }
 
 private:
     WindowDescription window_description;
     std::vector<WindowFunctionDescription> window_functions;
-    Block input_header;
     bool need_sort;
+    SortDescription prefix_description;
+    void scatterByPartitionIfNeeded(QueryPipeline& pipeline);
 };
 
 }

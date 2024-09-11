@@ -8,9 +8,9 @@ namespace DB
 
 using FunctionSubtractQuarters = FunctionDateOrDateTimeAddInterval<SubtractQuartersImpl>;
 
-void registerFunctionSubtractQuarters(FunctionFactory & factory)
+REGISTER_FUNCTION(SubtractQuarters)
 {
-    factory.registerFunction<FunctionSubtractQuarters>();
+    factory.registerFunction<FunctionSubtractQuarters>(FunctionFactory::CaseInsensitive);
 }
 
 }

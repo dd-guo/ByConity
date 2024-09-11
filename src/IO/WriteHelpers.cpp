@@ -21,6 +21,8 @@
 
 #include <IO/WriteHelpers.h>
 #include <inttypes.h>
+#include <utility>
+#include <Common/formatIPv6.h>
 #include <Common/hex.h>
 
 
@@ -75,6 +77,29 @@ void formatUUID(std::reverse_iterator<const UInt8 *> src16, UInt8 * dst36)
     formatHex(src16 + 2, &dst36[24], 6);
 }
 
+void writeIPv4Text(const IPv4 & ip, WriteBuffer & buf)
+{
+    size_t idx = (ip >> 24);
+    buf.write(one_byte_to_string_lookup_table[idx] + 1, one_byte_to_string_lookup_table[idx][0]);
+    buf.write('.');
+    idx = (ip >> 16) & 0xFF;
+    buf.write(one_byte_to_string_lookup_table[idx] + 1, one_byte_to_string_lookup_table[idx][0]);
+    buf.write('.');
+    idx = (ip >> 8) & 0xFF;
+    buf.write(one_byte_to_string_lookup_table[idx] + 1, one_byte_to_string_lookup_table[idx][0]);
+    buf.write('.');
+    idx = ip & 0xFF;
+    buf.write(one_byte_to_string_lookup_table[idx] + 1, one_byte_to_string_lookup_table[idx][0]);
+}
+
+void writeIPv6Text(const IPv6 & ip, WriteBuffer & buf)
+{
+    char addr[IPV6_MAX_TEXT_LENGTH + 1] {};
+    char * paddr = addr;
+
+    formatIPv6(reinterpret_cast<const unsigned char *>(&ip), paddr);
+    buf.write(addr, paddr - addr - 1);
+}
 
 void writeException(const Exception & e, WriteBuffer & buf, bool with_stack_trace)
 {
@@ -124,5 +149,46 @@ void writePointerHex(const void * ptr, WriteBuffer & buf)
     writeHexUIntLowercase(reinterpret_cast<uintptr_t>(ptr), hex_str);
     buf.write(hex_str, 2 * sizeof(ptr));
 }
+
+template<>
+void writeBinary(const std::vector<bool> & x, WriteBuffer & buf)
+{
+    size_t size = x.size();
+    writeVarUInt(size, buf);
+
+    if (!size)
+        return;
+
+    size_t bitmap_cnt = (size + 63) / 64;
+    size_t s = 0;
+
+    for (size_t i = 0; i < bitmap_cnt - 1; i++) {
+        uint64_t val = 0;
+
+        for (size_t j = 0; j < 64; ++j) {
+            if (!x[s++])
+                continue;
+
+            val |= 1UL << j;
+        }
+
+        writeBinary(val, buf);
+        size -= 64;
+    }
+
+    {
+        uint64_t val = 0;
+
+        for (size_t j = 0; j < size; ++j) {
+            if (!x[s++])
+                continue;
+
+            val |= 1UL << j;
+        }
+
+        writeBinary(val, buf);
+    }
+}
+
 
 }

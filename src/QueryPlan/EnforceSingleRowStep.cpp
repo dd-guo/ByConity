@@ -17,12 +17,14 @@
 
 #include <Processors/Transforms/EnforceSingleRowTransform.h>
 #include <Processors/QueryPipeline.h>
+#include <Interpreters/join_common.h>
 
 namespace DB
 {
 EnforceSingleRowStep::EnforceSingleRowStep(const DB::DataStream & input_stream_)
     : ITransformingStep(input_stream_, input_stream_.header, {})
 {
+    makeOutputNullable();
 }
 
 void EnforceSingleRowStep::transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &)
@@ -34,20 +36,34 @@ void EnforceSingleRowStep::transformPipeline(QueryPipeline & pipeline, const Bui
 void EnforceSingleRowStep::setInputStreams(const DataStreams & input_streams_)
 {
     input_streams = input_streams_;
+    makeOutputNullable();
 }
 
-void EnforceSingleRowStep::serialize(WriteBuffer & buf) const
+void EnforceSingleRowStep::makeOutputNullable()
 {
-    IQueryPlanStep::serializeImpl(buf);
+    auto input_header = input_streams[0].header;
+    NamesAndTypes nullable_output_header;
+    for(auto & input : input_header)
+    {
+        if (!JoinCommon::canBecomeNullable(input.type))
+            nullable_output_header.emplace_back(input.name, input.type);
+        else
+            nullable_output_header.emplace_back(input.name, JoinCommon::convertTypeToNullable(input.type));
+    }
+    output_stream = DataStream{.header = {nullable_output_header}};
 }
 
-QueryPlanStepPtr EnforceSingleRowStep::deserialize(ReadBuffer & buf, ContextPtr)
+std::shared_ptr<EnforceSingleRowStep> EnforceSingleRowStep::fromProto(const Protos::EnforceSingleRowStep & proto, ContextPtr)
 {
-    String step_description;
-    readBinary(step_description, buf);
+    auto [step_description, base_input_stream] = ITransformingStep::deserializeFromProtoBase(proto.query_plan_base());
+    auto step = std::make_shared<EnforceSingleRowStep>(base_input_stream);
+    step->setStepDescription(step_description);
+    return step;
+}
 
-    DataStream input_stream = deserializeDataStream(buf);
-    return std::make_unique<EnforceSingleRowStep>(input_stream);
+void EnforceSingleRowStep::toProto(Protos::EnforceSingleRowStep & proto, bool) const
+{
+    ITransformingStep::serializeToProtoBase(*proto.mutable_query_plan_base());
 }
 
 std::shared_ptr<IQueryPlanStep> EnforceSingleRowStep::copy(ContextPtr) const

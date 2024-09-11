@@ -4,16 +4,22 @@
 namespace DB
 {
 
-void SerializationWrapper::enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const
+
+void SerializationWrapper::enumerateStreams(
+    EnumerateStreamsSettings & settings,
+    const StreamCallback & callback,
+    const SubstreamData & data) const
 {
-    nested_serialization->enumerateStreams(callback, path);
+    nested_serialization->enumerateStreams(settings, callback, data);
 }
 
+
 void SerializationWrapper::serializeBinaryBulkStatePrefix(
+    const IColumn & column,
     SerializeBinaryBulkSettings & settings,
     SerializeBinaryBulkStatePtr & state) const
 {
-    nested_serialization->serializeBinaryBulkStatePrefix(settings, state);
+    nested_serialization->serializeBinaryBulkStatePrefix(column, settings, state);
 }
 
 void SerializationWrapper::serializeBinaryBulkStateSuffix(
@@ -41,15 +47,14 @@ void SerializationWrapper::serializeBinaryBulkWithMultipleStreams(
     nested_serialization->serializeBinaryBulkWithMultipleStreams(column, offset, limit, settings, state);
 }
 
-void SerializationWrapper::deserializeBinaryBulkWithMultipleStreams(
+size_t SerializationWrapper::deserializeBinaryBulkWithMultipleStreams(
     ColumnPtr & column,
     size_t limit,
     DeserializeBinaryBulkSettings & settings,
     DeserializeBinaryBulkStatePtr & state,
     SubstreamsCache * cache) const
 {
-
-    nested_serialization->deserializeBinaryBulkWithMultipleStreams(column, limit, settings, state, cache);
+    return nested_serialization->deserializeBinaryBulkWithMultipleStreams(column, limit, settings, state, cache);
 }
 
 void SerializationWrapper::serializeBinaryBulk(const IColumn & column, WriteBuffer & ostr, size_t offset, size_t limit) const
@@ -57,9 +62,9 @@ void SerializationWrapper::serializeBinaryBulk(const IColumn & column, WriteBuff
     nested_serialization->serializeBinaryBulk(column, ostr, offset, limit);
 }
 
-void SerializationWrapper::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double avg_value_size_hint) const
+size_t SerializationWrapper::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double avg_value_size_hint, bool zero_copy_cache_read, const UInt8* filter) const
 {
-    nested_serialization->deserializeBinaryBulk(column, istr, limit, avg_value_size_hint);
+    return nested_serialization->deserializeBinaryBulk(column, istr, limit, avg_value_size_hint, zero_copy_cache_read, filter);
 }
 
 void SerializationWrapper::serializeBinary(const Field & field, WriteBuffer & ostr) const

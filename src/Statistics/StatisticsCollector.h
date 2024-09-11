@@ -40,17 +40,7 @@ public:
     using ColumnStatsMap = StatisticsImpl::ColumnStatsMap;
 
     StatisticsCollector(
-        ContextPtr context_, CatalogAdaptorPtr catalog_, const StatsTableIdentifier & table_info_, const CollectorSettings & settings_)
-        : context(context_), catalog(catalog_), table_info(table_info_), settings(settings_)
-    {
-        logger = &Poco::Logger::get("StatisticsLogger" + table_info.getDbTableName());
-    }
-
-    // use default settings
-    StatisticsCollector(ContextPtr context_, CatalogAdaptorPtr catalog_, const StatsTableIdentifier & table_info_)
-        : StatisticsCollector(context_, catalog_, table_info_, CollectorSettings(context_->getSettingsRef()))
-    {
-    }
+        ContextPtr context_, CatalogAdaptorPtr catalog_, const StatsTableIdentifier & table_info_, const CollectorSettings & settings_);
 
     void collect(const ColumnDescVector & col_names);
 
@@ -74,6 +64,7 @@ private:
 
     // table stats
     TableStats table_stats;
+    StoragePtr storage;
 
     // column stats
     ColumnStatsMap columns_stats;

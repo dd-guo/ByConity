@@ -88,6 +88,8 @@ public:
 
     bool useDefaultImplementationForNulls() const override { return null_is_skipped; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, [[maybe_unused]] size_t input_rows_count) const override
     {
         if constexpr (ignore_set)
@@ -141,8 +143,15 @@ public:
 
             if (const auto * lc = typeid_cast<const ColumnLowCardinality *>(col))
             {
-                lc_indexes = lc->getIndexesPtr();
-                arg.column = lc->getDictionary().getNestedColumn();
+                if (!lc->isFullState())
+                {
+                    lc_indexes = lc->getIndexesPtr();
+                    arg.column = lc->getDictionary().getNestedColumn();
+                }
+                else
+                {
+                    arg.column = lc->getNestedColumnPtr();
+                }
                 arg.type = removeLowCardinality(arg.type);
             }
         }
@@ -171,7 +180,7 @@ void registerFunctionsInImpl(FunctionFactory & factory)
 
 }
 
-void registerFunctionsIn(FunctionFactory & factory)
+REGISTER_FUNCTION(In)
 {
     registerFunctionsInImpl<false>(factory);
     registerFunctionsInImpl<true>(factory);

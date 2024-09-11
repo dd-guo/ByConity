@@ -25,6 +25,7 @@
 #include <Processors/Chunk.h>
 #include <Processors/ISimpleTransform.h>
 #include <Poco/Logger.h>
+#include <Core/Field.h>
 #include <Interpreters/Context_fwd.h>
 
 namespace DB
@@ -53,6 +54,7 @@ public:
     inline static const String REPARTITION_FUNC{"cityHash64"};
 
     static const DataTypePtr REPARTITION_FUNC_RESULT_TYPE;
+    static const DataTypePtr REPARTITION_FUNC_NULLABLE_RESULT_TYPE;
 
     static std::pair<IColumn::Selector, PartitionStartPoints> doRepartition(
         size_t partition_num,
@@ -63,6 +65,8 @@ public:
         const DataTypePtr & result_type);
 
     static ExecutableFunctionPtr getDefaultRepartitionFunction(const ColumnsWithTypeAndName & arguments, ContextPtr context);
+
+    static ExecutableFunctionPtr getRepartitionHashFunction(const String & func_name, const ColumnsWithTypeAndName & arguments, ContextPtr context, const Array & params = {});
 
 protected:
     void transform(Chunk & chunk) override;

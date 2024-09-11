@@ -64,9 +64,20 @@ public:
     };
     using PoolOptionsMap = std::unordered_map<std::string, BrpcChannelPoolOptions::PoolOptions>;
 
+    void setPoolCheckConfig(UInt64 rpc_channel_pool_check_interval_seconds_, UInt64 rpc_channel_pool_expired_seconds_)
+    {
+        rpc_channel_pool_check_interval_seconds = rpc_channel_pool_check_interval_seconds_;
+        rpc_channel_pool_expired_seconds = rpc_channel_pool_expired_seconds_;
+    }
+
+    void initPoolExpireTimer();
+
 private:
 
     PoolOptionsMap options_map;
+
+    UInt64 rpc_channel_pool_expired_seconds{0};
+    UInt64 rpc_channel_pool_check_interval_seconds{0};
 
 public:
 #define STR(M) #M
@@ -82,7 +93,8 @@ public:
     M(int, rpc_default_max_retry, 3, "") \
     M(bool, rpc_default_enable_circuit_breaker, false, "") \
     M(bool, rpc_default_log_succeed_without_server, true, "") \
-    M(bool, rpc_default_succeed_without_server, true, "")
+    M(bool, rpc_default_succeed_without_server, true, "") \
+    M(std::string, rpc_default_connection_pool, "rpc_default", "")
 
 // stream default config params
 #define APPLY_FOR_STREAM_PARAM(M) \
@@ -94,7 +106,8 @@ public:
     M(int, stream_default_max_retry, 3, "") \
     M(bool, stream_default_enable_circuit_breaker, false, "") \
     M(bool, stream_default_log_succeed_without_server, true, "") \
-    M(bool, stream_default_succeed_without_server, true, "")
+    M(bool, stream_default_succeed_without_server, true, "") \
+    M(std::string, stream_default_connection_pool, "stream_default", "")
 
 
 #define DECLARE(TYPE, NAME, DEFAULT, DESCRIPTION) static const TYPE NAME;
@@ -120,7 +133,8 @@ public:
                 P##_pool_options.channel_options.max_retry = P##_default_max_retry; \
                 P##_pool_options.channel_options.enable_circuit_breaker = P##_default_enable_circuit_breaker; \
                 P##_pool_options.channel_options.log_succeed_without_server = P##_default_log_succeed_without_server; \
-                P##_pool_options.channel_options.succeed_without_server = P##_default_succeed_without_server;
+                P##_pool_options.channel_options.succeed_without_server = P##_default_succeed_without_server; \
+                P##_pool_options.channel_options.connection_group = P##_default_connection_pool;
 
                 FILL(rpc)
                 FILL(stream)
@@ -130,7 +144,6 @@ public:
     }
 
     const PoolOptions * getDefaultPoolOptions(std::string key);
-
 
 private:
     BrpcChannelPoolOptions() = default;

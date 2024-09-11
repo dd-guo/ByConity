@@ -32,6 +32,7 @@
 #include <Common/OptimizedRegularExpression.h>
 #include <Common/typeid_cast.h>
 #include <Common/thread_local_rng.h>
+#include <Core/SettingsEnums.h>
 
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTExpressionList.h>
@@ -267,7 +268,7 @@ CREATE TABLE [IF NOT EXISTS] [db.]table_name [ON CLUSTER cluster]
 ) ENGINE = MergeTree()
 ORDER BY expr
 [PARTITION BY expr]
-[CLUSTER BY expr INTO <TOTAL_BUCKET_NUMBER> BUCKETS [SPLIT_NUMBER <SPLIT_NUMBER_VALUE>] [WITH_RANGE] ]
+[CLUSTER BY [EXPRESSION <expr>] expr INTO <TOTAL_BUCKET_NUMBER> BUCKETS [SPLIT_NUMBER <SPLIT_NUMBER_VALUE>] [WITH_RANGE] ]
 [PRIMARY KEY expr]
 [SAMPLE BY expr]
 [TTL expr [DELETE|TO DISK 'xxx'|TO VOLUME 'xxx'], ...]
@@ -554,7 +555,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// Allow implicit {uuid} macros only for zookeeper_path in ON CLUSTER queries
         bool is_on_cluster = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
         bool is_replicated_database = args.getLocalContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY &&
-                                      DatabaseCatalog::instance().getDatabase(args.table_id.database_name)->getEngineName() == "Replicated";
+                                      DatabaseCatalog::instance().getDatabase(args.table_id.database_name, args.getLocalContext())->getEngineName() == "Replicated";
         bool allow_uuid_macro = is_on_cluster || is_replicated_database || args.query.attach;
 
         /// Unfold {database} and {table} macro on table creation, so table can be renamed.
@@ -613,7 +614,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         cnch_table_name = engine_args[arg_num + 1]->as<ASTIdentifier &>().name();
 
         arg_num += 2;
-        engine_args.erase(engine_args.begin(), engine_args.begin() + 2);
     }
 
     /// This merging param maybe used as part of sorting key
@@ -698,10 +698,57 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     if (replicated || is_ha) /// TODO: fix me
         storage_settings = std::make_unique<MergeTreeSettings>(args.getContext()->getReplicatedMergeTreeSettings());
     else
-        storage_settings = std::make_unique<MergeTreeSettings>(args.getContext()->getMergeTreeSettings());
+        storage_settings = std::make_unique<MergeTreeSettings>(args.getContext()->getMergeTreeSettings(args.skip_unknown_settings));
+
+    /// In ANSI mode, allow_nullable_key must be true
+    if (auto dialect_type = args.getLocalContext()->getSettingsRef().dialect_type; dialect_type != DialectType::CLICKHOUSE)
+    {
+        // If user sets allow_nullable_key=0.
+        if (storage_settings->allow_nullable_key.changed && !storage_settings->allow_nullable_key.value)
+            throw Exception("In ANSI mode, allow_nullable_key must be true.", ErrorCodes::BAD_ARGUMENTS);
+
+        storage_settings->allow_nullable_key.value = true;
+        storage_settings->storage_dialect_type.value = dialect_type;
+    }
+
+    bool allow_nullable_key = storage_settings->allow_nullable_key;
+
+    /// Extract dialect_type from storage settings if any.
+    /// And set the dialect_type for context if any underlying implementation depends on the it.
+    /// For example, if we create a table in MYSQL dialect: t(dt DateTime, ...) ... PARTITION BY date_format(dt).
+    /// Here the function date_format() has different implementation in MYSQL and CLICKHOUSE.
+    /// When we insert data to the table, even we don't set dialect_type=MYSQL for the query,
+    /// we need to use MYSQL dialect to create the storage so that we can chose the correct implementation for PARTITION KEY.
+    String storage_dialect_type = "CLICKHOUSE";
+    auto context_for_keys = args.getContext();
+    do
+    {
+        if (!args.storage_def->settings)
+            break;
+        auto * field = args.storage_def->settings->changes.tryGet("storage_dialect_type");
+        if (!field)
+            break;
+        storage_dialect_type = field->get<String>();
+        if (storage_dialect_type != "CLICKHOUSE")
+        {
+            context_for_keys = Context::createCopy(args.getContext());
+            context_for_keys->setSetting("dialect_type", storage_dialect_type);
+        }
+    } while (false);
 
     if (is_extended_storage_def)
     {
+        do
+        {
+            if (!args.storage_def->settings)
+                break;
+            auto * field = args.storage_def->settings->changes.tryGet("allow_nullable_key");
+            if (!field)
+                break;
+            if (field->get<bool>())
+                allow_nullable_key = true;
+        } while (false);
+
         ASTPtr partition_by_key;
         if (args.storage_def->partition_by)
             partition_by_key = args.storage_def->partition_by->ptr();
@@ -709,10 +756,10 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// Partition key may be undefined, but despite this we store it's empty
         /// value in partition_key structure. MergeTree checks this case and use
         /// single default partition with name "all".
-        metadata.partition_key = KeyDescription::getKeyFromAST(partition_by_key, metadata.columns, args.getContext());
+        metadata.partition_key = KeyDescription::getKeyFromAST(partition_by_key, metadata.columns, context_for_keys);
 
         if (args.storage_def->cluster_by)
-            metadata.cluster_by_key = KeyDescription::getClusterByKeyFromAST(args.storage_def->cluster_by->ptr(), metadata.columns, args.getContext());
+            metadata.cluster_by_key = KeyDescription::getClusterByKeyFromAST(args.storage_def->cluster_by->ptr(), metadata.columns, context_for_keys);
 
         /// PRIMARY KEY without ORDER BY is allowed and considered as ORDER BY.
         if (!args.storage_def->order_by && args.storage_def->primary_key)
@@ -727,7 +774,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         if (args.storage_def->unique_key)
         {
             metadata.unique_key = KeyDescription::getKeyFromAST(
-                args.storage_def->unique_key->ptr(), metadata.columns, args.getContext());
+                args.storage_def->unique_key->ptr(), metadata.columns, context_for_keys);
         }
 
         /// Get sorting key from engine arguments.
@@ -736,38 +783,41 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// before storage creation. After that storage will just copy this
         /// column if sorting key will be changed.
         metadata.sorting_key = KeyDescription::getSortingKeyFromAST(
-            args.storage_def->order_by->ptr(), metadata.columns, args.getContext(), merging_param_key_arg);
+            args.storage_def->order_by->ptr(), metadata.columns, context_for_keys, merging_param_key_arg);
 
         /// If primary key explicitly defined, than get it from AST
         if (args.storage_def->primary_key)
         {
-            metadata.primary_key = KeyDescription::getKeyFromAST(args.storage_def->primary_key->ptr(), metadata.columns, args.getContext());
+            metadata.primary_key = KeyDescription::getKeyFromAST(args.storage_def->primary_key->ptr(), metadata.columns, context_for_keys);
         }
         else /// Otherwise we don't have explicit primary key and copy it from order by
         {
-            metadata.primary_key = KeyDescription::getKeyFromAST(args.storage_def->order_by->ptr(), metadata.columns, args.getContext());
+            metadata.primary_key = KeyDescription::getKeyFromAST(args.storage_def->order_by->ptr(), metadata.columns, context_for_keys);
             /// and set it's definition_ast to nullptr (so isPrimaryKeyDefined()
             /// will return false but hasPrimaryKey() will return true.
             metadata.primary_key.definition_ast = nullptr;
         }
 
         if (args.storage_def->sample_by)
-            metadata.sampling_key = KeyDescription::getKeyFromAST(args.storage_def->sample_by->ptr(), metadata.columns, args.getContext());
+            metadata.sampling_key = KeyDescription::getKeyFromAST(args.storage_def->sample_by->ptr(), metadata.columns, context_for_keys);
 
         if (args.storage_def->ttl_table)
         {
             metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(
-                args.storage_def->ttl_table->ptr(), metadata.columns, args.getContext(), metadata.primary_key);
+                args.storage_def->ttl_table->ptr(),
+                metadata.columns, context_for_keys,
+                metadata.primary_key,
+                allow_nullable_key);
         }
 
         if (args.query.columns_list && args.query.columns_list->indices)
             for (auto & index : args.query.columns_list->indices->children)
-                metadata.secondary_indices.push_back(IndexDescription::getIndexFromAST(index, args.columns, args.getContext()));
+                metadata.secondary_indices.push_back(IndexDescription::getIndexFromAST(index, args.columns, context_for_keys));
 
         if (args.query.columns_list && args.query.columns_list->projections)
             for (auto & projection_ast : args.query.columns_list->projections->children)
             {
-                auto projection = ProjectionDescription::getProjectionFromAST(projection_ast, args.columns, args.getContext());
+                auto projection = ProjectionDescription::getProjectionFromAST(projection_ast, args.columns, context_for_keys);
                 metadata.projections.add(std::move(projection));
             }
 
@@ -775,14 +825,21 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             for (auto & constraint : args.query.columns_list->constraints->children)
                 metadata.constraints.constraints.push_back(constraint);
 
+        if (args.query.columns_list && args.query.columns_list->foreign_keys)
+            for (auto & foreign_key : args.query.columns_list->foreign_keys->children)
+                metadata.foreign_keys.foreign_keys.push_back(foreign_key);
+
+        if (args.query.columns_list && args.query.columns_list->unique)
+            for (auto & unique_key : args.query.columns_list->unique->children)
+                metadata.unique_not_enforced.unique.push_back(unique_key);
+
         auto column_ttl_asts = args.columns.getColumnTTLs();
         for (const auto & [name, ast] : column_ttl_asts)
         {
-            auto new_ttl_entry = TTLDescription::getTTLFromAST(ast, args.columns, args.getContext(), metadata.primary_key);
+            auto new_ttl_entry = TTLDescription::getTTLFromAST(ast, args.columns, context_for_keys, metadata.primary_key);
             metadata.column_ttls_by_name[name] = new_ttl_entry;
         }
 
-        // For cnch, if storage_policy is not specified, modify it to cnch's default
         if (is_cnch || is_cloud)
         {
             if (!args.storage_def->settings)
@@ -792,14 +849,28 @@ static StoragePtr create(const StorageFactory::Arguments & args)
                 args.storage_def->set(args.storage_def->settings, settings_ast);
             }
 
+            /// For cnch, if storage_policy is not specified, modify it to cnch's default
             if (!args.storage_def->settings->changes.tryGet("storage_policy"))
             {
                 args.storage_def->settings->changes.push_back(
                     SettingChange("storage_policy", args.getContext()->getDefaultCnchPolicyName()));
             }
+
+            /// Persist allow_nullable_key to kv for MYSQL and ANSI dialect when creating table.
+            if (storage_settings->allow_nullable_key && !args.storage_def->settings->changes.tryGet("allow_nullable_key"))
+            {
+                args.storage_def->settings->changes.push_back(SettingChange("allow_nullable_key", 1));
+            }
+
+            if (storage_settings->storage_dialect_type.value != DialectType::CLICKHOUSE && !args.storage_def->settings->changes.tryGet("storage_dialect_type"))
+            {
+                args.storage_def->settings->changes.push_back(SettingChange(
+                    "storage_dialect_type",
+                    SettingFieldDialectTypeTraits::toString(storage_settings->storage_dialect_type.value)));
+            }
         }
 
-        storage_settings->loadFromQuery(*args.storage_def);
+        storage_settings->loadFromQuery(*args.storage_def, args.attach);
 
         // updates the default storage_settings with settings specified via SETTINGS arg in a query
         if (args.storage_def->settings)
@@ -817,7 +888,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
         auto partition_by_ast = makeASTFunction("toYYYYMM", std::make_shared<ASTIdentifier>(date_column_name));
 
-        metadata.partition_key = KeyDescription::getKeyFromAST(partition_by_ast, metadata.columns, args.getContext());
+        metadata.partition_key = KeyDescription::getKeyFromAST(partition_by_ast, metadata.columns, context_for_keys);
 
 
         ++arg_num;
@@ -825,7 +896,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// If there is an expression for sampling
         if (arg_cnt - arg_num == 3)
         {
-            metadata.sampling_key = KeyDescription::getKeyFromAST(engine_args[arg_num], metadata.columns, args.getContext());
+            metadata.sampling_key = KeyDescription::getKeyFromAST(engine_args[arg_num], metadata.columns, context_for_keys);
             ++arg_num;
         }
 
@@ -835,10 +906,10 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// before storage creation. After that storage will just copy this
         /// column if sorting key will be changed.
         metadata.sorting_key
-            = KeyDescription::getSortingKeyFromAST(engine_args[arg_num], metadata.columns, args.getContext(), merging_param_key_arg);
+            = KeyDescription::getSortingKeyFromAST(engine_args[arg_num], metadata.columns, context_for_keys, merging_param_key_arg);
 
         /// In old syntax primary_key always equals to sorting key.
-        metadata.primary_key = KeyDescription::getKeyFromAST(engine_args[arg_num], metadata.columns, args.getContext());
+        metadata.primary_key = KeyDescription::getKeyFromAST(engine_args[arg_num], metadata.columns, context_for_keys);
         /// But it's not explicitly defined, so we evaluate definition to
         /// nullptr
         metadata.primary_key.definition_ast = nullptr;
@@ -858,12 +929,24 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             throw Exception("Table TTL is not allowed for MergeTree in old syntax", ErrorCodes::BAD_ARGUMENTS);
     }
 
+    /// For compatibility, if version is used without unique key specified, just increase arg_num
+    if (arg_num < arg_cnt && !args.storage_def->unique_key)
+    {
+        if (merging_params.mode != MergeTreeMetaBase::MergingParams::Ordinary || (!is_cnch && !is_cloud))
+            throw Exception("Only CnchMergeTree and CloudMergeTree support version column with arg_num < arg_cnt", ErrorCodes::BAD_ARGUMENTS);
+
+        if (!engine_args.back()->as<ASTIdentifier>() && !engine_args.back()->as<ASTFunction>())
+            throw Exception("Version column must be identifier or function expression", ErrorCodes::BAD_ARGUMENTS);
+
+        ++arg_num;
+    }
+
     if (args.storage_def->unique_key)
     {
         if (merging_params.mode != MergeTreeMetaBase::MergingParams::Ordinary || (!is_cnch && !is_cloud))
             throw Exception("Only CnchMergeTree and CloudMergeTree support UNIQUE KEY", ErrorCodes::BAD_ARGUMENTS);
 
-        if (engine_args.size() > 0)
+        if (arg_num < arg_cnt)
         {
             if (!engine_args.back()->as<ASTIdentifier>() && !engine_args.back()->as<ASTFunction>())
                 throw Exception("Version column must be identifier or function expression", ErrorCodes::BAD_ARGUMENTS);
@@ -894,15 +977,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     if (arg_num != arg_cnt)
         throw Exception("Wrong number of engine arguments.", ErrorCodes::BAD_ARGUMENTS);
 
-    /// In ANSI mode, allow_nullable_key must be true
-    if (args.getLocalContext()->getSettingsRef().dialect_type == DialectType::ANSI)
-    {
-        // If user sets allow_nullable_key=0.
-        if (storage_settings->allow_nullable_key.changed && !storage_settings->allow_nullable_key.value)
-            throw Exception("In ANSI mode, allow_nullable_key must be true.", ErrorCodes::BAD_ARGUMENTS);
-
-        storage_settings->allow_nullable_key.value = true;
-    }
 
     if (replicated)
     {
@@ -926,7 +1000,6 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             args.table_id,
             cnch_database_name,
             cnch_table_name,
-            "", /// Do NOT set relative path for CloudMergeTree args.relative_data_path,
             metadata,
             args.getContext(),
             date_column_name,

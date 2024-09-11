@@ -4,7 +4,6 @@
 
 #    include <IO/WriteBufferFromS3.h>
 #    include <IO/WriteHelpers.h>
-#    include <Common/MemoryTracker.h>
 
 #    include <aws/s3/S3Client.h>
 #    include <aws/s3/model/CreateMultipartUploadRequest.h>
@@ -18,6 +17,11 @@
 
 namespace ProfileEvents
 {
+    extern const Event S3CreateMultipartUpload;
+    extern const Event S3UploadPart;
+    extern const Event S3CompleteMultipartUpload;
+    extern const Event S3PutObject;
+    
     extern const Event S3WriteBytes;
 }
 
@@ -84,18 +88,8 @@ void WriteBufferFromS3::allocateBuffer()
     last_part_size = 0;
 }
 
-void WriteBufferFromS3::finalize()
-{
-    /// FIXME move final flush into the caller
-    MemoryTracker::LockExceptionInThread lock(VariableContext::Global);
-    finalizeImpl();
-}
-
 void WriteBufferFromS3::finalizeImpl()
 {
-    if (finalized)
-        return;
-
     next();
 
     if (multipart_upload_id.empty())
@@ -108,8 +102,6 @@ void WriteBufferFromS3::finalizeImpl()
         writePart();
         completeMultipartUpload();
     }
-
-    finalized = true;
 }
 
 void WriteBufferFromS3::createMultipartUpload()
@@ -120,6 +112,7 @@ void WriteBufferFromS3::createMultipartUpload()
     if (object_metadata.has_value())
         req.SetMetadata(object_metadata.value());
 
+    ProfileEvents::increment(ProfileEvents::S3CreateMultipartUpload);
     auto outcome = client_ptr->CreateMultipartUpload(req);
 
     if (outcome.IsSuccess())
@@ -152,6 +145,7 @@ void WriteBufferFromS3::writePart()
         LOG_WARNING(log, "Maximum part number in S3 protocol has reached (too many parts). Server may not accept this whole upload.");
     }
 
+    ProfileEvents::increment(ProfileEvents::S3UploadPart);
     Aws::S3::Model::UploadPartRequest req;
 
     req.SetBucket(bucket);
@@ -194,6 +188,7 @@ void WriteBufferFromS3::completeMultipartUpload()
 
     req.SetMultipartUpload(multipart_upload);
 
+    ProfileEvents::increment(ProfileEvents::S3CompleteMultipartUpload);
     auto outcome = client_ptr->CompleteMultipartUpload(req);
 
     if (outcome.IsSuccess())
@@ -211,12 +206,6 @@ void WriteBufferFromS3::makeSinglepartUpload()
     if (size < 0)
         throw Exception("Failed to make single part upload. Buffer in invalid state", ErrorCodes::S3_ERROR);
 
-    if (size == 0)
-    {
-        LOG_DEBUG(log, "Skipping single part upload. Buffer is empty.");
-        return;
-    }
-
     Aws::S3::Model::PutObjectRequest req;
     req.SetBucket(bucket);
     req.SetKey(key);
@@ -225,6 +214,7 @@ void WriteBufferFromS3::makeSinglepartUpload()
     if (object_metadata.has_value())
         req.SetMetadata(object_metadata.value());
 
+    ProfileEvents::increment(ProfileEvents::S3PutObject);
     auto outcome = client_ptr->PutObject(req);
 
     if (outcome.IsSuccess())

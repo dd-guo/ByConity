@@ -28,6 +28,7 @@ public:
 
     String getName() const override { return name; }
     bool isVariadic() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForConstants() const override { return true; }
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override;
@@ -78,8 +79,12 @@ ColumnPtr FunctionValidateNestedArraySizes::executeImpl(
         if (is_condition_const && !condition)
             break;
 
-        if (!is_condition_const && !condition_column->getData()[i])
-            continue;
+        if (!is_condition_const)
+        {
+            chassert(condition_column != nullptr);
+            if (!condition_column->getData()[i])
+                continue;
+        }
 
         /// The condition is true, then check the row in subcolumns in Nested Type has the same array size
         size_t first_length = 0;
@@ -118,7 +123,7 @@ ColumnPtr FunctionValidateNestedArraySizes::executeImpl(
     return ColumnUInt8::create(input_rows_count, 1);
 }
 
-void registerFunctionValidateNestedArraySizes(FunctionFactory & factory)
+REGISTER_FUNCTION(ValidateNestedArraySizes)
 {
     factory.registerFunction<FunctionValidateNestedArraySizes>();
 }

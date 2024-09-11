@@ -15,13 +15,17 @@
 
 #pragma once
 
-#include <Common/Exception.h>
 #include <CloudServices/CnchWorkerClient.h>
 #include <Interpreters/Context_fwd.h>
+#include <Interpreters/VirtualWarehouseQueue.h>
 #include <ResourceManagement/CommonData.h>
 #include <ResourceManagement/VWScheduleAlgo.h>
+#include <ServiceDiscovery/IServiceDiscovery.h>
+#include <Common/Exception.h>
+#include <Core/SettingsEnums.h>
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -33,16 +37,29 @@ namespace Poco
 class Logger;
 }
 
-namespace ErrorCodes
-{
-    extern const int LOGICAL_ERROR;
-}
-
 namespace DB
 {
 class Context;
+class CnchWorkerClient;
+using CnchWorkerClientPtr = std::shared_ptr<CnchWorkerClient>;
 class WorkerGroupHandleImpl;
 using WorkerGroupHandle = std::shared_ptr<WorkerGroupHandleImpl>;
+
+struct ComplementResult
+{
+    explicit ComplementResult(size_t target_index_) : target_index(target_index_) {}
+    size_t target_index {0};
+    std::optional<size_t> source_index;
+    size_t candidate_index {0};
+    HostWithPorts host_ports;
+    WorkerMetrics worker_metrics;
+};
+
+struct WorkerComplement
+{
+    std::vector<bool> candidates;
+    std::vector<ComplementResult> complement_infos;
+};
 
 enum class VirtualWarehouseHandleSource
 {
@@ -52,11 +69,13 @@ enum class VirtualWarehouseHandleSource
 
 constexpr auto toString(VirtualWarehouseHandleSource s)
 {
-    if (s == VirtualWarehouseHandleSource::RM)
-        return "RM";
-    else if (s == VirtualWarehouseHandleSource::PSM)
-        return "PSM";
-    throw Exception("Unknown VW source", ErrorCodes::LOGICAL_ERROR);
+    switch (s)
+    {
+        case VirtualWarehouseHandleSource::RM:
+            return "RM";
+        case VirtualWarehouseHandleSource::PSM:
+            return "PSM";
+    }
 }
 
 /**
@@ -81,7 +100,7 @@ private:
     VirtualWarehouseHandleImpl(VirtualWarehouseHandleSource source, const VirtualWarehouseData & vw_data, const ContextPtr global_context_);
 
 public:
-    using Container = std::unordered_map<String, WorkerGroupHandle>;
+    using Container = std::map<String, WorkerGroupHandle>;
     using VirtualWarehouseHandle = std::shared_ptr<VirtualWarehouseHandleImpl>;
     using CnchWorkerClientPtr = std::shared_ptr<CnchWorkerClient>;
     using VWScheduleAlgo = ResourceManagement::VWScheduleAlgo;
@@ -100,21 +119,46 @@ public:
     auto getUUID() const { return uuid; }
     auto & getSettingsRef() const { return settings; }
 
-    size_t empty(UpdateMode mode = NoUpdate);
+    bool empty(UpdateMode mode = NoUpdate);
     Container getAll(UpdateMode mode = NoUpdate);
+    size_t getNumWorkers(UpdateMode mode = NoUpdate);
 
     WorkerGroupHandle getWorkerGroup(const String & worker_group_id, UpdateMode mode = TryUpdate);
-    WorkerGroupHandle pickWorkerGroup(VWScheduleAlgo query_algo, const Requirement & requirement = {}, UpdateMode mode = TryUpdate);
+    WorkerGroupHandle pickWorkerGroup(
+        VWScheduleAlgo query_algo,
+        bool use_router = false,
+        VWLoadBalancing load_balance = VWLoadBalancing::RANDOM,
+        const Requirement & requirement = {},
+        UpdateMode mode = TryUpdate
+        );
     WorkerGroupHandle pickLocally(const VWScheduleAlgo & algo, const Requirement & requirement = {});
-    WorkerGroupHandle randomWorkerGroup() const;
+    WorkerGroupHandle randomWorkerGroup(UpdateMode mode = TryUpdate);
     std::optional<HostWithPorts> tryPickWorkerFromRM(VWScheduleAlgo algo, const Requirement & requirement = {});
+    void updateWorkerStatusFromRM(const std::vector<WorkerGroupData> & groups_data);
+    void updateWorkerStatusFromPSM(const IServiceDiscovery::WorkerGroupMap & groups_data, const std::string & vw_name);
 
     bool addWorkerGroup(const WorkerGroupHandle & worker_group);
 
+    /// Caller should already know the worker group id when picking a single worker.
+    /// So VW handle just forward the request to the target WG handle, or forward to a random WG if it's not specified.
+    CnchWorkerClientPtr pickWorker(const String & worker_group_id, bool skip_busy_worker = true);
+
+    void updateSettings(const VirtualWarehouseSettings & settings);
+    std::pair<UInt64, CnchWorkerClientPtr> pickWorker(const String & worker_group_id, UInt64 sequence, bool skip_busy_worker = true);
     CnchWorkerClientPtr getWorker();
     CnchWorkerClientPtr getWorkerByHash(const String & key);
+    CnchWorkerClientPtr getWorkerByHostWithPorts(const HostWithPorts & host_ports);
     std::vector<CnchWorkerClientPtr> getAllWorkers();
 
+    VWQueueResultStatus enqueue(VWQueueInfoPtr queue_info, UInt64 timeout_ms)
+    {
+        return queue_manager.enqueue(queue_info, timeout_ms);
+    }
+    VirtualWarehouseQueueManager & getQueueManager() { return queue_manager; }
+
+    std::optional<WorkerComplement> complementPhysicalWorkerGroup(WorkerGroupData & common_group, const WorkerGroupData & completion_group);
+
+    void updatePriorityGroups();
 private:
     bool addWorkerGroupImpl(const WorkerGroupHandle & worker_group, const std::lock_guard<std::mutex> & lock);
 
@@ -134,11 +178,22 @@ private:
     VirtualWarehouseSettings settings;
     Poco::Logger * log;
 
+    /// In ByteHouse, a VW will be auto recycled (auto-suspend) if no new queries received for a period (5 minutes by default).
+    /// And when user send queries to the VW again, ByteYard will make sure to send out the queries after workers are full ready.
+    /// Even though workers are full ready, the VW handle may still hold the outdated data as the UpdateMode is always TryUpdate.
+    /// This cause some query failures in auto-resume period. https:****
+    /// To fix this issue, we do a ForceUpdate if the data is not updated for a long time (the timeout of auto-suspend).
+    size_t force_update_interval_ns = 5ULL * 60 * 1000 * 1000 * 1000;
+    size_t try_update_interval_ns = 500ULL * 1000 * 1000;
     std::atomic<UInt64> last_update_time_ns{0};
+    std::atomic<UInt64> last_settings_timestamp{0};
 
     mutable std::mutex state_mutex;
     Container worker_groups;
+    using PriorityGroups = std::pair<Int64, std::vector<WorkerGroupHandle>>;
+    std::vector<PriorityGroups> priority_groups;
     std::atomic<size_t> pick_group_sequence = 0; /// round-robin index for pickWorkerGroup.
+    VirtualWarehouseQueueManager queue_manager;
 };
 
 using VirtualWarehouseHandle = std::shared_ptr<VirtualWarehouseHandleImpl>;

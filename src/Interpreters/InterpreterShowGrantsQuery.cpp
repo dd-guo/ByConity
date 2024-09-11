@@ -28,7 +28,8 @@ namespace
     ASTs getGrantQueriesImpl(
         const T & grantee,
         const AccessControlManager * manager /* not used if attach_mode == true */,
-        bool attach_mode = false)
+        bool attach_mode = false,
+        bool sensitive_mode = false)
     {
         ASTs res;
 
@@ -37,7 +38,9 @@ namespace
 
         std::shared_ptr<ASTGrantQuery> current_query = nullptr;
 
-        for (const auto & element : grantee.access.getElements())
+        // NOTE: do this if attach_mode = true only?
+        const auto & access_elements = sensitive_mode ? grantee.sensitive_access.getElements() : grantee.access.getElements();
+        for (const auto & element : access_elements)
         {
             if (element.empty())
                 continue;
@@ -53,6 +56,7 @@ namespace
             if (!current_query)
             {
                 current_query = std::make_shared<ASTGrantQuery>();
+                current_query->is_sensitive = sensitive_mode;
                 current_query->grantees = grantees;
                 current_query->attach_mode = attach_mode;
                 if (element.is_partial_revoke)
@@ -62,6 +66,9 @@ namespace
 
             current_query->access_rights_elements.emplace_back(std::move(element));
         }
+
+        if (sensitive_mode)
+            return res;
 
         for (const auto & element : grantee.granted_roles.getElements())
         {
@@ -85,12 +92,13 @@ namespace
     ASTs getGrantQueriesImpl(
         const IAccessEntity & entity,
         const AccessControlManager * manager /* not used if attach_mode == true */,
-        bool attach_mode = false)
+        bool attach_mode = false,
+        bool sensitive_mode = false)
     {
         if (const User * user = typeid_cast<const User *>(&entity))
-            return getGrantQueriesImpl(*user, manager, attach_mode);
+            return getGrantQueriesImpl(*user, manager, attach_mode, sensitive_mode);
         if (const Role * role = typeid_cast<const Role *>(&entity))
-            return getGrantQueriesImpl(*role, manager, attach_mode);
+            return getGrantQueriesImpl(*role, manager, attach_mode, sensitive_mode);
         throw Exception(entity.outputTypeAndName() + " is expected to be user or role", ErrorCodes::LOGICAL_ERROR);
     }
 
@@ -115,6 +123,11 @@ BlockInputStreamPtr InterpreterShowGrantsQuery::executeImpl()
     WriteBufferFromOwnString grant_buf;
     for (const auto & grant_query : grant_queries)
     {
+        if (getContext()->getUserName() != "default")
+        {
+            auto& to_rewrite_grant_query = grant_query->as<ASTGrantQuery &>();
+            to_rewrite_grant_query.rewriteNamesWithoutTenant(getContext().get());
+        }
         grant_buf.restart();
         formatAST(*grant_query, grant_buf, false, true);
         column->insert(grant_buf.str());
@@ -128,7 +141,6 @@ BlockInputStreamPtr InterpreterShowGrantsQuery::executeImpl()
     String prefix = "SHOW ";
     if (desc.starts_with(prefix))
         desc = desc.substr(prefix.length()); /// `desc` always starts with "SHOW ", so we can trim this prefix.
-
     return std::make_shared<OneBlockInputStream>(Block{{std::move(column), std::make_shared<DataTypeString>(), desc}});
 }
 
@@ -143,7 +155,7 @@ std::vector<AccessEntityPtr> InterpreterShowGrantsQuery::getEntities() const
     for (const auto & id : ids)
     {
         auto entity = access_control.tryRead(id);
-        if (entity)
+        if (entity && isTenantMatchedEntityName(entity->getName()))
             entities.push_back(entity);
     }
 
@@ -159,21 +171,25 @@ ASTs InterpreterShowGrantsQuery::getGrantQueries() const
 
     ASTs grant_queries;
     for (const auto & entity : entities)
-        boost::range::push_back(grant_queries, getGrantQueries(*entity, access_control));
+    {
+        /* The true/false order must be kept, to be used for detecting sensitive tenant in KVAccessStorage.cpp */
+        boost::range::push_back(grant_queries, getGrantQueries(*entity, access_control, true));
+        boost::range::push_back(grant_queries, getGrantQueries(*entity, access_control, false));
+    }
 
     return grant_queries;
 }
 
 
-ASTs InterpreterShowGrantsQuery::getGrantQueries(const IAccessEntity & user_or_role, const AccessControlManager & access_control)
+ASTs InterpreterShowGrantsQuery::getGrantQueries(const IAccessEntity & user_or_role, const AccessControlManager & access_control, bool sensitive_mode)
 {
-    return getGrantQueriesImpl(user_or_role, &access_control, false);
+    return getGrantQueriesImpl(user_or_role, &access_control, false, sensitive_mode);
 }
 
 
-ASTs InterpreterShowGrantsQuery::getAttachGrantQueries(const IAccessEntity & user_or_role)
+ASTs InterpreterShowGrantsQuery::getAttachGrantQueries(const IAccessEntity & user_or_role, bool sensitive_mode)
 {
-    return getGrantQueriesImpl(user_or_role, nullptr, true);
+    return getGrantQueriesImpl(user_or_role, nullptr, true, sensitive_mode);
 }
 
 }

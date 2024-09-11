@@ -1,6 +1,8 @@
 #include <Interpreters/castColumn.h>
 
 #include <Functions/FunctionsConversion.h>
+#include <Functions/FunctionsBitmap.h>
+#include <DataTypes/DataTypeBitMap64.h>
 
 namespace DB
 {
@@ -8,7 +10,7 @@ namespace DB
 template <CastType cast_type = CastType::nonAccurate>
 static ColumnPtr castColumn(const ColumnWithTypeAndName & arg, const DataTypePtr & type)
 {
-    if (arg.type->equals(*type))
+    if (arg.type->equals(*type) && cast_type != CastType::accurateOrNull)
         return arg.column;
 
     ColumnsWithTypeAndName arguments
@@ -50,4 +52,13 @@ ColumnPtr castColumnAccurateOrNull(const ColumnWithTypeAndName & arg, const Data
     return castColumn<CastType::accurateOrNull>(arg, type);
 }
 
+ColumnPtr castToBitmap64Column(const ColumnWithTypeAndName & arg, const DataTypePtr & type)
+{
+    if (arg.type->equals(*type))
+        return arg.column;
+    FunctionOverloadResolverPtr func_builder_cast = ArrayToBitmapOverloadResolver::create(nullptr);
+    ColumnsWithTypeAndName arguments{arg};
+    auto func_cast = func_builder_cast->build(arguments);
+    return func_cast->execute(arguments, type, arg.column->size());
+}
 }

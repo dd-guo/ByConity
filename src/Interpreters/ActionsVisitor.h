@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <string_view>
 #include <Core/ColumnNumbers.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/InDepthNodeVisitor.h>
@@ -28,7 +29,12 @@
 #include <Interpreters/SubqueryForSet.h>
 #include <Parsers/IAST.h>
 #include <Parsers/ASTExpressionList.h>
-
+#include <Storages/MergeTree/Index/BitmapIndexHelper.h>
+#include <Storages/MergeTree/Index/MergeTreeIndexHelper.h>
+#include <Parsers/ASTExpressionList.h>
+#include <Parsers/ASTPreparedParameter.h>
+#include <Parsers/IAST.h>
+#include <Storages/StorageInMemoryMetadata.h>
 
 namespace DB
 {
@@ -184,6 +190,10 @@ public:
         size_t visit_depth;
         ScopeStack actions_stack;
         AggregationKeysInfo aggregation_keys_info;
+        bool build_expression_with_window_functions;
+
+        MergeTreeIndexContextPtr index_context;
+        StorageMetadataPtr metadata_snapshot;
 
         /*
          * Remember the last unique column suffix to avoid quadratic behavior
@@ -204,10 +214,15 @@ public:
             bool no_makeset_,
             bool only_consts_,
             bool create_source_for_in_,
-            AggregationKeysInfo aggregation_keys_info_);
+            AggregationKeysInfo aggregation_keys_info_,
+            bool build_expression_with_window_functions_ = false,
+            MergeTreeIndexContextPtr index_context_ = nullptr,
+            StorageMetadataPtr metadata_snapshot = nullptr);
 
         /// Does result of the calculation already exists in the block.
         bool hasColumn(const String & column_name) const;
+        std::vector<std::string_view> getAllColumnNames() const;
+
         void addColumn(ColumnWithTypeAndName column)
         {
             actions_stack.addColumn(std::move(column));
@@ -263,8 +278,10 @@ private:
     static void visit(const ASTIdentifier & identifier, const ASTPtr & ast, Data & data);
     static void visit(const ASTFunction & node, const ASTPtr & ast, Data & data);
     static void visit(const ASTLiteral & literal, const ASTPtr & ast, Data & data);
+    static void visit(const ASTPreparedParameter & prepared_param, const ASTPtr & ast, Data & data);
     static void visit(ASTExpressionList & expression_list, const ASTPtr & ast, Data & data);
 
+    static SetPtr tryMakeSet(const ASTFunction & node, Data & data, bool no_subqueries, bool create_ordered_set = false);
     static SetPtr makeSet(const ASTFunction & node, Data & data, bool no_subqueries, bool create_ordered_set = false);
     static ASTs doUntuple(const ASTFunction * function, ActionsMatcher::Data & data);
     static std::optional<NameAndTypePair> getNameAndTypeFromAST(const ASTPtr & ast, Data & data);

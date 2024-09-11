@@ -47,7 +47,7 @@ template <typename T>
 static inline void writeQuoted(const DecimalField<T> & x, WriteBuffer & buf)
 {
     writeChar('\'', buf);
-    writeText(x.getValue(), x.getScale(), buf);
+    writeText(x.getValue(), x.getScale(), buf, {});
     writeChar('\'', buf);
 }
 
@@ -72,6 +72,13 @@ static String formatFloat(const Float64 x)
     return { buffer, buffer + builder.position() };
 }
 
+template <typename T>
+static inline String formatDecimal(const DecimalField<T> & x)
+{
+    WriteBufferFromOwnString buf;
+    writeText(x.getValue(), x.getScale(), buf, true);
+    return buf.str();
+}
 
 String FieldVisitorToString::operator() (const Null &) const { return "NULL"; }
 String FieldVisitorToString::operator() (const NegativeInfinity &) const { return "-Inf"; }
@@ -89,6 +96,8 @@ String FieldVisitorToString::operator() (const UInt128 & x) const { return forma
 String FieldVisitorToString::operator() (const UInt256 & x) const { return formatQuoted(x); }
 String FieldVisitorToString::operator() (const Int256 & x) const { return formatQuoted(x); }
 String FieldVisitorToString::operator() (const UUID & x) const { return formatQuoted(x); }
+String FieldVisitorToString::operator() (const IPv4 & x) const { return formatQuoted(x); }
+String FieldVisitorToString::operator() (const IPv6 & x) const { return formatQuoted(x); }
 String FieldVisitorToString::operator() (const AggregateFunctionStateData & x) const { return formatQuoted(x.data); }
 
 String FieldVisitorToString::operator() (const Array & x) const
@@ -137,22 +146,6 @@ String FieldVisitorToString::operator() (const Map & x) const
 {
     WriteBufferFromOwnString wb;
 
-    wb << '(';
-    for (auto it = x.begin(); it != x.end(); ++it)
-    {
-        if (it != x.begin())
-            wb << ", ";
-        wb << applyVisitor(*this, *it);
-    }
-    wb << ')';
-
-    return wb.str();
-}
-
-String FieldVisitorToString::operator() (const ByteMap & x) const
-{
-    WriteBufferFromOwnString wb;
-
     wb << '{';
     for (auto it = x.begin(); it != x.end(); ++it)
     {
@@ -173,5 +166,30 @@ String FieldVisitorToString::operator() (const BitMap64 & x) const
     wb << "BitMap64_" << x.toString();
     return wb.str();
 }
+
+String FieldVisitorToString::operator() (const Object & x) const
+{
+    WriteBufferFromOwnString wb;
+
+    wb << '{';
+    for (auto it = x.begin(); it != x.end(); ++it)
+    {
+        if (it != x.begin())
+            wb << ", ";
+
+        writeDoubleQuoted(it->first, wb);
+        wb << ": " << applyVisitor(*this, it->second);
+    }
+    wb << '}';
+
+    return wb.str();
+
+}
+
+
+String DecimalFieldVisitorToString::operator() (const DecimalField<Decimal32> & x) const { return formatDecimal(x); }
+String DecimalFieldVisitorToString::operator() (const DecimalField<Decimal64> & x) const { return formatDecimal(x); }
+String DecimalFieldVisitorToString::operator() (const DecimalField<Decimal128> & x) const { return formatDecimal(x); }
+String DecimalFieldVisitorToString::operator() (const DecimalField<Decimal256> & x) const { return formatDecimal(x); }
 
 }

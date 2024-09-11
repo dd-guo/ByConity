@@ -43,6 +43,7 @@ public:
     JoinType getType() const override { return JoinType::Switcher; }
 
     const TableJoin & getTableJoin() const override { return *table_join; }
+    TableJoin & getTableJoin() override { return *table_join; }
 
     /// Add block of data from right hand of JOIN into current join object.
     /// If join-in-memory memory limit exceeded switches to join-on-disk and continue with it.
@@ -79,13 +80,15 @@ public:
         return join->alwaysReturnsEmptySet();
     }
 
-    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & block, UInt64 max_block_size) const override
+    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & block, UInt64 max_block_size, size_t total_size, size_t index) const override
     {
-        return join->createStreamWithNonJoinedRows(block, max_block_size);
+        return join->createStreamWithNonJoinedRows(block, max_block_size, total_size, index);
     }
 
-    void serialize(WriteBuffer & buf) const override;
-    static JoinPtr deserialize(ReadBuffer & buf, ContextPtr context);
+    void tryBuildRuntimeFilters() const override
+    {
+        join->tryBuildRuntimeFilters();
+    }
 
 private:
     JoinPtr join;
@@ -119,7 +122,7 @@ protected:
     {
         if (!stream)
         {
-            stream = join.createStreamWithNonJoinedRows(result_sample_block, max_block_size);
+            stream = join.createStreamWithNonJoinedRows(result_sample_block, max_block_size, 0, 0);
             if (!stream)
                 return {};
         }

@@ -54,6 +54,8 @@ enum class CnchTransactionInitiator
     Merge = 3, /// Transaction initiated by merge task
     GC = 4, /// Transaction initiated by garbage collection task
     Txn = 5, /// Transaction initiated by interactive transaction session
+    MvRefresh = 6, /// Transaction initiated by Mv refresh task
+    MergeSelect = 7, /// Transaction initiated by merge selecting task
 };
 
 const char * txnInitiatorToString(CnchTransactionInitiator initiator);
@@ -233,6 +235,8 @@ struct UndoResource
     /// domain level logics
     bool isLegacy() const { return pb_model.placeholders_size() == 0; }
     void clean(Catalog::Catalog & catalog, MergeTreeMetaBase * storage) const;
+    void commit(const Context & context) const;
+    String toDebugString() const { return pb_model.ShortDebugString(); }
 
 private:
     static inline std::atomic<UInt64> counter{0};
@@ -246,6 +250,7 @@ struct UndoResourceNames
     NameSet parts;
     NameSet bitmaps;
     NameSet staged_parts;
+    NameSet kvfs_lock_keys;
 };
 
 UndoResourceNames integrateResources(const UndoResources & resources);
@@ -265,6 +270,13 @@ struct CommitExtraInfo
 {
 };
 
+struct TransactionRecordLite
+{
+    UInt64 commit_ts;
+    CnchTransactionStatus status;
+    TransactionRecordLite() = default;
+    TransactionRecordLite(UInt64 _commit_ts, CnchTransactionStatus _status) : commit_ts(_commit_ts), status(_status) {}
+}; 
 
 /// Transaction Record provide an abstract layer on top of Protos::DataModelTransactionRecord
 /// User getters and setters, DO NOT create custom constructors
@@ -384,7 +396,7 @@ struct TransactionRecord
     /// helpers & debug methods
     bool isReadOnly() const { return read_only; }
     bool isPrepared() const { return pb_model.status() == CnchTransactionStatus::Running && prepared; }
-    bool isSecondary() const { return pb_model.has_primary_txn_id() && pb_model.type() == CnchTransactionType::Implicit; }
+    bool isSecondary() const { return pb_model.has_primary_txn_id() && pb_model.primary_txn_id() != pb_model.txn_id() && pb_model.type() == CnchTransactionType::Implicit; }
     bool isPrimary() const { return !isSecondary(); }
     bool ended() const
     {
@@ -392,6 +404,15 @@ struct TransactionRecord
     }
     bool hasMainTableUUID() const { return pb_model.has_main_table_uuid(); }
     String toString() const { return pb_model.ShortDebugString(); }
+    bool isInactive() const { return pb_model.status() == CnchTransactionStatus::Inactive; }
 };
+
+enum class TransactionCommitMode
+{
+    INDEPENDENT = 0, // transactions of one table are commit independently on all servers
+    SEQUENTIAL = 1, // transactions of one table are commit sequentialy on host server.
+};
+
+using TransactionRecords = std::vector<TransactionRecord>;
 
 }

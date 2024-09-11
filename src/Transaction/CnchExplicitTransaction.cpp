@@ -82,7 +82,26 @@ TxnTimestamp CnchExplicitTransaction::commit()
                              .setCommitTs(commit_ts)
                              .setMainTableUUID(getMainTableUUID());
 
-            bool success = getContext()->getCnchCatalog()->setTransactionRecord(txn_record, target_record);
+            Catalog::BatchCommitRequest requests(true, true);
+            Catalog::BatchCommitResponse response;
+            bool success = false;
+            if (!extern_commit_functions.empty())
+            {
+                for (auto & txn_f : extern_commit_functions)
+                {
+                    auto extern_requests = txn_f.commit_func(getContext());
+                    for (auto &req : extern_requests.puts)
+                        requests.AddPut(req);
+                    for (auto &req : extern_requests.deletes)
+                        requests.AddDelete(req.key);
+                }
+                success = getContext()->getCnchCatalog()->setTransactionRecordWithRequests(txn_record, target_record, requests, response);
+
+            }
+            else
+            {
+                success = getContext()->getCnchCatalog()->setTransactionRecord(txn_record, target_record);
+            }
 
             txn_record = std::move(target_record);
 
@@ -112,14 +131,14 @@ TxnTimestamp CnchExplicitTransaction::commit()
                 }
             }
         }
-        catch (const Exception & e)
+        catch (const Exception &)
         {
             // if (e.code() != bytekv::sdk::Errorcode::REQUEST_TIMEOUT || !retry)
             // {
             //     ProfileEvents::increment(ProfileEvents::CnchTxnCommitV2Failed);
             //     throw;
             // }
-            throw e;
+            throw;
         }
 
         LOG_WARNING(
@@ -152,6 +171,8 @@ TxnTimestamp CnchExplicitTransaction::rollback()
     /// TODO: set the transacation record status to aborted
     LOG_DEBUG(log, "Explicit transaction {} failed, start rollback\n", txn_record.txnID().toUInt64());
     /// First, abort all secondary transaction
+    if (!extern_commit_functions.empty())
+        return abort();
     /// TODO: exception handling
     std::for_each(secondary_txns.begin(), secondary_txns.end(), [this](auto & txn)
     {
@@ -198,12 +219,29 @@ TxnTimestamp CnchExplicitTransaction::abort()
         }
     });
 
+    Catalog::BatchCommitRequest requests(true, true);
+    Catalog::BatchCommitResponse response;
+    bool success = false;
+
     /// CAS
     TransactionRecord target_record = getTransactionRecord();
     target_record.setStatus(CnchTransactionStatus::Aborted);
     target_record.setCommitTs(getContext()->getTimestamp());
 
-    bool success = getContext()->getCnchCatalog()->setTransactionRecord(txn_record, target_record);
+    if (!extern_commit_functions.empty())
+    {
+        for (auto & txn_f : extern_commit_functions)
+        {
+            auto extern_requests = txn_f.abort_func(getContext());
+            for (auto &req : extern_requests.puts)
+                requests.AddDelete(req.key);
+            for (auto &req : extern_requests.deletes)
+                requests.AddPut(req);
+        }
+        success = getContext()->getCnchCatalog()->setTransactionRecordWithRequests(txn_record, target_record, requests, response);
+    }
+    else
+        success = getContext()->getCnchCatalog()->setTransactionRecord(txn_record, target_record);
     txn_record = std::move(target_record);
     if (success)
     {
@@ -247,11 +285,13 @@ void CnchExplicitTransaction::clean(TxnCleanTask &)
     }
 }
 
-bool CnchExplicitTransaction::addSecondaryTransaction(const TransactionCnchPtr & txn)
+void CnchExplicitTransaction::addSecondaryTransaction(const TransactionCnchPtr & txn)
 {
-    auto lock = getLock();
-    secondary_txns.push_back(txn);
-    return true;
+    if (!txn->isReadOnly())
+    {
+        auto lock = getLock();
+        secondary_txns.push_back(txn);
+    }
 }
 
 bool CnchExplicitTransaction::addStatement(const String & statement)

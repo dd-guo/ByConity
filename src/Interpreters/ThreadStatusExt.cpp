@@ -9,7 +9,9 @@
 #include <Common/QueryProfiler.h>
 #include <Common/ThreadProfileEvents.h>
 #include <Common/TraceCollector.h>
+#include <Common/time.h>
 #include <common/errnoToString.h>
+#include <Common/JeprofControl.h>
 
 #if defined(OS_LINUX)
 #   include <Common/hasLinuxCapability.h>
@@ -33,11 +35,17 @@ namespace ErrorCodes
 
 void ThreadStatus::applyQuerySettings()
 {
+    /// reset the truncation flag for every query due to overflow check setting could be changed across queries.
+    /// e.g., check_date_overflow could be changed from false to true from q1 to q2.
+    /// for q1, check_date_overflow is false, but there is date overflow -> the bit is on;
+    /// for q2, check_date_overflow is changed to true, but there is no date overflow -> if the bit is not reset, it is still on.
+    resetOverflow();
     auto query_context_ptr = query_context.lock();
     assert(query_context_ptr);
     const Settings & settings = query_context_ptr->getSettingsRef();
 
     query_id = query_context_ptr->getCurrentQueryId();
+    xid = query_context_ptr->tryGetCurrentTransactionID();
     initQueryProfiler();
 
     untracked_memory_limit = settings.max_untracked_memory;
@@ -59,6 +67,39 @@ void ThreadStatus::applyQuerySettings()
 #endif
 }
 
+ThreadGroupStatusPtr ThreadGroupStatus::createForBackgroundProcess(ContextPtr storage_context)
+{
+    auto group = std::make_shared<ThreadGroupStatus>();
+
+    group->memory_tracker.setDescription("background process to apply mutate/merge in table");
+    /// However settings from storage context have to be applied
+    const Settings & settings = storage_context->getSettingsRef();
+    group->memory_tracker.setProfilerStep(settings.memory_profiler_step);
+    group->memory_tracker.setSampleProbability(settings.memory_profiler_sample_probability);
+    group->memory_tracker.setParent(&background_memory_tracker);
+    if (settings.memory_tracker_fault_probability > 0.0)
+        group->memory_tracker.setFaultProbability(settings.memory_tracker_fault_probability);
+
+    return group;
+}
+
+ThreadGroupSwitcher::ThreadGroupSwitcher(ThreadGroupStatusPtr thread_group)
+{
+    chassert(thread_group);
+
+    /// might be nullptr
+    prev_thread_group = CurrentThread::getGroup();
+
+    CurrentThread::detachQueryIfNotDetached();
+    CurrentThread::attachTo(thread_group);
+}
+
+ThreadGroupSwitcher::~ThreadGroupSwitcher()
+{
+    CurrentThread::detachQueryIfNotDetached();
+    if (prev_thread_group)
+        CurrentThread::attachTo(prev_thread_group);
+}
 
 void ThreadStatus::attachQueryContext(ContextPtr query_context_)
 {
@@ -141,9 +182,9 @@ void ThreadStatus::setupState(const ThreadGroupStatusPtr & thread_group_)
     thread_state = ThreadState::AttachedToQuery;
 }
 
-void ThreadStatus::initializeQuery()
+void ThreadStatus::initializeQuery(MemoryTracker * memory_tracker_)
 {
-    setupState(std::make_shared<ThreadGroupStatus>());
+    setupState(std::make_shared<ThreadGroupStatus>(memory_tracker_));
 
     /// No need to lock on mutex here
     thread_group->memory_tracker.setDescription("(for query)");
@@ -163,22 +204,6 @@ void ThreadStatus::attachQuery(const ThreadGroupStatusPtr & thread_group_, bool 
         throw Exception("Attempt to attach to nullptr thread group", ErrorCodes::LOGICAL_ERROR);
 
     setupState(thread_group_);
-}
-
-inline UInt64 time_in_nanoseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(timepoint.time_since_epoch()).count();
-}
-
-inline UInt64 time_in_microseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(timepoint.time_since_epoch()).count();
-}
-
-
-inline UInt64 time_in_seconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(timepoint.time_since_epoch()).count();
 }
 
 void ThreadStatus::initPerformanceCounters()
@@ -224,7 +249,8 @@ void ThreadStatus::initPerformanceCounters()
     {
         try
         {
-            taskstats = TasksStatsCounters::create(thread_id);
+            if (auto query_context_ptr = query_context.lock(); query_context_ptr && query_context_ptr->getSettingsRef().enable_os_task_stats)
+                taskstats = TasksStatsCounters::create(thread_id);
         }
         catch (...)
         {
@@ -269,6 +295,12 @@ void ThreadStatus::finalizePerformanceCounters()
         if (global_context_ptr && query_context_ptr)
         {
             const auto & settings = query_context_ptr->getSettingsRef();
+
+            if (settings.log_queries && settings.log_max_io_thread_queries)
+            {
+                tryUpdateMaxIOThreadProfile(settings.remote_filesystem_read_prefetch);
+            }
+
             if (settings.log_queries && settings.log_query_threads)
             {
                 const auto now = std::chrono::system_clock::now();
@@ -289,6 +321,10 @@ void ThreadStatus::finalizePerformanceCounters()
 
 void ThreadStatus::initQueryProfiler()
 {
+    /// Not use profiler when enable jeprof to avoid libunwind's not async signal safe problem
+    if (jeprofEnabled())
+        return;
+
     /// query profilers are useless without trace collector
     auto global_context_ptr = global_context.lock();
     if (!global_context_ptr || !global_context_ptr->hasTraceCollector())
@@ -381,6 +417,7 @@ void ThreadStatus::detachQuery(bool exit_if_already_detached, bool thread_exits)
     memory_tracker.setParent(thread_group->memory_tracker.getParent());
 
     query_id.clear();
+    xid = 0;
     query_context.reset();
     thread_trace_context.trace_id = 0;
     thread_trace_context.span_id = 0;
@@ -448,18 +485,33 @@ void ThreadStatus::logToQueryThreadLog(QueryThreadLog & thread_log, const String
         if (query_context_ptr->getSettingsRef().log_profile_events != 0)
         {
             /// NOTE: Here we are in the same thread, so we can make memcpy()
-            elem.profile_counters = std::make_shared<ProfileEvents::Counters>(performance_counters.getPartiallyAtomicSnapshot());
+            elem.profile_counters = std::make_shared<ProfileEvents::Counters::Snapshot>(performance_counters.getPartiallyAtomicSnapshot());
         }
     }
 
     thread_log.add(elem);
 }
 
-void CurrentThread::initializeQuery()
+void ThreadStatus::tryUpdateMaxIOThreadProfile(bool use_async_read)
+{
+    if (!thread_group)
+        return;
+    auto curr_snapshot = std::make_shared<ProfileEvents::Counters::Snapshot>(performance_counters.getPartiallyAtomicSnapshot());
+    std::lock_guard lock(thread_group->mutex);
+    if (auto curr_io_time_us = performance_counters.getIOReadTime(use_async_read); thread_group->max_io_time_us < curr_io_time_us)
+    {
+        std::swap(thread_group->max_io_thread_profile_counters, curr_snapshot);
+        thread_group->max_io_time_us = curr_io_time_us;
+        thread_group->max_io_time_thread_ms = (time_in_microseconds(std::chrono::system_clock::now()) - query_start_time_microseconds) / 1000;
+        thread_group->max_io_time_thread_name = getThreadName();
+    }
+}
+
+void CurrentThread::initializeQuery(MemoryTracker * memory_tracker)
 {
     if (unlikely(!current_thread))
         return;
-    current_thread->initializeQuery();
+    current_thread->initializeQuery(memory_tracker);
     current_thread->deleter = CurrentThread::defaultThreadDeleter;
 }
 
@@ -508,9 +560,9 @@ void CurrentThread::detachQueryIfNotDetached()
 }
 
 
-CurrentThread::QueryScope::QueryScope(ContextMutablePtr query_context)
+CurrentThread::QueryScope::QueryScope(ContextMutablePtr query_context, MemoryTracker * memory_tracker)
 {
-    CurrentThread::initializeQuery();
+    CurrentThread::initializeQuery(memory_tracker);
     CurrentThread::attachQueryContext(query_context);
     if (!query_context->hasQueryContext())
         query_context->makeQueryContext();

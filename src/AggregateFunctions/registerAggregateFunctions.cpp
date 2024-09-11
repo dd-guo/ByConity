@@ -30,15 +30,20 @@ namespace DB
 struct Settings;
 
 class AggregateFunctionFactory;
+void registerAggregateFunctionArbitrary(AggregateFunctionFactory &);
 void registerAggregateFunctionAvg(AggregateFunctionFactory &);
 void registerAggregateFunctionAvgWeighted(AggregateFunctionFactory &);
 void registerAggregateFunctionCount(AggregateFunctionFactory &);
 void registerAggregateFunctionDeltaSum(AggregateFunctionFactory &);
 void registerAggregateFunctionDeltaSumTimestamp(AggregateFunctionFactory &);
 void registerAggregateFunctionGroupArray(AggregateFunctionFactory &);
+void registerAggregateFunctionGroupConcat(AggregateFunctionFactory &);
 void registerAggregateFunctionGroupUniqArray(AggregateFunctionFactory &);
 void registerAggregateFunctionGroupArrayInsertAt(AggregateFunctionFactory &);
 void registerAggregateFunctionsQuantile(AggregateFunctionFactory &);
+void registerAggregateFunctionQuantileTDigestWithSSize(AggregateFunctionFactory &);
+void registerAggregateFunctionsQuantileInterpolatedWeighted(AggregateFunctionFactory &);
+void registerAggregateFunctionsQuantileBFloat16Weighted(AggregateFunctionFactory &);
 void registerAggregateFunctionsSequenceMatch(AggregateFunctionFactory &);
 void registerAggregateFunctionWindowFunnel(AggregateFunctionFactory &);
 void registerAggregateFunctionRate(AggregateFunctionFactory &);
@@ -47,6 +52,7 @@ void registerAggregateFunctionsMax(AggregateFunctionFactory &);
 void registerAggregateFunctionsAny(AggregateFunctionFactory &);
 void registerAggregateFunctionsStatisticsStable(AggregateFunctionFactory &);
 void registerAggregateFunctionsStatisticsSimple(AggregateFunctionFactory &);
+void registerAggregateFunctionsVarianceMatrix(AggregateFunctionFactory &);
 void registerAggregateFunctionSum(AggregateFunctionFactory &);
 void registerAggregateFunctionSumCount(AggregateFunctionFactory &);
 void registerAggregateFunctionSumMap(AggregateFunctionFactory &);
@@ -69,7 +75,15 @@ void registerAggregateFunctionRankCorrelation(AggregateFunctionFactory &);
 void registerAggregateFunctionMannWhitney(AggregateFunctionFactory &);
 void registerAggregateFunctionWelchTTest(AggregateFunctionFactory &);
 void registerAggregateFunctionStudentTTest(AggregateFunctionFactory &);
+void registerAggregateFunctionMeanZTest(AggregateFunctionFactory &);
+void registerAggregateFunctionCramersV(AggregateFunctionFactory &);
+void registerAggregateFunctionTheilsU(AggregateFunctionFactory &);
+void registerAggregateFunctionContingency(AggregateFunctionFactory &);
+void registerAggregateFunctionCramersVBiasCorrected(AggregateFunctionFactory &);
+void registerAggregateFunctionSingleValueOrNull(AggregateFunctionFactory &);
 void registerAggregateFunctionSequenceNextNode(AggregateFunctionFactory &);
+void registerAggregateFunctionExponentialMovingAverage(AggregateFunctionFactory &);
+void registerAggregateFunctionSparkbar(AggregateFunctionFactory &);
 void registerAggregateFunctionMergeStreamStack(AggregateFunctionFactory &);
 void registerAggregateFunctionSessionSplit(AggregateFunctionFactory &);
 void registerAggregateFunctionSessionAnalysis(AggregateFunctionFactory & factory);
@@ -78,9 +92,11 @@ void registerAggregateFunctionRetention2(AggregateFunctionFactory &);
 void registerAggregateFunctionRetentionLoss(AggregateFunctionFactory &);
 void registerAggregateFunctionGenArray(AggregateFunctionFactory & factory);
 void registerAggregateFunctionGenArrayMonth(AggregateFunctionFactory & factory);
+void registerAggregateFunctionAttribution(AggregateFunctionFactory &);
 void registerAggregateFunctionAttributionAnalysis(AggregateFunctionFactory &);
-void registerAggregateFunctionAttributionAnalysisMerge(AggregateFunctionFactory &);
-void registerAggregateFunctionAttributionCorrelationMerge(AggregateFunctionFactory &);
+void registerAggregateFunctionAttributionAnalysisFuse(AggregateFunctionFactory &);
+void registerAggregateFunctionAttributionCorrelation(AggregateFunctionFactory &);
+void registerAggregateFunctionAttributionCorrelationFuse(AggregateFunctionFactory &);
 void registerAggregateFunctionFinderFunnel(AggregateFunctionFactory & factory);
 void registerAggregateFunctionFinderGroupFunnel(AggregateFunctionFactory & factory);
 void registerAggregateFunctionFunnelRep(AggregateFunctionFactory & factory);
@@ -93,6 +109,7 @@ void registerAggregateFunctionSlideMatchCount(AggregateFunctionFactory & factory
 void registerAggregateFunctionFrequency(AggregateFunctionFactory & factory);
 void registerAggregateFunctionPathSplit(AggregateFunctionFactory & factory);
 void registerAggregateFunctionPathCount(AggregateFunctionFactory & factory);
+void registerAggregateFunctionFunnelPathSplit(AggregateFunctionFactory & factory);
 void registerAggregateFunctionXirr(AggregateFunctionFactory & factory);
 void registerAggregateFunctionsBitmapLogic(AggregateFunctionFactory & factory);
 void registerAggregateFunctionsBitmapFromColumn(AggregateFunctionFactory &);
@@ -101,11 +118,22 @@ void registerAggregateFunctionsBitmapExpressionCalculation(AggregateFunctionFact
 void registerAggregateFunctionsBitmapMaxLevel(AggregateFunctionFactory & factory);
 void registerAggregateFunctionsBitMapJoin(AggregateFunctionFactory & factory);
 void registerAggregateFunctionsBitMapJoinAndCard(AggregateFunctionFactory & factory);
-void registerAggregateFunctionCpcSketch(AggregateFunctionFactory & factory);
+void registerAggregateFunctionHllSketch(AggregateFunctionFactory & factory);
 void registerAggregateFunctionKllSketch(AggregateFunctionFactory & factory);
 void registerAggregateFunctionNdvBuckets(AggregateFunctionFactory & factory);
 void registerAggregateFunctionNdvBucketsExtend(AggregateFunctionFactory & factory);
 void registerAggregateFunctionNothing(AggregateFunctionFactory & factory);
+void registerAggregateFunctionHllSketchEstimate(AggregateFunctionFactory &);
+void registerAggregateFunctionAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionFastAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionFastAuc2(AggregateFunctionFactory &);
+void registerAggregateFunctionFastPrevAuc2(AggregateFunctionFactory &);
+void registerAggregateFunctionFastAuc3(AggregateFunctionFactory &);
+void registerAggregateFunctionRegAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionRegAucV2(AggregateFunctionFactory &);
+void registerAggregateFunctionDebiasAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionEcpmAuc(AggregateFunctionFactory &);
+void registerAggregateFunctionNdcg(AggregateFunctionFactory &);
 
 class AggregateFunctionCombinatorFactory;
 void registerAggregateFunctionCombinatorIf(AggregateFunctionCombinatorFactory &);
@@ -119,6 +147,8 @@ void registerAggregateFunctionCombinatorOrFill(AggregateFunctionCombinatorFactor
 void registerAggregateFunctionCombinatorResample(AggregateFunctionCombinatorFactory &);
 void registerAggregateFunctionCombinatorDistinct(AggregateFunctionCombinatorFactory &);
 void registerAggregateFunctionCombinatorStack(AggregateFunctionCombinatorFactory &);
+void registerAggregateFunctionCombinatorMap(AggregateFunctionCombinatorFactory & factory);
+void registerAggregateFunctionCombinatorOrderBy(AggregateFunctionCombinatorFactory &);
 
 void registerWindowFunctions(AggregateFunctionFactory & factory);
 
@@ -129,15 +159,20 @@ void registerAggregateFunctions()
     {
         auto & factory = AggregateFunctionFactory::instance();
 
+        registerAggregateFunctionArbitrary(factory);
         registerAggregateFunctionAvg(factory);
         registerAggregateFunctionAvgWeighted(factory);
         registerAggregateFunctionCount(factory);
         registerAggregateFunctionDeltaSum(factory);
         registerAggregateFunctionDeltaSumTimestamp(factory);
         registerAggregateFunctionGroupArray(factory);
+        registerAggregateFunctionGroupConcat(factory);
         registerAggregateFunctionGroupUniqArray(factory);
         registerAggregateFunctionGroupArrayInsertAt(factory);
         registerAggregateFunctionsQuantile(factory);
+        registerAggregateFunctionQuantileTDigestWithSSize(factory);
+        registerAggregateFunctionsQuantileInterpolatedWeighted(factory);
+        registerAggregateFunctionsQuantileBFloat16Weighted(factory);
         registerAggregateFunctionsSequenceMatch(factory);
         registerAggregateFunctionWindowFunnel(factory);
         registerAggregateFunctionRate(factory);
@@ -146,6 +181,7 @@ void registerAggregateFunctions()
         registerAggregateFunctionsAny(factory);
         registerAggregateFunctionsStatisticsStable(factory);
         registerAggregateFunctionsStatisticsSimple(factory);
+        registerAggregateFunctionsVarianceMatrix(factory);
         registerAggregateFunctionSum(factory);
         registerAggregateFunctionSumCount(factory);
         registerAggregateFunctionSumMap(factory);
@@ -154,6 +190,11 @@ void registerAggregateFunctions()
         registerAggregateFunctionUniqUpTo(factory);
         registerAggregateFunctionTopK(factory);
         registerAggregateFunctionsBitwise(factory);
+        registerAggregateFunctionCramersV(factory);
+        registerAggregateFunctionTheilsU(factory);
+        registerAggregateFunctionContingency(factory);
+        registerAggregateFunctionCramersVBiasCorrected(factory);
+        registerAggregateFunctionSingleValueOrNull(factory);
 #if !defined(ARCADIA_BUILD)
         registerAggregateFunctionsBitmap(factory);
 #endif
@@ -171,6 +212,9 @@ void registerAggregateFunctions()
         registerAggregateFunctionSequenceNextNode(factory);
         registerAggregateFunctionWelchTTest(factory);
         registerAggregateFunctionStudentTTest(factory);
+        registerAggregateFunctionMeanZTest(factory);
+        registerAggregateFunctionExponentialMovingAverage(factory);
+        registerAggregateFunctionSparkbar(factory);
         registerAggregateFunctionMergeStreamStack(factory);
         registerAggregateFunctionSessionSplit(factory);
         registerAggregateFunctionSessionAnalysis(factory);
@@ -179,9 +223,11 @@ void registerAggregateFunctions()
         registerAggregateFunctionRetentionLoss(factory);
         registerAggregateFunctionGenArray(factory);
         registerAggregateFunctionGenArrayMonth(factory);
+        registerAggregateFunctionAttribution(factory);
         registerAggregateFunctionAttributionAnalysis(factory);
-        registerAggregateFunctionAttributionAnalysisMerge(factory);
-        registerAggregateFunctionAttributionCorrelationMerge(factory);
+        registerAggregateFunctionAttributionAnalysisFuse(factory);
+        registerAggregateFunctionAttributionCorrelation(factory);
+        registerAggregateFunctionAttributionCorrelationFuse(factory);
         registerAggregateFunctionFinderFunnel(factory);
         registerAggregateFunctionFinderGroupFunnel(factory);
         registerAggregateFunctionFunnelRep(factory);
@@ -194,6 +240,7 @@ void registerAggregateFunctions()
         registerAggregateFunctionFrequency(factory);
         registerAggregateFunctionPathSplit(factory);
         registerAggregateFunctionPathCount(factory);
+        registerAggregateFunctionFunnelPathSplit(factory);
         registerAggregateFunctionXirr(factory);
 
         registerWindowFunctions(factory);
@@ -206,11 +253,22 @@ void registerAggregateFunctions()
         registerAggregateFunctionsBitmapMaxLevel(factory);
         registerAggregateFunctionsBitMapJoin(factory);
         registerAggregateFunctionsBitMapJoinAndCard(factory);
-        registerAggregateFunctionCpcSketch(factory);
+        registerAggregateFunctionHllSketch(factory);
         registerAggregateFunctionKllSketch(factory);
         registerAggregateFunctionNdvBuckets(factory);
         registerAggregateFunctionNdvBucketsExtend(factory);
         registerAggregateFunctionNothing(factory);
+        registerAggregateFunctionHllSketchEstimate(factory);
+        registerAggregateFunctionAuc(factory);
+        registerAggregateFunctionFastAuc(factory);
+        registerAggregateFunctionFastAuc2(factory);
+        registerAggregateFunctionFastPrevAuc2(factory);
+        registerAggregateFunctionFastAuc3(factory);
+        registerAggregateFunctionRegAuc(factory);
+        registerAggregateFunctionRegAucV2(factory);
+        registerAggregateFunctionDebiasAuc(factory);
+        registerAggregateFunctionEcpmAuc(factory);
+        registerAggregateFunctionNdcg(factory);
     }
 
     {
@@ -227,6 +285,8 @@ void registerAggregateFunctions()
         registerAggregateFunctionCombinatorResample(factory);
         registerAggregateFunctionCombinatorDistinct(factory);
         registerAggregateFunctionCombinatorStack(factory);
+        registerAggregateFunctionCombinatorMap(factory);
+        registerAggregateFunctionCombinatorOrderBy(factory);
     }
 }
 

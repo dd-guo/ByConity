@@ -21,27 +21,23 @@
 
 #include <Columns/ColumnString.h>
 #include <DataTypes/DataTypeString.h>
-#include <DataTypes/getLeastSupertype.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/FunctionsConversion.h>
 #include <Functions/GatherUtils/Algorithms.h>
 #include <Functions/GatherUtils/Sinks.h>
-#include <Functions/GatherUtils/Slices.h>
 #include <Functions/GatherUtils/Sources.h>
 #include <Functions/IFunction.h>
+#include <Functions/formatString.h>
 #include <IO/WriteHelpers.h>
 #include <common/map.h>
-#include <common/range.h>
 
-#include "formatString.h"
 
 namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int ILLEGAL_COLUMN;
+extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
 using namespace GatherUtils;
@@ -54,7 +50,8 @@ class ConcatImpl : public IFunction
 {
 public:
     static constexpr auto name = Name::name;
-    static FunctionPtr create(ContextPtr /*context*/) { return std::make_shared<ConcatImpl>(); }
+    explicit ConcatImpl(ContextPtr context_) : context(context_) { }
+    static FunctionPtr create(ContextPtr context) { return std::make_shared<ConcatImpl>(context); }
 
     String getName() const override { return name; }
 
@@ -64,30 +61,18 @@ public:
 
     bool isInjective(const ColumnsWithTypeAndName &) const override { return is_injective; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     bool useDefaultImplementationForConstants() const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.size() < 2)
             throw Exception(
-                "Number of arguments for function " + getName() + " doesn't match: passed " + toString(arguments.size())
-                    + ", should be at least 2.",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
-
-        if (arguments.size() > FormatImpl::argument_threshold)
-            throw Exception(
-                "Number of arguments for function " + getName() + " doesn't match: passed " + toString(arguments.size())
-                    + ", should be at most " + std::to_string(FormatImpl::argument_threshold),
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
-
-        for (const auto arg_idx : collections::range(0, arguments.size()))
-        {
-            const auto * arg = arguments[arg_idx].get();
-            if (!isStringOrFixedString(arg))
-                throw Exception{"Illegal type " + arg->getName() + " of argument " + std::to_string(arg_idx + 1) + " of function "
-                                    + getName(),
-                                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-        }
+                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                "Number of arguments for function {} doesn't match: passed {}, should be at least 2",
+                getName(),
+                arguments.size());
 
         return std::make_shared<DataTypeString>();
     }
@@ -97,14 +82,15 @@ public:
         /// Format function is not proven to be faster for two arguments.
         /// Actually there is overhead of 2 to 5 extra instructions for each string for checking empty strings in FormatImpl.
         /// Though, benchmarks are really close, for most examples we saw executeBinary is slightly faster (0-3%).
-        /// For 3 and more arguments FormatImpl is much faster (up to 50-60%).
+        /// For 3 and more arguments FormatStringImpl is much faster (up to 50-60%).
         if (arguments.size() == 2)
             return executeBinary(arguments, input_rows_count);
-        else
-            return executeFormatImpl(arguments, input_rows_count);
+        return executeFormatImpl(arguments, input_rows_count);
     }
 
-protected:
+private:
+    ContextWeakPtr context;
+
     ColumnPtr executeBinary(const ColumnsWithTypeAndName & arguments, size_t input_rows_count) const
     {
         const IColumn * c0 = arguments[0].column.get();
@@ -142,6 +128,7 @@ protected:
         std::vector<const ColumnString::Offsets *> offsets(num_arguments);
         std::vector<size_t> fixed_string_sizes(num_arguments);
         std::vector<String> constant_strings(num_arguments);
+        std::vector<ColumnString::MutablePtr> converted_col_ptrs(num_arguments);
         bool has_column_string = false;
         bool has_column_fixed_string = false;
         for (size_t i = 0; i < num_arguments; ++i)
@@ -164,8 +151,29 @@ protected:
                 constant_strings[i] = const_col->getValue<String>();
             }
             else
-                throw Exception(
-                    "Illegal column " + column->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN);
+            {
+                /// A non-String/non-FixedString-type argument: use the default serialization to convert it to String
+                auto full_column = column->convertToFullIfNeeded();
+                auto serialization = arguments[i].type->getDefaultSerialization();
+                auto converted_col_str = ColumnString::create();
+                ColumnStringHelpers::WriteHelper write_helper(*converted_col_str, column->size());
+                auto & write_buffer = write_helper.getWriteBuffer();
+                FormatSettings format_settings;
+                for (size_t row = 0; row < column->size(); ++row)
+                {
+                    serialization->serializeText(*full_column, row, write_buffer, format_settings);
+                    write_helper.rowWritten();
+                }
+                write_helper.finalize();
+
+                /// Keep the pointer alive
+                converted_col_ptrs[i] = std::move(converted_col_str);
+
+                /// Same as the normal `ColumnString` branch
+                has_column_string = true;
+                data[i] = &converted_col_ptrs[i]->getChars();
+                offsets[i] = &converted_col_ptrs[i]->getOffsets();
+            }
         }
 
         String pattern;
@@ -174,7 +182,7 @@ protected:
         for (size_t i = 0; i < num_arguments; ++i)
             pattern += "{}";
 
-        FormatImpl::formatExecute(
+        FormatStringImpl::formatExecute(
             has_column_string,
             has_column_fixed_string,
             std::move(pattern),
@@ -190,38 +198,10 @@ protected:
     }
 };
 
-template<typename Name>
-class ConcatWsImpl : public ConcatImpl<Name, false>
-{
-public:
-    static FunctionPtr create(ContextPtr /*context*/) { return std::make_shared<ConcatWsImpl>(); }
-
-    using ConcatImpl<Name, false>::executeFormatImpl;
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
-    {
-        ColumnsWithTypeAndName new_arguments((arguments.size() << 1) - 3);
-
-        for (size_t i = 0; i < new_arguments.size(); ++i)
-        {
-            if (i & 1)
-                new_arguments[i] = arguments[0];
-            else
-                new_arguments[i] = arguments[(i >> 1) + 1];
-        }
-
-        return executeFormatImpl(new_arguments, input_rows_count);
-    }
-};
-
 
 struct NameConcat
 {
     static constexpr auto name = "concat";
-};
-struct NameConcatWs
-{
-    static constexpr auto name = "concatWs";
 };
 struct NameConcatAssumeInjective
 {
@@ -229,18 +209,18 @@ struct NameConcatAssumeInjective
 };
 
 using FunctionConcat = ConcatImpl<NameConcat, false>;
-using FunctionConcatWs = ConcatWsImpl<NameConcatWs>;
 using FunctionConcatAssumeInjective = ConcatImpl<NameConcatAssumeInjective, true>;
 
 
-/// Also works with arrays.
+/// Works with arrays via `arrayConcat`, maps via `mapConcat`, and tuples via `tupleConcat`.
+/// Additionally, allows concatenation of arbitrary types that can be cast to string using the corresponding default serialization.
 class ConcatOverloadResolver : public IFunctionOverloadResolver
 {
 public:
     static constexpr auto name = "concat";
     static FunctionOverloadResolverPtr create(ContextPtr context) { return std::make_unique<ConcatOverloadResolver>(context); }
 
-    explicit ConcatOverloadResolver(ContextPtr context_) : context(context_) {}
+    explicit ConcatOverloadResolver(ContextPtr context_) : context(context_) { }
 
     String getName() const override { return name; }
     size_t getNumberOfArguments() const override { return 0; }
@@ -248,22 +228,33 @@ public:
 
     FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & return_type) const override
     {
-        if (isArray(arguments.at(0).type))
-        {
+        if (arguments.size() == 1)
+            return FunctionFactory::instance().getImpl("toString", context)->build(arguments);
+        if (std::all_of(arguments.begin(), arguments.end(),
+            [this](const auto & elem) {
+                return context && context->getSettingsRef().dialect_type == DialectType::MYSQL ?
+                    isArray(removeNullable(elem.type)) :
+                    isArray(elem.type);
+            }))
             return FunctionFactory::instance().getImpl("arrayConcat", context)->build(arguments);
-        }
-        else
-            return std::make_unique<FunctionToFunctionBaseAdaptor>(
-                FunctionConcat::create(context), collections::map<DataTypes>(arguments, [](const auto & elem) { return elem.type; }), return_type);
+        if (std::all_of(arguments.begin(), arguments.end(), [](const auto & elem) { return isMap(elem.type); }))
+            return FunctionFactory::instance().getImpl("mapConcat", context)->build(arguments);
+        if (std::all_of(arguments.begin(), arguments.end(), [](const auto & elem) { return isTuple(elem.type); }))
+            return FunctionFactory::instance().getImpl("tupleConcat", context)->build(arguments);
+        return std::make_unique<FunctionToFunctionBaseAdaptor>(
+                FunctionConcat::create(context),
+                collections::map<DataTypes>(arguments, [](const auto & elem) { return elem.type; }),
+                return_type);
     }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
-        if (arguments.size() < 2)
+        if (arguments.empty())
             throw Exception(
-                "Number of arguments for function " + getName() + " doesn't match: passed " + toString(arguments.size())
-                    + ", should be at least 2.",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                "Number of arguments for function {} doesn't match: passed {}, should be at least 1.",
+                getName(),
+                arguments.size());
 
         /// We always return Strings from concat, even if arguments were fixed strings.
         return std::make_shared<DataTypeString>();
@@ -275,11 +266,9 @@ private:
 
 }
 
-void registerFunctionsConcat(FunctionFactory & factory)
+REGISTER_FUNCTION(Concat)
 {
     factory.registerFunction<ConcatOverloadResolver>(FunctionFactory::CaseInsensitive);
-    factory.registerFunction<FunctionConcatWs>();
-    factory.registerAlias("concat_ws", NameConcatWs::name);
     factory.registerFunction<FunctionConcatAssumeInjective>();
 }
 

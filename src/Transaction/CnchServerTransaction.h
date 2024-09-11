@@ -22,8 +22,10 @@
 #include <Transaction/IntentLock.h>
 #include <Transaction/TxnTimestamp.h>
 #include <Common/CurrentMetrics.h>
-
+#include <atomic>
 #include <memory>
+
+#include <Statistics/AutoStatisticsMemoryRecord.h>
 
 namespace DB
 {
@@ -60,12 +62,26 @@ public:
     void clean(TxnCleanTask & task) override;
 
     void removeIntermediateData() override;
+
+    void incrementModifiedCount(const Statistics::AutoStats::ModifiedCounter& new_counts);
+
+    Poco::Logger * getLogger() { return log; } 
+
 protected:
     static constexpr size_t MAX_RETRY = 3;
     std::vector<ActionPtr> actions;
     CurrentMetrics::Increment active_txn_increment;
+    Statistics::AutoStats::ModifiedCounter modified_counter;
+
 private:
+
     Poco::Logger * log {&Poco::Logger::get("CnchServerTransaction")};
+
+    std::atomic_bool dedup_stage_flag{false};
+
+    size_t action_size_before_dedup = 0;
+
+    void executeDedupStage();
 
 };
 

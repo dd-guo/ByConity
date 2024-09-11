@@ -39,7 +39,15 @@ namespace DB
 
 class QueryStatus;
 class ExecutingGraph;
+class ReadProgressCallback;
 using ExecutingGraphPtr = std::unique_ptr<ExecutingGraph>;
+using ReadProgressCallbackPtr = std::unique_ptr<ReadProgressCallback>;
+
+struct PipelineExecutorOptions
+{
+    bool need_processors_profiles = false;
+    bool report_processors_profile = false;
+};
 
 /// Executes query pipeline.
 class PipelineExecutor
@@ -51,7 +59,7 @@ public:
     /// During pipeline execution new processors can appear. They will be added to existing set.
     ///
     /// Explicit graph representation is built in constructor. Throws if graph is not correct.
-    explicit PipelineExecutor(Processors & processors_, QueryStatus * elem = nullptr, bool need_processors_profiles_ = false);
+    explicit PipelineExecutor(Processors & processors_, QueryStatus * elem = nullptr, const PipelineExecutorOptions & executor_options = PipelineExecutorOptions());
     ~PipelineExecutor();
 
     /// Execute pipeline in multiple threads. Must be called once.
@@ -77,13 +85,31 @@ public:
 
     String dumpPipeline() const;
 
+    bool isExecutionInitialized() const
+    {
+        return is_execution_initialized;
+    }
+
+    /// Set callback for read progress.
+    /// It would be called every time when processor reports read progress.
+    void setReadProgressCallback(ReadProgressCallbackPtr callback);
+
+    bool isCancelled() const
+    {
+        return cancelled;
+    }
+
 private:
     Processors & processors;
     std::mutex processors_mutex;
 
     bool need_processors_profiles;
 
+    bool report_processors_profile;
+
     ExecutingGraphPtr graph;
+
+    ReadProgressCallbackPtr read_progress_callback;
 
     using Stack = std::stack<UInt64>;
 
@@ -192,6 +218,9 @@ private:
     void finish();
 
     void dumpPipelineToFile(const String & suffix) const;
+
+    void reportProcessorProfile(const IProcessor * processor) const;
+    void reportProcessorProfileOnCancel(const Processors & processors) const;
 };
 
 using PipelineExecutorPtr = std::shared_ptr<PipelineExecutor>;

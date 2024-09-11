@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <Common/Exception.h>
+#include <Common/KnownObjectNames.h>
 #include <Interpreters/Context.h>
 #include <Core/Settings.h>
 #include <DataStreams/MaterializingBlockOutputStream.h>
@@ -17,6 +18,8 @@
 #include <Processors/Formats/Impl/ParallelParsingInputFormat.h>
 #include <Processors/Formats/Impl/ParallelFormattingOutputFormat.h>
 #include <Poco/URI.h>
+#include <IO/CompressionMethod.h>
+#include <boost/algorithm/string/case_conv.hpp>
 
 #include <IO/ReadHelpers.h>
 
@@ -34,6 +37,7 @@ namespace ErrorCodes
     extern const int FORMAT_IS_NOT_SUITABLE_FOR_INPUT;
     extern const int FORMAT_IS_NOT_SUITABLE_FOR_OUTPUT;
     extern const int UNSUPPORTED_METHOD;
+    extern const int BAD_ARGUMENTS;
 }
 
 const FormatFactory::Creators & FormatFactory::getCreators(const String & name) const
@@ -62,6 +66,7 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.avro.schema_registry_url = settings.format_avro_schema_registry_url.toString();
     format_settings.csv.allow_double_quotes = settings.format_csv_allow_double_quotes;
     format_settings.csv.allow_single_quotes = settings.format_csv_allow_single_quotes;
+    format_settings.csv.write_utf8_with_bom = settings.format_csv_write_utf8_with_bom;
     format_settings.csv.crlf_end_of_line = settings.output_format_csv_crlf_end_of_line;
     format_settings.csv.delimiter = settings.format_csv_delimiter;
     format_settings.csv.empty_as_default = settings.input_format_defaults_for_omitted_fields;
@@ -77,18 +82,49 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.custom.row_between_delimiter = settings.format_custom_row_between_delimiter;
     format_settings.date_time_input_format = settings.date_time_input_format;
     format_settings.date_time_output_format = settings.date_time_output_format;
+    format_settings.bool_true_representation = settings.bool_true_representation;
+    format_settings.bool_false_representation = settings.bool_false_representation;
     format_settings.enable_streaming = settings.output_format_enable_streaming;
     format_settings.import_nested_json = settings.input_format_import_nested_json;
     format_settings.input_allow_errors_num = settings.input_format_allow_errors_num;
     format_settings.input_allow_errors_ratio = settings.input_format_allow_errors_ratio;
+    format_settings.json.read_objects_as_strings = settings.input_format_json_read_objects_as_strings;
     format_settings.json.array_of_rows = settings.output_format_json_array_of_rows;
     format_settings.json.escape_forward_slashes = settings.output_format_json_escape_forward_slashes;
-    format_settings.json.named_tuples_as_objects = settings.output_format_json_named_tuples_as_objects;
+    format_settings.json.write_named_tuples_as_objects = settings.output_format_json_named_tuples_as_objects;
+    format_settings.json.read_named_tuples_as_objects = settings.input_format_json_named_tuples_as_objects;
+    format_settings.json.defaults_for_missing_elements_in_named_tuple = settings.input_format_json_defaults_for_missing_elements_in_named_tuple;
     format_settings.json.quote_64bit_integers = settings.output_format_json_quote_64bit_integers;
     format_settings.json.quote_denormals = settings.output_format_json_quote_denormals;
-    format_settings.parquet.allow_missing_columns = settings.input_format_parquet_allow_missing_columns;
+    format_settings.orc.output_string_as_string = settings.output_format_orc_string_as_string;
+    format_settings.orc.allow_out_of_range = settings.input_orc_date_type_out_of_range;
+    format_settings.orc.use_fast_decoder = settings.input_format_orc_use_fast_decoder;
+    format_settings.orc.filter_push_down = settings.input_format_orc_filter_push_down;
+    format_settings.orc.import_nested = settings.input_format_orc_import_nested;
+    format_settings.orc.case_insensitive_column_matching = settings.input_format_orc_case_insensitive_column_matching;
+    format_settings.orc.use_footer_cache = settings.input_format_orc_use_footer_cache;
+    format_settings.seekable_read = settings.input_format_allow_seeks;
+    format_settings.max_rows_to_read_for_schema_inference = settings.input_format_max_rows_to_read_for_schema_inference;
+    format_settings.max_bytes_to_read_for_schema_inference = settings.input_format_max_rows_to_read_for_schema_inference;
+    format_settings.schema_inference_make_columns_nullable = settings.schema_inference_make_columns_nullable;
+    format_settings.avoid_buffering = settings.input_format_arrow_avoid_buffering;
     format_settings.null_as_default = settings.input_format_null_as_default;
     format_settings.parquet.row_group_size = settings.output_format_parquet_row_group_size;
+    format_settings.parquet.output_string_as_string = settings.output_format_parquet_string_as_string;
+    format_settings.parquet.output_fixed_string_as_fixed_byte_array = settings.output_format_parquet_fixed_string_as_fixed_byte_array;
+    format_settings.parquet.allow_missing_columns = settings.input_format_parquet_allow_missing_columns;
+    format_settings.parquet.preserve_order = settings.input_format_parquet_preserve_order;
+    format_settings.parquet.coalesce_read = settings.input_format_parquet_coalesce_read;
+    format_settings.parquet.use_lazy_io_cache = settings.input_format_parquet_use_lazy_io_cache;
+    format_settings.parquet.import_nested = settings.input_format_parquet_import_nested;
+    format_settings.parquet.case_insensitive_column_matching = settings.input_format_parquet_case_insensitive_column_matching;
+    format_settings.parquet.max_block_size = settings.input_format_parquet_max_block_size;
+    // NOTE:: this is used for parallel parquet read. It's a temporary solution
+    format_settings.parquet.max_download_threads = settings.max_download_threads;
+    format_settings.parquet.min_bytes_for_seek = settings.input_format_parquet_min_bytes_for_seek;
+    format_settings.parquet.filter_push_down = settings.input_format_parquet_filter_push_down;
+    format_settings.parquet.use_footer_cache = settings.input_format_parquet_use_footer_cache;
+    format_settings.parquet.use_native_reader = settings.input_format_parquet_use_native_reader;
     format_settings.pretty.charset = settings.output_format_pretty_grid_charset.toString() == "ASCII" ? FormatSettings::Pretty::Charset::ASCII : FormatSettings::Pretty::Charset::UTF8;
     format_settings.pretty.color = settings.output_format_pretty_color;
     format_settings.pretty.max_column_pad_width = settings.output_format_pretty_max_column_pad_width;
@@ -99,7 +135,10 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.regexp.regexp = settings.format_regexp;
     format_settings.regexp.skip_unmatched = settings.format_regexp_skip_unmatched;
     format_settings.schema.format_schema = settings.format_schema;
-    format_settings.schema.format_schema_path = context->getFormatSchemaPath();
+    /// Prefer to get local format_schema_path for each table to support multi-tanants;
+    format_settings.schema.format_schema_path = !settings.format_custom_schema_path.value.empty() ?
+                                                settings.format_custom_schema_path :
+                                                context->getFormatSchemaPath();
     format_settings.schema.is_server = context->hasGlobalContext() && (context->getGlobalContext()->getApplicationType() == Context::ApplicationType::SERVER);
     format_settings.skip_unknown_fields = settings.input_format_skip_unknown_fields;
     format_settings.template_settings.resultset_format = settings.format_template_resultset;
@@ -116,7 +155,19 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.write_statistics = settings.output_format_write_statistics;
     format_settings.arrow.low_cardinality_as_dictionary = settings.output_format_arrow_low_cardinality_as_dictionary;
     format_settings.arrow.allow_missing_columns = settings.input_format_arrow_allow_missing_columns;
+    format_settings.arrow.output_string_as_string = settings.output_format_arrow_string_as_string;
+    format_settings.arrow.output_fixed_string_as_fixed_byte_array = settings.output_format_arrow_fixed_string_as_fixed_byte_array;
+    format_settings.arrow.import_nested = settings.input_format_arrow_import_nested;
+    format_settings.orc.import_nested = settings.input_format_orc_import_nested;
+    format_settings.orc.output_string_as_string = settings.output_format_orc_string_as_string;
     format_settings.orc.allow_missing_columns = settings.input_format_orc_allow_missing_columns;
+    format_settings.protobuf.enable_multiple_message = settings.input_format_protobuf_enable_multiple_message;
+    format_settings.protobuf.default_length_parser = settings.input_format_protobuf_default_length_parser;
+    format_settings.map.parse_null_map_as_empty = settings.input_format_parse_null_map_as_empty;
+    format_settings.map.skip_null_map_value = settings.input_format_skip_null_map_value;
+    format_settings.map.max_map_key_length = settings.input_format_max_map_key_long;
+    format_settings.check_data_overflow = settings.check_data_overflow;
+    format_settings.date_time_overflow_behavior = settings.date_time_overflow_behavior;
 
     /// Validate avro_schema_registry_url with RemoteHostFilter when non-empty and in Server context
     if (format_settings.schema.is_server)
@@ -308,6 +359,7 @@ OutputFormatPtr FormatFactory::getOutputFormatParallelIfPossible(
     WriteBuffer & buf,
     const Block & sample,
     ContextPtr context,
+    bool out_to_directory,
     WriteCallback callback,
     const std::optional<FormatSettings> & _format_settings) const
 {
@@ -319,7 +371,8 @@ OutputFormatPtr FormatFactory::getOutputFormatParallelIfPossible(
 
     const Settings & settings = context->getSettingsRef();
 
-    if (settings.output_format_parallel_formatting && getCreators(name).supports_parallel_formatting
+    if (!out_to_directory && settings.output_format_parallel_formatting
+        && getCreators(name).supports_parallel_formatting
         && !settings.output_format_json_array_of_rows)
     {
         auto formatter_creator = [output_getter, sample, callback, format_settings]
@@ -378,6 +431,49 @@ OutputFormatPtr FormatFactory::getOutputFormat(
     return format;
 }
 
+void FormatFactory::registerAdditionalInfoForSchemaCacheGetter(
+    const String & name, AdditionalInfoForSchemaCacheGetter additional_info_for_schema_cache_getter)
+{
+    auto & target = dict[name].additional_info_for_schema_cache_getter;
+    if (target)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "FormatFactory: additional info for schema cache getter {} is already registered", name);
+    target = std::move(additional_info_for_schema_cache_getter);
+}
+
+String FormatFactory::getAdditionalInfoForSchemaCache(const String & name, ContextPtr context, const std::optional<FormatSettings> & format_settings_)
+{
+    const auto & additional_info_getter = getCreators(name).additional_info_for_schema_cache_getter;
+    if (!additional_info_getter)
+        return "";
+
+    auto format_settings = format_settings_ ? *format_settings_ : getFormatSettings(context);
+    return additional_info_getter(format_settings);
+}
+
+SchemaReaderPtr FormatFactory::getSchemaReader(
+    const String & name,
+    ReadBuffer & buf,
+    const ContextPtr & context,
+    const std::optional<FormatSettings> & _format_settings) const
+{
+    const auto & schema_reader_creator = getCreators(name).schema_reader_creator;
+    if (!schema_reader_creator)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "FormatFactory: Format {} doesn't support schema inference.", name);
+
+    auto format_settings = _format_settings ? *_format_settings : getFormatSettings(context);
+    auto schema_reader = schema_reader_creator(buf, format_settings);
+    // if (schema_reader->needContext())
+    //     schema_reader->setContext(context);
+    return schema_reader;
+}
+
+void FormatFactory::registerSchemaReader(const String & name, SchemaReaderCreator schema_reader_creator)
+{
+    auto & target = dict[name].schema_reader_creator;
+    if (target)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "FormatFactory: Schema reader {} is already registered", name);
+    target = std::move(schema_reader_creator);
+}
 
 void FormatFactory::registerInputFormat(const String & name, InputCreator input_creator)
 {
@@ -385,6 +481,8 @@ void FormatFactory::registerInputFormat(const String & name, InputCreator input_
     if (target)
         throw Exception("FormatFactory: Input format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(input_creator);
+    registerFileExtension(name, name);
+    KnownFormatNames::instance().add(name);
 }
 
 void FormatFactory::registerOutputFormat(const String & name, OutputCreator output_creator)
@@ -393,6 +491,80 @@ void FormatFactory::registerOutputFormat(const String & name, OutputCreator outp
     if (target)
         throw Exception("FormatFactory: Output format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(output_creator);
+    registerFileExtension(name, name);
+    KnownFormatNames::instance().add(name);
+}
+
+void FormatFactory::registerFileExtension(const String & extension, const String & format_name)
+{
+    file_extension_formats[boost::to_lower_copy(extension)] = format_name;
+}
+
+String FormatFactory::getFormatFromFileName(String file_name, bool throw_if_not_found, String format_name)
+{
+    if (!format_name.empty() && format_name != "auto")
+        return format_name;
+
+    if (file_name == "stdin")
+        return getFormatFromFileDescriptor(STDIN_FILENO);
+
+    CompressionMethod compression_method = chooseCompressionMethod(file_name, "");
+    if (CompressionMethod::None != compression_method)
+    {
+        auto pos = file_name.find_last_of('.');
+        if (pos != String::npos)
+            file_name = file_name.substr(0, pos);
+    }
+
+    auto pos = file_name.find_last_of('.');
+    if (pos == String::npos)
+    {
+        if (throw_if_not_found)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot determine the file format by it's extension");
+        return "";
+    }
+
+    String file_extension = file_name.substr(pos + 1, String::npos);
+    boost::algorithm::to_lower(file_extension);
+    auto it = file_extension_formats.find(file_extension);
+    if (it == file_extension_formats.end())
+    {
+        if (throw_if_not_found)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot determine the file format by it's extension");
+        return "";
+    }
+    return it->second;
+}
+
+String FormatFactory::getFormatFromFileDescriptor(int fd)
+{
+#ifdef OS_LINUX
+    std::string proc_path = fmt::format("/proc/self/fd/{}", fd);
+    char file_path[PATH_MAX] = {'\0'};
+    if (readlink(proc_path.c_str(), file_path, sizeof(file_path) - 1) != -1)
+        return getFormatFromFileName(file_path, false);
+    return "";
+#elif defined(OS_DARWIN)
+    char file_path[PATH_MAX] = {'\0'};
+    if (fcntl(fd, F_GETPATH, file_path) != -1)
+        return getFormatFromFileName(file_path, false);
+    return "";
+#else
+    (void)fd;
+    return "";
+#endif
+}
+
+void FormatFactory::checkFormatName(const String & name) const
+{
+    auto it = dict.find(name);
+    if (it == dict.end())
+        throw Exception("Unknown format " + name, ErrorCodes::UNKNOWN_FORMAT);
+}
+
+bool FormatFactory::exists(const String & name) const
+{
+    return dict.find(name) != dict.end();
 }
 
 void FormatFactory::registerInputFormatProcessor(const String & name, InputProcessorCreator input_creator)
@@ -401,6 +573,7 @@ void FormatFactory::registerInputFormatProcessor(const String & name, InputProce
     if (target)
         throw Exception("FormatFactory: Input format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(input_creator);
+    registerFileExtension(name, name);
 }
 
 void FormatFactory::registerOutputFormatProcessor(const String & name, OutputProcessorCreator output_creator)
@@ -409,6 +582,7 @@ void FormatFactory::registerOutputFormatProcessor(const String & name, OutputPro
     if (target)
         throw Exception("FormatFactory: Output format " + name + " is already registered", ErrorCodes::LOGICAL_ERROR);
     target = std::move(output_creator);
+    registerFileExtension(name, name);
 }
 
 void FormatFactory::registerFileSegmentationEngine(const String & name, FileSegmentationEngine file_segmentation_engine)
@@ -443,6 +617,19 @@ bool FormatFactory::checkIfFormatIsColumnOriented(const String & name)
     const auto & target = getCreators(name);
     return target.is_column_oriented;
 }
+
+bool FormatFactory::checkIfFormatHasSchemaReader(const String & name) const
+{
+    const auto & target = getCreators(name);
+    return bool(target.schema_reader_creator);
+}
+
+
+// bool FormatFactory::checkIfFormatHasExternalSchemaReader(const String & name) const
+// {
+//     const auto & target = getCreators(name);
+//     return bool(target.external_schema_reader_creator);
+// }
 
 FormatFactory & FormatFactory::instance()
 {

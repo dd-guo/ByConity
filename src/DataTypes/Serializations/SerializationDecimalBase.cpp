@@ -30,6 +30,7 @@
 #include <Common/Endian.h>
 #include <Common/assert_cast.h>
 #include <Common/typeid_cast.h>
+#include <DataTypes/Serializations/SerializationHelpers.h>
 
 
 namespace DB
@@ -79,13 +80,11 @@ void SerializationDecimalBase<T>::deserializeBinary(IColumn & column, ReadBuffer
 }
 
 template <typename T>
-void SerializationDecimalBase<T>::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double) const
+size_t SerializationDecimalBase<T>::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double, bool /*zero_copy_cache_read*/, const UInt8* filter) const
 {
     typename ColumnType::Container & x = typeid_cast<ColumnType &>(column).getData();
-    size_t initial_size = x.size();
-    x.resize(initial_size + limit);
-    size_t size = istr.readBig(reinterpret_cast<char*>(&x[initial_size]), sizeof(FieldType) * limit);
-    x.resize(initial_size + size / sizeof(FieldType));
+
+    return deserializeBinaryBulkForVector(x, istr, limit, filter, 1);
 }
 
 template <class T, bool condition>
@@ -106,8 +105,8 @@ struct MemoryCompareWrapper<T, true>
         using UnsignedType = typename std::make_unsigned<real_type>::type;
         auto unsigned_value = static_cast<UnsignedType>(value);
         /// flip sign bit for signed type
-        if constexpr (std::is_signed_v<T>)
-            unsigned_value ^= (1ull << (sizeof(T) * 8 - 1));
+        if constexpr (std::is_signed_v<real_type>)
+            unsigned_value ^= (1ull << (sizeof(real_type) * 8 - 1));
         /// write in big-endian order
         unsigned_value = Endian::big(unsigned_value);
         writeBinary(unsigned_value, ostr);
@@ -123,8 +122,8 @@ struct MemoryCompareWrapper<T, true>
         readBinary(unsigned_value, istr);
         unsigned_value = Endian::big(unsigned_value);
         /// flip sign bit for signed type
-        if constexpr (std::is_signed_v<T>)
-            unsigned_value ^= (1ull << (sizeof(T) * 8 - 1));
+        if constexpr (std::is_signed_v<real_type>)
+            unsigned_value ^= (1ull << (sizeof(real_type) * 8 - 1));
         assert_cast<ColumnType &>(column).getData().push_back(FieldType(unsigned_value));
     }
 };

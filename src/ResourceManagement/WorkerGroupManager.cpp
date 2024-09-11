@@ -46,7 +46,7 @@ void WorkerGroupManager::loadWorkerGroups()
     loadWorkerGroupsImpl(&wg_lock);
 }
 
-void WorkerGroupManager::loadWorkerGroupsImpl(std::lock_guard<std::mutex> * /*wg_lock*/)
+void WorkerGroupManager::loadWorkerGroupsImpl(std::lock_guard<bthread::Mutex> * /*wg_lock*/)
 {
     auto catalog = rm_controller.getCnchCatalog();
 
@@ -74,13 +74,13 @@ void WorkerGroupManager::loadWorkerGroupsImpl(std::lock_guard<std::mutex> * /*wg
 
     for (auto & data : data_vec)
     {
-        if (data.type != WorkerGroupType::Shared)
+        if (data.type != WorkerGroupType::Shared && data.type != WorkerGroupType::Composite)
             continue;
 
         try
         {
             cells.try_emplace(data.id, createWorkerGroupObject(data, &cells_lock));
-            LOG_DEBUG(log, "Loaded shared worker group {}", data.id);
+            LOG_DEBUG(log, "Loaded shared/composite worker group {}", data.id);
         }
         catch (...)
         {
@@ -97,30 +97,31 @@ void WorkerGroupManager::clearWorkerGroups()
     clearWorkerGroupsImpl(&wg_lock);
 }
 
-void WorkerGroupManager::clearWorkerGroupsImpl(std::lock_guard<std::mutex> * /*wg_lock*/)
+void WorkerGroupManager::clearWorkerGroupsImpl(std::lock_guard<bthread::Mutex> * /*wg_lock*/)
 {
     std::lock_guard cells_lock(cells_mutex);
     cells.clear();
 }
 
-WorkerGroupPtr WorkerGroupManager::createWorkerGroupObject(const WorkerGroupData & data, std::lock_guard<std::mutex> * wg_lock)
+WorkerGroupPtr WorkerGroupManager::createWorkerGroupObject(const WorkerGroupData & data, std::lock_guard<std::mutex> * lock)
 {
     switch (data.type)
     {
         case WorkerGroupType::Physical:
-            return std::make_shared<PhysicalWorkerGroup>(rm_controller.getContext(), data.id, data.vw_uuid, data.psm);
+            return std::make_shared<PhysicalWorkerGroup>(data.id, data.vw_uuid, data.psm);
 
-        case WorkerGroupType::Shared: {
+        case WorkerGroupType::Shared: 
+        case WorkerGroupType::Composite: {
             std::optional<std::lock_guard<std::mutex>> maybe_lock;
-            if (!wg_lock)
+            if (!lock)
             {
                 maybe_lock.emplace(cells_mutex);
-                wg_lock = &maybe_lock.value();
+                lock = &maybe_lock.value();
             }
 
-            auto res = std::make_shared<SharedWorkerGroup>(data.id, data.vw_uuid, data.linked_id, data.is_auto_linked);
+            auto res = std::make_shared<SharedWorkerGroup>(data.type, data.id, data.vw_uuid, data.linked_id, data.is_auto_linked, data.priority);
 
-            if (auto linked_group = tryGetImpl(data.linked_id, *wg_lock))
+            if (auto linked_group = tryGetImpl(data.linked_id, *lock))
                 res->setLinkedGroup(linked_group);
 
             return res;
@@ -131,19 +132,19 @@ WorkerGroupPtr WorkerGroupManager::createWorkerGroupObject(const WorkerGroupData
     }
 }
 
-WorkerGroupPtr WorkerGroupManager::tryGetWorkerGroup(const std::string & id, std::lock_guard<std::mutex> * vw_lock)
+WorkerGroupPtr WorkerGroupManager::tryGetWorkerGroup(const std::string & id, std::lock_guard<bthread::Mutex> * vw_lock)
 {
-    std::unique_ptr<std::lock_guard<std::mutex>> vw_lock_guard;
+    std::unique_ptr<std::lock_guard<bthread::Mutex>> vw_lock_guard;
     if (!vw_lock)
     {
-        vw_lock_guard = std::make_unique<std::lock_guard<std::mutex>>(rm_controller.getVirtualWarehouseManager().getMutex());
+        vw_lock_guard = std::make_unique<std::lock_guard<bthread::Mutex>>(rm_controller.getVirtualWarehouseManager().getMutex());
         vw_lock = vw_lock_guard.get();
     }
     auto wg_lock = getLock();
     return tryGetWorkerGroupImpl(id, vw_lock, &wg_lock);
 }
 
-WorkerGroupPtr WorkerGroupManager::tryGetWorkerGroupImpl(const std::string & id, std::lock_guard<std::mutex> * vw_lock, std::lock_guard<std::mutex> * wg_lock)
+WorkerGroupPtr WorkerGroupManager::tryGetWorkerGroupImpl(const std::string & id, std::lock_guard<bthread::Mutex> * vw_lock, std::lock_guard<bthread::Mutex> * wg_lock)
 {
     auto res = tryGet(id);
     if (!res && need_sync_with_catalog.load(std::memory_order_relaxed))
@@ -154,7 +155,7 @@ WorkerGroupPtr WorkerGroupManager::tryGetWorkerGroupImpl(const std::string & id,
         if (!catalog->tryGetWorkerGroup(id, data))
             return nullptr;
 
-        res = rm_controller.createWorkerGroup(id, false, data.vw_name, data, vw_lock, wg_lock);
+        res = rm_controller.createWorkerGroup(id, data.vw_name, data, vw_lock, wg_lock);
     }
     return res;
 }
@@ -165,25 +166,25 @@ std::unordered_map<String, WorkerGroupPtr> WorkerGroupManager::getAllWorkerGroup
     return getAllWorkerGroupsImpl(&wg_lock);
 }
 
-std::unordered_map<String, WorkerGroupPtr> WorkerGroupManager::getAllWorkerGroupsImpl(std::lock_guard<std::mutex> * /*wg_lock*/)
+std::unordered_map<String, WorkerGroupPtr> WorkerGroupManager::getAllWorkerGroupsImpl(std::lock_guard<bthread::Mutex> * /*wg_lock*/)
 {
     return getAll();
 }
 
 
-WorkerGroupPtr WorkerGroupManager::getWorkerGroup(const std::string & id, std::lock_guard<std::mutex> * vw_lock)
+WorkerGroupPtr WorkerGroupManager::getWorkerGroup(const std::string & id, std::lock_guard<bthread::Mutex> * vw_lock)
 {
-    std::unique_ptr<std::lock_guard<std::mutex>> vw_lock_guard;
+    std::unique_ptr<std::lock_guard<bthread::Mutex>> vw_lock_guard;
     if (!vw_lock)
     {
-        vw_lock_guard = std::make_unique<std::lock_guard<std::mutex>>(rm_controller.getVirtualWarehouseManager().getMutex());
+        vw_lock_guard = std::make_unique<std::lock_guard<bthread::Mutex>>(rm_controller.getVirtualWarehouseManager().getMutex());
         vw_lock = vw_lock_guard.get();
     }
     auto wg_lock = getLock();
     return getWorkerGroupImpl(id, vw_lock, &wg_lock);
 }
 
-WorkerGroupPtr WorkerGroupManager::getWorkerGroupImpl(const std::string & id, std::lock_guard<std::mutex> * vw_lock, std::lock_guard<std::mutex> * wg_lock)
+WorkerGroupPtr WorkerGroupManager::getWorkerGroupImpl(const std::string & id, std::lock_guard<bthread::Mutex> * vw_lock, std::lock_guard<bthread::Mutex> * wg_lock)
 {
     auto res = tryGetWorkerGroupImpl(id, vw_lock, wg_lock);
     if (!res)
@@ -191,21 +192,12 @@ WorkerGroupPtr WorkerGroupManager::getWorkerGroupImpl(const std::string & id, st
     return res;
 }
 
-WorkerGroupPtr WorkerGroupManager::createWorkerGroup(
-    const std::string & id, bool if_not_exists, const std::string & vw_name, WorkerGroupData data, std::lock_guard<std::mutex> * vw_lock)
-{
-    std::unique_ptr<std::lock_guard<std::mutex>> vw_lock_guard;
-    if (!vw_lock)
-    {
-        vw_lock_guard = std::make_unique<std::lock_guard<std::mutex>>(rm_controller.getVirtualWarehouseManager().getMutex());
-        vw_lock = vw_lock_guard.get();
-    }
-    auto wg_lock = getLock();
-    return createWorkerGroupImpl(id, if_not_exists, vw_name, data, vw_lock, &wg_lock);
-}
-
 WorkerGroupPtr WorkerGroupManager::createWorkerGroupImpl(
-    const std::string & id, bool if_not_exists, const std::string & vw_name, WorkerGroupData data, std::lock_guard<std::mutex> * vw_lock, std::lock_guard<std::mutex> * /*wg_lock*/)
+    const std::string & id,
+    const std::string & vw_name,
+    WorkerGroupData data,
+    std::lock_guard<bthread::Mutex> * vw_lock,
+    std::lock_guard<bthread::Mutex> * /*wg_lock*/)
 {
     if (!vw_lock)
         throw Exception("Virtual warehouse lock should have been obtained", ErrorCodes::LOGICAL_ERROR);
@@ -221,10 +213,10 @@ WorkerGroupPtr WorkerGroupManager::createWorkerGroupImpl(
     auto creator = [&] {
         try
         {
-            if (data.type == WorkerGroupType::Shared)
+            if (data.type == WorkerGroupType::Shared || data.type == WorkerGroupType::Composite)
             {
-                if (const auto & linked = tryGet(data.linked_id);
-                    !linked || linked->getType() == WorkerGroupType::Shared)
+                if (const auto & linked = tryGet(data.linked_id); !linked || linked->getType() == WorkerGroupType::Shared 
+                    || linked->getType() == WorkerGroupType::Composite || linked->getVWName() == vw_name)
                     throw Exception("Create shared worker group with error! linked_id: " + data.linked_id, ErrorCodes::LOGICAL_ERROR);
             }
             catalog->createWorkerGroup(id, data);
@@ -241,7 +233,11 @@ WorkerGroupPtr WorkerGroupManager::createWorkerGroupImpl(
     };
 
     auto [group, created] = getOrCreate(id, std::move(creator));
-    if (!if_not_exists && !created)
+
+    /// Even user don't pass `IF NOT EXISTS`, we need to stop the creation if it already exists.
+    /// Because it may change VW settings in the next step which will introduce inconsistent state.
+    /// See ResourceManagerController::createWorkerGroup.
+    if (!created)
         throw Exception("Worker group " + id + " already exists.", ErrorCodes::WORKER_GROUP_ALREADY_EXISTS);
 
     return group;
@@ -253,7 +249,7 @@ void WorkerGroupManager::dropWorkerGroup(const std::string & id)
     dropWorkerGroupImpl(id, &wg_lock);
 }
 
-void WorkerGroupManager::dropWorkerGroupImpl(const std::string & id, std::lock_guard<std::mutex> * /*lock*/)
+void WorkerGroupManager::dropWorkerGroupImpl(const std::string & id, std::lock_guard<bthread::Mutex> * /*lock*/)
 {
     auto catalog = rm_controller.getCnchCatalog();
     try

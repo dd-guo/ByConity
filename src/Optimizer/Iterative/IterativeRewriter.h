@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 #include <chrono>
+#include <map>
 
 namespace DB
 {
@@ -34,8 +35,12 @@ struct IterativeRewriterContext
 {
     ContextMutablePtr globalContext;
     CTEInfo & cte_info;
-    std::chrono::time_point<std::chrono::system_clock> start_time;
     UInt64 optimizer_timeout;
+    ExcludedRulesMap * excluded_rules_map;
+    Stopwatch watch{CLOCK_THREAD_CPUTIME_ID};
+    // for debugging
+    QueryPlan & plan;
+    int rule_apply_count = 0;
 };
 
 /**
@@ -46,10 +51,12 @@ class IterativeRewriter : public Rewriter
 {
 public:
     IterativeRewriter(const std::vector<RulePtr> & rules_, std::string name_);
+    static std::map<std::underlying_type_t<RuleType>, size_t> getRuleCallTimes();
     String name() const override { return names; }
+private:
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_iterative_rewriter; }
     void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
 
-private:
     String names;
     RuleIndex rules;
 

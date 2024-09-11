@@ -114,7 +114,7 @@ StorageSystemCnchTablesHistory::StorageSystemCnchTablesHistory(const StorageID &
 
 Pipe StorageSystemCnchTablesHistory::read(
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum /*processed_stage*/,
@@ -128,7 +128,7 @@ Pipe StorageSystemCnchTablesHistory::read(
 
     NameSet names_set(column_names.begin(), column_names.end());
 
-    Block sample_block = metadata_snapshot->getSampleBlock();
+    Block sample_block = storage_snapshot->metadata->getSampleBlock();
     Block res_block;
 
     std::vector<UInt8> columns_mask(sample_block.columns());
@@ -181,7 +181,7 @@ Pipe StorageSystemCnchTablesHistory::read(
     for (size_t i=0; i<filtered_index_column->size(); i++)
         requested_table_id.push_back(trashed_tables_id[(*filtered_index_column)[i].get<UInt64>()]);
 
-    auto tables = cnch_catalog->getTablesByID(requested_table_id);
+    auto tables = cnch_catalog->getTablesByIDs(requested_table_id);
 
     BlockInputStreamPtr input = std::make_shared<CnchTablesHistoryInputStream>(std::move(columns_mask),
         std::move(res_block), max_block_size, tables);

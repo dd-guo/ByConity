@@ -54,9 +54,49 @@ struct LengthUTF8Impl
         throw Exception("Cannot apply function lengthUTF8 to Array argument", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
+    [[noreturn]] static void map(const ColumnString::Offsets &, PaddedPODArray<UInt64> &, bool)
+    {
+        throw Exception("Cannot apply function lengthUTF8 to Array argument", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+
     [[noreturn]] static void uuid(const ColumnUUID::Container &, size_t &, PaddedPODArray<UInt64> &)
     {
         throw Exception("Cannot apply function lengthUTF8 to UUID argument", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+
+    [[noreturn]] static void ipv6(const ColumnIPv6::Container &, size_t &, PaddedPODArray<UInt64> &)
+    {
+        throw Exception("Cannot apply function lengthUTF8 to IPv6 argument", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+
+    [[noreturn]] static void ipv4(const ColumnIPv4::Container &, size_t &, PaddedPODArray<UInt64> &)
+    {
+        throw Exception("Cannot apply function lengthUTF8 to IPv4 argument", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+    
+    static bool isCompilable(const DataTypes & )
+    {
+        return false;
+    }
+    static llvm::Value * compileString(llvm::IRBuilderBase & , const DataTypes & , Values &  )
+    {
+        return nullptr;
+    }
+    static llvm::Value * compileFixedString(llvm::IRBuilderBase & , const DataTypes & , Values &  )
+    {
+        return nullptr;
+    }
+    static llvm::Value * compileArray(llvm::IRBuilderBase & , const DataTypes & , Values &  )
+    {
+        return nullptr;
+    }
+    static llvm::Value * compileMap(llvm::IRBuilderBase & , const DataTypes & , Values &  )
+    {
+        return nullptr;
+    }
+    static llvm::Value * compileUuid(llvm::IRBuilderBase & , const DataTypes & , Values &  )
+    {
+        return nullptr;
     }
 };
 
@@ -68,7 +108,7 @@ using FunctionLengthUTF8 = FunctionStringOrArrayToT<LengthUTF8Impl, NameLengthUT
 
 }
 
-void registerFunctionLengthUTF8(FunctionFactory & factory)
+REGISTER_FUNCTION(LengthUTF8)
 {
     factory.registerFunction<FunctionLengthUTF8>();
 

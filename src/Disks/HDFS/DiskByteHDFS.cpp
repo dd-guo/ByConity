@@ -13,14 +13,20 @@
  * limitations under the License.
  */
 
+#include <filesystem>
 #include <memory>
 #include <Disks/DiskFactory.h>
 #include <Disks/DiskType.h>
 #include <Disks/HDFS/DiskByteHDFS.h>
+#include <Disks/IO/AsynchronousBoundedReadBuffer.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/Context_fwd.h>
+#include <IO/Scheduler/IOScheduler.h>
+#include <IO/PFRAWSReadBufferFromFS.h>
+#include <IO/WSReadBufferFromFS.h>
 #include <Storages/HDFS/ReadBufferFromByteHDFS.h>
 #include <Storages/HDFS/WriteBufferFromHDFS.h>
+#include "IO/HDFSRemoteFSReader.h"
 
 namespace DB
 {
@@ -28,6 +34,7 @@ namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
     extern const int INCORRECT_DISK_INDEX;
+    extern const int UNKNOWN_ELEMENT_IN_CONFIG;
 }
 
 DiskPtr DiskByteHDFSReservation::getDisk(size_t i) const
@@ -46,7 +53,7 @@ public:
     {
         base_path = std::filesystem::path(disk_path) / dir_path;
 
-        hdfs_fs.list(base_path, file_names);
+        hdfs_fs.list(base_path, file_names, file_sizes);
     }
 
     virtual void next() override { ++idx; }
@@ -64,18 +71,23 @@ public:
         return file_names[idx];
     }
 
+    size_t size() const override { return file_sizes.at(idx); }
+
 private:
     HDFSFileSystem & hdfs_fs;
 
     std::filesystem::path base_path;
     size_t idx;
     std::vector<String> file_names;
+    std::vector<size_t> file_sizes;
 };
 
 /// TODO: use HDFSCommon replace HDFSFileSystem
 DiskByteHDFS::DiskByteHDFS(const String & disk_name_, const String & hdfs_base_path_, const HDFSConnectionParams & hdfs_params_)
     : disk_name(disk_name_), disk_path(hdfs_base_path_), hdfs_params(hdfs_params_), hdfs_fs(hdfs_params_, 10000, 100, 0)
 {
+    pread_reader_opts = std::make_shared<HDFSRemoteFSReaderOpts>(hdfs_params, true);
+    read_reader_opts = std::make_shared<HDFSRemoteFSReaderOpts>(hdfs_params, false);
 }
 
 const String & DiskByteHDFS::getName() const
@@ -126,7 +138,8 @@ void DiskByteHDFS::createDirectories(const String & path)
 void DiskByteHDFS::clearDirectory(const String & path)
 {
     std::vector<String> file_names;
-    hdfs_fs.list(absolutePath(path), file_names);
+    std::vector<size_t> file_sizes;
+    hdfs_fs.list(absolutePath(path), file_names, file_sizes);
     for (const String & file_name : file_names)
     {
         hdfs_fs.remove(fs::path(disk_path) / path / file_name);
@@ -165,24 +178,58 @@ void DiskByteHDFS::replaceFile(const String & from_path, const String & to_path)
     hdfs_fs.renameTo(from_abs_path, to_abs_path);
 }
 
-void DiskByteHDFS::copy(const String &, const std::shared_ptr<IDisk> &, const String &)
-{
-    throw Exception("DiskByteHDFS didn't support copy to another disk", ErrorCodes::NOT_IMPLEMENTED);
-}
-
 void DiskByteHDFS::listFiles(const String & path, std::vector<String> & file_names)
 {
-    hdfs_fs.list(absolutePath(path), file_names);
+    std::vector<size_t> file_sizes;
+    hdfs_fs.list(absolutePath(path), file_names, file_sizes);
 }
 
 std::unique_ptr<ReadBufferFromFileBase> DiskByteHDFS::readFile(const String & path, const ReadSettings & settings) const
 {
-    return std::make_unique<ReadBufferFromByteHDFS>(absolutePath(path), settings.byte_hdfs_pread, hdfs_params, settings.buffer_size);
+    String file_path = absolutePath(path);
+
+    if (IO::Scheduler::IOSchedulerSet::instance().enabled() && settings.enable_io_scheduler) {
+        if (settings.enable_io_pfra) {
+            return std::make_unique<PFRAWSReadBufferFromFS>(
+                file_path,
+                settings.byte_hdfs_pread ? pread_reader_opts : read_reader_opts,
+                IO::Scheduler::IOSchedulerSet::instance().schedulerForPath(file_path),
+                PFRAWSReadBufferFromFS::Options{
+                    .min_buffer_size_ = settings.remote_fs_buffer_size,
+                    .throttler_ = settings.remote_throttler,
+                });
+        } else {
+            return std::make_unique<WSReadBufferFromFS>(
+                file_path,
+                settings.byte_hdfs_pread ? pread_reader_opts : read_reader_opts,
+                IO::Scheduler::IOSchedulerSet::instance().schedulerForPath(file_path),
+                settings.remote_fs_buffer_size,
+                nullptr,
+                0,
+                settings.remote_throttler);
+        }
+    }
+    else
+    {
+        std::unique_ptr<ReadBufferFromFileBase> impl;
+
+        impl = std::make_unique<ReadBufferFromByteHDFS>(file_path, hdfs_params, settings,
+                nullptr, 0, /* use_external_buffer */ settings.remote_fs_prefetch);
+
+        if (settings.remote_fs_prefetch)
+        {
+            auto global_context = Context::getGlobalContextInstance();
+            auto reader = global_context->getThreadPoolReader();
+            return std::make_unique<AsynchronousBoundedReadBuffer>(std::move(impl), *reader, settings);
+        }
+
+        return impl;
+    }
 }
 
 std::unique_ptr<WriteBufferFromFileBase> DiskByteHDFS::writeFile(const String & path, const WriteSettings & settings)
 {
-    int write_mode = settings.mode == WriteMode::Append ? O_APPEND : O_WRONLY;
+    int write_mode = settings.mode == WriteMode::Append ? (O_APPEND | O_WRONLY) : O_WRONLY;
     return std::make_unique<WriteBufferFromHDFS>(absolutePath(path), hdfs_params, settings.buffer_size, write_mode);
 }
 
@@ -202,7 +249,7 @@ void DiskByteHDFS::removeFileIfExists(const String & path)
 
 void DiskByteHDFS::removeDirectory(const String & path)
 {
-    hdfs_fs.remove(absolutePath(path), true);
+    hdfs_fs.remove(absolutePath(path), false);
 }
 
 void DiskByteHDFS::removeRecursive(const String & path)
@@ -248,6 +295,8 @@ void registerDiskByteHDFS(DiskFactory & factory)
                       const String & config_prefix,
                       ContextPtr context_) -> DiskPtr {
         String path = config.getString(config_prefix + ".path");
+        if (path.empty())
+            throw Exception("Disk path can not be empty. Disk " + name, ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
         if (!path.ends_with("/"))
         {
             path.push_back('/');

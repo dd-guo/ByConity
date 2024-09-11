@@ -15,19 +15,20 @@
 
 #pragma once
 
-#include <Optimizer/tests/test_config.h>
 #include <Optimizer/tests/gtest_base_plan_test.h>
+#include <Optimizer/tests/test_config.h>
 
 namespace DB
 {
 
 /**
- * change resource path in test.config.h.in.
+ * change resource path in test_config.h.in.
  */
 class BaseSsbPlanTest : public AbstractPlanTestSuite
 {
 public:
-    explicit BaseSsbPlanTest(const std::unordered_map<String, Field> & settings = {}) : AbstractPlanTestSuite("ssb", settings)
+    explicit BaseSsbPlanTest(const std::unordered_map<String, Field> & settings = {}, int sf_ = 100, bool use_sample = false)
+        : AbstractPlanTestSuite("ssb" + std::to_string(sf_) + (use_sample ? "_sample" : ""), settings), sf(sf_)
     {
         createTables();
         dropTableStatistics();
@@ -35,9 +36,21 @@ public:
     }
 
     std::vector<std::filesystem::path> getTableDDLFiles() override { return {SSB_TABLE_DDL_FILE}; }
-    std::filesystem::path getStatisticsFile() override { return SSB_TABLE_STATISTICS_FILE; }
+    std::filesystem::path getStatisticsFile() override
+    {
+        return std::filesystem::path(SSB_TABLE_STATISTICS_FOLDER) / getDatabaseName() / "stats.json";
+    }
     std::filesystem::path getQueriesDir() override { return SSB_QUERIES_DIR; }
-    std::filesystem::path getExpectedExplainDir() override { return std::filesystem::path(SSB_EXPECTED_EXPLAIN_RESULT) / "ssb"; }
+    std::filesystem::path getExpectedExplainDir() override
+    {
+        auto dir = getDatabaseName() + label;
+        return std::filesystem::path(SSB_EXPECTED_EXPLAIN_RESULT) / dir;
+    }
+
+    void setLabel(const std::string & label_) { this->label = "_" + label_; }
+
+    int sf;
+    std::string label;
 };
 
 }

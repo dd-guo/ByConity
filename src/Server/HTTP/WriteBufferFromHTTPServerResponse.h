@@ -6,9 +6,11 @@
 #include <IO/Progress.h>
 #include <IO/WriteBuffer.h>
 #include <IO/WriteBufferFromOStream.h>
+#include <Interpreters/DistributedStages/MPPQueryCoordinator.h>
 #include <Server/HTTP/HTTPServerResponse.h>
 #include <Common/NetException.h>
 #include <Common/Stopwatch.h>
+#include <Interpreters/DistributedStages/MPPQueryCoordinator.h>
 
 #include <mutex>
 #include <optional>
@@ -30,6 +32,8 @@ namespace DB
 /// Also this class write and flush special X-ClickHouse-Progress HTTP headers
 ///  if no data was sent at the time of progress notification.
 /// This allows to implement progress bar in HTTP clients.
+class MPPQueryCoordinator;
+using MPPQueryCoordinatorPtr = std::shared_ptr<MPPQueryCoordinator>;
 class WriteBufferFromHTTPServerResponse final : public BufferWithOwnMemory<WriteBuffer>
 {
 private:
@@ -56,6 +60,7 @@ private:
 
     std::mutex mutex;    /// progress callback could be called from different threads.
 
+    MPPQueryCoordinatorPtr coordinator;
 
     /// Must be called under locked mutex.
     /// This method send headers, if this was not done already,
@@ -86,8 +91,7 @@ public:
     /// Send at least HTTP headers if no data has been sent yet.
     /// Use after the data has possibly been sent and no error happened (and thus you do not plan
     /// to change response HTTP code.
-    /// This method is idempotent.
-    void finalize() override;
+    void finalizeImpl() override;
 
     /// Turn compression on or off.
     /// The setting has any effect only if HTTP headers haven't been sent yet.
@@ -115,6 +119,8 @@ public:
     {
         send_progress_interval_ms = send_progress_interval_ms_;
     }
+
+    void setMPPCordinator(MPPQueryCoordinatorPtr coordinator_) { coordinator = std::move(coordinator_); }
 
     ~WriteBufferFromHTTPServerResponse() override;
 };

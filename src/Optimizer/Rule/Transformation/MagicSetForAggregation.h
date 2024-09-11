@@ -15,10 +15,14 @@
 
 #pragma once
 
+#include <Optimizer/Cascades/GroupExpression.h>
 #include <Optimizer/Rule/Rule.h>
+#include <QueryPlan/AnyStep.h>
 
 namespace DB
 {
+class CascadesContext;
+
 /**
  * Magic Set create special partial structure to filter data early.
  * While these options may result in more computation inside the view,
@@ -28,36 +32,39 @@ namespace DB
  * see more
  * - Cost-Based Optimization for Magic: Algebra and Implementation
  * - Sideways Information Passing for Push-Style Query Processing
- *
- * todo
- * - magic set work with dynamic filter.
- * - magic set work with CTE.
- * - implement more push down rules if needed.
  */
 class MagicSetRule : public Rule
 {
 public:
     RuleType getType() const override = 0;
-    PatternPtr getPattern() const override = 0;
-
+    ConstRefPatternPtr getPattern() const override = 0;
     const std::vector<RuleType> & blockRules() const override;
-    bool isEnabled(ContextPtr context) override { return context->getSettingsRef().enable_magic_set; }
+    bool isEnabled(ContextPtr context) const override { return context->getSettingsRef().enable_magic_set; }
+
+    static double getFilterFactor(
+        const PlanNodeStatisticsPtr & source_statistics,
+        const PlanNodeStatisticsPtr & filter_statistics,
+        const Names & source_names,
+        const Names & filter_names);
 
     /*
-     * Build Magic Set as special join: Y filter join X.
+     * Build Magic Set as special join: X Semi join Y.
      * Y is small filter source, X is big target.
      * <pre>
-     * - Inner Join (magic set filter join)
+     * - Semi Join (magic set filter join)
      *     - X
-     *         - Aggregating (add distinct if enforce_distinct)
-     *             - Projection (prune column or reallocate symbol)
-     *                  - Y
+     *     - Projection (prune column or reallocate symbol)
+     *         - Y
      * </pre>
      */
-    static PlanNodePtr buildMagicSetAsFilterJoin(
-        const PlanNodePtr & source, const PlanNodePtr & filter_source,
-        const Names& source_names, const Names& filter_names,
-        ContextMutablePtr & context, bool enforce_distinct = true);
+    static PlanNodePtr buildMagicSetAsSemiJoin(
+        const PlanNodePtr & source,
+        PlanNodePtr filter_source,
+        const Names & source_names,
+        const Names & filter_names,
+        CascadesContext & context);
+
+    static void recordCTERefIntoGroup(PlanNodePtr plan_node, CascadesContext & context);
 };
 
 /**
@@ -72,11 +79,10 @@ public:
  * <pre>
  * - Join or Right Join
  *     - Aggregating
- *         - Inner Join (magic set filter join)
+ *         - Semi Join (magic set filter join)
  *             - X
- *             - Aggregating
- *                 - Projection
- *                     - Y
+ *             - Projection (prune column or reallocate symbol)
+ *                 - Y
  *     - Y
  * </pre>
  */
@@ -85,8 +91,7 @@ class MagicSetForAggregation : public MagicSetRule
 public:
     RuleType getType() const override { return RuleType::MAGIC_SET_FOR_AGGREGATION; }
     String getName() const override { return "MAGIC_SET_FOR_AGGREGATION"; }
-
-    PatternPtr getPattern() const override;
+    ConstRefPatternPtr getPattern() const override;
 
 protected:
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
@@ -108,11 +113,10 @@ protected:
  * - Join or Right Join
  *     - Projection
  *         - Aggregating
- *             - Inner Join (magic set filter join)
+ *             - Semi Join (magic set filter join)
  *                 - X
- *                 - Aggregating
- *                     - Projection
- *                         - Y
+ *                 - Projection
+ *                     - Y
  *     - Y
  * </pre>
  */
@@ -121,8 +125,7 @@ class MagicSetForProjectionAggregation : public MagicSetRule
 public:
     RuleType getType() const override { return RuleType::MAGIC_SET_FOR_PROJECTION_AGGREGATION; }
     String getName() const override { return "MAGIC_SET_FOR_PROJECTION_AGGREGATION"; }
-
-    PatternPtr getPattern() const override;
+    ConstRefPatternPtr getPattern() const override;
 
 protected:
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;

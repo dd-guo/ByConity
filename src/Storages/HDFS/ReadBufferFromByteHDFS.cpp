@@ -13,17 +13,48 @@
  * limitations under the License.
  */
 
-#include <Storages/HDFS/ReadBufferFromByteHDFS.h>
+#include "Storages/HDFS/ReadBufferFromByteHDFS.h"
+#include <Interpreters/RemoteReadLog.h>
+
+#if USE_HDFS
+
 #include "Common/ProfileEvents.h"
-#include <common/logger_useful.h>
+#include "Common/Stopwatch.h"
+#include "Storages/HDFS/HDFSCommon.h"
+#include "Common/Exception.h"
+#include "common/sleep.h"
+
+#include <fcntl.h>
+#include <hdfs/hdfs.h>
+
+namespace ProfileEvents
+{
+    extern const int HdfsFileOpen;
+    extern const int HdfsFileOpenMicroseconds;
+    extern const int ReadBufferFromHdfsRead;
+    extern const int HDFSReadElapsedMicroseconds;
+    extern const int ReadBufferFromHdfsReadBytes;
+    extern const int HDFSSeek;
+    extern const int HDFSSeekElapsedMicroseconds;
+
+    extern const int HdfsSlowNodeCount;
+    extern const int HdfsFailedNodeCount;
+    extern const int HdfsGetBlkLocMicroseconds;
+}
+
 namespace DB
 {
-//static thread_local int64_t maxDnConnection = 0;
-//static thread_local int64_t maxReadPacket = 0;
+namespace ErrorCodes
+{
+    extern const int CANNOT_SEEK_THROUGH_FILE;
+    extern const int UNKNOWN_FILE_SIZE;
+    extern const int NETWORK_ERROR;
+    extern const int CANNOT_OPEN_FILE;
+}
 
 static void ReadBufferFromHdfsCallBack(const hdfsEvent & event)
 {
-    LOG_TRACE(&Poco::Logger::get("ReadBufferFromByteHDFS"), "get event {} & {}", event.eventType, event.value);
+    // LOG_TRACE(&Poco::Logger::get("ReadBufferFromByteHDFS"), "get event {} & {}", event.eventType, event.value);
     switch (event.eventType)
     {
         case Hdfs::Event::HDFS_EVENT_SLOWNODE:
@@ -57,272 +88,322 @@ static void ReadBufferFromHdfsCallBack(const hdfsEvent & event)
 //        }
         default:
             break;
-//                LOG_TRACE(&Logger::get("ReadBufferFromHDFS"), "unused hdfs event type "<< event.eventType);
     }
 }
 
-ReadBufferFromByteHDFS::ReadBufferFromByteHDFS(
-    const String & hdfs_name_,
-    bool pread_,
-    const HDFSConnectionParams & hdfs_params_,
-    size_t buf_size,
-    char * existing_memory,
-    size_t alignment,
-    bool read_all_once_,
-    ThrottlerPtr total_network_throttler_)
-    : ReadBufferFromFileBase(buf_size, existing_memory, alignment)
-    , hdfs_name(hdfs_name_)
-    , pread(pread_)
-    , fuzzy_hdfs_uri(hdfs_name_)
-    , hdfs_files{}
-    , read_all_once(read_all_once_)
-    , hdfs_params(hdfs_params_)
-    , current_pos(0)
-    , offset_in_current_file(0)
-    , builder(nullptr)
-    // for nnproxy, we create a filesystem for each readbuffer. Otherwise, we use the global filesystem.
-    /// , fs(hdfs_params_.conn_type == HDFSConnectionParams::CONN_NNPROXY ? nullptr : DB::getDefaultHdfsFileSystem()->getFS())
-    , fin{nullptr}
-    , total_network_throttler(total_network_throttler_)
+static void doWithRetry(std::function<void()> func)
 {
-    String fuzzyFileNames;
-    uriPrefix = hdfs_name_.substr(0, fuzzy_hdfs_uri.find_last_of('/'));
-    if (uriPrefix.length() == fuzzy_hdfs_uri.length())
+    static constexpr size_t max_retry = 3;
+    size_t sleep_time_with_backoff_milliseconds = 100;
+    for (size_t attempt = 0;; ++attempt)
     {
-        fuzzyFileNames = fuzzy_hdfs_uri;
-        uriPrefix.clear();
-    }
-    else
-    {
-        uriPrefix += "/";
-        fuzzyFileNames = fuzzy_hdfs_uri.substr(uriPrefix.length());
-    }
-
-    Poco::URI uri(uriPrefix); // not include file name
-
-    Strings fuzzyNameList = parseDescription(fuzzyFileNames, 0, fuzzyFileNames.length(), ',', 100 /* hard coded max files */);
-    std::vector<Strings> fileNames;
-    for (auto fuzzyName : fuzzyNameList)
-        fileNames.push_back(parseDescription(fuzzyName, 0, fuzzyName.length(), '|', 100));
-    for (auto & vecNames : fileNames)
-    {
-        for (auto & name : vecNames)
+        bool last_attempt = (attempt + 1 == max_retry);
+        try
         {
-            hdfs_files.push_back(std::move(name));
+            func();
+            return;
+        }
+        catch (...)
+        {
+            if (last_attempt)
+                throw;
+
+            sleepForMilliseconds(sleep_time_with_backoff_milliseconds);
+            sleep_time_with_backoff_milliseconds *= 2;
         }
     }
-
-    builder = hdfs_params.createBuilder(uri);
 }
 
-ReadBufferFromByteHDFS::~ReadBufferFromByteHDFS()
+struct ReadBufferFromByteHDFS::ReadBufferFromHDFSImpl
 {
-    close();
+    HDFSConnectionParams hdfs_params;
+    bool pread {false};
+    RemoteReadLog * remote_read_log;
+    String remote_read_context;
+    size_t read_until_position = 0;
+
+    String hdfs_file_path;
+    HDFSBuilderPtr builder;
+    HDFSFSPtr fs;
+    hdfsFile fin;
+
+    size_t file_offset = 0;
+
+    ReadBufferFromHDFSImpl(
+        const String & hdfs_file_path_,
+        const HDFSConnectionParams & hdfs_params_,
+        size_t read_until_position_,
+        const ReadSettings & settings_)
+        : hdfs_params(hdfs_params_)
+        , pread(settings_.byte_hdfs_pread)
+        , remote_read_log(settings_.remote_read_log)
+        , remote_read_context(settings_.remote_read_context)
+        , read_until_position(read_until_position_)
+    {
+        Poco::URI uri(hdfs_file_path_);
+        hdfs_file_path = uri.getPath();
+
+        builder = hdfs_params_.createBuilder(uri);
+        doWithRetry([this] {
+            fs = createHDFSFS(builder.get());
+        });
+
+        Stopwatch watch;
+        doWithRetry([this] {
+            ProfileEvents::increment(ProfileEvents::HdfsFileOpen);
+            fin = hdfsOpenFile(fs.get(), hdfs_file_path.c_str(), O_RDONLY, 0, 0, 0, ReadBufferFromHdfsCallBack);
+            if (!fin)
+                throw Exception(ErrorCodes::CANNOT_OPEN_FILE, "Fail to open hdfs file {}. Error: {}", hdfs_file_path, std::string(hdfsGetLastError()));
+        });
+        ProfileEvents::increment(ProfileEvents::HdfsFileOpenMicroseconds, watch.elapsedMicroseconds());
+    }
+
+    ~ReadBufferFromHDFSImpl()
+    {
+        hdfsCloseFile(fs.get(), fin);
+        fin = nullptr;
+    }
+
+    size_t readImpl(char * to, size_t bytes)
+    {
+        size_t num_bytes_to_read = bytes;
+        if (read_until_position)
+        {
+            if (read_until_position == file_offset)
+                return 0;
+
+            if (read_until_position < file_offset)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Attempt to read beyond right offset ({} > {})", file_offset, read_until_position - 1);
+
+            num_bytes_to_read = std::min(bytes, read_until_position - file_offset);
+        }
+
+        Stopwatch watch;
+        const auto request_time = std::chrono::system_clock::now();
+        size_t total_bytes_read = 0;
+        do
+        {
+            int bytes_read = 0;
+
+            if (pread)
+                bytes_read = hdfsPRead(fs.get(), fin, to + total_bytes_read, num_bytes_to_read - total_bytes_read);
+            else
+                bytes_read = hdfsRead(fs.get(), fin, to + total_bytes_read, num_bytes_to_read - total_bytes_read);
+
+            if (bytes_read < 0)
+            {
+                throw Exception(
+                    ErrorCodes::NETWORK_ERROR,
+                    "Fail to read from HDFS file path: {}. Error: {}",
+                    hdfs_file_path,
+                    std::string(hdfsGetLastError()));
+            }
+            if (bytes_read == 0)
+                break;
+            total_bytes_read += bytes_read;
+        } while (total_bytes_read < num_bytes_to_read);
+
+        auto duration_us = watch.elapsedMicroseconds();
+        if (remote_read_log)
+            remote_read_log->insert(request_time, hdfs_file_path, file_offset, total_bytes_read, duration_us, remote_read_context);
+        file_offset += total_bytes_read;
+
+        ProfileEvents::increment(ProfileEvents::ReadBufferFromHdfsRead, 1);
+        ProfileEvents::increment(ProfileEvents::ReadBufferFromHdfsReadBytes, total_bytes_read);
+        ProfileEvents::increment(ProfileEvents::HDFSReadElapsedMicroseconds, duration_us);
+        return total_bytes_read;
+    }
+
+    void seek(off_t offset)
+    {
+        Stopwatch watch;
+        int status = hdfsSeek(fs.get(), fin, offset);
+        if (status != 0)
+            throw Exception(ErrorCodes::CANNOT_SEEK_THROUGH_FILE, "Fail to seek HDFS file: {}, error: {}", hdfs_file_path, std::string(hdfsGetLastError()));
+
+        file_offset = offset;
+
+        ProfileEvents::increment(ProfileEvents::HDFSSeek);
+        ProfileEvents::increment(ProfileEvents::HDFSSeekElapsedMicroseconds, watch.elapsedMicroseconds());
+    }
+
+    off_t getPosition() const
+    {
+        return file_offset;
+    }
+
+    size_t getFileSize() const
+    {
+        auto * file_info = hdfsGetPathInfo(fs.get(), hdfs_file_path.c_str());
+        if (!file_info)
+            throw Exception(ErrorCodes::UNKNOWN_FILE_SIZE, "Cannot find out file size for: {}", hdfs_file_path);
+        return file_info->mSize;
+    }
+
+    void setReadUntilPosition(size_t position)
+    {
+        if (position != static_cast<size_t>(read_until_position))
+            read_until_position = position;
+    }
+
+    void setReadUntilEnd()
+    {
+        if (read_until_position)
+            read_until_position = 0;
+    }
+};
+
+ReadBufferFromByteHDFS::ReadBufferFromByteHDFS(
+    const String & hdfs_file_path_,
+    const HDFSConnectionParams & hdfs_params_,
+    const ReadSettings & read_settings,
+    char * existing_memory_,
+    size_t alignment_,
+    bool use_external_buffer_,
+    off_t read_until_position_,
+    std::optional<size_t> file_size_)
+    : ReadBufferFromFileBase(use_external_buffer_ ? 0 : read_settings.remote_fs_buffer_size, existing_memory_, alignment_, file_size_)
+    , settings(read_settings)
+    , impl(std::make_unique<ReadBufferFromHDFSImpl>(hdfs_file_path_, hdfs_params_, read_until_position_, settings))
+    , total_network_throttler(settings.remote_throttler)
+{
 }
 
-void ReadBufferFromByteHDFS::close()
+ReadBufferFromByteHDFS::~ReadBufferFromByteHDFS() = default;
+
+IAsynchronousReader::Result ReadBufferFromByteHDFS::readInto(char * data, size_t size, size_t read_offset, size_t ignore_bytes)
 {
-    hdfsCloseFile(fs.get(), fin);
-    fin = nullptr;
+    /**
+     * Set `data` to current working and internal buffers.
+     * Internal buffer with size `size`. Working buffer with size 0.
+     */
+    set(data, size);
+
+    bool result = false;
+
+    seek(read_offset, SEEK_SET);
+    /**
+     * Lazy seek is performed here.
+     * In asynchronous buffer when seeking to offset in range [pos, pos + min_bytes_for_seek]
+     * we save how many bytes need to be ignored (new_offset - position() bytes).
+     */
+    if (ignore_bytes)
+    {
+        ignore(ignore_bytes);
+        result = hasPendingData();
+        ignore_bytes = 0;
+    }
+
+    if (!result)
+        result = next();
+
+    /// Required for non-async reads.
+    if (result)
+    {
+        assert(available());
+        // nextimpl_working_buffer_offset = offset;
+        return { working_buffer.size(), BufferBase::offset(), nullptr };
+    }
+
+    return {0, 0, nullptr};
 }
 
 bool ReadBufferFromByteHDFS::nextImpl()
 {
-    int offset = 0;
-    int size = internal_buffer.size();
-    Stopwatch watch(profile_callback ? clock_type : CLOCK_MONOTONIC);
-    // If hdfs connection is not trigger, do it now
-    tryConnect();
-
-    do
+    int bytes_read = impl->readImpl(internal_buffer.begin(), internal_buffer.size());
+    if (bytes_read)
     {
-        ProfileEvents::increment(ProfileEvents::ReadBufferFromHdfsRead);
-        assertValidBuffer(offset, size);
-        int done = -1;
-        if (pread)
-            done = hdfsPRead(fs.get(), fin, internal_buffer.begin() + offset, size);
-        else
-            done = hdfsRead(fs.get(), fin, internal_buffer.begin() + offset, size);
-        if (done < 0)
-        {
-            ProfileEvents::increment(ProfileEvents::ReadBufferFromHdfsReadFailed);
-            throw Exception(
-                "Fail to read HDFS file: " + hdfs_files[current_pos] + " " + String(hdfsGetLastError()), ErrorCodes::CANNOT_OPEN_FILE);
-        }
+        working_buffer = internal_buffer;
+        working_buffer.resize(bytes_read);
 
-        // Update position in current file
-        offset_in_current_file += done;
+        if (total_network_throttler)
+            total_network_throttler->add(bytes_read);
+        return true;
+    }
 
-        if (done)
-        {
-            ///ProfileEvents::increment(ProfileEvents::NetworkReadBytes, done);
-            ProfileEvents::increment(ProfileEvents::ReadBufferFromHdfsReadBytes, done);
-            if (total_network_throttler)
-            {
-                total_network_throttler->add(done);
-            }
-            if (!read_all_once)
-            {
-                working_buffer.resize(done);
-                break;
-            }
-            else
-            {
-                offset += done;
-                size -= done;
-                if (size > 0)
-                {
-                    continue;
-                }
-                else
-                {
-                    working_buffer.resize(offset);
-                    break;
-                }
-            }
-        }
-        else
-        {
-            // reach eof of one file, go to next file if there is
-            if (current_pos < hdfs_files.size() - 1)
-            {
-                ++current_pos;
-                offset_in_current_file = 0;
-                close(); // close current hdfs file
-                Poco::URI uri(uriPrefix + hdfs_files[current_pos]);
-                auto & path = uri.getPath();
-                int retry = 0;
-                do
-                {
-                    ProfileEvents::increment(ProfileEvents::HdfsFileOpen);
-                    fin = hdfsOpenFile(fs.get(), path.c_str(), O_RDONLY, 0, 0, 0, ReadBufferFromHdfsCallBack);
-                    if (retry++ > 1)
-                        break; // retry one more time in case namenode instable
-                } while (fin == nullptr);
-            }
-            else
-            {
-                return false;
-            }
-        }
-
-    } while (true);
-
-    watch.stop();
-    ProfileEvents::increment(ProfileEvents::HDFSReadElapsedMilliseconds, watch.elapsedMilliseconds());
-    return true;
+    return false;
 }
 
-void ReadBufferFromByteHDFS::tryConnect()
+off_t ReadBufferFromByteHDFS::seek(off_t offset_, int whence_)
 {
+    if (whence_ == SEEK_CUR)
+        offset_ = getPosition() + offset_;
+    else if (whence_ != SEEK_SET)
+        throw Exception("Seek expects SEEK_SET or SEEK_CUR as whence", ErrorCodes::BAD_ARGUMENTS);
+    assert(offset_ >= 0);
 
-    if(fs == nullptr) {
-        int retry = 0 ;
-        Poco::URI uri(uriPrefix);
-        do{
-            // add retry on failure.
-            fs = createHDFSFS(builder.get());
-            if (fs == nullptr)
-            {
-                hdfs_params.setNNProxyBroken();
-                hdfs_params.lookupOnNeed();
-                builder = hdfs_params.createBuilder(uri);
-                if(retry++ >2) {
-                    throw Exception(
-                        "Unable to connect to HDFS with " + hdfs_params.toString() + " error: " + String(hdfsGetLastError()),
-                        ErrorCodes::ALL_CONNECTION_TRIES_FAILED);
-                }
-            }
-        } while(fs ==nullptr);
-    }
+    if (offset_ == getPosition())
+        return offset_;
 
-    if ( fin == nullptr)
+    /// new position still inside working buffer
+    /// impl->getPosition() is the file position of the working buffer end
+    /// Therefore working buffer corresponds to the file range
+    /// [impl->getPosition() - working_buffer.size(), impl->getPosition()]
+    if (!working_buffer.empty()
+        && size_t(offset_) >= impl->getPosition() - working_buffer.size()
+        && offset_ <= impl->getPosition())
     {
-        int retry = 0;
-        Poco::URI uri(uriPrefix + hdfs_files[current_pos]);
-        auto & path = uri.getPath();
-        do
-        {
-            ProfileEvents::increment(ProfileEvents::HdfsFileOpen);
-            fin = hdfsOpenFile(fs.get(), path.c_str(), O_RDONLY, 0, 0, 0, ReadBufferFromHdfsCallBack);
-            if (retry++ > 1)
-                break; // retry one more time in case namenode instable
-        } while (fin == nullptr);
-
-        if (fin == nullptr)
-        {
-            const char * last_err = hdfsGetLastError();
-            String err_msg = last_err == nullptr ? "" : String(last_err);
-            throw Exception("ReadBufferFromByteHDFS::cannot open file, " + err_msg, ErrorCodes::CANNOT_OPEN_FILE);
-        }
+        pos = working_buffer.end() - (impl->getPosition() - offset_);
+        assert(pos >= working_buffer.begin());
+        assert(pos <= working_buffer.end());
+        return getPosition();
     }
+
+    resetWorkingBuffer();
+    impl->seek(offset_);
+    return getPosition();
 }
 
-off_t ReadBufferFromByteHDFS::doSeek(off_t offset, int whence)
+off_t ReadBufferFromByteHDFS::getPosition()
 {
-    size_t new_pos;
-    if (whence == SEEK_SET)
-    {
-        assert(offset >= 0);
-        new_pos = offset;
-    }
-    else if (whence == SEEK_CUR)
-    {
-        /// calculate seek position in file based on current position in file
-        /// offset_in_current_file: pos in file of 'working buffer end'
-        size_t pos_in_file = offset_in_current_file - (working_buffer.end() - pos);
-        new_pos = pos_in_file + offset;
-    }
-    else
-    {
-        throw Exception("ReadBufferFromByteHDFS::seek expects SEEK_SET or SEEK_CUR as whence", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
-    }
-
-    tryConnect();
-
-    size_t pos_in_file = offset_in_current_file;
-    // Seek to current position
-    if (new_pos + (working_buffer.end() - pos) == pos_in_file)
-        return new_pos;
-
-    if (hasPendingData() && new_pos <= pos_in_file && new_pos >= pos_in_file - working_buffer.size())
-    {
-        /// Position is still inside buffer.
-        pos = working_buffer.begin() + (new_pos - (pos_in_file - working_buffer.size()));
-        return new_pos;
-    }
-    else
-    {
-        ProfileEvents::increment(ProfileEvents::HDFSSeek);
-        Stopwatch watch;
-
-        pos = working_buffer.end();
-        if (!hdfsSeek(fs.get(), fin, new_pos))
-        {
-            offset_in_current_file = new_pos;
-            ProfileEvents::increment(ProfileEvents::HDFSSeekElapsedMicroseconds, watch.elapsedMicroseconds());
-            return new_pos;
-        }
-        else
-        {
-            const char * last_err = hdfsGetLastError();
-            String err_msg = last_err == nullptr ? "" : String(last_err);
-            throw Exception("ReadBufferFromByteHDFS::cannot seek to the offset, " + err_msg, ErrorCodes::CANNOT_SEEK_THROUGH_FILE);
-        }
-    }
-    // return -1;
+    return impl->getPosition() - available();
 }
 
 size_t ReadBufferFromByteHDFS::getFileSize()
 {
-    tryConnect();
+    if (file_size)
+        return *file_size;
 
-    Poco::URI uri(uriPrefix + hdfs_files[current_pos]);
-    auto & hdfs_file_path = uri.getPath();
-    auto * file_info = hdfsGetPathInfo(fs.get(), hdfs_file_path.c_str());
-    if (!file_info)
-        throw Exception(ErrorCodes::UNKNOWN_FILE_SIZE, "Cannot find out file size for: {}", hdfs_file_path);
-    return file_info->mSize;
+    file_size = impl->getFileSize();
+    return *file_size;
+}
+
+String ReadBufferFromByteHDFS::getFileName() const
+{
+    return impl->hdfs_file_path;
+}
+
+void ReadBufferFromByteHDFS::setReadUntilPosition(size_t position)
+{
+    impl->setReadUntilPosition(position);
+}
+
+void ReadBufferFromByteHDFS::setReadUntilEnd()
+{
+    impl->setReadUntilEnd();
+}
+
+size_t ReadBufferFromByteHDFS::getFileOffsetOfBufferEnd() const {
+    return impl->file_offset;
+}
+
+size_t ReadBufferFromByteHDFS::readBigAt(char * to, size_t n, size_t range_begin, const std::function<bool(size_t)> & progress_callback)
+{
+    if (n == 0)
+        return 0;
+
+    auto pooled_impl = impl_pool.get([this] (){
+        return new ReadBufferFromHDFSImpl(impl->hdfs_file_path, impl->hdfs_params, 0, settings);
+    });
+
+    pooled_impl->seek(range_begin);
+    size_t bytes_read = pooled_impl->readImpl(to, n);
+
+    if (bytes_read && progress_callback)
+        progress_callback(bytes_read);
+    return bytes_read;
 }
 
 }
+
+#endif

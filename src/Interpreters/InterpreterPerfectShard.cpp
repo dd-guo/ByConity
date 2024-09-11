@@ -41,6 +41,7 @@
 #include <QueryPlan/AggregatingStep.h>
 
 #include <IO/WriteBufferFromString.h>
+#include <Common/Exception.h>
 
 #include <queue>
 
@@ -79,8 +80,15 @@ bool InterpreterPerfectShard::checkPerfectShardable()
     if (checkIfSelectListExistConstant(select->select()))
         return false;
 
-    if (!checkAggregationReturnType())
+    try
+    {
+        if (!checkAggregationReturnType())
+            return false;
+    }catch(...)
+    {
+        tryLogCurrentException("Cannot apply perfect-shard when check aggregation return type, fallback to normal mode");
         return false;
+    }
 
     return perfect_shardable;
 }
@@ -164,17 +172,9 @@ void InterpreterPerfectShard::buildQueryPlan(QueryPlan & query_plan)
 
     sendQuery(query_plan);
 
-    try
-    {
-        buildFinalPlan(query_plan);
+    buildFinalPlan(query_plan);
 
-        LOG_DEBUG(log, "Perfect-Shard applied");
-
-    }catch(...){
-        tryLogCurrentException(log, __PRETTY_FUNCTION__);
-        LOG_DEBUG(log, "Build query plan for Perfect-Shard failed, fallback to original plan");
-        perfect_shardable = false;
-    }
+    LOG_DEBUG(log, "Perfect-Shard applied");
 }
 
 QueryProcessingStage::Enum InterpreterPerfectShard::determineProcessingStage()
@@ -209,7 +209,7 @@ void InterpreterPerfectShard::sendQuery(QueryPlan & query_plan)
     }
 
     ClusterProxy::SelectStreamFactory select_stream_factory = ClusterProxy::SelectStreamFactory(
-        header, processed_stage, StorageID(main_database, main_table), scalars, false, context->getExternalTables()
+        header, {}, {}, processed_stage, StorageID(main_database, main_table), scalars, false, context->getExternalTables()
     );
 
     LOG_TRACE(log, "Perfect-Shard will send query {} ", queryToString(query));
@@ -240,7 +240,13 @@ void InterpreterPerfectShard::buildFinalPlan(QueryPlan & query_plan)
         interpreter.executeLimitBy(query_plan);
     }
 
-    interpreter.executeProjection(query_plan, interpreter.analysis_result.final_projection);
+     if (processed_stage != QueryProcessingStage::Complete)
+     {
+        // LOG_DEBUG(log, fmt::format("query plan header: {}, final_projection: {}", 
+        //     query_plan.getCurrentDataStream().header.dumpStructure(),
+        //     interpreter.analysis_result.final_projection->dumpDAG()));
+        interpreter.executeProjection(query_plan, interpreter.analysis_result.final_projection);
+     }
 
     interpreter.executeLimit(query_plan);
     interpreter.executeOffset(query_plan);
@@ -262,7 +268,7 @@ String InterpreterPerfectShard::getAggregationName(const String & function_name,
         return getAggregationName(function_name, nullable->getNestedType());
     // TODO: bitmap64, pathfind, stack is not implement right now
     else
-        return "";
+        throw Exception(fmt::format("Cannot apply perfect-shard for function {}", function_name), ErrorCodes::NOT_IMPLEMENTED);
 }
 
 void InterpreterPerfectShard::addAggregation(QueryPlan & query_plan)
@@ -290,7 +296,8 @@ void InterpreterPerfectShard::addAggregation(QueryPlan & query_plan)
             if (it != original_project.end())
                 argument_column_name = it->second;
         }
-        aggregate.column_name = descr.column_name;
+        //aggregate.column_name = descr.column_name;
+        aggregate.column_name = argument_column_name;
         aggregate.argument_names.push_back(argument_column_name);
         aggregate.arguments.push_back(header_before_aggregation.getPositionByName(argument_column_name));
         DataTypePtr type = header_before_aggregation.getByName(argument_column_name).type;
@@ -311,9 +318,16 @@ void InterpreterPerfectShard::addAggregation(QueryPlan & query_plan)
     // TODO: determine overflow
     bool overflow_row = false;
 
+    for (const auto & agg : aggregates)
+    {
+        WriteBufferFromOwnString buffer;
+        agg.explain(buffer, 0);
+        LOG_DEBUG(log, fmt::format("perfect-shard aggregates: {}", buffer.str()));
+    }
+
     Aggregator::Params params(header_before_aggregation, keys, aggregates,
-                              overflow_row,
-                              settings.max_threads);
+                              overflow_row, 
+                              settings.max_threads); // TODO support agg spill param
 
     auto merge_threads = interpreter.getMaxStreams();
     auto temporary_data_merge_threads = settings.aggregation_memory_efficient_merge_threads
@@ -321,19 +335,26 @@ void InterpreterPerfectShard::addAggregation(QueryPlan & query_plan)
                                         : static_cast<size_t>(settings.max_threads);
 
     bool storage_has_evenly_distributed_read = false;
+    PlanHints hints{};
 
+    //LOG_DEBUG(log, fmt::format("query plan header: {}, header_before_aggregation: {}", query_plan.getCurrentDataStream().header.dumpStructure(), header_before_aggregation.dumpStructure()));
     auto aggregating_step = std::make_unique<AggregatingStep>(
-            query_plan.getCurrentDataStream(),
-            params, GroupingSetsParamsList{}, true,
-            settings.max_block_size,
-            merge_threads,
-            temporary_data_merge_threads,
-            storage_has_evenly_distributed_read,
-            std::move(group_by_info),
-            std::move(group_by_sort_description),
-            // because final_=true => no further merging/aggregating step =>
-            // should_produce_results_in_order_of_bucket_number_ = false
-            false);
+        query_plan.getCurrentDataStream(),
+        params,
+        NameSet{},
+        GroupingSetsParamsList{},
+        true,
+        settings.max_block_size,
+        merge_threads,
+        temporary_data_merge_threads,
+        storage_has_evenly_distributed_read,
+        std::move(group_by_info),
+        std::move(group_by_sort_description),
+        // because final_=true => no further merging/aggregating step =>
+        // should_produce_results_in_order_of_bucket_number_ = false
+        false,
+        false,
+        hints);
 
     query_plan.addStep(std::move(aggregating_step));
 }
@@ -377,6 +398,7 @@ bool InterpreterPerfectShard::checkAggregationReturnType() const
                     argument_column_name = it->second;
             }
             DataTypePtr type = result_header.getByName(argument_column_name).type;
+
             return !getAggregationName(descr.function->getName(), type).empty();
         };
 
@@ -386,8 +408,19 @@ bool InterpreterPerfectShard::checkAggregationReturnType() const
                 return false;
         }
     }
+    else
+        return false;
 
     return true;
+}
+
+void InterpreterPerfectShard::turnOffPerfectShard(ContextMutablePtr context, ASTPtr &)
+{
+    SettingsChanges setting_changes;
+
+    setting_changes.emplace_back("distributed_perfect_shard", false);
+
+    context->applySettingsChanges(setting_changes);
 }
 
 }

@@ -16,8 +16,8 @@
 #pragma once
 
 #include <Interpreters/Context.h>
+#include <Optimizer/Property/Equivalences.h>
 #include <Optimizer/Rewriter/Rewriter.h>
-#include <Optimizer/Equivalences.h>
 #include <QueryPlan/SimplePlanVisitor.h>
 
 namespace DB
@@ -25,10 +25,13 @@ namespace DB
 class UnifyJoinOutputs : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "UnifyJoinOutputs"; }
-
 private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override
+    {
+        return context->getSettingsRef().enable_unify_join_outputs;
+    }   
     class UnionFindExtractor;
     class Rewriter;
 };
@@ -56,7 +59,7 @@ public:
 
 private:
     ContextMutablePtr context;
-    CTEPreorderVisitHelper cte_helper;
+    SimpleCTEVisitHelper<PlanNodePtr> cte_helper;
     std::unordered_map<PlanNodeId, UnionFind<String>> & union_find_map;
 };
 }

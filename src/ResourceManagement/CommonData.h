@@ -16,16 +16,20 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
+#include <Common/formatReadable.h>
 #include <Common/HostWithPorts.h>
 #include <Core/Types.h>
 #include <Core/UUID.h>
+#include <Core/SettingsEnums.h>
 #include <ResourceManagement/VirtualWarehouseType.h>
 #include <ResourceManagement/VWScheduleAlgo.h>
 #include <ResourceManagement/WorkerGroupType.h>
+#include <Protos/data_models.pb.h>
 
 namespace DB
 {
@@ -43,34 +47,73 @@ namespace DB::Protos
     class WorkerNodeResourceData;
     class WorkerGroupData;
     class WorkerGroupMetrics;
+    class WorkerMetrics;
 }
 
 namespace DB::ResourceManagement
 {
 
+struct QueueRule
+{
+    std::string rule_name;
+    std::vector<std::string> databases;
+    std::vector<std::string> tables;
+    std::string query_id;
+    std::string user;
+    std::string ip;
+    std::string fingerprint;
+
+    void fillProto(Protos::QueueRule & queue_rule) const;
+    void parseFromProto(const Protos::QueueRule & queue_rule);
+};
+
+struct QueueData
+{
+    std::string queue_name;
+    size_t max_concurrency{100};
+    size_t query_queue_size{200};
+    std::vector<QueueRule> queue_rules;
+
+    void fillProto(Protos::QueueData & queue_data) const;
+    void parseFromProto(const Protos::QueueData & queue_data);
+};
+
 struct VirtualWarehouseSettings
 {
+    /// basic information ///
     VirtualWarehouseType type{VirtualWarehouseType::Unknown};
-    size_t num_workers{0}; /// per group
-    size_t min_worker_groups{0};
-    size_t max_worker_groups{0};
+    size_t min_worker_groups{0}; // include shared groups
+    size_t max_worker_groups{0}; // include shared groups
+    size_t num_workers{0}; /// #worker per group
+    size_t auto_suspend{0};
+    size_t auto_resume{1};
+
+    /// vw queue (resource group) ///
     size_t max_concurrent_queries{0};
     size_t max_queued_queries{0};
     size_t max_queued_waiting_ms{5000};
-    size_t auto_suspend{0};
-    size_t auto_resume{1};
     VWScheduleAlgo vw_schedule_algo{VWScheduleAlgo::Random};
+
+    /// resource coordinator (auto-sharing & auto-scaling) ///
     size_t max_auto_borrow_links{0};
     size_t max_auto_lend_links{0};
-    size_t cpu_threshold_for_borrow{100};
-    size_t mem_threshold_for_borrow{100};
-    size_t cpu_threshold_for_lend{0};
-    size_t mem_threshold_for_lend{0};
+
+    // vw is allowed to create a new shared wg link to other wg(in other vw) if metric > threshold
+    size_t cpu_busy_threshold{100};
+    size_t mem_busy_threshold{100};
+
+    // vw is allowed to share its wg to other vws if metric < threshold.
+    size_t cpu_idle_threshold{0};
+    size_t mem_idle_threshold{0};
+
+    // if vw has lent wgs and metrc > threshold, recall the lent wg (by drop the shared wg).
     size_t cpu_threshold_for_recall{100};
     size_t mem_threshold_for_recall{100};
-    size_t cooldown_seconds_after_auto_link{300};
-    size_t cooldown_seconds_after_auto_unlink{300};
 
+    size_t cooldown_seconds_after_scaleup{300};
+    size_t cooldown_seconds_after_scaledown{300};
+
+    std::vector<QueueData> queue_datas;
 
     void fillProto(Protos::VirtualWarehouseSettings & pb_settings) const;
     void parseFromProto(const Protos::VirtualWarehouseSettings & pb_settings);
@@ -97,14 +140,30 @@ struct VirtualWarehouseAlterSettings
     std::optional<VWScheduleAlgo> vw_schedule_algo;
     std::optional<size_t> max_auto_borrow_links;
     std::optional<size_t> max_auto_lend_links;
-    std::optional<size_t> cpu_threshold_for_borrow;
-    std::optional<size_t> mem_threshold_for_borrow;
-    std::optional<size_t> cpu_threshold_for_lend;
-    std::optional<size_t> mem_threshold_for_lend;
+    std::optional<size_t> cpu_busy_threshold;
+    std::optional<size_t> mem_busy_threshold;
+    std::optional<size_t> cpu_idle_threshold;
+    std::optional<size_t> mem_idle_threshold;
     std::optional<size_t> cpu_threshold_for_recall;
     std::optional<size_t> mem_threshold_for_recall;
-    std::optional<size_t> cooldown_seconds_after_auto_link;
-    std::optional<size_t> cooldown_seconds_after_auto_unlink;
+    std::optional<size_t> cooldown_seconds_after_scaleup;
+    std::optional<size_t> cooldown_seconds_after_scaledown;
+
+    Protos::QueueAlterType queue_alter_type {Protos::QueueAlterType::UNKNOWN};
+    std::optional<size_t> max_concurrency;
+    std::optional<size_t> query_queue_size;
+    std::optional<String> query_id;
+    std::optional<String> user;
+    std::optional<String> ip;
+    std::optional<String> rule_name;
+    std::optional<String> fingerprint;
+    std::optional<String> queue_name;
+    bool has_table {false};
+    bool has_database {false};
+    std::vector<String> tables;
+    std::vector<String> databases;
+
+    std::optional<QueueData> queue_data;
 
     void fillProto(Protos::VirtualWarehouseAlterSettings & pb_settings) const;
     void parseFromProto(const Protos::VirtualWarehouseAlterSettings & pb_settings);
@@ -116,7 +175,6 @@ struct VirtualWarehouseAlterSettings
         return vw_settings;
     }
 };
-
 struct VirtualWarehouseData
 {
     /// constants
@@ -189,20 +247,27 @@ struct WorkerNodeResourceData
     std::string worker_group_id;
 
     double cpu_usage;
+    double cpu_usage_1min;
     double memory_usage;
+    double memory_usage_1min;
     UInt64 memory_available;
     UInt64 disk_space;
     UInt32 query_num;
+    UInt32 manipulation_num;
+    UInt32 consumer_num;
 
     UInt64 cpu_limit;
     UInt64 memory_limit;
 
+    // TODO: consider using UInt64 here to avoid Year 2038 problem
     UInt32 register_time;
+    // TODO: consider using UInt64 here to avoid Year 2038 problem
     UInt32 last_update_time;
 
     UInt64 reserved_memory_bytes;
     UInt32 reserved_cpu_cores;
     WorkerState state;
+    UInt64 last_status_create_time {0};
 
     std::string serializeAsString() const;
     void parseFromString(const std::string & s);
@@ -213,20 +278,17 @@ struct WorkerNodeResourceData
         res.parseFromString(s);
         return res;
     }
+    WorkerNodeResourceData() = default;
+    WorkerNodeResourceData(const Protos::WorkerNodeResourceData & resource_info);
 
     void fillProto(Protos::WorkerNodeResourceData & resource_info) const;
     static WorkerNodeResourceData createFromProto(const Protos::WorkerNodeResourceData & resource_info);
     inline String toDebugString() const
     {
         std::stringstream ss;
-        ss << "{ vw:" << vw_name
-        << ", worker_group:" << worker_group_id
-        << ", id:" << id
-        << ", cpu_usage:" << cpu_usage
-        << ", memory_usage:" << memory_usage
-        << ", memory_available:" << memory_available
-        << ", query_num:" << query_num
-        << " }";
+        ss << "{ vw:" << vw_name << ", worker_group:" << worker_group_id << ", id:" << id << ", register_time: " << register_time
+           << ", cpu_usage:" << cpu_usage << ", memory_usage:" << memory_usage
+           << ", memory_available:" << formatReadableSizeWithDecimalSuffix(memory_available) << ", query_num:" << query_num << " }";
         return ss.str();
     }
 };
@@ -277,32 +339,40 @@ struct ResourceRequirement
 
 };
 
-/// Worker Group's aggregated metrics.
+struct WorkerMetrics
+{
+    String id;
+
+    double cpu_1min{0};
+    double mem_1min{0};
+    uint32_t num_queries{0};
+    uint32_t num_manipulations{0};
+    uint32_t num_consumers{0};
+    uint32_t num_dedups{0};
+
+    void fillProto(Protos::WorkerMetrics & data) const;
+    void parseFromProto(const Protos::WorkerMetrics & data);
+    static inline auto createFromProto(const Protos::WorkerMetrics & pb_data)
+    {
+        WorkerMetrics metrics;
+        metrics.parseFromProto(pb_data);
+        return metrics;
+    }
+
+    inline auto numTasks() const
+    {
+        return num_manipulations + num_consumers + num_dedups;
+    }
+};
+
+/// Worker Group's metrics.
 struct WorkerGroupMetrics
 {
     String id;
-    uint32_t num_workers; /// 0 means metrics (and the worker group) is unavailable.
 
-    /// CPU state.
-    double min_cpu_usage;
-    double max_cpu_usage;
-    double avg_cpu_usage;
+    std::vector<WorkerMetrics> worker_metrics_vec;
 
-    /// MEM state.
-    double min_mem_usage;
-    double max_mem_usage;
-    double avg_mem_usage;
-    uint64_t min_mem_available;
-
-    /// Query State.
-    uint32_t total_queries;
-
-    WorkerGroupMetrics(const String & _id = "") : id(_id)
-    {
-        min_cpu_usage = std::numeric_limits<double>::max();
-        min_mem_usage = std::numeric_limits<double>::max();
-        min_mem_available = std::numeric_limits<uint64_t>::max();
-    }
+    WorkerGroupMetrics(const String & _id = "") : id(_id) { }
 
     void reset();
     void fillProto(Protos::WorkerGroupMetrics & proto) const;
@@ -314,36 +384,36 @@ struct WorkerGroupMetrics
         return metrics;
     }
 
-    bool available(const ResourceRequirement & requirement) const
+    bool available([[maybe_unused]] const ResourceRequirement & requirement) const
     {
-        /// Worker group is unavailable if there are not enough active workers.
-        if (num_workers < requirement.expected_workers)
-            return false;
-
-        /// Worker group is unavailable if any worker's cpu usage is higher than the threshold.
-        if (requirement.cpu_usage_max_threshold > 0.01 && max_cpu_usage > requirement.cpu_usage_max_threshold)
-            return false;
-
-        /// Worker group is unavailable if any worker's available memory space is less than request.
-        if (requirement.request_mem_bytes && min_mem_available < requirement.request_mem_bytes)
-            return false;
-
-        if (requirement.blocklist.contains(id))
-            return false;
-
+        /// TODO: TBC
         return true;
     }
 
-    inline String toDebugString() const
+    double avg_cpu_1min() const
     {
-        std::stringstream ss;
-        ss << id << ":"
-            << max_cpu_usage << "|" << min_cpu_usage << "|" << avg_cpu_usage << "|"
-            << max_mem_usage << "|" << min_mem_usage << "|" << avg_mem_usage << "|" << min_mem_available
-            << "|" << total_queries;
-        return ss.str();
+        if (worker_metrics_vec.empty())
+            return 0;
+
+        double sum = 0;
+        for (const auto & metrics : worker_metrics_vec)
+            sum += metrics.cpu_1min;
+        return sum / worker_metrics_vec.size();
+    }
+
+    double avg_mem_1min() const
+    {
+        if (worker_metrics_vec.empty())
+            return 0;
+
+        double sum = 0;
+        for (const auto & metrics : worker_metrics_vec)
+            sum += metrics.mem_1min;
+        return sum / worker_metrics_vec.size();
     }
 };
+
+
 
 struct WorkerGroupData
 {
@@ -358,11 +428,13 @@ struct WorkerGroupData
     std::vector<HostWithPorts> host_ports_vec;
     size_t num_workers{};
 
+    std::vector<WorkerNodeResourceData> worker_node_resource_vec;
     /// For query scheduler
     WorkerGroupMetrics metrics;
 
     bool is_auto_linked {false};
     std::string linked_vw_name;
+    Int64 priority {0};
 
     std::string serializeAsString() const;
     void parseFromString(const std::string & s);
@@ -415,4 +487,5 @@ using WorkerGroupData = RM::WorkerGroupData;
 using WorkerGroupType = RM::WorkerGroupType;
 using ResourceRequirement = RM::ResourceRequirement;
 using VWScheduleAlgo = RM::VWScheduleAlgo;
+using WorkerMetrics = RM::WorkerMetrics;
 }

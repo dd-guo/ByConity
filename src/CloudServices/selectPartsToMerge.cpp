@@ -31,6 +31,7 @@ ServerSelectPartsDecision selectPartsToMerge(
     size_t max_total_size_to_merge,
     bool aggressive,
     bool enable_batch_select,
+    bool final,
     [[maybe_unused]] bool merge_with_ttl_allowed,
     Poco::Logger * log)
 {
@@ -55,10 +56,17 @@ ServerSelectPartsDecision selectPartsToMerge(
 
     size_t parts_selected_precondition = 0;
 
+    const auto & config = data.getContext()->getConfigRef();
+    size_t max_parts_to_break = config.getInt64("dance_merge_selector.max_parts_to_break", MERGE_MAX_PARTS_TO_BREAK);
+
     // split parts into buckets if current table is bucket table.
     std::unordered_map<Int64, ServerDataPartsVector> buckets;
     if (data.isBucketTable())
+    {
+        /// Do aggressive merge for bucket table. (try to merge all parts in the bucket to 1 part)
+        aggressive = true;
         groupPartsByBucketNumber(data, buckets, data_parts);
+    }
     else
         buckets.emplace(0, data_parts);
 
@@ -72,7 +80,9 @@ ServerSelectPartsDecision selectPartsToMerge(
         {
             const String & partition_id = part->info().partition_id;
 
-            if (!prev_partition_id || partition_id != *prev_partition_id)
+            if (!prev_partition_id
+                || partition_id != *prev_partition_id
+                || (!parts_ranges.empty() && parts_ranges.back().size() >= max_parts_to_break))
             {
                 if (parts_ranges.empty() || !parts_ranges.back().empty())
                     parts_ranges.emplace_back();
@@ -123,9 +133,19 @@ ServerSelectPartsDecision selectPartsToMerge(
 
             IMergeSelector::Part part_info;
             part_info.size = part->part_model().size();
-            part_info.rows = part->rowsCount();
             time_t part_commit_time = TxnTimestamp(part->getCommitTime()).toSecond();
+            auto p_part = part->tryGetPreviousPart();
+            while (p_part)
+            {
+                ++part_info.chain_depth;
+                part_info.size += p_part->part_model().size();
+                part_commit_time = TxnTimestamp(p_part->getCommitTime()).toSecond();
+                p_part = p_part->tryGetPreviousPart();
+            }
+            /// Consider the base part's age as the part chain's age, 
+            /// so that the merge selector will give it a better score.
             part_info.age = current_time > part_commit_time ? current_time - part_commit_time : 0;
+            part_info.rows = part->rowsCount();
             part_info.level = part->info().level;
             part_info.data = &part;
             /// TODO:
@@ -189,36 +209,33 @@ ServerSelectPartsDecision selectPartsToMerge(
     }
     */
 
-    std::unique_ptr<IMergeSelector> merge_selector;
-    const auto & config = data.getContext()->getConfigRef();
-    auto merge_selector_str = config.getString("merge_selector", "simple");
-    if (merge_selector_str == "dance")
+    /// Always use dance merge selector for StorageCnchMergeTree.
+    DanceMergeSelector::Settings merge_settings;
+    merge_settings.loadFromConfig(config);
+    /// Override value from table settings
+    merge_settings.max_parts_to_merge_base = std::min(data_settings->cnch_merge_max_parts_to_merge, data_settings->max_parts_to_merge_at_once);
+    merge_settings.max_total_rows_to_merge = data_settings->cnch_merge_max_total_rows_to_merge;
+    /// make sure rowid could be represented in 4 bytes
+    if (metadata_snapshot->hasUniqueKey())
     {
-        DanceMergeSelector::Settings merge_settings;
-        merge_settings.loadFromConfig(config);
-        /// Override value from table settings
-        merge_settings.max_parts_to_merge_base = data_settings->max_parts_to_merge_at_once;
-        merge_settings.max_total_rows_to_merge = data_settings->cnch_merge_max_total_rows_to_merge;
-        merge_settings.enable_batch_select = enable_batch_select;
-        if (aggressive)
-            merge_settings.min_parts_to_merge_base = 1;
-        merge_selector = std::make_unique<DanceMergeSelector>(data, merge_settings);
+        auto & max_rows = merge_settings.max_total_rows_to_merge;
+        if (!(0 < max_rows && max_rows <= std::numeric_limits<UInt32>::max()))
+            max_rows = std::numeric_limits<UInt32>::max();
     }
-    else
-    {
-        SimpleMergeSelector::Settings merge_settings;
-        /// Override value from table settings
-        merge_settings.max_parts_to_merge_at_once = data_settings->max_parts_to_merge_at_once;
-        merge_settings.max_total_rows_to_merge = data_settings->cnch_merge_max_total_rows_to_merge;
-        if (aggressive)
-            merge_settings.base = 1;
-        merge_selector = std::make_unique<SimpleMergeSelector>(merge_settings);
-    }
+    merge_settings.enable_batch_select = enable_batch_select;
+    /// NOTE: Here final is different from aggressive.
+    /// The selector may not allow to merge [p1, p2] even though there are only two parts and aggressive is set.
+    /// When final is set, we will skip some check for range [0, max_end) so that it can be a candidate result.
+    if (aggressive)
+        merge_settings.min_parts_to_merge_base = 1;
+    merge_settings.final = final;
+    merge_settings.max_age_for_single_part_chain = data_settings->merge_with_ttl_timeout;
+    auto merge_selector = std::make_unique<DanceMergeSelector>(data, merge_settings);
 
     auto ranges = merge_selector->selectMulti(parts_ranges, max_total_size_to_merge, nullptr);
     if (ranges.empty())
     {
-        LOG_DEBUG(log, "There is no need to merge parts according to merge selector algorithm: {}", merge_selector_str);
+        LOG_DEBUG(log, "Get empty result from merge selector.");
         return ServerSelectPartsDecision::CANNOT_SELECT;
     }
 
@@ -226,8 +243,16 @@ ServerSelectPartsDecision selectPartsToMerge(
     {
         /// Do not allow to "merge" part with itself for regular merges, unless it is a TTL-merge where it is ok to remove some values with expired ttl
         if (range.size() == 1)
-            throw Exception("Logical error: merge selector returned only one part to merge", ErrorCodes::LOGICAL_ERROR);
-
+        {
+            /// double check.
+            if (range.front().chain_depth == 0)
+            {
+                LOG_ERROR(log, "merge selector returned only one part to merge {}, skip this range.",
+                    (*static_cast<const ServerDataPartPtr *>(range.front().data))->name());
+                continue;
+            }
+            // throw Exception("Logical error: merge selector returned only one part to merge", ErrorCodes::LOGICAL_ERROR);
+        }
         res.emplace_back();
         res.back().reserve(range.size());
         for (auto & part : range)
@@ -244,7 +269,7 @@ void groupPartsByBucketNumber(const MergeTreeMetaBase & data, std::unordered_map
     for (const auto & part : data_parts)
     {
         /// Can only merge those already been clustered parts.
-        if (part->part_model().table_definition_hash() != table_definition_hash)
+        if (!table_definition_hash.match(part->part_model().table_definition_hash()))
             continue;
         if (auto it = grouped_buckets.find(part->part_model().bucket_number()); it != grouped_buckets.end())
             it->second.push_back(part);

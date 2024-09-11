@@ -2,6 +2,7 @@
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/Serializations/SerializationNullable.h>
 #include <DataTypes/Serializations/SerializationTupleElement.h>
 #include <Columns/ColumnNullable.h>
@@ -13,8 +14,8 @@
 #include <IO/WriteHelpers.h>
 #include <IO/ConcatReadBuffer.h>
 #include <Parsers/IAST.h>
-#include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -44,6 +45,8 @@ bool DataTypeNullable::onlyNull() const
 
 MutableColumnPtr DataTypeNullable::createColumn() const
 {
+    nested_data_type->enable_zero_cpy_read = enable_zero_cpy_read;
+    // TODO support null_map zero_copy
     return ColumnNullable::create(nested_data_type->createColumn(), ColumnUInt8::create());
 }
 
@@ -80,14 +83,14 @@ ColumnPtr DataTypeNullable::getSubcolumn(const String & subcolumn_name, const IC
     return nested_data_type->getSubcolumn(subcolumn_name, column_nullable.getNestedColumn());
 }
 
-SerializationPtr DataTypeNullable::getSubcolumnSerialization(
-    const String & subcolumn_name, const BaseSerializationGetter & base_serialization_getter) const
-{
-    if (subcolumn_name == "null")
-        return std::make_shared<SerializationTupleElement>(base_serialization_getter(DataTypeUInt8()), subcolumn_name, false);
+// SerializationPtr DataTypeNullable::getSubcolumnSerialization(
+//     const String & subcolumn_name, const BaseSerializationGetter & base_serialization_getter) const
+// {
+//     if (subcolumn_name == "null")
+//         return std::make_shared<SerializationTupleElement>(base_serialization_getter(DataTypeUInt8()), subcolumn_name, false);
 
-    return nested_data_type->getSubcolumnSerialization(subcolumn_name, base_serialization_getter);
-}
+//     return nested_data_type->getSubcolumnSerialization(subcolumn_name, base_serialization_getter);
+// }
 
 SerializationPtr DataTypeNullable::doGetDefaultSerialization() const
 {
@@ -124,6 +127,20 @@ DataTypePtr removeNullable(const DataTypePtr & type)
     if (type->isNullable())
         return static_cast<const DataTypeNullable &>(*type).getNestedType();
     return type;
+}
+
+DataTypePtr makeNullableOrLowCardinalityNullable(const DataTypePtr & type)
+{
+    if (isNullableOrLowCardinalityNullable(type))
+        return type;
+
+    if (type->lowCardinality())
+    {
+        const auto & dictionary_type = assert_cast<const DataTypeLowCardinality &>(*type).getDictionaryType();
+        return std::make_shared<DataTypeLowCardinality>(makeNullable(dictionary_type));
+    }
+
+    return std::make_shared<DataTypeNullable>(type);
 }
 
 }

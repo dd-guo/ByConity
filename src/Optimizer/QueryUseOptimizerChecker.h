@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <optional>
 #include <Core/QueryProcessingStage.h>
 #include <DataStreams/BlockIO.h>
 #include <Parsers/ASTVisitor.h>
@@ -24,17 +25,21 @@ namespace DB
 {
 class Context;
 
+void turnOffOptimizer(ContextMutablePtr context, ASTPtr & node);
+
 class QueryUseOptimizerChecker
 {
 public:
-    static bool check(ASTPtr & node, const ContextMutablePtr & context, bool use_distributed_stages = false);
+    static bool check(ASTPtr node, ContextMutablePtr context, bool throw_exception = false);
 };
 
 struct QueryUseOptimizerContext
 {
-    const ContextMutablePtr & context;
-    NameSet & with_tables;
+    ContextMutablePtr context;
+    NameSet ctes;
     Tables external_tables;
+    bool disallow_with_totals = false;
+    bool disallow_subquery = false;
 };
 
 class QueryUseOptimizerVisitor : public ASTVisitor<bool, QueryUseOptimizerContext>
@@ -43,14 +48,14 @@ public:
     bool visitNode(ASTPtr & node, QueryUseOptimizerContext &) override;
     bool visitASTSelectQuery(ASTPtr & node, QueryUseOptimizerContext &) override;
     bool visitASTTableJoin(ASTPtr & node, QueryUseOptimizerContext &) override;
-    bool visitASTArrayJoin(ASTPtr & node, QueryUseOptimizerContext &) override;
     bool visitASTIdentifier(ASTPtr & node, QueryUseOptimizerContext &) override;
     bool visitASTFunction(ASTPtr & node, QueryUseOptimizerContext &) override;
-    bool visitASTOrderByElement(ASTPtr & node, QueryUseOptimizerContext &) override;
     bool visitASTQuantifiedComparison(ASTPtr & node, QueryUseOptimizerContext &) override;
+    const String & getReason() const { return reason; }
 
 private:
-    void collectWithTableNames(ASTSelectQuery & query, NameSet & with_tables);
+    static void collectWithTableNames(ASTSelectQuery & query, NameSet & with_tables);
+    String reason;
 };
 
 }

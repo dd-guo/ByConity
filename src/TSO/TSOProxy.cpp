@@ -16,6 +16,8 @@
 #include <TSO/TSOProxy.h>
 //#include <TSO/TSOMetaByteKVImpl.h>
 #include <TSO/TSOMetaFDBImpl.h>
+#include <common/logger_useful.h>
+#include <Common/Stopwatch.h>
 
 namespace DB
 {
@@ -27,26 +29,26 @@ namespace ErrorCodes
 
 namespace TSO
 {
-
-TSOProxy::TSOProxy(const TSOConfig & config)
-{
-    if (config.type == StoreType::FDB)
-    {
-        metastore_ptr = std::make_shared<TSOMetaFDBImpl>(config.fdb_conf.cluster_conf_path, config.key_name);
-    }
-    else
-        throw Exception("TSO metastore type should be set. Only support foundationdb and bytekv.", ErrorCodes::TSO_INTERNAL_ERROR);
-}
+constexpr int32_t SLOW_THRESHOLD_MS = 1500;
 
 void TSOProxy::setTimestamp(UInt64 timestamp)
 {
-    metastore_ptr->put(std::to_string(timestamp));
+    Stopwatch watch;
+    metastore_ptr->put(key, std::to_string(timestamp));
+    UInt64 milliseconds = watch.elapsedMilliseconds();
+    if (milliseconds >= SLOW_THRESHOLD_MS)
+        LOG_DEBUG(log, "setTimestamp to Catalog took {} ms", milliseconds);
 }
 
 UInt64 TSOProxy::getTimestamp()
 {
     String timestamp_str;
-    metastore_ptr->get(timestamp_str);
+    Stopwatch watch;
+    metastore_ptr->get(key, timestamp_str);
+    UInt64 milliseconds = watch.elapsedMilliseconds();
+    if (milliseconds >= SLOW_THRESHOLD_MS)
+        LOG_DEBUG(log, "getTimestamp to Catalog took {} ms", milliseconds);
+
     if (timestamp_str.empty())
     {
         return 0;
@@ -59,7 +61,7 @@ UInt64 TSOProxy::getTimestamp()
 
 void TSOProxy::clean()
 {
-    metastore_ptr->clean();
+    metastore_ptr->clean(key);
 }
 
 }

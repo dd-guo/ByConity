@@ -21,42 +21,45 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshadow"
 void DDLCreateAction::executeV1(TxnTimestamp commit_time)
 {
-    Catalog::CatalogPtr cnch_catalog = global_context.getCnchCatalog();
+    Catalog::CatalogPtr catalog = global_context.getCnchCatalog();
 
-    if (!params.database.empty() && params.table.empty())
+    if (auto * p = std::get_if<CreateDatabaseParams>(&params))
     {
-        /// create database
-        assert(!params.attach);
-        cnch_catalog->createDatabase(params.database, params.uuid, txn_id, commit_time);
+        catalog->createDatabase(p->name, p->uuid, txn_id, commit_time, p->statement, p->engine_name, p->text_case_option);
     }
-    else if (!params.is_dictionary)
+    else if (auto * p = std::get_if<CreateSnapshotParams>(&params))
     {
-        /// create table
-        updateTsCache(params.uuid, commit_time);
-        if (params.attach)
-            cnch_catalog->attachTable(params.database, params.table, commit_time);
+        catalog->createSnapshot(p->db_uuid, p->name, commit_time, p->ttl_in_days, p->bind_table);
+    }
+    else if (auto * p = std::get_if<CreateDictionaryParams>(&params))
+    {
+        if (p->attach)
+            catalog->attachDictionary(p->storage_id.database_name, p->storage_id.table_name);
         else
-            cnch_catalog->createTable(StorageID{params.database, params.table, params.uuid}, params.statement, "", txn_id, commit_time);
+            catalog->createDictionary(p->storage_id, p->statement);
+    }
+    else if (auto * p = std::get_if<CreateTableParams>(&params))
+    {
+        if (p->attach)
+            catalog->attachTable(p->storage_id.database_name, p->storage_id.table_name, commit_time);
+        else
+            catalog->createTable(p->db_uuid, p->storage_id, p->statement, /*vw*/ "", txn_id, commit_time);
     }
     else
     {
-        /// for dictionary
-        if (params.attach)
-            cnch_catalog->attachDictionary(params.database, params.table);
-        else
-            cnch_catalog->createDictionary(StorageID{params.database, params.table, params.uuid}, params.statement);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown create action with index {}", params.index());
     }
 }
-
-void DDLCreateAction::updateTsCache(const UUID & uuid, const TxnTimestamp & commit_time)
-{
-    auto & ts_cache_manager = global_context.getCnchTransactionCoordinator().getTsCacheManager();
-    auto table_guard = ts_cache_manager.getTimestampCacheTableGuard(uuid);
-    auto & ts_cache = ts_cache_manager.getTimestampCacheUnlocked(uuid);
-    ts_cache->insertOrAssign(UUIDHelpers::UUIDToString(uuid), commit_time);
-}
+#pragma clang diagnostic pop
 
 void DDLCreateAction::abort() {}
 

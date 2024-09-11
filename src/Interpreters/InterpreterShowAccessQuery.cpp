@@ -1,6 +1,7 @@
 #include <Interpreters/InterpreterShowAccessQuery.h>
 
 #include <Parsers/formatAST.h>
+#include <Parsers/ASTGrantQuery.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterShowCreateAccessEntityQuery.h>
 #include <Interpreters/InterpreterShowGrantsQuery.h>
@@ -37,9 +38,12 @@ BlockInputStreamPtr InterpreterShowAccessQuery::executeImpl() const
     WriteBufferFromOwnString buf;
     for (const auto & query : queries)
     {
-        buf.restart();
-        formatAST(*query, buf, false, true);
-        column->insert(buf.str());
+        if (getContext()->getUserName() != "default")
+        {
+            if (auto * to_rewrite_grant_query = query->as<ASTGrantQuery>())
+                to_rewrite_grant_query->rewriteNamesWithoutTenant(getContext().get());
+        }
+        column->insert(query->formatWithHiddenSecrets());
     }
 
     String desc = "ACCESS";
@@ -58,7 +62,8 @@ std::vector<AccessEntityPtr> InterpreterShowAccessQuery::getEntities() const
         auto ids = access_control.findAll(type);
         for (const auto & id : ids)
         {
-            if (auto entity = access_control.tryRead(id))
+            auto entity = access_control.tryRead(id);
+            if (entity && isTenantMatchedEntityName(entity->getName()))
                 entities.push_back(entity);
         }
     }
@@ -78,7 +83,11 @@ ASTs InterpreterShowAccessQuery::getCreateAndGrantQueries() const
     {
         create_queries.push_back(InterpreterShowCreateAccessEntityQuery::getCreateQuery(*entity, access_control));
         if (entity->isTypeOf(EntityType::USER) || entity->isTypeOf(EntityType::ROLE))
-            boost::range::push_back(grant_queries, InterpreterShowGrantsQuery::getGrantQueries(*entity, access_control));
+        {
+            /* The true/false order must be kept, to be used for detecting sensitive tenant in KVAccessStorage.cpp */
+            boost::range::push_back(grant_queries, InterpreterShowGrantsQuery::getGrantQueries(*entity, access_control, true));
+            boost::range::push_back(grant_queries, InterpreterShowGrantsQuery::getGrantQueries(*entity, access_control, false));
+        }
     }
 
     ASTs result = std::move(create_queries);

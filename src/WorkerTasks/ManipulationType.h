@@ -29,6 +29,8 @@ enum class ManipulationType : unsigned int
     BuildBitmap,
     Dump,
     Clustering,
+    Attach,
+    MvRefresh
 };
 
 
@@ -46,6 +48,10 @@ inline constexpr const char * typeToString(ManipulationType type)
             return "Mutate";
         case ManipulationType::Clustering:
             return "Clustering";
+        case ManipulationType::Attach:
+            return "Attach";
+        case ManipulationType::MvRefresh:
+            return "MvRefresh";
         default:
             /// TODO:
             return "Unknown";

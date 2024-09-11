@@ -17,10 +17,23 @@ set(SRCS
     "${LIBRARY_DIR}/src/containers/run.c"
     "${LIBRARY_DIR}/src/roaring.c"
     "${LIBRARY_DIR}/src/roaring_priority_queue.c"
-    "${LIBRARY_DIR}/src/roaring_array.c")
+    "${LIBRARY_DIR}/src/roaring_array.c"
+    "${LIBRARY_DIR}/src/memory.c")
 
 add_library(roaring ${SRCS})
 
 target_include_directories(roaring PRIVATE "${LIBRARY_DIR}/include/roaring")
 target_include_directories(roaring SYSTEM BEFORE PUBLIC "${LIBRARY_DIR}/include")
 target_include_directories(roaring SYSTEM BEFORE PUBLIC "${LIBRARY_DIR}/cpp")
+
+# We redirect malloc/free family of functions to different functions that will track memory in ClickHouse.
+# Also note that we exploit implicit function declarations.
+target_compile_definitions(roaring PRIVATE
+    -Dmalloc=clickhouse_malloc
+    -Dcalloc=clickhouse_calloc
+    -Drealloc=clickhouse_realloc
+    -Dreallocarray=clickhouse_reallocarray
+    -Dfree=clickhouse_free
+    -Dposix_memalign=clickhouse_posix_memalign)
+
+target_link_libraries(roaring PUBLIC clickhouse_common_io)

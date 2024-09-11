@@ -21,6 +21,8 @@ namespace DB::DaemonManager::BRPCMetrics
 {
     extern bvar::Adder< int > g_executeImpl_PartGC_error;
     extern bvar::Adder< int > g_executeImpl_PartGC;
+    extern bvar::Adder< int > g_executeImpl_ManifestCheckpoint_error;
+    extern bvar::Adder< int > g_executeImpl_ManifestCheckpoint;
     extern bvar::Adder< int > g_executeImpl_MergeMutate_error;
     extern bvar::Adder< int > g_executeImpl_MergeMutate;
     extern bvar::Adder< int > g_executeImpl_Consumer_error;
@@ -31,9 +33,19 @@ namespace DB::DaemonManager::BRPCMetrics
     extern bvar::Adder< int > g_executeImpl_DedupWorker;
     extern bvar::Adder< int > g_executeImpl_GlobalGC_error;
     extern bvar::Adder< int > g_executeImpl_GlobalGC;
+    extern bvar::Adder< int > g_executeImpl_AutoStatistics_error;
+    extern bvar::Adder< int > g_executeImpl_AutoStatistics;
     extern bvar::Adder< int > g_executeImpl_TxnGC_error;
     extern bvar::Adder< int > g_executeImpl_TxnGC;
     extern bvar::Adder< int > g_executeImpl_Clustering_error;
     extern bvar::Adder< int > g_executeImpl_Clustering;
+    extern bvar::Adder< int > g_executeImpl_ObjectSchemaAssemble_error;
+    extern bvar::Adder< int > g_executeImpl_ObjectSchemaAssemble;
+    extern bvar::Adder< int > g_executeImpl_MaterializedMySQL_error;
+    extern bvar::Adder< int > g_executeImpl_MaterializedMySQL;
+    extern bvar::Adder< int > g_executeImpl_CnchRefreshMaterializedView_error;
+    extern bvar::Adder< int > g_executeImpl_CnchRefreshMaterializedView;
+    extern bvar::Adder< int > g_executeImpl_PartMover_error;
+    extern bvar::Adder< int > g_executeImpl_PartMover;
 }/// end namespace
 

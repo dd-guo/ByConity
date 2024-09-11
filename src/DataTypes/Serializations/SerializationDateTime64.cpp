@@ -3,7 +3,7 @@
 #include <Columns/ColumnVector.h>
 #include <Common/assert_cast.h>
 #include <Common/typeid_cast.h>
-#include <common/DateLUT.h>
+#include <Common/DateLUT.h>
 #include <Formats/FormatSettings.h>
 #include <Formats/ProtobufReader.h>
 #include <Formats/ProtobufWriter.h>
@@ -12,15 +12,40 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <IO/parseDateTimeBestEffort.h>
+#include <Common/CurrentThread.h>
+
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE;
+}
 
 SerializationDateTime64::SerializationDateTime64(
     const DateLUTImpl & time_zone_, const DateLUTImpl & utc_time_zone_, UInt32 scale_)
     : SerializationDecimalBase<DateTime64>(DecimalUtils::max_precision<DateTime64>, scale_)
     , time_zone(time_zone_), utc_time_zone(utc_time_zone_)
 {
+}
+
+
+void SerializationDateTime64::checkDataOverflow(const DateTime64 & x, const FormatSettings & settings) const
+{
+    if (!settings.check_data_overflow || !current_thread)
+        return;
+
+    /// y is the seconds since 1970-01-01, negative for date before
+    auto y = extractWholePart(x, scale);
+    const time_t min_datetime_timestamp = utc_time_zone.makeDateTime(1900, 1, 1, 0, 0, 0);
+
+    /// overflow bit is set if the value is over the max; but min boundary is not yet checked; so check it here
+    if (!current_thread->getOverflow(ThreadStatus::OverflowFlag::Date) && y >= min_datetime_timestamp)
+        return;
+
+    current_thread->unsetOverflow(ThreadStatus::OverflowFlag::Date);
+    throw Exception(ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE, "Under MYSQL dialect or check_data_overflow = 1, the Datetime64 value should be within UTC [1900-01-01 00:00:00, 2299-12-31 23:59:59]");
 }
 
 void SerializationDateTime64::serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const
@@ -40,10 +65,11 @@ void SerializationDateTime64::serializeText(const IColumn & column, size_t row_n
     }
 }
 
-void SerializationDateTime64::deserializeText(IColumn & column, ReadBuffer & istr, const FormatSettings &) const
+void SerializationDateTime64::deserializeText(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
     DateTime64 result = 0;
     readDateTime64Text(result, scale, istr, time_zone);
+    checkDataOverflow(result, settings);
     assert_cast<ColumnType &>(column).getData().push_back(result);
 }
 
@@ -67,6 +93,9 @@ static inline void readText(DateTime64 & x, UInt32 scale, ReadBuffer & istr, con
         case FormatSettings::DateTimeInputFormat::BestEffort:
             parseDateTime64BestEffort(x, scale, istr, time_zone, utc_time_zone);
             return;
+        case FormatSettings::DateTimeInputFormat::BestEffortUS:
+            parseDateTime64BestEffortUS(x, scale, istr, time_zone, utc_time_zone);
+            return;
     }
 }
 
@@ -74,6 +103,7 @@ void SerializationDateTime64::deserializeTextEscaped(IColumn & column, ReadBuffe
 {
     DateTime64 x = 0;
     readText(x, scale, istr, settings, time_zone, utc_time_zone);
+    checkDataOverflow(x, settings);
     assert_cast<ColumnType &>(column).getData().push_back(x);
 }
 
@@ -96,6 +126,7 @@ void SerializationDateTime64::deserializeTextQuoted(IColumn & column, ReadBuffer
     {
         readIntText(x, istr);
     }
+    checkDataOverflow(x, settings);
     assert_cast<ColumnType &>(column).getData().push_back(x);    /// It's important to do this at the end - for exception safety.
 }
 
@@ -118,6 +149,7 @@ void SerializationDateTime64::deserializeTextJSON(IColumn & column, ReadBuffer &
     {
         readIntText(x, istr);
     }
+    checkDataOverflow(x, settings);
     assert_cast<ColumnType &>(column).getData().push_back(x);
 }
 
@@ -141,6 +173,7 @@ void SerializationDateTime64::deserializeTextCSV(IColumn & column, ReadBuffer & 
         ++istr.position();
 
     readText(x, scale, istr, settings, time_zone, utc_time_zone);
+    checkDataOverflow(x, settings);
 
     if (maybe_quote == '\'' || maybe_quote == '\"')
         assertChar(maybe_quote, istr);

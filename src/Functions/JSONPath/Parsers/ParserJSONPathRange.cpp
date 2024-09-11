@@ -43,6 +43,10 @@ namespace ErrorCodes
  */
 bool ParserJSONPathRange::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
+    if (pos->type == TokenType::Dot)
+    {
+        ++pos;
+    }
 
     if (pos->type != TokenType::OpeningSquareBracket)
     {
@@ -67,7 +71,7 @@ bool ParserJSONPathRange::parseImpl(Pos & pos, ASTPtr & node, Expected & expecte
         {
             return false;
         }
-        range_indices.first = number_ptr->as<ASTLiteral>()->value.get<UInt32>();
+        range_indices.first = static_cast<UInt32>(number_ptr->as<ASTLiteral>()->value.get<UInt32>());
 
         if (pos->type == TokenType::Comma || pos->type == TokenType::ClosingSquareBracket)
         {
@@ -84,7 +88,7 @@ bool ParserJSONPathRange::parseImpl(Pos & pos, ASTPtr & node, Expected & expecte
             {
                 return false;
             }
-            range_indices.second = number_ptr->as<ASTLiteral>()->value.get<UInt32>();
+            range_indices.second = static_cast<UInt32>(number_ptr->as<ASTLiteral>()->value.get<UInt32>());
         }
         else
         {

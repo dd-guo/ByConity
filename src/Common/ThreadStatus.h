@@ -30,10 +30,11 @@
 #include <common/StringRef.h>
 
 #include <boost/noncopyable.hpp>
-#include <bthread/mtx_cv_base.h>
+#include <bthread/mutex.h>
 
 #include <functional>
 #include <map>
+#include <stack>
 #include <memory>
 
 
@@ -69,13 +70,26 @@ using InternalTextLogsQueueWeakPtr = std::weak_ptr<InternalTextLogsQueue>;
   * Create via CurrentThread::initializeQuery (for queries) or directly (for various background tasks).
   * Use via CurrentThread::getGroup.
   */
+class ThreadGroupStatus;
+using ThreadGroupStatusPtr = std::shared_ptr<ThreadGroupStatus>;
 class ThreadGroupStatus
 {
 public:
+    ThreadGroupStatus(MemoryTracker * memory_tracker_ = nullptr)
+        : memory_tracker(memory_tracker_ ? *memory_tracker_ : private_memory_tracker)
+    {
+    }
+
     mutable bthread::Mutex mutex;
 
     ProfileEvents::Counters performance_counters{VariableContext::Process};
-    MemoryTracker memory_tracker{VariableContext::Process};
+    MemoryTracker private_memory_tracker{VariableContext::Process};
+    MemoryTracker & memory_tracker;
+    /// for MaxIOThreadProfileEvents
+    std::shared_ptr<ProfileEvents::Counters::Snapshot> max_io_thread_profile_counters;
+    UInt64 max_io_time_us{0};
+    uint64_t max_io_time_thread_ms{0};
+    String max_io_time_thread_name;
 
     ContextWeakPtr query_context;
     ContextWeakPtr global_context;
@@ -85,6 +99,8 @@ public:
 
     std::vector<UInt64> thread_ids;
 
+    static ThreadGroupStatusPtr createForBackgroundProcess(ContextPtr storage_context);
+    
     /// The first thread created this thread group
     UInt64 master_thread_id = 0;
 
@@ -94,7 +110,20 @@ public:
     UInt64 normalized_query_hash = 0;
 };
 
-using ThreadGroupStatusPtr = std::shared_ptr<ThreadGroupStatus>;
+
+/**
+ * Since merge is executed with multiple threads, this class
+ * switches the parent MemoryTracker as part of the thread group to account all the memory used.
+ */
+class ThreadGroupSwitcher : private boost::noncopyable
+{
+public:
+    explicit ThreadGroupSwitcher(ThreadGroupStatusPtr thread_group);
+    ~ThreadGroupSwitcher();
+
+private:
+    ThreadGroupStatusPtr prev_thread_group;
+};
 
 
 extern thread_local ThreadStatus * current_thread;
@@ -135,7 +164,38 @@ public:
     // for these changes.
     OpenTelemetryTraceContext thread_trace_context;
 
+    enum OverflowFlag {Date = 1, Float = 2, Integer = 4, Decimal = 8, Time = 16};
+    void setOverflow(OverflowFlag flag)
+    {
+        overflow_bits |= flag;
+    }
+
+    void unsetOverflow(OverflowFlag flag)
+    {
+        overflow_bits &= ~flag;
+    }
+
+    bool getOverflow(OverflowFlag flag) const
+    {
+        return overflow_bits & flag;
+    }
+
+    bool getOverflow() const
+    {
+        return overflow_bits;
+    }
+
+    void resetOverflow()
+    {
+        overflow_bits = 0;
+    }
+
 protected:
+    /// Set the bit if the value is overflow (out of range) during parsing
+    /// Used under mysql dialect for convert overflow to null
+    /// TODO(fredwang) remove this flag --- return the flag from the date deserialization/parsing functions directly.
+    uint8_t overflow_bits = 0;
+
     ThreadGroupStatusPtr thread_group;
 
     std::atomic<int> thread_state{ThreadState::DetachedFromQuery};
@@ -146,6 +206,7 @@ protected:
     ContextWeakPtr query_context;
 
     String query_id;
+    UInt64 xid = 0;
 
     /// A logs queue used by TCPHandler to pass logs to a client
     InternalTextLogsQueueWeakPtr logs_queue_ptr;
@@ -170,6 +231,12 @@ protected:
 
     /// Is used to send logs from logs_queue to client in case of fatal errors.
     std::function<void()> fatal_error_callback;
+
+    /// Used to save all the involved queries tenant_id
+    std::stack<String> tenant_ids;
+
+    /// when we handle external table parsing, we need to disable tenant logic temporarily
+    bool disable_tenant = false;
 
 public:
     ThreadStatus();
@@ -197,13 +264,57 @@ public:
         return query_id;
     }
 
+    UInt64 getTransactionId() const
+    {
+        return xid;
+    }
+
+    void setTransactionId(UInt64 xid_)
+    {
+        xid = xid_;
+    }
+
+    bool isEnableTenant() const
+    {
+        return !disable_tenant;
+    }
+
+    void disableTenant()
+    {
+        disable_tenant = true;
+    }
+
+    void enableTenant()
+    {
+        disable_tenant = false;
+    }
+
+    String getTenantId() const
+    {
+        String result;
+        if (!tenant_ids.empty())
+            return tenant_ids.top();
+        return result;
+    }
+
+    void pushTenantId(const String& new_tenant_id)
+    {
+        tenant_ids.push(new_tenant_id);
+    }
+
+    void popTenantId()
+    {
+        if (!tenant_ids.empty())
+            tenant_ids.pop();
+    }
+
     auto getQueryContext() const
     {
         return query_context.lock();
     }
 
     /// Starts new query and create new thread group for it, current thread becomes master thread of the query
-    void initializeQuery();
+    void initializeQuery(MemoryTracker * memory_tracker_ = nullptr);
 
     /// Attaches slave thread to existing thread group
     void attachQuery(const ThreadGroupStatusPtr & thread_group_, bool check_detached = true);
@@ -232,6 +343,8 @@ public:
 
     /// Detaches thread from the thread group and the query, dumps performance counters if they have not been dumped
     void detachQuery(bool exit_if_already_detached = false, bool thread_exits = false);
+
+    void tryUpdateMaxIOThreadProfile(bool use_async_read);
 
 protected:
     void applyQuerySettings();

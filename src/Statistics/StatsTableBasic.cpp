@@ -13,8 +13,8 @@
  * limitations under the License.
  */
 
-#include <Optimizer/Dump/Json2Pb.h>
 #include <Statistics/StatsTableBasic.h>
+#include <google/protobuf/util/json_util.h>
 
 namespace DB::Statistics
 {
@@ -34,15 +34,28 @@ int64_t StatsTableBasic::getRowCount() const
 {
     return table_basic_pb.row_count();
 }
+
+void StatsTableBasic::setTimestamp(DateTime64 timestamp)
+{
+    table_basic_pb.set_timestamp(timestamp.value);
+}
+
+DateTime64 StatsTableBasic::getTimestamp() const
+{
+    DateTime64 result;
+    result.value = table_basic_pb.has_timestamp() ? table_basic_pb.timestamp() : 0;
+    return result;
+}
+
 String StatsTableBasic::serializeToJson() const
 {
     String json_str;
-    Json2Pb::pbMsg2JsonStr(table_basic_pb, json_str, false);
+    google::protobuf::util::MessageToJsonString(table_basic_pb, &json_str);
     return json_str;
 }
 void StatsTableBasic::deserializeFromJson(std::string_view json)
 {
-    Json2Pb::jsonStr2PbMsg({json.data(), json.size()}, table_basic_pb, false);
+    google::protobuf::util::JsonStringToMessage(std::string(json), &table_basic_pb);
 }
 
 } // namespace DB

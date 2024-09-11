@@ -17,6 +17,7 @@
 
 #include <Core/Field.h>
 #include <Common/Exception.h>
+#include <Common/LinkedHashSet.h>
 #include <DataTypes/IDataType.h>
 #include <Optimizer/Utils.h>
 #include <unordered_set>
@@ -94,7 +95,10 @@ namespace Predicate
         // AllOrNoneValueSet properties
 
         // AllOrNoneValueSet operation
-        String toString() { return all ? "[ALL]" : "[NONE]"; } // NOLINT(readability-make-member-function-const)
+        String toString() const
+        {
+            return all ? "[ALL]" : "[NONE]";
+        }
 
     private:
         DataTypePtr type;
@@ -107,7 +111,7 @@ namespace Predicate
     };
 
     // TODO: test correctness for std::unordered_set<Field, FieldHash>
-    using FieldSet = std::unordered_set<Field, FieldHashing>;
+    using FieldSet = LinkedHashSet<Field, FieldHashing>;
 
     class DiscreteValueSet
     {
@@ -138,6 +142,11 @@ namespace Predicate
         bool operator==(const DiscreteValueSet & other) const
         {
             return inclusive == other.inclusive && values == other.getValues();
+        }
+
+        String toString() const
+        {
+            return "unimplemented";
         }
 
         // ValueSet factory method
@@ -195,6 +204,7 @@ namespace Predicate
      *  The {@code next} lower bound must not be before {@code this} lower bound.
      * */
         std::optional<Range> merge(const Range & next) const;
+        String toString() const;
 
     private:
         bool low_inclusive;
@@ -254,6 +264,7 @@ namespace Predicate
 
         // SortedRangeSet operation
         Range getSpan() const;
+        String toString() const;
 
         // SortedRangeSet factory method
         static SortedRangeSet createFromUnsortedRanges(Ranges ranges);

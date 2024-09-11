@@ -21,15 +21,20 @@
 
 #include <Common/ProfileEvents.h>
 #include <Common/CurrentThread.h>
-#include <Common/typeid_cast.h>
-#include <Columns/ColumnArray.h>
+#include <Common/Exception.h>
+#include <common/logger_useful.h>
 
 /// Available events. Add something here as you wish.
 #define APPLY_FOR_EVENTS(M) \
-    M(Query, "Number of queries to be interpreted and potentially executed. Does not include queries that failed to parse or were rejected due to AST size limits, quota limits or limits on the number of simultaneously running queries. May include internal queries initiated by ClickHouse itself. Does not count subqueries.") \
-    M(VwQuery, "Number of queries started to be interpreted and maybe executed that belongs to a virtual warehouse.") \
+    M(Query, \
+      "Number of queries to be interpreted and potentially executed. Does not include queries that failed to parse or were rejected due " \
+      "to AST size limits, quota limits or limits on the number of simultaneously running queries. May include internal queries " \
+      "initiated by ClickHouse itself. Does not count subqueries.") \
     M(SelectQuery, "Same as Query, but only for SELECT queries.") \
     M(InsertQuery, "Same as Query, but only for INSERT queries.") \
+    M(SystemQuery, "Same as Query, but only for SYSTEM queries.") \
+    M(DefaultQuery, "Same as Query, but only for DEFAULT queries.") \
+    M(TimedOutQuery, "Number of queries that timed out") \
     M(FailedQuery, "Number of failed queries.") \
     M(FailedSelectQuery, "Same as FailedQuery, but only for SELECT queries.") \
     M(FailedInsertQuery, "Same as FailedQuery, but only for INSERT queries.") \
@@ -55,8 +60,11 @@
     M(UncompressedCacheHits, "") \
     M(UncompressedCacheMisses, "") \
     M(UncompressedCacheWeightLost, "") \
-    M(MMappedFileCacheHits, "") \
-    M(MMappedFileCacheMisses, "") \
+    M(MMappedFileCacheHits, "Number of times a file has been found in the MMap cache (for the 'mmap' read_method), so we didn't have to mmap it again.") \
+    M(MMappedFileCacheMisses, "Number of times a file has not been found in the MMap cache (for the 'mmap' read_method), so we had to mmap it again.") \
+    M(OpenedFileCacheHits, "Number of times a file has been found in the opened file cache, so we didn't have to open it again.") \
+    M(OpenedFileCacheMisses, "Number of times a file has been found in the opened file cache, so we had to open it again.") \
+    M(OpenedFileCacheMicroseconds, "Amount of time spent executing OpenedFileCache methods.") \
     M(IOBufferAllocs, "") \
     M(IOBufferAllocBytes, "") \
     M(ArenaAllocChunks, "") \
@@ -65,23 +73,47 @@
     M(TableFunctionExecute, "") \
     M(MarkCacheHits, "") \
     M(MarkCacheMisses, "") \
-    M(PrimaryIndexCacheHits, "") \
-    M(PrimaryIndexCacheMisses, "") \
     M(QueryCacheHits, "") \
     M(QueryCacheMisses, "") \
+    M(IntermediateResultCacheHits, "") \
+    M(IntermediateResultCacheMisses, "") \
+    M(IntermediateResultCacheRefuses, "") \
+    M(IntermediateResultCacheWait, "") \
+    M(IntermediateResultCacheUncompleted, "") \
+    M(IntermediateResultCacheReadBytes, "") \
+    M(IntermediateResultCacheWriteBytes, "") \
+    M(PrimaryIndexCacheHits, "") \
+    M(PrimaryIndexCacheMisses, "") \
+    M(PrimaryIndexDiskCacheHits, "") \
+    M(PrimaryIndexDiskCacheMisses, "") \
+    M(LoadPrimaryIndexMicroseconds, "") \
     M(ChecksumsCacheHits, "") \
     M(ChecksumsCacheMisses, "") \
-    M(CreatedReadBufferOrdinary, "") \
+    M(LoadDataPartFooter, "Number of times load data part footer from remote.") \
+    M(LoadChecksums, "Number of times load checksums.") \
+    M(LoadRemoteChecksums, "Number of times load checksums from remote.") \
+    M(LoadChecksumsMicroseconds, "Times spent loading checksums from remote.") \
+    M(CreatedReadBufferOrdinary, "Number of times ordinary read buffer was created for reading data (while choosing among other read methods).") \
+    M(CreatedReadBufferDirectIO, "Number of times a read buffer with O_DIRECT was created for reading data (while choosing among other read methods).") \
+    M(CreatedReadBufferDirectIOFailed, "Number of times a read buffer with O_DIRECT was attempted to be created for reading data (while choosing among other read methods), but the OS did not allow it (due to lack of filesystem support or other reasons) and we fallen back to the ordinary reading method.") \
     M(CreatedReadBufferAIO, "") \
     M(CreatedReadBufferAIOFailed, "") \
     M(CreatedReadBufferMMap, "") \
     M(CreatedReadBufferMMapFailed, "") \
     M(DiskReadElapsedMicroseconds, "Total time spent waiting for read syscall. This include reads from page cache.") \
     M(DiskWriteElapsedMicroseconds, "Total time spent waiting for write syscall. This include writes to page cache.") \
-    M(NetworkReceiveElapsedMicroseconds, "Total time spent waiting for data to receive or receiving data from network. Only ClickHouse-related network interaction is included, not by 3rd party libraries.") \
-    M(NetworkSendElapsedMicroseconds, "Total time spent waiting for data to send to network or sending data to network. Only ClickHouse-related network interaction is included, not by 3rd party libraries..") \
-    M(NetworkReceiveBytes, "Total number of bytes received from network. Only ClickHouse-related network interaction is included, not by 3rd party libraries.") \
-    M(NetworkSendBytes, "Total number of bytes send to network. Only ClickHouse-related network interaction is included, not by 3rd party libraries.") \
+    M(NetworkReceiveElapsedMicroseconds, \
+      "Total time spent waiting for data to receive or receiving data from network. Only ClickHouse-related network interaction is " \
+      "included, not by 3rd party libraries.") \
+    M(NetworkSendElapsedMicroseconds, \
+      "Total time spent waiting for data to send to network or sending data to network. Only ClickHouse-related network interaction is " \
+      "included, not by 3rd party libraries..") \
+    M(NetworkReceiveBytes, \
+      "Total number of bytes received from network. Only ClickHouse-related network interaction is included, not by 3rd party libraries.") \
+    M(NetworkSendBytes, \
+      "Total number of bytes send to network. Only ClickHouse-related network interaction is included, not by 3rd party libraries.") \
+    M(LocalReadThrottlerBytes, "Bytes passed through 'max_local_read_bandwidth_for_server'/'max_local_read_bandwidth' throttler.") \
+    M(LocalReadThrottlerSleepMicroseconds, "Total time a query was sleeping to conform 'max_local_read_bandwidth_for_server'/'max_local_read_bandwidth' throttling.") \
     M(ThrottlerSleepMicroseconds, "Total time a query was sleeping to conform the 'max_network_bandwidth' setting.") \
     \
     M(QueryMaskingRulesMatch, "Number of times query masking rules was successfully matched.") \
@@ -153,16 +185,30 @@
     \
     M(SlowRead, "Number of reads from a file that were slow. This indicate system overload. Thresholds are controlled by read_backoff_* settings.") \
     M(ReadBackoff, "Number of times the number of query processing threads was lowered due to slow reads.") \
+    M(TaskStealCount, "Number of task stolen from another thread.") \
     \
-    M(ReplicaYieldLeadership, "Number of times Replicated table was yielded its leadership due to large replication lag relative to other replicas.") \
-    M(ReplicaPartialShutdown, "How many times Replicated table has to deinitialize its state due to session expiration in ZooKeeper. The state is reinitialized every time when ZooKeeper is available again.") \
-    \
+    M(ReplicaYieldLeadership, \
+      "Number of times Replicated table was yielded its leadership due to large replication lag relative to other replicas.") \
+    M(ReplicaPartialShutdown, \
+      "How many times Replicated table has to deinitialize its state due to session expiration in ZooKeeper. The state is reinitialized " \
+      "every time when ZooKeeper is available again.") \
+\
     M(SelectedParts, "Number of data parts selected to read from a MergeTree table.") \
     M(SelectedRanges, "Number of (non-adjacent) ranges in all data parts selected to read from a MergeTree table.") \
     M(SelectedMarks, "Number of marks (index granules) selected to read from a MergeTree table.") \
     M(SelectedRows, "Number of rows SELECTed from all tables.") \
     M(SelectedBytes, "Number of bytes (uncompressed; for columns as they stored in memory) SELECTed from all tables.") \
-    \
+\
+    M(PrewhereSelectedMarks, "Number of marks (index granules) selected to read from a MergeTree table after apply prewhere conditions, must <= SelectedMarks.") \
+    M(PrewhereSelectedRows, "Number of rows selected after apply prewhere conditions, must be <= SelectedRows") \
+\
+    M(Manipulation, "Number of manipulations.") \
+    M(ManipulationSuccess, "Number of success manipulations.") \
+\
+    M(IndexGranuleSeekTime, "The total time that skip index spent on seeking files.") \
+    M(IndexGranuleReadTime, "The total time that skip index spent on reading files.") \
+    M(IndexGranuleCalcTime, "The total time that skip index spent on calculating conditions.") \
+\
     M(Merge, "Number of launched background merges.") \
     M(MergedRows, "Rows read for background merges. This is the number of rows before merge.") \
     M(MergedUncompressedBytes, "Uncompressed bytes (for columns as they stored in memory) that was read for background merges. This is the number before merge.") \
@@ -260,11 +306,29 @@
     M(PerfInstructionTLBMisses, "Instruction TLB misses") \
     M(PerfLocalMemoryReferences, "Local NUMA node memory reads") \
     M(PerfLocalMemoryMisses, "Local NUMA node memory read misses") \
-    \
+    M(PerfInequalConditionElapsedMicroseconds, "") \
+    M(PerfInequalConditionGetRowMicroseconds, "") \
+    M(PerfInequalConditionExecuteMicroseconds, "") \
+    M(PerfInequalConditionAppendMicroseconds, "") \
+    M(PerfJoinElapsedMicroseconds, "") \
+    M(PerfFilterElapsedMicroseconds, "") \
+\
+    M(QueryCreateTablesMicroseconds, "") \
+    M(QuerySendResourcesMicroseconds, "") \
+    M(CloudTableDefinitionCacheHits, "") \
+    M(CloudTableDefinitionCacheMisses, "") \
+\
     M(CreatedHTTPConnections, "Total amount of created HTTP connections (closed or opened).") \
     \
-    M(CannotWriteToWriteBufferDiscard, "Number of stack traces dropped by query profiler or signal handler because pipe is full or cannot write to pipe.") \
-    M(QueryProfilerSignalOverruns, "Number of times we drop processing of a signal due to overrun plus the number of signals that OS has not delivered due to overrun.") \
+    M(ThreadPoolReaderTaskMicroseconds, "Time spent getting the data in asynchronous reading") \
+    M(ThreadPoolReaderScheduleMicroseconds, "Time spent waiting for scheduling.") \
+    M(ThreadPoolReaderReadBytes, "Bytes read from a thread pool task in asynchronous reading") \
+    M(ThreadPoolReaderSubmit, "The number of submit asynchronous reading tasks.") \
+    \
+    M(CannotWriteToWriteBufferDiscard, \
+      "Number of stack traces dropped by query profiler or signal handler because pipe is full or cannot write to pipe.") \
+    M(QueryProfilerSignalOverruns, \
+      "Number of times we drop processing of a signal due to overrun plus the number of signals that OS has not delivered due to overrun.") \
     \
     M(CreatedLogEntryForMerge, "Successfully created log entry to merge parts in ReplicatedMergeTree.") \
     M(NotCreatedLogEntryForMerge, "Log entry to merge parts in ReplicatedMergeTree is not created due to concurrent log update by another replica.") \
@@ -272,7 +336,6 @@
     M(NotCreatedLogEntryForMutation, "Log entry to mutate parts in ReplicatedMergeTree is not created due to concurrent log update by another replica.") \
     \
     M(S3ReadMicroseconds, "Time of GET and HEAD requests to S3 storage.") \
-    M(S3ReadBytes, "Read bytes (incoming) in GET and HEAD requests to S3 storage.") \
     M(S3ReadRequestsCount, "Number of GET and HEAD requests to S3 storage.") \
     M(S3ReadRequestsErrors, "Number of non-throttling errors in GET and HEAD requests to S3 storage.") \
     M(S3ReadRequestsThrottling, "Number of 429 and 503 errors in GET and HEAD requests to S3 storage.") \
@@ -284,12 +347,62 @@
     M(S3WriteRequestsErrors, "Number of non-throttling errors in POST, DELETE, PUT and PATCH requests to S3 storage.") \
     M(S3WriteRequestsThrottling, "Number of 429 and 503 errors in POST, DELETE, PUT and PATCH requests to S3 storage.") \
     M(S3WriteRequestsRedirects, "Number of redirects in POST, DELETE, PUT and PATCH requests to S3 storage.") \
-    \
-    M(AggregationPreallocatedElementsInHashTables, "How many elements were preallocated in hash tables for aggregation.") \
-    M(AggregationHashTablesInitializedAsTwoLevel, "How many hash tables were inited as two-level for aggregation.") \
+\
+    M(S3DeleteObjects, "Number of S3 API DeleteObject(s) calls.") \
+    M(S3CopyObject, "Number of S3 API CopyObject calls.") \
+    M(S3ListObjects, "Number of S3 API ListObjects calls.") \
+    M(S3HeadObject,  "Number of S3 API HeadObject calls.") \
+    M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.") \
+    M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.") \
+    M(S3UploadPart, "Number of S3 API UploadPart calls.") \
+    M(S3AbortMultipartUpload, "Number of S3 API AbortMultipartUpload calls.") \
+    M(S3CompleteMultipartUpload, "Number of S3 API CompleteMultipartUpload calls.") \
+    M(S3PutObject, "Number of S3 API PutObject calls.") \
+    M(S3GetObject, "Number of S3 API GetObject calls.") \
+\
+    M(DiskS3DeleteObjects, "Number of DiskS3 API DeleteObject(s) calls.") \
+    M(DiskS3CopyObject, "Number of DiskS3 API CopyObject calls.") \
+    M(DiskS3ListObjects, "Number of DiskS3 API ListObjects calls.") \
+    M(DiskS3HeadObject,  "Number of DiskS3 API HeadObject calls.") \
+    M(DiskS3CreateMultipartUpload, "Number of DiskS3 API CreateMultipartUpload calls.") \
+    M(DiskS3UploadPartCopy, "Number of DiskS3 API UploadPartCopy calls.") \
+    M(DiskS3UploadPart, "Number of DiskS3 API UploadPart calls.") \
+    M(DiskS3AbortMultipartUpload, "Number of DiskS3 API AbortMultipartUpload calls.") \
+    M(DiskS3CompleteMultipartUpload, "Number of DiskS3 API CompleteMultipartUpload calls.") \
+    M(DiskS3PutObject, "Number of DiskS3 API PutObject calls.") \
+    M(DiskS3GetObject, "Number of DiskS3 API GetObject calls.") \
+\
+    M(SchemaInferenceCacheHits, "Number of times the requested source is found in schema cache") \
+    M(SchemaInferenceCacheSchemaHits, "Number of times the schema is found in schema cache during schema inference") \
+    M(SchemaInferenceCacheNumRowsHits, "Number of times the number of rows is found in schema cache during count from files") \
+    M(SchemaInferenceCacheMisses, "Number of times the requested source is not in schema cache") \
+    M(SchemaInferenceCacheSchemaMisses, "Number of times the requested source is in cache but the schema is not in cache during schema inference") \
+    M(SchemaInferenceCacheNumRowsMisses, "Number of times the requested source is in cache but the number of rows is not in cache while count from files") \
+    M(SchemaInferenceCacheEvictions, "Number of times a schema from cache was evicted due to overflow") \
+    M(SchemaInferenceCacheInvalidations, "Number of times a schema in cache became invalid due to changes in data") \
     \
     M(QueryMemoryLimitExceeded, "Number of times when memory limit exceeded for query.") \
     M(MarkBitmapIndexReadMicroseconds, "Total time spent in reading mark bitmap index.") \
+    M(RemoteFSReadMicroseconds, "Time of reading from remote filesystem.") \
+    M(RemoteFSReadBytes, "Read bytes from remote filesystem.") \
+    \
+    M(RemoteFSSeeks, "Total number of seeks for async buffer") \
+    M(RemoteFSPrefetchRequests, "Number of prefetches made with asynchronous reading from remote filesystem") \
+    M(RemoteFSCancelledPrefetches, "Number of cancelled prefetches (because of seek)") \
+    M(RemoteFSUnusedPrefetches, "Number of prefetches pending at buffer destruction") \
+    M(RemoteFSPrefetchedReads, "Number of reads from prefetched buffer") \
+    M(RemoteFSPrefetchTaskWait, "Number of waiting when reading from prefetched buffer") \
+    M(RemoteFSPrefetchTaskNotWait, "Number of not waiting when reading from prefetched buffer") \
+    M(RemoteFSPrefetchedBytes, "Number of bytes from prefetched buffer") \
+    M(RemoteFSUnprefetchedReads, "Number of reads from unprefetched buffer") \
+    M(RemoteFSUnprefetchedBytes, "Number of bytes from unprefetched buffer") \
+    M(RemoteFSLazySeeks, "Number of lazy seeks") \
+    M(RemoteFSSeeksWithReset, "Number of seeks which lead to a new connection") \
+    M(RemoteFSSeeksOverUntilPosition, "Number of seeks which is greater than read_until_position") \
+    M(RemoteFSBuffers, "Number of buffers created for asynchronous reading from remote filesystem") \
+    M(RemoteFSAsynchronousReadWaitMicroseconds, "Time spent in waiting for asynchronous remote reads.") \
+    M(RemoteFSSynchronousReadWaitMicroseconds, "Time spent in waiting for synchronous remote reads.") \
+    M(ReusedDataPartReaders, "Number of reused data part reader.") \
     \
     M(SDRequest, "Number requests sent to SD") \
     M(SDRequestFailed, "Number requests sent to SD that failed") \
@@ -297,28 +410,48 @@
     M(SDRequestUpstreamFailed, "Number requests sent to SD upstream that failed") \
     \
     M(WriteBufferFromHdfsWriteBytes, "")\
-    M(HDFSWriteElapsedMilliseconds, "")\
+    M(HDFSWriteElapsedMicroseconds, "")\
     M(WriteBufferFromHdfsWrite, "")\
     M(WriteBufferFromHdfsWriteFailed, "")\
+    M(HdfsConnect, "") \
+    M(HdfsConnectMicroseconds, "") \
+    M(HdfsRequestErrors, "") \
     M(HdfsFileOpen, "")\
+    M(HdfsFileOpenMicroseconds, "")\
+    M(HdfsExists, "") \
+    M(HdfsList, "") \
+    M(HdfsRename, "") \
     M(ReadBufferFromHdfsRead, "")\
     M(ReadBufferFromHdfsReadFailed, "")\
     M(ReadBufferFromHdfsReadBytes, "")\
-    M(HDFSReadElapsedMilliseconds, "")\
+    M(HDFSReadElapsedMicroseconds, "")\
     M(HDFSSeek, "")\
     M(HDFSSeekElapsedMicroseconds, "")\
-    M(HdfsGetBlkLocMicroseconds, "Total number of millisecons spent to call getBlockLocations") \
-    M(HdfsSlowNodeCount, "Total number of millisecons spent to call getBlockLocations") \
-    M(HdfsFailedNodeCount, "Total number of millisecons spent to call getBlockLocations")     \
-    \
+    M(HdfsGetBlkLocMicroseconds, "Total number of milliseconds spent to call getBlockLocations") \
+    M(HdfsSlowNodeCount, "Total number of milliseconds spent to call getBlockLocations") \
+    M(HdfsFailedNodeCount, "Total number of milliseconds spent to call getBlockLocations") \
+\
     M(DiskCacheGetMicroSeconds, "Total time for disk cache get operation") \
     M(DiskCacheAcquireStatsLock, "Total time for acquire table stats lock") \
-    M(DiskCacheScheduleCacheTaskMicroSeconds, "Total time for schedule disk cache task") \
+    M(DiskCacheScheduleCacheTaskMicroseconds, "Total time for schedule disk cache task") \
+    M(DiskCacheTaskDropCount, "Total drop count for schedule disk cache task") \
     M(DiskCacheUpdateStatsMicroSeconds, "Total time for update disk cache statistics") \
     M(DiskCacheGetMetaMicroSeconds, "Total time for disk cache get operations") \
     M(DiskCacheGetTotalOps, "Total count of disk cache get operations") \
     M(DiskCacheSetTotalOps, "Total count of disk cache set operations") \
-    \
+    M(DiskCacheSetTotalBytes, "Total  of disk cache set operations") \
+    M(DiskCacheDeviceBytesWritten, "Total bytes written of disk cache device") \
+    M(DiskCacheDeviceBytesRead, "Total bytes read of disk cache device") \
+    M(DiskCacheDeviceWriteIOErrors, "Total errors of disk cache device write io") \
+    M(DiskCacheDeviceReadIOErrors, "Total errors of disk cache device read io") \
+    M(DiskCacheDeviceWriteIOLatency, "Latency of disk cache device write io") \
+    M(DiskCacheDeviceReadIOLatency, "Latency of disk cache device read io") \
+\
+    M(ParquetFileOpened, "Number of parquet file read") \
+    M(ParquetReadRows, "Number of rows read by parquet native reader") \
+    M(ParquetPrewhereSkippedPageRows, "Number of rows skipped by page filter") \
+    M(ParquetPrewhereSkippedRows, "Number of rows skipped by parquet prewhere") \
+\
     M(CnchTxnAborted, "Total number of aborted transactions (excludes preempting transactions)") \
     M(CnchTxnCommitted, "Total number of committed transactions") \
     M(CnchTxnExpired, "Total number of expired transactions") \
@@ -328,12 +461,31 @@
     M(CnchTxnCommitV2Failed, "Number of commitV2 failures") \
     M(CnchTxnCommitV1ElapsedMilliseconds, "Total number of milliseconds spent to commitV1") \
     M(CnchTxnCommitV2ElapsedMilliseconds, "Total number of milliseconds spent to commitV2") \
-    M(CnchTxnPrecommitElapsedMilliseconds, "Total number of milliseconds spent to preempt tranasctions") \
+    M(CnchTxnPrecommitElapsedMilliseconds, "Total number of milliseconds spent to preempt transactions") \
     M(CnchTxnCommitKVElapsedMilliseconds, "Total number of milliseconds spent to commit transaction in catalog") \
     M(CnchTxnCleanFailed, "Number of times clean a transaction was failed") \
     M(CnchTxnCleanElapsedMilliseconds, "Total number of milliseconds spent to clean transactions") \
     M(CnchTxnAllTransactionRecord, "Total number of transaction records") \
     M(CnchTxnFinishedTransactionRecord, "Total number of finished transaction records") \
+    M(CnchTxnRecordCacheHits, "Total number of txn record hits in cache") \
+    M(CnchTxnRecordCacheMisses, "Total number of txn record misses in cache") \
+    M(CnchWriteDataElapsedMilliseconds, "") \
+    M(CnchDumpParts, "") \
+    M(CnchDumpPartsElapsedMilliseconds, "") \
+    M(CnchDumpPartsBytes, "") \
+\
+    M(CnchLoadMarksRequests, "") \
+    M(CnchLoadMarksBytes, "") \
+    M(CnchLoadMarksMicroseconds, "") \
+    M(CnchLoadMarksFromDiskCacheRequests, "") \
+    M(CnchLoadMarksFromDiskCacheBytes, "") \
+    M(CnchLoadMarksFromDiskCacheMicroseconds, "") \
+\
+    M(CnchPartAllocationSplits, \
+      "Number of times part allocation has been split between using bucket number and hashing due to partially clustered bucket table") \
+    M(CnchSendResourceRpcCallElapsedMilliseconds, "Total RPC time for send resource to all workers, exclude RPC wait time") \
+    M(CnchSendResourceElapsedMilliseconds, "Total time for send resource to all workers") \
+    M(CnchDiskCacheNodeUnLocalityParts, "Total count of un-locality disk cache part") \
     \
     M(IntentLockElapsedMilliseconds, "Total time spent to acquire intent locks") \
     M(IntentLockWriteIntentElapsedMilliseconds, "Total time spent to write intents") \
@@ -343,24 +495,45 @@
     M(CatalogConstructorSuccess, "") \
     M(CatalogConstructorFailed, "") \
     M(CatalogTime, "Total time spent getting data parts from Catalog") \
+    M(PrunePartsTime, "Total time spent pruning data parts") \
     M(TotalPartitions, "Number of total partitions") \
     M(PrunedPartitions, "Number of pruned partitions") \
     M(UpdateTableStatisticsSuccess, "") \
     M(UpdateTableStatisticsFailed, "") \
     M(GetTableStatisticsSuccess, "") \
     M(GetTableStatisticsFailed, "") \
-    M(GetAvailableTableStatisticsTagsSuccess, "") \
-    M(GetAvailableTableStatisticsTagsFailed, "") \
     M(RemoveTableStatisticsSuccess, "") \
     M(RemoveTableStatisticsFailed, "") \
     M(UpdateColumnStatisticsSuccess, "") \
     M(UpdateColumnStatisticsFailed, "") \
     M(GetColumnStatisticsSuccess, "") \
     M(GetColumnStatisticsFailed, "") \
-    M(GetAvailableColumnStatisticsTagsSuccess, "") \
-    M(GetAvailableColumnStatisticsTagsFailed, "") \
+    M(GetAllColumnStatisticsSuccess, "") \
+    M(GetAllColumnStatisticsFailed, "") \
     M(RemoveColumnStatisticsSuccess, "") \
     M(RemoveColumnStatisticsFailed, "") \
+    M(RemoveAllColumnStatisticsSuccess, "") \
+    M(RemoveAllColumnStatisticsFailed, "") \
+    M(UpdateStatisticsSettingsFailed, "") \
+    M(UpdateStatisticsSettingsSuccess, "") \
+    M(GetStatisticsSettingsFailed, "") \
+    M(GetStatisticsSettingsSuccess, "") \
+    M(UpdateSQLBindingFailed, "") \
+    M(UpdateSQLBindingSuccess, "") \
+    M(GetSQLBindingFailed, "") \
+    M(GetSQLBindingSuccess, "") \
+    M(GetSQLBindingsFailed, "") \
+    M(GetSQLBindingsSuccess, "") \
+    M(RemoveSQLBindingFailed, "") \
+    M(RemoveSQLBindingSuccess, "") \
+    M(UpdatePreparedStatementFailed, "") \
+    M(UpdatePreparedStatementSuccess, "") \
+    M(GetPreparedStatementFailed, "") \
+    M(GetPreparedStatementSuccess, "") \
+    M(GetPreparedStatementsFailed, "") \
+    M(GetSPreparedStatementsSuccess, "") \
+    M(RemovePreparedStatementFailed, "") \
+    M(RemovePreparedStatementSuccess, "") \
     M(CreateDatabaseSuccess, "") \
     M(CreateDatabaseFailed, "") \
     M(GetDatabaseSuccess, "") \
@@ -371,6 +544,16 @@
     M(DropDatabaseFailed, "") \
     M(RenameDatabaseSuccess, "") \
     M(RenameDatabaseFailed, "") \
+    M(AlterDatabaseSuccess, "") \
+    M(AlterDatabaseFailed, "") \
+    M(CreateSnapshotSuccess, "") \
+    M(CreateSnapshotFailed, "") \
+    M(RemoveSnapshotSuccess, "") \
+    M(RemoveSnapshotFailed, "") \
+    M(TryGetSnapshotSuccess, "") \
+    M(TryGetSnapshotFailed, "") \
+    M(GetAllSnapshotsSuccess, "") \
+    M(GetAllSnapshotsFailed, "") \
     M(CreateTableSuccess, "") \
     M(CreateTableFailed, "") \
     M(DropTableSuccess, "") \
@@ -411,6 +594,8 @@
     M(GetServerDataPartsInPartitionsFailed, "") \
     M(GetAllServerDataPartsSuccess, "") \
     M(GetAllServerDataPartsFailed, "") \
+    M(GetAllServerDataPartsWithDBMSuccess, "") \
+    M(GetAllServerDataPartsWithDBMFailed, "") \
     M(GetDataPartsByNamesSuccess, "") \
     M(GetDataPartsByNamesFailed, "") \
     M(GetStagedDataPartsByNamesSuccess, "") \
@@ -421,6 +606,8 @@
     M(GetStagedPartsFailed, "") \
     M(GetDeleteBitmapsInPartitionsSuccess, "") \
     M(GetDeleteBitmapsInPartitionsFailed, "") \
+    M(GetDeleteBitmapsFromCacheInPartitionsSuccess, "") \
+    M(GetDeleteBitmapsFromCacheInPartitionsFailed, "") \
     M(GetDeleteBitmapByKeysSuccess, "") \
     M(GetDeleteBitmapByKeysFailed, "") \
     M(AddDeleteBitmapsSuccess, "") \
@@ -435,6 +622,12 @@
     M(GetKafkaOffsetsTopicPartitionListFailed, "") \
     M(ClearOffsetsForWholeTopicSuccess, "") \
     M(ClearOffsetsForWholeTopicFailed, "") \
+    M(SetTransactionForKafkaConsumerSuccess, "") \
+    M(SetTransactionForKafkaConsumerFailed, "") \
+    M(GetTransactionForKafkaConsumerSuccess, "") \
+    M(GetTransactionForKafkaConsumerFailed, "") \
+    M(ClearKafkaTransactionsForTableSuccess, "") \
+    M(ClearKafkaTransactionsForTableFailed, "") \
     M(DropAllPartSuccess, "") \
     M(DropAllPartFailed, "") \
     M(GetPartitionListSuccess, "") \
@@ -509,6 +702,8 @@
     M(GetUndoBufferFailed, "") \
     M(GetAllUndoBufferSuccess, "") \
     M(GetAllUndoBufferFailed, "") \
+    M(GetUndoBufferIteratorSuccess, "") \
+    M(GetUndoBufferIteratorFailed, "") \
     M(GetTransactionRecordsSuccess, "") \
     M(GetTransactionRecordsFailed, "") \
     M(GetTransactionRecordsTxnIdsSuccess, "") \
@@ -537,8 +732,8 @@
     M(UpdateServerWorkerGroupFailed, "") \
     M(GetWorkersInWorkerGroupSuccess, "") \
     M(GetWorkersInWorkerGroupFailed, "") \
-    M(GetTableByIDSuccess, "") \
-    M(GetTableByIDFailed, "") \
+    M(GetTableHistoriesSuccess, "") \
+    M(GetTableHistoriesFailed, "") \
     M(GetTablesByIDSuccess, "") \
     M(GetTablesByIDFailed, "") \
     M(GetAllDataBasesSuccess, "") \
@@ -559,8 +754,12 @@
     M(GetDatabaseInTrashFailed, "") \
     M(GetAllTablesIDSuccess, "") \
     M(GetAllTablesIDFailed, "") \
+    M(GetTablesIDByTenantSuccess, "") \
+    M(GetTablesIDByTenantFailed, "") \
     M(GetTableIDByNameSuccess, "") \
     M(GetTableIDByNameFailed, "") \
+    M(GetTableIDsByNamesSuccess, "") \
+    M(GetTableIDsByNamesFailed, "") \
     M(GetAllWorkerGroupsSuccess, "") \
     M(GetAllWorkerGroupsFailed, "") \
     M(GetAllDictionariesSuccess, "") \
@@ -575,6 +774,8 @@
     M(ClearStagePartsMetaFailed, "") \
     M(ClearDataPartsMetaForTableSuccess, "") \
     M(ClearDataPartsMetaForTableFailed, "") \
+    M(ClearDeleteBitmapsMetaForTableSuccess, "") \
+    M(ClearDeleteBitmapsMetaForTableFailed, "") \
     M(GetSyncListSuccess, "") \
     M(GetSyncListFailed, "") \
     M(ClearSyncListSuccess, "") \
@@ -607,8 +808,8 @@
     M(GetTablePreallocateVWFailed, "") \
     M(GetTablePartitionMetricsSuccess, "") \
     M(GetTablePartitionMetricsFailed, "") \
-    M(GetTablePartitionMetricsFromMetastoreSuccess, "") \
-    M(GetTablePartitionMetricsFromMetastoreFailed, "") \
+    M(GetPartitionMetricsFromMetastoreSuccess, "") \
+    M(GetPartitionMetricsFromMetastoreFailed, "") \
     M(UpdateTopologiesSuccess, "") \
     M(UpdateTopologiesFailed, "") \
     M(GetTopologiesSuccess, "") \
@@ -689,6 +890,10 @@
     M(DropMaskingPoliciesFailed, "") \
     M(IsHostServerSuccess, "") \
     M(IsHostServerFailed, "") \
+    M(CnchDataPartCacheHits, "")\
+    M(CnchDataPartCacheMisses, "")\
+    M(CnchDataDeleteBitmapCacheHits, "")\
+    M(CnchDataDeleteBitmapCacheMisses, "")\
     M(CnchReadSizeFromDiskCache, "") \
     M(CnchReadSizeFromRemote, "") \
     M(CnchReadDataMicroSeconds,"") \
@@ -705,21 +910,243 @@
     M(GetBGJobStatusesFailed, "") \
     M(DropBGJobStatusSuccess, "") \
     M(DropBGJobStatusFailed, "") \
-    \
+    M(GetTableTrashItemsMetricsDataFromMetastoreSuccess, "") \
+    M(GetTableTrashItemsMetricsDataFromMetastoreFailed, "") \
+    M(GetPartsInfoMetricsSuccess, "") \
+    M(GetPartsInfoMetricsFailed, "") \
+    M(PutSensitiveResourceSuccess, "") \
+    M(PutSensitiveResourceFailed, "") \
+    M(GetSensitiveResourceSuccess, "") \
+    M(GetSensitiveResourceFailed, "") \
+    M(PutAccessEntitySuccess, "") \
+    M(PutAccessEntityFailed, "") \
+    M(TryGetAccessEntitySuccess, "") \
+    M(TryGetAccessEntityFailed, "") \
+    M(GetAllAccessEntitySuccess, "") \
+    M(GetAllAccessEntityFailed, "") \
+    M(DropAccessEntitySuccess, "") \
+    M(DropAccessEntityFailed, "") \
+    M(TryGetAccessEntityNameSuccess, "") \
+    M(TryGetAccessEntityNameFailed, "") \
+\
     M(PartsToAttach, "") \
     M(NumOfRowsToAttach, "") \
+    M(VWQueueMilliseconds, "Total time spent to wait in virtual warehouse queue") \
+    M(VWQueueType, "Which type of virtual warehouse queue") \
+    M(ScheduleTimeMilliseconds, "Total time spent to schedule plan segment") \
     \
-    M(WriteBufferFromS3WriteOp, "S3 write op count") \
-    M(WriteBufferFromS3WriteOpFailed, "s3 write op failed count") \
-    M(WriteBufferFromS3WriteOpMicro, "s3 write op time") \
-    M(WriteBufferFromS3WriteOpBytes, "s3 write op size") \
-    M(WriteBufferFromS3ControlOp, "s3 control op count") \
-    M(WriteBufferFromS3ControlOpFailed, "s3 control op failed count") \
-    M(WriteBufferFromS3ControlOpMicro, "s3 control op time") \
-    M(ReadBufferFromS3Read, "s3 read op count") \
-    M(ReadBufferFromS3ReadFailed, "s3 read failed count") \
-    M(ReadBufferFromS3ReadBytes, "s3 read op size") \
-    M(ReadBufferFromS3ReadMicro, "s3 read op time") \
+    M(ScheduledDedupTaskNumber, "Total number of scheduled dedup task") \
+    M(DeleteBitmapCacheHit, "Total number of times to hit the cache to get delete bitmap for a part") \
+    M(DeleteBitmapCacheMiss, "Total number of times to miss the cache to get delete bitmap for a part") \
+    M(UniqueKeyIndexMetaCacheHit, "Total number of times to hit the unique key index cache") \
+    M(UniqueKeyIndexMetaCacheMiss, "Total number of times to miss the unique key index cache") \
+    M(UniqueKeyIndexBlockCacheHit, "Total number of times to hit the unique key index block cache") \
+    M(UniqueKeyIndexBlockCacheMiss, "Total number of times to miss the unique key index block cache") \
+    \
+    M(AllWorkerSize, "Total worker size of worker group") \
+    M(HealthWorkerSize, "Number of worker which can execute any type plan segment") \
+    M(HeavyLoadWorkerSize, "Number of worker which can only execute source plan segment") \
+    M(SourceOnlyWorkerSize, "Number of worker which can only execute source plan segment") \
+    M(UnhealthWorkerSize, "Number of unhealthy worker") \
+    M(NotConnectedWorkerSize, "Number of not connected worker size") \
+    M(SelectHealthWorkerMilliSeconds, "Total time for select health worker") \
+    \
+    M(PreloadSubmitTotalOps, "Total count of preload submit by writer node") \
+    M(PreloadSendTotalOps, "Total count of preload send by server node") \
+    M(PreloadExecTotalOps, "Total count of preload run by reader node") \
+\
+    M(WriteBufferFromS3WriteMicroseconds, "Time spent on writing to S3.") \
+    M(WriteBufferFromS3WriteBytes, "Bytes written to S3.") \
+    M(WriteBufferFromS3WriteErrors, "Number of exceptions while writing to S3.") \
+    \
+    M(ReadBufferFromS3ReadCount, "The count of ReadBufferFromS3 read from s3 stream") \
+    M(ReadBufferFromS3FailedCount, "ReadBuffer from s3 failed count") \
+    M(ReadBufferFromS3ReadBytes, "Bytes size ReadBufferFromS3 read from s3 stream") \
+    M(ReadBufferFromS3ReadMicroseconds, "The time spent ReadBufferFromS3 read from s3 stream") \
+    M(ReadBufferFromS3StreamInitMicroseconds, "Time spent initializing connection to S3.") \
+    M(ReadBufferFromS3Seeks, "The seek count of read buffer from s3.") \
+    \
+    M(ReadBufferFromRpcStreamFileRead, "remote rpc file data read count") \
+    M(ReadBufferFromRpcStreamFileReadFailed, "remote rpc file data read failed count") \
+    M(ReadBufferFromRpcStreamFileReadMs, "remote rpc file data read ms") \
+    M(ReadBufferFromRpcStreamFileReadBytes, "remote rpc file data read bytes") \
+    M(ReadBufferFromRpcStreamFileConnect, "remote rpc file data connect count") \
+    M(ReadBufferFromRpcStreamFileConnectFailed, "remote rpc file data connect failed count") \
+    M(ReadBufferFromRpcStreamFileConnectMs, "remote rpc file data connect ms") \
+    \
+    M(IOSchedulerOpenFileMicro, "Time used in open file when using io scheduler") \
+    M(IOSchedulerScheduleMicro, "Time used in schedule io request") \
+    M(IOSchedulerSubmittedUserRequests, "Number of submitted user request from user") \
+    M(IOSchedulerExecutedRawReuqests, "Number of submitted raw request from io scheduler") \
+    \
+    M(WSReadBufferReadFailed, "WSReadBufferFromFS failed read count") \
+    M(WSReadBufferReadCount, "WSReadBufferFromFS read count") \
+    M(WSReadBufferReadBytes, "WSReadBufferFromFS readed bytes") \
+    M(WSReadBufferReadMicro, "WSReadBufferFromFS readed time in micro seconds") \
+    \
+    M(PFRAWSReadBufferReadCount, "PFRAWSReadBufferFromFS nextImpl invoked count") \
+    M(PFRAWSReadBufferPrefetchCount, "PFRAWSReadBufferFromFS prefetch triggered count") \
+    M(PFRAWSReadBufferPrefetchUtilCount, "PFRAWSReadBufferFromFS prefetch used count") \
+    M(PFRAWSReadBufferPrefetchWaitMicro, "PFRAWSReadBufferFromFS wait time before prefetch finished when utilize it") \
+    M(PFRAWSReadBufferRemoteReadCount, "PFRAWSReadBufferFromFS remote read count, including direct read and prefetch read") \
+    M(PFRAWSReadBufferRemoteReadBytes, "PFRAWSReadBufferFromFS triggered remote read bytes") \
+    M(PFRAWSReadBufferReadMicro, "PFRAWSReadBufferFromFS read time, including seek and nextImpl") \
+    \
+    M(S3TrivialReaderReadCount, "S3TrivialReader read count") \
+    M(S3TrivialReaderReadMicroseconds, "S3TrivialReader read micro seconds") \
+    M(S3TrivialReaderReadBytes, "S3TrivialReader read bytes") \
+    M(S3ReadAheadReaderReadCount, "The count of S3ReadAheadReader read from s3 stream") \
+    M(S3ReadAheadReaderReadBytes, "The bytes number of S3ReadAheadReader read from s3 stream") \
+    M(S3ReadAheadReaderReadMicro, "The time spent on S3ReadAheadReader read from s3 stream") \
+    M(S3ReadAheadReaderIgnoreCount, "The count of S3ReadAheadReader ignore from s3 stream") \
+    M(S3ReadAheadReaderIgnoreBytes, "The bytes number of S3ReadAheadReader ignore from s3 stream") \
+    M(S3ReadAheadReaderIgnoreMicro, "The time spent on S3ReadAheadReader ignore from s3 stream") \
+    M(S3ReadAheadReaderGetRequestCount, "The count of S3ReadAheadReader invokes s3 get request.") \
+    M(S3ReadAheadReaderExpectReadBytes, "The expected read bytes from S3ReadAheadReader's get request.") \
+    M(S3ReadAheadReaderGetRequestMicro, "The time spent on S3ReadAheadReader sends s3 get request.") \
+    M(S3ReadAheadReaderSeekTimes, "The seek times of S3ReadAheadReader.") \
+    M(S3ReadAheadReaderExpandTimes, "The stream range expand times of S3ReadAheadReader.") \
+    M(S3ResetSessions, "Number of HTTP sessions that were reset in S3 read.") \
+    M(S3PreservedSessions, "Number of HTTP sessions that were preserved in S3 read.") \
+    M(ConnectionPoolIsFullMicroseconds, "Total time spent waiting for a slot in connection pool.") \
+    \
+    M(PocoHTTPS3GetCount, "") \
+    M(PocoHTTPS3GetTime, "") \
+    M(PocoHTTPS3GetSessionTime, "") \
+    M(CRTHTTPS3GetCount, "") \
+    M(CRTHTTPS3GetTime, "") \
+    M(CRTHTTPS3WriteBytes, "") \
+\
+    M(BigHashEvictionCount, "BigHash eviction count") \
+    M(BigHashEvictionExpiredCount, "BigHash eviction expired count") \
+    M(BigHashLogicalWrittenCount, "BigHash logical written bytes") \
+    M(BigHashPhysicalWrittenCount, "BigHash physical written bytes") \
+    M(BigHashInsertCount, "BigHash insert count") \
+    M(BigHashSuccInsertCount, "BigHash insert succeed count") \
+    M(BigHashRemoveCount, "BigHash remove count") \
+    M(BigHashSuccRemoveCount, "BigHash remove succeed count") \
+    M(BigHashLookupCount, "BigHash lookup count") \
+    M(BigHashSuccLookupCount, "BigHash lookup succeed count") \
+    M(BigHashIOErrorCount, "BigHash IO error count") \
+    M(BigHashBFFalsePositiveCount, "BigHash bloom filter false positive count") \
+    M(BigHashBFProbCount, "BigHash bloom filter prob count") \
+    M(BigHashBFRejectCount, "BigHash bloom filter reject count") \
+\
+    M(BlockCacheInsertCount, "BlockCache insert count") \
+    M(BlockCacheInsertHashCollisionCount, "BlockCache insert hash collision count") \
+    M(BlockCacheSuccInsertCount, "BlockCache insert succeed count") \
+    M(BlockCacheLookupFalsePositiveCount, "BlockCache lookup false positive count") \
+    M(BlockCacheLookupEntryHeaderChecksumErrorCount, "BlockCache lookup entry header checksum error count") \
+    M(BlockCacheLookupValueChecksumErrorCount, "BlockCache lookup value checksum error count") \
+    M(BlockCacheRemoveCount, "BlockCache remove count") \
+    M(BlockCacheSuccRemoveCount, "BlockCache remove succeed count") \
+    M(BlockCacheEvictionLookupMissCount, "BlockCache eviction looukup miss count") \
+    M(BlockCacheEvictionExpiredCount, "BlockCache eviction expired count") \
+    M(BlockCacheAllocErrorCount, "BlockCache alloc error count") \
+    M(BlockCacheLogicWrittenCount, "BlockCache logic written count") \
+    M(BlockCacheLookupCount, "BlockCache lookup count") \
+    M(BlockCacheSuccLookupCount, "BlockCache succeed lookup count") \
+    M(BlockCacheReinsertionErrorCount, "BlockCache reinsertion error count") \
+    M(BlockCacheReinsertionCount, "BlockCache reinsertion count") \
+    M(BlockCacheReinsertionBytes, "BlockCache reinsertion size in bytes") \
+    M(BlockCacheLookupForItemDestructorErrorCount, "BlockCache lookup for item destructor error count") \
+    M(BlockCacheRemoveAttemptionCollisions, "BlockCache remove attemption collisions") \
+    M(BlockCacheReclaimEntryHeaderChecksumErrorCount, "BlockCache reclaim entry header checksum error count") \
+    M(BlockCacheReclaimValueChecksumErrorCount, "BlockCache reclaim value checksum error count") \
+    M(BlockCacheCleanupEntryHeaderChecksumErrorCount, "BlockCache cleanup entry header checksum error count") \
+    M(BlockCacheCleanupValueChecksumErrorCount, "BlockCache cleanup value checksum error count") \
+\
+    M(NvmCacheLookupCount, "NvmCache lookup count") \
+    M(NvmCacheLookupSuccCount, "NvmCache lookup success count") \
+    M(NvmCacheInsertCount, "NvmCache insert count") \
+    M(NvmCacheInsertSuccCount, "NvmCache insert success count") \
+    M(NvmCacheRemoveCount, "NvmCache remove count") \
+    M(NvmCacheRemoveSuccCount, "NvmCache remove success count") \
+    M(NvmCacheIoErrorCount, "NvmCache io error count") \
+    M(NvmGets, "NvmCache get op count") \
+    M(NvmGetMissFast, "NvmCache fast get miss count") \
+    M(NvmGetCoalesced, "NvmCache get coalesced count") \
+    M(NvmGetMiss, "NvmCache get miss count") \
+    M(NvmGetMissDueToInflightRemove, "NvmCache get miss count due to inflight remove") \
+    M(NvmPuts, "NvmCache put op count") \
+    M(NvmPutErrors, "NvmCache put error count") \
+    M(NvmAbortedPutOnTombstone, "NvmCache abort count of puts due to tombstone") \
+    M(NvmAbortedPutOnInflightGet, "NvmCache abort count of puts due to inflight get") \
+    M(NvmDeletes, "NvmCache remove op count") \
+    M(NvmSkippedDeletes, "NvmCache skipped remove op count") \
+\
+    M(RegionManagerPhysicalWrittenCount, "RegionManager physical written byte count") \
+    M(RegionManagerReclaimRegionErrorCount, "RegionManager reclaim region error count") \
+    M(RegionManagerReclaimCount, "RegionManager reclaim count") \
+    M(RegionManagerReclaimTimeCount, "RegionManager reclaim time count") \
+    M(RegionManagerEvictionCount, "RegionManager eviction count") \
+    M(RegionManagerNumInMemBufFlushRetries, "RegionManager number of in-memory buffer flush retries") \
+    M(RegionManagerNumInMemBufFlushFailures, "RegionManager number of in-memory buffer flush failures") \
+    M(RegionManagerNumInMemBufCleanupRetries, "RegionManager number of in-memory buffer cleanup retries") \
+    M(RegionManagerCleanRegionRetries, "RegionManager number of clean region retries") \
+\
+    M(TSORequest, "Number requests sent to TSO") \
+    M(TSORequestMicroseconds, "Total time spent in get timestamp from TSO") \
+    M(TSOError, "Error logged by TSO Service as a response to CNCH") \
+    \
+    M(BackupVW, "Whether use backup virtual warehouse or not") \
+    M(GetByKeySuccess, "") \
+    M(GetByKeyFailed, "") \
+\
+    M(SkipRowsTimeMicro, "Time used in skip unnecessary rows") \
+    M(ReadRowsTimeMicro, "Time used in read necessary rows") \
+    M(GinIndexCacheHit, "Cache hit of gin index") \
+    M(GinIndexCacheMiss, "Cache miss of gin index") \
+    M(PostingReadBytes, "Readed postings list size in bytes") \
+    M(QueryRewriterTime, "Total elapsed time spent on QueryRewriter in milliseconds") \
+    M(QueryAnalyzerTime, "Total elapsed time spent on QueryAnalyzer in milliseconds") \
+    M(QueryPlannerTime, "Total elapsed time spent on QueryPlanner in milliseconds") \
+    M(QueryOptimizerTime, "Total elapsed time spent on QueryOptimizer in milliseconds") \
+    M(PlanSegmentSplitterTime, "Total elapsed time spent on PlanSegmentSplitter in milliseconds") \
+    M(GetMvBaseTableIDSuccess, "") \
+    M(GetMvBaseTableIDFailed, "") \
+    M(GetMvBaseTableVersionSuccess, "") \
+    M(GetMvBaseTableVersionFailed, "") \
+    M(UpdateMvMetaIDSuccess, "") \
+    M(UpdateMvMetaIDFailed, "") \
+\
+    M(NumberOfMarkRangesBeforeBeMergedInPKFilter, "Number of mark ranges in primary index filtering before adjacent ranges be merged into more bigger ranges") \
+    M(PlanSegmentInstanceRetry, "How many times this plan segment has been retried, only valid under bsp mode") \
+\
+    M(OrcTotalStripes, "Total Stripes") \
+    M(OrcReadStripes, "Total Read Stripes") \
+    M(HdfsReadBigAtCount, "ReadBigAt count for Hdfs") \
+    M(HdfsReadBigAtBytes, "ReadBitAt bytes for Hdfs") \
+    M(OrcSkippedRows, "rows skipped") \
+    M(OrcTotalRows, "rows total") \
+    M(OrcReadDirectCount, "direct read counts") \
+    M(OrcReadCacheCount, "cache read counts") \
+    M(OrcIOMergedCount, "") \
+    M(OrcIOMergedBytes, "") \
+    M(OrcIOSharedCount, "") \
+    M(OrcIOSharedBytes, "") \
+    M(OrcIODirectCount, "") \
+    M(OrcIODirectBytes, "") \
+    M(PreparePartsForReadMilliseconds, "The time spend on loading CNCH part from ServerPart on worker when query with table version") \
+\
+    M(IOUringSQEsSubmitted, "Total number of io_uring SQEs submitted") \
+    M(IOUringSQEsResubmits, "Total number of io_uring SQE resubmits performed") \
+    M(IOUringCQEsCompleted, "Total number of successfully completed io_uring CQEs") \
+    M(IOUringCQEsFailed, "Total number of completed io_uring CQEs with failures") \
+    M(IOUringAsynchronousReadWaitMicroseconds, "Time spent in waiting for asynchronous reads in io_uring local read.") \
+    M(IOUringSynchronousReadWaitMicroseconds, "Time spent in waiting for synchronous reads in io_uring local read.") \
+    M(IOUringReaderIgnoredBytes, "Number of bytes ignored in IOUringReader") \
+\
+    M(LoadedServerParts, "Total server parts loaded from storage manager by version") \
+    M(LoadServerPartsMilliseconds, "The time spend on loading server parts by version from storage data manager.") \
+    M(LoadManifestPartsCacheHits, "Cache(disk) hit count of loading parts from manifest") \
+    M(LoadManifestPartsCacheMisses, "Cache(disk) miss count of loading parts from manifest") \
+\
+    M(DeserializeSkippedCompressedBytes, "Total compressed bytes skipped when deserialize") \
+    M(TotalGranulesCount, "The total granules before skipping index needs to read. If there are multiple indexes, the value is the sum value.") \
+    M(TotalSkippedGranules, "The total granules that skipping index dropped. If there are multiple indexes, the value is the sum value.") \
+    M(GinIndexFilterResultCacheHit, "Number of posting list result cache hit") \
+    M(GinIndexFilterResultCacheMiss, "Number of posting list result cache miss") \
 
 namespace ProfileEvents
 {
@@ -760,11 +1187,59 @@ void Counters::reset()
     resetCounters();
 }
 
-Counters Counters::getPartiallyAtomicSnapshot() const
+uint64_t Counters::getIOReadTime(bool use_async_read) const
 {
-    Counters res(VariableContext::Snapshot, nullptr);
+    if (counters)
+    {
+        // If we use async read, we only calculate the time of wait for asynchronous result
+        if (use_async_read)
+        {
+            return counters[ProfileEvents::RemoteFSAsynchronousReadWaitMicroseconds]
+                + counters[ProfileEvents::RemoteFSSynchronousReadWaitMicroseconds] + counters[ProfileEvents::DiskReadElapsedMicroseconds];
+        }
+        // Else, we calculate the origin read IO time
+        else
+        {
+            return counters[ProfileEvents::HDFSReadElapsedMicroseconds] + counters[ProfileEvents::ReadBufferFromS3ReadMicroseconds]
+                + counters[ProfileEvents::DiskReadElapsedMicroseconds];
+        }
+    }
+
+    return 0;
+}
+
+Counters::Snapshot::Snapshot()
+    : counters_holder(new Count[num_counters] {})
+{}
+
+uint64_t Counters::Snapshot::getIOReadTime(bool use_async_read) const
+{
+    if (counters_holder)
+    {
+        // If we use async read, we only calculate the time of wait for asynchronous result
+        if (use_async_read)
+        {
+            return counters_holder[ProfileEvents::RemoteFSAsynchronousReadWaitMicroseconds]
+                + counters_holder[ProfileEvents::RemoteFSSynchronousReadWaitMicroseconds]
+                + counters_holder[ProfileEvents::DiskReadElapsedMicroseconds];
+        }
+        // Else, we calculate the origin read IO time
+        else
+        {
+            return counters_holder[ProfileEvents::HDFSReadElapsedMicroseconds]
+                + counters_holder[ProfileEvents::ReadBufferFromS3ReadMicroseconds]
+                + counters_holder[ProfileEvents::DiskReadElapsedMicroseconds];
+        }
+    }
+
+    return 0;
+}
+
+Counters::Snapshot Counters::getPartiallyAtomicSnapshot() const
+{
+    Snapshot res;
     for (Event i = 0; i < num_counters; ++i)
-        res.counters[i].store(counters[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        res.counters_holder[i] = counters[i].load(std::memory_order_relaxed);
     return res;
 }
 
@@ -778,6 +1253,15 @@ const char * getName(Event event)
     };
 
     return strings[event];
+}
+
+const DB::String getSnakeName(Event event)
+{
+    DB::String res{getName(event)};
+
+    convertCamelToSnake(res);
+
+    return res;
 }
 
 const char * getDocumentation(Event event)
@@ -795,10 +1279,20 @@ const char * getDocumentation(Event event)
 
 Event end() { return END; }
 
-
-void increment(Event event, Count amount)
+void increment(Event event, Count amount, Metrics::MetricType type, LabelledMetrics::MetricLabels labels, time_t ts)
 {
     DB::CurrentThread::getProfileEvents().increment(event, amount);
+    try
+    {
+        if (type != Metrics::MetricType::None)
+        {
+            Metrics::EmitMetric(type, getSnakeName(event), amount, LabelledMetrics::toString(labels), ts);
+        }
+    }
+    catch (DB::Exception & e)
+    {
+        LOG_ERROR(&Poco::Logger::get("ProfileEvents"), "Metrics emit metric failed: {}", e.message());
+    }
 }
 
 }

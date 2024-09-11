@@ -8,10 +8,12 @@ namespace DB
 {
 
 using FunctionToYYYYMMDDhhmmss = FunctionDateOrDateTimeToSomething<DataTypeUInt64, ToYYYYMMDDhhmmssImpl>;
+using FunctionToYYYYMMDDhhmmssMySql = FunctionDateOrDateTimeToSomething<DataTypeFloat64, ToYYYYMMDDhhmmssMySqlImpl>;
 
-void registerFunctionToYYYYMMDDhhmmss(FunctionFactory & factory)
+REGISTER_FUNCTION(ToYYYYMMDDhhmmss)
 {
     factory.registerFunction<FunctionToYYYYMMDDhhmmss>();
+    factory.registerFunction<FunctionToYYYYMMDDhhmmssMySql>();
 }
 
 }

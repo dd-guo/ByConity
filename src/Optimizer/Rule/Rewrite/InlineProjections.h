@@ -30,17 +30,20 @@ namespace DB
 class InlineProjections : public Rule
 {
 public:
+    explicit InlineProjections(bool inline_arraysetcheck_ = false) : inline_arraysetcheck(inline_arraysetcheck_) { }
+    InlineProjections(PlanNodePtr & parent, PlanNodePtr & child, ContextMutablePtr & context, bool inline_arraysetcheck);
+
     RuleType getType() const override { return RuleType::INLINE_PROJECTION; }
     String getName() const override { return "INLINE_PROJECTION"; }
-
-    PatternPtr getPattern() const override;
+    bool isEnabled(ContextPtr context) const override {return context->getSettingsRef().enable_inline_projection; }
+    ConstRefPatternPtr getPattern() const override;
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
-    static std::optional<PlanNodePtr> inlineProjections(PlanNodePtr & parent, PlanNodePtr & child, ContextMutablePtr & context);
+    static std::optional<PlanNodePtr> inlineProjections(PlanNodePtr & parent, PlanNodePtr & child, ContextMutablePtr & context, bool inline_arraysetcheck);
 
 private:
-    static std::set<String> extractInliningTargets(ProjectionNode * parent, ProjectionNode * child, ContextMutablePtr & context);
+    static std::set<String> extractInliningTargets(ProjectionNode * parent, ProjectionNode * child, ContextMutablePtr & context, bool inline_arraysetcheck);
     static ASTPtr inlineReferences(const ConstASTPtr & expression, Assignments & assignments);
-
+    bool inline_arraysetcheck;
 };
 
 class InlineProjectionIntoJoin : public Rule
@@ -48,8 +51,8 @@ class InlineProjectionIntoJoin : public Rule
 public:
     RuleType getType() const override { return RuleType::INLINE_PROJECTION_INTO_JOIN; }
     String getName() const override { return "INLINE_PROJECTION_INTO_JOIN"; }
-
-    PatternPtr getPattern() const override;
+    bool isEnabled(ContextPtr context) const override {return context->getSettingsRef().enable_inline_projection_into_join; }  
+    ConstRefPatternPtr getPattern() const override;
 
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
 };
@@ -59,8 +62,8 @@ class InlineProjectionOnJoinIntoJoin : public Rule
 public:
     RuleType getType() const override { return RuleType::INLINE_PROJECTION_ON_JOIN_INTO_JOIN; }
     String getName() const override { return "INLINE_PROJECTION_ON_JOIN_INTO_JOIN"; }
-
-    PatternPtr getPattern() const override;
+    bool isEnabled(ContextPtr context) const override {return context->getSettingsRef().enable_inline_projection_on_join_into_join; }   
+    ConstRefPatternPtr getPattern() const override;
 
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
 };

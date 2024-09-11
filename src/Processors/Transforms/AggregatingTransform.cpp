@@ -22,10 +22,11 @@
 #include <Processors/Transforms/AggregatingTransform.h>
 
 #include <DataStreams/NativeBlockInputStream.h>
+#include <DataStreams/materializeBlock.h>
 #include <Processors/ISource.h>
 #include <Processors/Pipe.h>
 #include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
-#include <DataStreams/materializeBlock.h>
+#include <Protos/plan_node_utils.pb.h>
 
 namespace ProfileEvents
 {
@@ -418,9 +419,14 @@ AggregatingTransform::AggregatingTransform(Block header, AggregatingTransformPar
 }
 
 AggregatingTransform::AggregatingTransform(
-    Block header, AggregatingTransformParamsPtr params_, ManyAggregatedDataPtr many_data_,
-    size_t current_variant, size_t max_threads_, size_t temporary_data_merge_threads_)
-    : IProcessor({std::move(header)}, {params_->getHeader()}), params(std::move(params_))
+    Block header,
+    AggregatingTransformParamsPtr params_,
+    ManyAggregatedDataPtr many_data_,
+    size_t current_variant,
+    size_t max_threads_,
+    size_t temporary_data_merge_threads_)
+    : IProcessor({std::move(header)}, {params_->getHeader()})
+    , params(std::move(params_))
     , key_columns(params->params.keys_size)
     , aggregate_columns(params->params.aggregates_size)
     , many_data(std::move(many_data_))
@@ -428,6 +434,22 @@ AggregatingTransform::AggregatingTransform(
     , max_threads(std::min(many_data->variants.size(), max_threads_))
     , temporary_data_merge_threads(temporary_data_merge_threads_)
 {
+}
+
+void AggregatingTransformParams::toProto(Protos::AggregatingTransformParams & proto) const
+{
+    params.toProto(*proto.mutable_params());
+    proto.set_final(final);
+}
+
+std::shared_ptr<AggregatingTransformParams>
+AggregatingTransformParams::fromProto(const Protos::AggregatingTransformParams & proto, ContextPtr context)
+{
+    auto params = Aggregator::Params::fromProto(proto.params(), context);
+    auto final = proto.final();
+    auto step = std::make_shared<AggregatingTransformParams>(params, final);
+
+    return step;
 }
 
 AggregatingTransform::~AggregatingTransform() = default;
@@ -548,7 +570,7 @@ void AggregatingTransform::consume(Chunk chunk)
     {
         auto block = getInputs().front().getHeader().cloneWithColumns(chunk.detachColumns());
         block = materializeBlock(block);
-        if (!params->aggregator.mergeBlock(block, variants, no_more_keys))
+        if (!params->aggregator.mergeOnBlock(block, variants, no_more_keys))
             is_consume_finished = true;
     }
     else
@@ -570,7 +592,7 @@ void AggregatingTransform::initGenerate()
     if (variants.empty() && params->params.keys_size == 0 && !params->params.empty_result_for_aggregation_by_empty_set)
     {
         if (params->only_merge)
-            params->aggregator.mergeBlock(getInputs().front().getHeader(), variants, no_more_keys);
+            params->aggregator.mergeOnBlock(getInputs().front().getHeader(), variants, no_more_keys);
         else
             params->aggregator.executeOnBlock(getInputs().front().getHeader(), variants, key_columns, aggregate_columns, no_more_keys);
     }

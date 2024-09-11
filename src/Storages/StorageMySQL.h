@@ -41,7 +41,7 @@ public:
 
     Pipe read(
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
@@ -49,6 +49,11 @@ public:
         unsigned num_streams) override;
 
     BlockOutputStreamPtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr context) override;
+
+    /// only ModifyEngine is supported for StorageMySQL
+    void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
+
+    void alter(const AlterCommands & params, ContextPtr context, TableLockHolder & alter_lock_holder) override;
 
 private:
     friend class StorageMySQLBlockOutputStream;
@@ -61,6 +66,8 @@ private:
     MySQLSettings mysql_settings;
 
     mysqlxx::PoolWithFailoverPtr pool;
+
+    Poco::Logger * logger;
 };
 
 }

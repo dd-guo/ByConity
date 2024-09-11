@@ -15,43 +15,72 @@
 
 #pragma once
 
+#include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
 #include <Storages/MutationCommands.h>
 #include <Transaction/Actions/IAction.h>
+#include <Core/Settings.h>
 
 namespace DB
 {
 
+struct AlterDatabaseActionParams
+{
+    StorageID storage_id;
+    String statement;
+    bool is_database = false;
+    String engine_name;
+};
+
 class DDLAlterAction : public IAction
 {
 public:
-    DDLAlterAction(const ContextPtr & query_context_, const TxnTimestamp & txn_id_, StoragePtr table_)
+    DDLAlterAction(const ContextPtr & query_context_, const TxnTimestamp & txn_id_, StoragePtr table_, const Settings & query_settings_, const String & query_id_)
         : IAction(query_context_, txn_id_),
         log(&Poco::Logger::get("AlterAction")),
-        table(std::move(table_))
+        table(std::move(table_)),
+        query_settings(query_settings_),
+        params{table->getStorageID(), "fake_statement", false, ""},
+        query_id(query_id_)
+    {
+    }
+
+    DDLAlterAction(const ContextPtr & query_context_, const TxnTimestamp & txn_id_, AlterDatabaseActionParams params_, const Settings & query_settings_)
+        : IAction(query_context_, txn_id_),
+        log(&Poco::Logger::get("AlterAction")),
+        query_settings(query_settings_),
+        params(std::move(params_))
     {
     }
 
     ~DDLAlterAction() override = default;
 
     /// TODO: versions
-    void setNewSchema(String schema_);
+    void setOldSchema(const String & shcema_);
+    void setNewSchema(const String & schema_);
     String getNewSchema() const { return new_schema; }
+    std::optional<CnchMergeTreeMutationEntry> getMutationEntry() const { return final_mutation_entry; }
 
     void setMutationCommands(MutationCommands commands);
+    const MutationCommands & getMutationCommands() const { return mutation_commands; }
 
     void executeV1(TxnTimestamp commit_time) override;
 
 private:
-    void updateTsCache(const UUID & uuid, const TxnTimestamp & commit_time) override;
+    // void updateTsCache(const UUID & uuid, const TxnTimestamp & commit_time) override;
     void appendPart(MutableMergeTreeDataPartCNCHPtr part);
     static void updatePartData(MutableMergeTreeDataPartCNCHPtr part, TxnTimestamp commit_time);
 
     Poco::Logger * log;
     const StoragePtr table;
 
+    String old_schema;
     String new_schema;
     MutationCommands mutation_commands;
+    std::optional<CnchMergeTreeMutationEntry> final_mutation_entry;
+    Settings query_settings;
+    AlterDatabaseActionParams params;
+    const String query_id;
 };
 
 using DDLAlterActionPtr = std::shared_ptr<DDLAlterAction>;

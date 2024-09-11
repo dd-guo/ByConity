@@ -24,7 +24,6 @@
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 
 #include <Common/MultiVersion.h>
-#include <Common/QueueForAsyncTask.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
@@ -241,20 +240,25 @@ public:
     ~MergeTreeData() override;
 
     bool getQueryProcessingStageWithAggregateProjection(
-        ContextPtr query_context, const StorageMetadataPtr & metadata_snapshot, SelectQueryInfo & query_info) const;
+        ContextPtr query_context, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const;
 
     QueryProcessingStage::Enum getQueryProcessingStage(
         ContextPtr query_context,
         QueryProcessingStage::Enum to_stage,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & info) const override;
 
     static bool partsContainSameProjections(const DataPartPtr & left, const DataPartPtr & right);
 
     bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, ContextPtr, const StorageMetadataPtr & metadata_snapshot) const override;
-
+    
     /// Load the set of data parts from disk. Call once - immediately after the object is created.
     void loadDataParts(bool skip_sanity_checks);
+
+    StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const override;
+
+    /// The same as above but does not hold vector of data parts.
+    StorageSnapshotPtr getStorageSnapshotWithoutParts(const StorageMetadataPtr & metadata_snapshot) const override;
 
     /** ----------------------- COMPATIBLE CODE BEGIN-------------------------- */
     /*  compatible with old metastore. remove this later  */
@@ -482,7 +486,12 @@ public:
     Pipe alterPartition(
         const StorageMetadataPtr & metadata_snapshot,
         const PartitionCommands & commands,
-        ContextPtr query_context) override;
+        ContextPtr query_context,
+        const ASTPtr & query = nullptr) override;
+
+    /// Creates description of columns of data type Object from the range of data parts.
+    static ColumnsDescription getConcreteObjectColumns(
+        const DataPartsVector & parts, const ColumnsDescription & storage_columns);    
 
     /// Extracts MergeTreeData of other *MergeTree* storage
     ///  and checks that their structure suitable for ALTER TABLE ATTACH PARTITION FROM
@@ -598,8 +607,6 @@ public:
     /// Get required partition vector with query info
     DataPartsVector getRequiredPartitions(const SelectQueryInfo & query_info, ContextPtr context);
 
-    void checkColumnsValidity(const ColumnsDescription & columns) const override;
-
 protected:
 
     friend class IMergeTreeDataPart;
@@ -607,7 +614,7 @@ protected:
     friend struct ReplicatedMergeTreeTableMetadata;
     friend class StorageReplicatedMergeTree;
     friend class MergeTreeDataWriter;
-
+    
     MergeTreePartsMover parts_mover;
 
     std::optional<UInt64> totalRowsByPartitionPredicateImpl(
@@ -693,6 +700,12 @@ protected:
     /// Moves part to specified space, used in ALTER ... MOVE ... queries
     bool movePartsToSpace(const DataPartsVector & parts, SpacePtr space);
 
+    /// Creates description of columns of data type Object from the range of data parts.
+    static ColumnsDescription getConcreteObjectColumns(
+        boost::iterator_range<DataPartIteratorByStateAndInfo> range, const ColumnsDescription & storage_columns);
+    void resetObjectColumnsFromActiveParts(const DataPartsLock & lock);
+    void updateObjectColumns(const DataPartPtr & part, const DataPartsLock & lock);
+    
     /// Throttlers used in DataPartsExchange to lower maximum fetch/sends
     /// speed.
     ThrottlerPtr replicated_fetches_throttler;
@@ -751,8 +764,6 @@ private:
     // Get partition matcher for FREEZE / UNFREEZE queries.
     MatcherFn getPartitionMatcher(const ASTPtr & partition, ContextPtr context) const;
 
-    /// Returns default settings for storage with possible changes from global config.
-    virtual std::unique_ptr<MergeTreeSettings> getDefaultSettings() const = 0;
 };
 
 /// RAII struct to record big parts that are submerging or emerging.

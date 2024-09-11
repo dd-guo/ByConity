@@ -27,44 +27,72 @@ namespace DB::Statistics
 class CatalogAdaptor
 {
 public:
+    explicit CatalogAdaptor(ContextPtr context_) : context(context_)
+    {
+    }
+    ContextPtr getContext()
+    {
+        return context;
+    }
     virtual bool hasStatsData(const StatsTableIdentifier & table) = 0;
     virtual StatsData readStatsData(const StatsTableIdentifier & table) = 0;
+    virtual std::vector<String> readStatsColumnsKey(const StatsTableIdentifier & table) = 0;
     virtual StatsCollection readSingleStats(const StatsTableIdentifier & table, const std::optional<String> & column_name) = 0;
     virtual void writeStatsData(const StatsTableIdentifier & table, const StatsData & stats_data) = 0;
 
     virtual void dropStatsColumnData(const StatsTableIdentifier & table, const ColumnDescVector & cols_desc) = 0;
     virtual void dropStatsData(const StatsTableIdentifier & table) = 0;
-    virtual void dropStatsDataAll(const String & database) = 0;
 
-    virtual void invalidateClusterStatsCache(const StatsTableIdentifier & table) = 0;
-    // const because it should use ConstContext
-    virtual void invalidateServerStatsCache(const StatsTableIdentifier & table) const = 0;
+    // fast way to query row count
+    std::optional<UInt64> queryRowCount(const StatsTableIdentifier & table_id);
 
-    virtual std::vector<StatsTableIdentifier> getAllTablesID(const String & database_name) const = 0;
-    virtual std::optional<StatsTableIdentifier> getTableIdByName(const String & database_name, const String & table) const = 0;
-    virtual StoragePtr getStorageByTableId(const StatsTableIdentifier & identifier) const = 0;
+    virtual std::vector<StatsTableIdentifier> getAllTablesID(const String & database_name) = 0;
+    virtual std::optional<StatsTableIdentifier> getTableIdByName(const String & database_name, const String & table) = 0;
+    virtual std::optional<StatsTableIdentifier> getTableIdByUUID(const UUID & uuid) = 0;
+    virtual StoragePtr getStorageByTableId(const StatsTableIdentifier & identifier) = 0;
+    virtual StoragePtr tryGetStorageByUUID(const UUID & uuid) = 0;
     virtual UInt64 getUpdateTime() = 0;
-    virtual ColumnDescVector getCollectableColumns(const StatsTableIdentifier & identifier) const = 0;
-    virtual const Settings & getSettingsRef() const = 0;
+    ColumnDescVector getAllCollectableColumns(const StatsTableIdentifier & identifier);
+    virtual const Settings & getSettingsRef() = 0;
 
-    virtual bool isTableCollectable(const StatsTableIdentifier & table) const
+    virtual UInt64 fetchAddUdiCount(const StatsTableIdentifier & table, UInt64 count) = 0;
+    virtual void removeUdiCount(const StatsTableIdentifier & table) = 0;
+    struct TableOptions
     {
-        (void)table;
-        return true;
+        bool is_collectable = false;
+        bool is_auto_updatable = false;
+    };
+
+    ColumnDescVector filterCollectableColumns(
+        const StatsTableIdentifier & table, const std::vector<String> & target_columns, bool exception_on_unsupported = false);
+
+    bool isTableCollectable(const StatsTableIdentifier & table)
+    {
+        return getTableOptions(table).is_collectable;
     }
 
-    virtual bool isTableAutoUpdated(const StatsTableIdentifier & table) const
+    // fast filter
+    static bool isDatabaseCollectable(const String & database_name);
+    static TableOptions getTableOptionsForStorage(IStorage & storage);
+
+    // normal filter
+    TableOptions getTableOptions(const StatsTableIdentifier & table);
+
+    bool isTableAutoUpdatable(const StatsTableIdentifier & table)
     {
-        (void)table;
-        return false;
+        return getTableOptions(table).is_auto_updatable;
     }
 
     virtual void checkHealth(bool is_write) { (void)is_write; }
     virtual ~CatalogAdaptor() = default;
+
+protected:
+    ContextPtr context;
 };
 
+
 using CatalogAdaptorPtr = std::shared_ptr<CatalogAdaptor>;
-using ConstCatalogAdaptorPtr = std::shared_ptr<const CatalogAdaptor>;
+using ConstCatalogAdaptorPtr = std::shared_ptr<CatalogAdaptor>;
 CatalogAdaptorPtr createCatalogAdaptor(ContextPtr context);
 inline ConstCatalogAdaptorPtr createConstCatalogAdaptor(ContextPtr context)
 {

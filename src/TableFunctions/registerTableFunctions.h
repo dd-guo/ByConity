@@ -41,6 +41,7 @@ void registerTableFunctionInput(TableFunctionFactory & factory);
 void registerTableFunctionGenerate(TableFunctionFactory & factory);
 
 #if USE_AWS_S3
+void registerTableFunctionCnchS3(TableFunctionFactory & factory);
 void registerTableFunctionS3(TableFunctionFactory & factory);
 void registerTableFunctionS3Cluster(TableFunctionFactory & factory);
 void registerTableFunctionCOS(TableFunctionFactory & factory);
@@ -54,6 +55,7 @@ void registerTableFunctionODBC(TableFunctionFactory & factory);
 void registerTableFunctionJDBC(TableFunctionFactory & factory);
 
 void registerTableFunctionView(TableFunctionFactory & factory);
+void registerTableFunctionViewIfPermitted(TableFunctionFactory & factory);
 
 #if USE_MYSQL
 void registerTableFunctionMySQL(TableFunctionFactory & factory);
@@ -61,6 +63,12 @@ void registerTableFunctionMySQL(TableFunctionFactory & factory);
 
 #if USE_LIBPQXX
 void registerTableFunctionPostgreSQL(TableFunctionFactory & factory);
+#endif
+
+#if USE_HIVE
+void registerTableFunctionCnchHive(TableFunctionFactory & factory);
+// void registerTableFunctionCloudHive(TableFunctionFactory & factory);
+void registerTableFunctionHiveMetadata(TableFunctionFactory & factory);
 #endif
 
 void registerTableFunctionDictionary(TableFunctionFactory & factory);

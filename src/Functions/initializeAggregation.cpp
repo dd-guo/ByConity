@@ -37,6 +37,8 @@ public:
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
 
@@ -111,13 +113,6 @@ ColumnPtr FunctionInitializeAggregation::executeImpl(const ColumnsWithTypeAndNam
     MutableColumnPtr result_holder = result_type->createColumn();
     IColumn & res_col = *result_holder;
 
-    /// AggregateFunction's states should be inserted into column using specific way
-    auto * res_col_aggregate_function = typeid_cast<ColumnAggregateFunction *>(&res_col);
-
-    if (!res_col_aggregate_function && agg_func.isState())
-        throw Exception("State function " + agg_func.getName() + " inserts results into non-state column "
-                        + result_type->getName(), ErrorCodes::ILLEGAL_COLUMN);
-
     PODArray<AggregateDataPtr> places(input_rows_count);
     for (size_t i = 0; i < input_rows_count; ++i)
     {
@@ -148,16 +143,15 @@ ColumnPtr FunctionInitializeAggregation::executeImpl(const ColumnsWithTypeAndNam
     }
 
     for (size_t i = 0; i < input_rows_count; ++i)
-        if (!res_col_aggregate_function)
-            agg_func.insertResultInto(places[i], res_col, arena.get());
-        else
-            res_col_aggregate_function->insertFrom(places[i]);
+        /// We should use insertMergeResultInto to insert result into ColumnAggregateFunction
+        /// correctly if result contains AggregateFunction's states
+        agg_func.insertMergeResultInto(places[i], res_col, arena.get());
     return result_holder;
 }
 
 }
 
-void registerFunctionInitializeAggregation(FunctionFactory & factory)
+REGISTER_FUNCTION(InitializeAggregation)
 {
     factory.registerFunction<FunctionInitializeAggregation>();
 }

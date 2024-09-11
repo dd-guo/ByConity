@@ -42,13 +42,14 @@ public:
     bool supportsSampling() const override { return true; }
     bool supportsFinal() const override { return true; }
     bool supportsMapImplicitColumn() const override { return true; }
+    void appendColumns(ASTPtr & query, const Names & column_names);
     const ASTPtr & getInnerQuery() const
     {
         return getInMemoryMetadataPtr()->getSelectQuery().inner_query ;
     }
     Pipe read(
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
@@ -58,7 +59,7 @@ public:
     void read(
         QueryPlan & query_plan,
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
@@ -72,6 +73,7 @@ public:
 
     static void replaceWithSubquery(ASTSelectQuery & outer_query, ASTPtr view_query, ASTPtr & view_name);
     static ASTPtr restoreViewName(ASTSelectQuery & select_query, const ASTPtr & view_name);
+    static String replaceValueWithQueryParameter (const String & column_name, const NameToNameMap & parameter_values);
 
 protected:
     StorageView(

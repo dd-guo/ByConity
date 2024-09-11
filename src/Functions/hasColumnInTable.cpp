@@ -52,10 +52,10 @@ public:
     static constexpr auto name = "hasColumnInTable";
     static FunctionPtr create(ContextPtr context_)
     {
-        return std::make_shared<FunctionHasColumnInTable>(context_->getGlobalContext());
+        return std::make_shared<FunctionHasColumnInTable>(context_);
     }
 
-    explicit FunctionHasColumnInTable(ContextPtr global_context_) : WithContext(global_context_)
+    explicit FunctionHasColumnInTable(ContextPtr context_) : WithContext(context_)
     {
     }
 
@@ -73,9 +73,13 @@ public:
         return name;
     }
 
+    bool isPreviledgedFunction() const override { return getContext()->shouldBlockPrivilegedOperations(); }
+
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override;
 
     bool isDeterministic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override;
 };
@@ -171,7 +175,7 @@ ColumnPtr FunctionHasColumnInTable::executeImpl(const ColumnsWithTypeAndName & a
 
 }
 
-void registerFunctionHasColumnInTable(FunctionFactory & factory)
+REGISTER_FUNCTION(HasColumnInTable)
 {
     factory.registerFunction<FunctionHasColumnInTable>();
 }

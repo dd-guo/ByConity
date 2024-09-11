@@ -162,6 +162,13 @@ public:
 
         indexes.template get<key_tag>().clear();
     }
+
+    size_t size()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        return indexes.size();
+    }
 };
 
 
@@ -177,13 +184,15 @@ public:
     using Key = TKey;
     using Mapped = TMapped;
     using MappedPtr = std::shared_ptr<Mapped>;
+    using Delay = std::chrono::seconds;
 
 private:
     using Clock = std::chrono::steady_clock;
+    using Timestamp = Clock::time_point;
 
 public:
-    LRUCache(size_t max_size_)
-        : max_size(std::max(static_cast<size_t>(1), max_size_)) {}
+    LRUCache(size_t max_size_, const Delay & expiration_delay_ = Delay::zero())
+        : max_size(std::max(static_cast<size_t>(1), max_size_)), expiration_delay(expiration_delay_) {}
 
     MappedPtr get(const Key & key)
     {
@@ -321,6 +330,15 @@ public:
         misses = 0;
     }
 
+    size_t innerContainerSize() const
+    {
+        std::lock_guard lock(mutex);
+        if (inner_container)
+            return inner_container->size();
+        else
+            return 0;
+    }
+
     virtual ~LRUCache() {}
 
 protected:
@@ -335,9 +353,17 @@ protected:
 
     struct Cell
     {
+        bool expired(const Timestamp & last_timestamp, const Delay & delay) const
+        {
+            return (delay == Delay::zero()) ||
+                ((last_timestamp > timestamp) && ((last_timestamp - timestamp) > delay));
+        }
+
         MappedPtr value;
         size_t size;
         LRUQueueIterator queue_iterator;
+        Timestamp timestamp;
+        bool load_from_external{false};
     };
 
     using Cells = std::unordered_map<Key, Cell, HashFunction>;
@@ -345,6 +371,41 @@ protected:
     Cells cells;
 
     mutable std::mutex mutex;
+
+    Cell & setInternal(const Key & key, const MappedPtr & mapped, bool from_external = false)
+    {
+        auto [it, inserted] = cells.emplace(std::piecewise_construct,
+            std::forward_as_tuple(key),
+            std::forward_as_tuple());
+
+        Cell & cell = it->second;
+
+        if (inserted)
+        {
+            try
+            {
+                cell.queue_iterator = queue.insert(queue.end(), key);
+            }
+            catch (...)
+            {
+                cells.erase(it);
+                throw;
+            }
+        }
+        else
+        {
+            current_size -= cell.size;
+            queue.splice(queue.end(), queue, cell.queue_iterator);
+        }
+
+        cell.load_from_external = from_external;
+        cell.value = mapped;
+        cell.size = cell.value ? weight_function(*cell.value) : 0;
+        current_size += cell.size;
+
+        return cell;
+    }
+
 private:
 
     /// Represents pending insertion attempt.
@@ -418,6 +479,7 @@ private:
     /// Total weight of values.
     size_t current_size = 0;
     const size_t max_size;
+    const Delay expiration_delay;
 
     std::atomic<size_t> hits {0};
     std::atomic<size_t> misses {0};
@@ -428,12 +490,11 @@ private:
     {
         auto it = cells.find(key);
         if (it == cells.end())
-        {
-            return MappedPtr();
-        }
+            return loadExternal(key);
 
         Cell & cell = it->second;
 
+        updateCellTimestamp(cell);
         /// Move the key to the end of the queue. The iterator remains valid.
         queue.splice(queue.end(), queue, cell.queue_iterator);
 
@@ -442,38 +503,18 @@ private:
 
     void setImpl(const Key & key, const MappedPtr & mapped, [[maybe_unused]] std::lock_guard<std::mutex> & cache_lock)
     {
-        auto [it, inserted] = cells.emplace(std::piecewise_construct,
-            std::forward_as_tuple(key),
-            std::forward_as_tuple());
-
-        Cell & cell = it->second;
-
-        if (inserted)
-        {
-            try
-            {
-                cell.queue_iterator = queue.insert(queue.end(), key);
-            }
-            catch (...)
-            {
-                cells.erase(it);
-                throw;
-            }
-        }
-        else
-        {
-            current_size -= cell.size;
-            queue.splice(queue.end(), queue, cell.queue_iterator);
-        }
-
-        cell.value = mapped;
-        cell.size = cell.value ? weight_function(*cell.value) : 0;
-        current_size += cell.size;
-
-        removeOverflow();
+        Cell & cell = setInternal(key, mapped);
+        updateCellTimestamp(cell);
+        removeOverflow(cell.timestamp);
     }
 
-    void removeOverflow()
+    void updateCellTimestamp(Cell & cell)
+    {
+        if (expiration_delay != Delay::zero())
+            cell.timestamp = Clock::now();
+    }
+
+    void removeOverflow(const Timestamp & last_timestamp)
     {
         size_t current_weight_lost = 0;
         size_t queue_size = cells.size();
@@ -489,11 +530,21 @@ private:
             }
 
             const auto & cell = it->second;
+            if (!cell.expired(last_timestamp, expiration_delay))
+                break;
 
             current_size -= cell.size;
             current_weight_lost += cell.size;
 
-            removeExternal(key, cell.value, cell.size);
+            if (!cell.load_from_external)
+                removeExternal(key, cell.value, cell.size);
+
+            onEvict(key);
+
+            //sync inner_container
+            if (inner_container)
+                inner_container->remove(key);
+
             cells.erase(it);
             queue.pop_front();
             --queue_size;
@@ -508,9 +559,12 @@ private:
         }
     }
 
+    // called when element is evict from cache
+    virtual void onEvict(const Key &) {}
     /// Override this method if you want to track how much weight was lost in removeOverflow method.
     virtual void onRemoveOverflowWeightLoss(size_t /*weight_loss*/) {}
     virtual void removeExternal(const Key & /*key*/, const MappedPtr &/*value*/, size_t /*weight*/) {}
+    virtual MappedPtr loadExternal(const Key &) { return MappedPtr(); }
 };
 
 

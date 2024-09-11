@@ -21,13 +21,22 @@
 
 #include <Parsers/ASTIdentifier.h>
 
+#include <DataTypes/MapHelpers.h>
+#include <IO/Operators.h>
 #include <IO/WriteHelpers.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/IdentifierSemantic.h>
 #include <Interpreters/StorageID.h>
+#include <Parsers/formatTenantDatabaseName.h>
 #include <Parsers/queryToString.h>
-#include <IO/Operators.h>
-#include <DataTypes/MapHelpers.h>
-
+#include <Poco/Logger.h>
+#include "Common/Exception.h"
+#include "Common/typeid_cast.h"
+#include <Common/DefaultCatalogName.h>
+#include <common/logger_useful.h>
+#include "IO/WriteBufferFromString.h"
+#include "Parsers/IAST.h"
+#include "Parsers/IAST_fwd.h"
 
 namespace DB
 {
@@ -126,8 +135,7 @@ const std::vector<String> & ASTIdentifier::nameParts() const
 
 void ASTIdentifier::formatImplWithoutAlias(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
 {
-    auto format_element = [&](const String & elem_name)
-    {
+    auto format_element = [&](const String & elem_name) {
         settings.ostr << (settings.hilite ? hilite_identifier : "");
         settings.writeIdentifier(elem_name);
         settings.ostr << (settings.hilite ? hilite_none : "");
@@ -187,8 +195,10 @@ void ASTIdentifier::restoreTable()
 
 std::shared_ptr<ASTTableIdentifier> ASTIdentifier::createTable() const
 {
-    if (name_parts.size() == 1) return std::make_shared<ASTTableIdentifier>(name_parts[0]);
-    if (name_parts.size() == 2) return std::make_shared<ASTTableIdentifier>(name_parts[0], name_parts[1]);
+    if (name_parts.size() == 1)
+        return std::make_shared<ASTTableIdentifier>(name_parts[0]);
+    if (name_parts.size() == 2)
+        return std::make_shared<ASTTableIdentifier>(name_parts[0], name_parts[1]);
     return nullptr;
 }
 
@@ -235,6 +245,84 @@ ASTPtr ASTIdentifier::deserialize(ReadBuffer & buf)
     return identifier;
 }
 
+void ASTIdentifier::toLowerCase()
+{
+    ASTWithAlias::toLowerCase();
+    boost::to_lower(full_name);
+    for (auto &name_part : name_parts)
+        boost::to_lower(name_part);
+
+    if (semantic)
+        boost::to_lower(semantic->table);
+}
+
+void ASTIdentifier::toUpperCase()
+{
+    ASTWithAlias::toUpperCase();
+    boost::to_upper(full_name);
+    for (auto &name_part : name_parts)
+        boost::to_upper(name_part);
+
+    if (semantic)
+        boost::to_upper(semantic->table);
+}
+
+void ASTIdentifier::rewriteCnchDatabaseName(const Context *)
+{
+    if (!cnch_rewritten)
+    {
+        switch (name_parts.size())
+        {
+            /// Only database name
+            case 1:
+            /// Only database name + table name
+            case 2:
+                name_parts[0] = formatTenantDatabaseName(name_parts[0]);
+                resetFullName();
+                break;
+            default:
+                break;
+        }
+        cnch_rewritten = true;
+    }
+}
+
+void ASTIdentifier::appendCatalogName(const std::string & catalog_name)
+{
+    if (!cnch_append_catalog)
+    {
+        switch (name_parts.size())
+        {
+            /// Only database name
+            case 1:
+            /// Only database name + table name
+            case 2:
+                name_parts[0] = formatCatalogDatabaseName(name_parts[0], catalog_name);
+                resetFullName();
+                break;
+            default:
+                break;
+        }
+    }
+    cnch_append_catalog = true;
+}
+
+void ASTIdentifier::appendTenantId(const Context* context, bool is_datbase_name)
+{
+    if (!context)
+        return;
+    switch (name_parts.size())
+    {
+        /// Only catalogname
+        case 1:
+            name_parts[0] = appendTenantIdOnly(name_parts[0], is_datbase_name);
+            resetFullName();
+            break;
+        default:
+            break;
+    }
+}
+
 ASTTableIdentifier::ASTTableIdentifier(const String & table_name, std::vector<ASTPtr> && name_params)
     : ASTIdentifier({table_name}, true, std::move(name_params))
 {
@@ -244,14 +332,17 @@ ASTTableIdentifier::ASTTableIdentifier(const StorageID & table_id, std::vector<A
     : ASTIdentifier(
         table_id.database_name.empty() ? std::vector<String>{table_id.table_name}
                                        : std::vector<String>{table_id.database_name, table_id.table_name},
-        true, std::move(name_params))
+        true,
+        std::move(name_params))
 {
     uuid = table_id.uuid;
+    rewriteCnchDatabaseName();
 }
 
 ASTTableIdentifier::ASTTableIdentifier(const String & database_name, const String & table_name, std::vector<ASTPtr> && name_params)
     : ASTIdentifier({database_name, table_name}, true, std::move(name_params))
 {
+    rewriteCnchDatabaseName();
 }
 
 ASTPtr ASTTableIdentifier::clone() const
@@ -263,14 +354,30 @@ ASTPtr ASTTableIdentifier::clone() const
 
 StorageID ASTTableIdentifier::getTableId() const
 {
-    if (name_parts.size() == 2) return {name_parts[0], name_parts[1], uuid};
-    else return {{}, name_parts[0], uuid};
+    if (name_parts.size() == 2)
+        return {name_parts[0], name_parts[1], uuid};
+    else
+        return {{}, name_parts[0], uuid};
+}
+
+String ASTTableIdentifier::getTableName() const
+{
+    if (name_parts.size() == 3)
+        return name_parts[2];
+    if (name_parts.size() == 2)
+        return name_parts[1];
+    else
+        return name_parts[0];
 }
 
 String ASTTableIdentifier::getDatabaseName() const
 {
-    if (name_parts.size() == 2) return name_parts[0];
-    else return {};
+    if (name_parts.size() == 3)
+        return name_parts[1];
+    if (name_parts.size() == 2)
+        return name_parts[0];
+    else
+        return {};
 }
 
 void ASTTableIdentifier::resetTable(const String & database_name, const String & table_name)
@@ -313,6 +420,55 @@ ASTPtr ASTTableIdentifier::deserialize(ReadBuffer & buf)
     return identifier;
 }
 
+void ASTTableIdentifier::rewriteCnchDatabaseName(const Context *)
+{
+    if (!cnch_rewritten)
+    {
+        switch (name_parts.size())
+        {
+        /// Only table name
+        case 1:
+            break;
+        /// Only database name + table name
+        case 2:
+            name_parts[0] = formatTenantDatabaseName(name_parts[0]);
+            resetFullName();
+            break;
+        default:
+            break;
+        }
+        cnch_rewritten = true;
+    }
+}
+
+
+void ASTTableIdentifier::appendCatalogName(const std::string & catalog_name)
+{
+    if (!cnch_append_catalog)
+    {
+        switch (name_parts.size())
+        {
+            /// Only table name
+            case 1:
+                break;
+            /// Only database name + table name
+            case 2:
+                name_parts[0] = formatCatalogDatabaseName(name_parts[0], catalog_name);
+                resetFullName();
+                break;
+            default:
+                break;
+        }
+    }
+    cnch_append_catalog = true;
+}
+
+void ASTTableIdentifier::appendTenantId([[maybe_unused]]const Context* context, bool  /*is_datbase_name*/)
+{
+    // this function shall not be called on TableIdentifier.
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "this function shall not be called on TableIdentifier.");
+}
+
 String getIdentifierName(const IAST * ast)
 {
     String res;
@@ -341,6 +497,49 @@ bool tryGetIdentifierNameInto(const IAST * ast, String & name)
     }
     return false;
 }
+
+std::string astToString(ASTIdentifier * ast)
+{
+    WriteBufferFromOwnString wb;
+    DB::IAST::FormatSettings settings(wb, true);
+    ast->format(settings);
+    return wb.str();
+}
+
+void tryRewriteCnchDatabaseName(ASTPtr & ast_database, const Context * context)
+{
+    if (!context)
+        return;
+    if (auto * astdb = dynamic_cast<ASTIdentifier *>(ast_database.get()))
+    {
+        // auto before = astdb->name();
+        astdb->rewriteCnchDatabaseName(context);
+        // auto after = astdb->name();
+    }
+}
+
+void tryAppendCatalogName(ASTPtr & ast_catalog, ASTPtr & ast_database)
+{
+    if (auto * astcatalog = dynamic_cast<ASTIdentifier *>(ast_catalog.get()))
+    {
+        if (auto * astdb = dynamic_cast<ASTIdentifier *>(ast_database.get()))
+        {
+            astdb->appendCatalogName(astcatalog->name());
+        }
+    }
+}
+
+void tryRewriteHiveCatalogName(ASTPtr & ast_catalog, const Context * context)
+{
+    if (!context)
+        return;
+    if (auto * c = dynamic_cast<ASTIdentifier *>(ast_catalog.get()))
+    {
+        if(c->name() == "cnch") return;
+        c->appendTenantId(context, true);
+    }
+}
+
 
 void setIdentifierSpecial(ASTPtr & ast)
 {

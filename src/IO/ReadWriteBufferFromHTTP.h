@@ -245,7 +245,7 @@ class UpdatableSession : public UpdatableSessionBase<HTTPSessionPtr>
     using Parent = UpdatableSessionBase<HTTPSessionPtr>;
 
 public:
-    explicit UpdatableSession(
+    UpdatableSession(
         const Poco::URI uri,
         const ConnectionTimeouts & timeouts_,
         const UInt64 max_redirects_)
@@ -265,7 +265,7 @@ class ReadWriteBufferFromHTTP : public detail::ReadWriteBufferFromHTTPBase<std::
     using Parent = detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatableSession>>;
 
 public:
-    explicit ReadWriteBufferFromHTTP(
+        ReadWriteBufferFromHTTP(
         Poco::URI uri_,
         const std::string & method_,
         OutStreamCallback out_stream_callback_,
@@ -296,12 +296,12 @@ public:
         : Parent(uri, timeouts_, max_redirects_)
         , per_endpoint_pool_size { per_endpoint_pool_size_ }
     {
-        session = makePooledHTTPSession(initial_uri, timeouts, per_endpoint_pool_size);
+        session = makePooledHTTPSession(initial_uri, timeouts, per_endpoint_pool_size, true, true);
     }
 
     void buildNewSession(const Poco::URI & uri) override
     {
-       session = makePooledHTTPSession(uri, timeouts, per_endpoint_pool_size);
+       session = makePooledHTTPSession(uri, timeouts, per_endpoint_pool_size, true, true);
     }
 };
 

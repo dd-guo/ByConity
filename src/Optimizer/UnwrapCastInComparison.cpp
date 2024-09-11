@@ -15,14 +15,20 @@
 
 #include <Optimizer/UnwrapCastInComparison.h>
 
+#include <Analyzers/function_utils.h>
+#include <DataTypes/DataTypeFunction.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Functions/InternalFunctionRuntimeFilter.h>
 #include <Interpreters/convertFieldToType.h>
+#include <Interpreters/join_common.h>
 #include <Optimizer/FunctionInvoker.h>
 #include <Optimizer/LiteralEncoder.h>
 #include <Optimizer/PredicateUtils.h>
 #include <Optimizer/Utils.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Common/typeid_cast.h>
 
 #include <cmath>
 
@@ -36,11 +42,9 @@ const static auto type_int64 = std::make_shared<DataTypeInt64>(); // NOLINT(cert
 ASTPtr unwrapCastInComparison(const ConstASTPtr & expression, ContextMutablePtr context, const NameToType & column_types)
 {
     UnwrapCastInComparisonVisitor unwrap_cast_visitor;
-    auto type_analyzer = TypeAnalyzer::create(context, column_types);
     UnwrapCastInComparisonContext unwrap_cast_context{
         .context = context,
         .column_types = column_types,
-        .type_analyzer = type_analyzer,
     };
     return ASTVisitorUtil::accept(expression->clone(), unwrap_cast_visitor, unwrap_cast_context);
 }
@@ -48,6 +52,12 @@ ASTPtr unwrapCastInComparison(const ConstASTPtr & expression, ContextMutablePtr 
 ASTPtr UnwrapCastInComparisonVisitor::visitASTFunction(ASTPtr & node, UnwrapCastInComparisonContext & context)
 {
     auto & function = node->as<ASTFunction &>();
+
+    /// skip runtime filter functions
+    if (function.name == InternalFunctionRuntimeFilter::name)
+    {
+        return node;
+    }
 
     if (!isComparisonFunction(function))
         return rewriteArgs(function, context);
@@ -72,8 +82,9 @@ ASTPtr UnwrapCastInComparisonVisitor::visitASTFunction(ASTPtr & node, UnwrapCast
         return rewriteArgs(function, context, true);
 
     auto & cast_source = cast->arguments->as<ASTExpressionList &>().children[0];
-    auto source_type = context.type_analyzer.getType(cast_source);
-    auto target_type = context.type_analyzer.getType(left);
+    auto type_analyzer = TypeAnalyzer::create(context.context, context.column_types);
+    auto source_type = type_analyzer.getType(cast_source);
+    auto target_type = type_analyzer.getType(left);
 
     if (!source_type || !target_type)
         return node;
@@ -158,7 +169,8 @@ ASTPtr UnwrapCastInComparisonVisitor::visitASTFunction(ASTPtr & node, UnwrapCast
         return rewriteArgs(function, context, true);
     }
 
-    auto casted_literal_type = literal_type->isNullable() ? makeNullable(source_type) : removeNullable(source_type);
+    auto casted_literal_type = isNullableOrLowCardinalityNullable(literal_type) ? JoinCommon::tryConvertTypeToNullable(source_type)
+                                                                                : JoinCommon::removeTypeNullability(source_type);
     auto ast_casted_literal = LiteralEncoder::encode(literal_in_source_type, casted_literal_type, context.context);
     compare_res = compare(literal, literal_type, round_trip_literal, literal_type, context.context);
 
@@ -203,7 +215,36 @@ ASTPtr UnwrapCastInComparisonVisitor::rewriteArgs(ASTFunction & function, Unwrap
         for (size_t i = 0; i < function.arguments->children.size(); ++i)
         {
             auto & arg = function.arguments->children[i];
-            new_args[i] = (first_only && i > 0) ? arg : ASTVisitorUtil::accept(arg, *this, context);
+            if (first_only && i > 0)
+            {
+                new_args[i] = arg;
+                continue;
+            }
+
+            UnwrapCastInComparisonContext * child_ctx = &context;
+            UnwrapCastInComparisonContext context_with_lambda_args;
+
+            if (auto * arg_func = arg->as<ASTFunction>(); arg_func && arg_func->name == "lambda")
+            {
+                context_with_lambda_args = context;
+                auto type_analyzer = TypeAnalyzer::create(context.context, context.column_types);
+                auto expression_types = type_analyzer.getExpressionTypes(function.ptr());
+                auto arg_type = expression_types.at(arg);
+                auto arg_type_func = typeid_cast<const DataTypeFunction *>(arg_type.get());
+
+                if (!arg_type_func)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "unexpected type found for lambda expression");
+
+                auto lambda_args_types = arg_type_func->getArgumentTypes();
+                auto lambda_args_asts = getLambdaExpressionArguments(*arg_func);
+
+                for (size_t idx = 0; idx < lambda_args_asts.size(); idx++)
+                    context_with_lambda_args.column_types[getIdentifierName(lambda_args_asts.at(idx))] = lambda_args_types.at(idx);
+
+                child_ctx = &context_with_lambda_args;
+            }
+
+            new_args[i] = ASTVisitorUtil::accept(arg, *this, *child_ctx);
         }
 
         new_func->children.clear();
@@ -235,7 +276,7 @@ static const char * toXXXFunctionPrefixes[]
        "toUUID",
        "toFixedString",
        "toDate",
-       // "toDate32", // TODO: date32
+       "toDate32",
        "toDateTime",
        "toDateTime32", // alias to toDateTime
        // "toDateTime64",  // TODO: not implemented since it requires decimal scale
@@ -275,14 +316,14 @@ bool UnwrapCastInComparisonVisitor::isNaNOrInf(Field & field, const DataTypePtr 
 
 bool UnwrapCastInComparisonVisitor::isComparableTypes(const DataTypePtr & left, const DataTypePtr & right, ContextPtr context)
 {
-    auto nonnull_left = removeNullable(left);
-    auto nonnull_right = removeNullable(right);
+    auto nonnull_left = removeNullable(recursiveRemoveLowCardinality(left));
+    auto nonnull_right = removeNullable(recursiveRemoveLowCardinality(right));
 
     try
     {
         compare(nonnull_left->getDefault(), nonnull_left, nonnull_right->getDefault(), nonnull_right, context);
     }
-    catch (Exception & )
+    catch (Exception &)
     {
         return false;
     }
@@ -294,8 +335,8 @@ bool UnwrapCastInComparisonVisitor::isComparableTypes(const DataTypePtr & left, 
 bool UnwrapCastInComparisonVisitor::isCastMonotonicAndInjective(
     const DataTypePtr & from_type, const DataTypePtr & to_type, const Field & literal, const DataTypePtr & literal_type, ContextPtr context)
 {
-    auto from_id = removeNullable(from_type)->getTypeId();
-    auto to_id = removeNullable(to_type)->getTypeId();
+    auto from_id = removeNullable(recursiveRemoveLowCardinality(from_type))->getTypeId();
+    auto to_id = removeNullable(recursiveRemoveLowCardinality(to_type))->getTypeId();
 
     // int->float32 is injective only within (-2^24, 2^24)
     auto is_lossless_cast_to_float32 = [](const Field & literal_, const DataTypePtr & literal_type_, ContextPtr & context_) {
@@ -471,7 +512,7 @@ bool UnwrapCastInComparisonVisitor::isCastMonotonicAndInjective(
 
 ASTPtr UnwrapCastInComparisonVisitor::inferExpressionToTrue(const ASTPtr & expression, const DataTypePtr & type)
 {
-    if (!type->isNullable())
+    if (!isNullableOrLowCardinalityNullable(type))
         return PredicateConst::TRUE_VALUE;
     else
         return makeASTFunction("trueIfNotNull", expression);
@@ -479,7 +520,7 @@ ASTPtr UnwrapCastInComparisonVisitor::inferExpressionToTrue(const ASTPtr & expre
 
 ASTPtr UnwrapCastInComparisonVisitor::inferExpressionToFalse(const ASTPtr & expression, const DataTypePtr & type)
 {
-    if (!type->isNullable())
+    if (!isNullableOrLowCardinalityNullable(type))
         return PredicateConst::FALSE_VALUE;
     else
         return makeASTFunction("falseIfNotNull", expression);

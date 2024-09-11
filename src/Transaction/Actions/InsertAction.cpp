@@ -18,6 +18,10 @@
 #include <Catalog/Catalog.h>
 #include <Interpreters/ServerPartLog.h>
 #include <Storages/StorageCnchMergeTree.h>
+#include <DataTypes/ObjectUtils.h>
+#include <Common/Exception.h>
+#include <common/logger_useful.h>
+#include <CloudServices/CnchDedupHelper.h>
 
 
 namespace DB
@@ -61,8 +65,9 @@ void InsertAction::executeV1(TxnTimestamp commit_time)
         bitmap->updateCommitTime(commit_time);
 
     auto catalog = global_context.getCnchCatalog();
-    catalog->finishCommit(table, txn_id, commit_time, {parts.begin(), parts.end()}, delete_bitmaps, false, /*preallocate_mode=*/ false);
-    ServerPartLog::addNewParts(getContext(), ServerPartLogElement::INSERT_PART, parts, txn_id, false);
+    bool write_manifest = cnch_table->getSettings()->enable_publish_version_on_commit;
+    catalog->finishCommit(table, txn_id, commit_time, {parts.begin(), parts.end()}, delete_bitmaps, false, /*preallocate_mode=*/ false, write_manifest);
+    ServerPartLog::addNewParts(getContext(), table->getStorageID(), ServerPartLogElement::INSERT_PART, parts, {}, txn_id, /*error=*/ false);
 }
 
 void InsertAction::executeV2()
@@ -76,7 +81,11 @@ void InsertAction::executeV2()
         throw Exception("Expected StorageCnchMergeTree, but got: " + table->getName(), ErrorCodes::LOGICAL_ERROR);
 
     auto catalog = global_context.getCnchCatalog();
-    catalog->writeParts(table, txn_id, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, {staged_parts.begin(), staged_parts.end()}}, false, /*preallocate_mode=*/ false);
+    bool write_manifest = cnch_table->getSettings()->enable_publish_version_on_commit;
+    catalog->writeParts(table, txn_id, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, {staged_parts.begin(), staged_parts.end()}}, false, /*preallocate_mode=*/ false, write_manifest);
+
+    if (table && table->getInMemoryMetadataPtr()->hasDynamicSubcolumns())
+        catalog->appendObjectPartialSchema(table, txn_id, parts);
 }
 
 /// Post progressing
@@ -89,16 +98,24 @@ void InsertAction::postCommit(TxnTimestamp commit_time)
     for (auto & part : parts)
         part->commit_time = commit_time;
 
-    ServerPartLog::addNewParts(getContext(), ServerPartLogElement::INSERT_PART, parts, txn_id, false);
+    // set commit flag for dynamic object column schema
+    if (table && table->getInMemoryMetadataPtr()->hasDynamicSubcolumns())
+        global_context.getCnchCatalog()->commitObjectPartialSchema(txn_id);
+
+    ServerPartLog::addNewParts(getContext(), table->getStorageID(), ServerPartLogElement::INSERT_PART, parts, staged_parts, txn_id, /*error=*/ false);
 }
 
 void InsertAction::abort()
 {
     // clear parts in kv
     // skip part cache to avoid blocking by write lock of part cache for long time
-    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, {staged_parts.begin(), staged_parts.end()}}, true);
+    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, {staged_parts.begin(), staged_parts.end()}});
 
-    ServerPartLog::addNewParts(getContext(), ServerPartLogElement::INSERT_PART, parts, txn_id, true);
+    // set commit flag for dynamic object column schema
+    if (table && table->getInMemoryMetadataPtr()->hasDynamicSubcolumns())
+        global_context.getCnchCatalog()->abortObjectPartialSchema(txn_id);
+
+    ServerPartLog::addNewParts(getContext(), table->getStorageID(), ServerPartLogElement::INSERT_PART, parts, staged_parts, txn_id, /*error=*/ true);
 }
 
 UInt32 InsertAction::collectNewParts() const
@@ -117,4 +134,49 @@ UInt32 InsertAction::collectNewParts(MutableMergeTreeDataPartsCNCHVector const &
     return size;
 }
 
+std::set<Int64> InsertAction::getBucketNumbers() const
+{
+    std::set<Int64> res;
+    for (const auto & part : parts)
+    {
+        if (!res.contains(part->bucket_number))
+            res.insert(part->bucket_number);
+    }
+    return res;
+}
+
+void InsertAction::checkAndSetDedupMode(CnchDedupHelper::DedupMode dedup_mode_)
+{
+    if (dedup_mode_ >= CnchDedupHelper::DedupMode::UPSERT)
+    {
+        if (!table->getInMemoryMetadataPtr()->hasUniqueKey())
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Table {} is not unique engine, but dedup mode is {}, it's a bug!",
+                table->getCnchStorageID().getNameForLogs(),
+                typeToString(dedup_mode_));
+
+        if (!staged_parts.empty())
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Dedup mode is {}, but staged parts are not empty for table {}, it's a bug!",
+                table->getCnchStorageID().getNameForLogs(),
+                typeToString(dedup_mode_));
+
+        LOG_TRACE(log, "Table {} is in {} mode.", table->getCnchStorageID().getNameForLogs(), typeToString(dedup_mode_));
+    }
+    dedup_mode = dedup_mode_;
+}
+
+CnchDedupHelper::DedupTaskPtr InsertAction::getDedupTask() const
+{
+    /// If parts are empty or dedup mode is append, just skip dedup stage.
+    if (dedup_mode == CnchDedupHelper::DedupMode::APPEND || parts.empty())
+        return nullptr;
+
+    auto dedup_task =  std::make_shared<CnchDedupHelper::DedupTask>(dedup_mode, table->getCnchStorageID());
+    dedup_task->new_parts = parts;
+    dedup_task->delete_bitmaps_for_new_parts = delete_bitmaps;
+    return dedup_task;
+}
 }

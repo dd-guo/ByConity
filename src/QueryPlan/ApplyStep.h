@@ -14,6 +14,9 @@
  */
 
 #pragma once
+#include <Core/Names.h>
+#include <Protos/EnumMacros.h>
+#include <Protos/plan_node.pb.h>
 #include <QueryPlan/Assignment.h>
 #include <QueryPlan/ITransformingStep.h>
 
@@ -22,38 +25,59 @@ namespace DB
 class ApplyStep : public IQueryPlanStep
 {
 public:
-    enum class ApplyType
-    {
-        CROSS = 0,
-        LEFT,
-        SEMI,
-        ANTI
-    };
+    ENUM_WITH_PROTO_CONVERTER(
+        ApplyType, // enum name
+        Protos::ApplyStep::ApplyType, // proto enum message
+        (CROSS, 0),
+        (LEFT),
+        (SEMI),
+        (ANTI));
 
-    enum class SubqueryType
-    {
-        SCALAR = 0,
-        IN,
-        EXISTS,
-        QUANTIFIED_COMPARISON
-    };
+    ENUM_WITH_PROTO_CONVERTER(
+        SubqueryType, // enum name
+        Protos::ApplyStep::SubqueryType, // proto enum message
+        (SCALAR, 0),
+        (IN),
+        (EXISTS),
+        (QUANTIFIED_COMPARISON));
 
-    ApplyStep(DataStreams input_streams_, Names correlation_, ApplyType apply_type_, SubqueryType subquery_type_, Assignment assignment_);
+    ApplyStep(
+        DataStreams input_streams_,
+        Names correlation_,
+        ApplyType apply_type_,
+        SubqueryType subquery_type_,
+        Assignment assignment_,
+        NameSet outer_columns_,
+        bool support_semi_anti_);
 
     String getName() const override { return "Apply"; }
     Type getType() const override { return Type::Apply; }
 
     QueryPipelinePtr updatePipeline(QueryPipelines, const BuildQueryPipelineSettings &) override;
-    void serialize(WriteBuffer & buffer) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buffer, ContextPtr context);
 
     const Names & getCorrelation() const { return correlation; }
     ApplyType getApplyType() const { return apply_type; }
     SubqueryType getSubqueryType() const { return subquery_type; }
     const Assignment & getAssignment() const { return assignment; }
+    const NameSet & getOuterColumns() const { return outer_columns; }
+    void setOuterColumns(NameSet outer_columns_) { outer_columns = outer_columns_; }
     DataTypePtr getAssignmentDataType() const;
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
+    bool supportSemiAnti() const { return support_semi_anti; }
+
+    void toProto(Protos::ApplyStep & proto, bool for_hash_equals = false) const
+    {
+        (void)proto;
+        (void)for_hash_equals;
+        throw Exception("unimplemented", ErrorCodes::PROTOBUF_BAD_CAST);
+    }
+
+    static std::shared_ptr<ApplyStep> fromProto(const Protos::ApplyStep & proto, ContextPtr)
+    {
+        (void)proto;
+        throw Exception("unimplemented", ErrorCodes::PROTOBUF_BAD_CAST);
+    }
 
 private:
     /**
@@ -83,6 +107,8 @@ private:
      * <p>
      */
     Assignment assignment;
+    NameSet outer_columns;
+    bool support_semi_anti;
 };
 
 }

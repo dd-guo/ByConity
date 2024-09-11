@@ -29,10 +29,12 @@ using PlanCostMap = std::unordered_map<PlanNodeId, double>;
 class CostCalculator
 {
 public:
+    static PlanNodeCost calculatePlanCost(QueryPlan & plan, const Context & context);
+
     static PlanCostMap calculate(QueryPlan & plan, const Context & context);
 
     static PlanNodeCost calculate(
-        ConstQueryPlanStepPtr & step,
+        QueryPlanStepPtr & step,
         const PlanNodeStatisticsPtr & stats,
         const std::vector<PlanNodeStatisticsPtr> & children_stats,
         const Context & context,
@@ -55,6 +57,7 @@ public:
     PlanNodeCost visitProjectionStep(const ProjectionStep & step, CostContext & context) override;
     PlanNodeCost visitFilterStep(const FilterStep & step, CostContext & context) override;
     PlanNodeCost visitJoinStep(const JoinStep & step, CostContext & cost_context) override;
+    PlanNodeCost visitArrayJoinStep(const ArrayJoinStep & step, CostContext & cost_context) override;
     PlanNodeCost visitAggregatingStep(const AggregatingStep & step, CostContext & context) override;
     PlanNodeCost visitWindowStep(const WindowStep & step, CostContext & context) override;
     PlanNodeCost visitMergingAggregatedStep(const MergingAggregatedStep & step, CostContext & context) override;
@@ -78,11 +81,16 @@ public:
     PlanNodeCost visitEnforceSingleRowStep(const EnforceSingleRowStep & step, CostContext & context) override;
     PlanNodeCost visitAssignUniqueIdStep(const AssignUniqueIdStep & step, CostContext & context) override;
     PlanNodeCost visitCTERefStep(const CTERefStep & step, CostContext & context) override;
+    PlanNodeCost visitExplainAnalyzeStep(const ExplainAnalyzeStep & step, CostContext & context) override;
+    PlanNodeCost visitTopNFilteringStep(const TopNFilteringStep & step, CostContext & context) override;
+    PlanNodeCost visitFillingStep(const FillingStep & step, CostContext & context) override;
+    PlanNodeCost visitReadStorageRowCountStep(const ReadStorageRowCountStep & step, CostContext & context) override;
+    PlanNodeCost visitIntermediateResultCacheStep(const IntermediateResultCacheStep & step, CostContext & context) override;
 };
 
 struct CostWithCTEReferenceCounts
 {
-    double cost;
+    PlanNodeCost cost;
     std::unordered_map<CTEId, UInt64> cte_reference_counts;
 };
 

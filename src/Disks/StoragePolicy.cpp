@@ -122,7 +122,7 @@ StoragePolicy::StoragePolicy(StoragePolicyPtr storage_policy,
     {
         if (storage_policy->containsVolume(volume->getName()))
         {
-            auto old_volume = storage_policy->getVolumeByName(volume->getName());
+            auto old_volume = storage_policy->getVolumeByName(volume->getName(), true);
             try
             {
                 auto new_volume = updateVolumeFromConfig(old_volume, config, config_prefix + ".volumes." + volume->getName(), disks);
@@ -208,7 +208,6 @@ DiskPtr StoragePolicy::getDiskByName(const String & disk_name) const
     for (auto && volume : volumes)
         for (auto && disk : volume->getDisks())
         {
-            LOG_DEBUG(&Poco::Logger::get("StoragePolicy::getDiskByName"), "Storage disk name: {} loaded", disk->getName());
             if (disk->getName() == disk_name)
                 return disk;
         }
@@ -269,7 +268,7 @@ ReservationPtr StoragePolicy::makeEmptyReservationOnLargestDisk() const
     {
         for (const auto & disk : volume->getDisks())
         {
-            auto avail_space = disk->getAvailableSpace();
+            auto avail_space = disk->getAvailableSpace().bytes;
             if (avail_space > max_space)
             {
                 max_space = avail_space;
@@ -297,11 +296,16 @@ VolumePtr StoragePolicy::getVolume(size_t index) const
 }
 
 
-VolumePtr StoragePolicy::getVolumeByName(const String & volume_name) const
+VolumePtr StoragePolicy::getVolumeByName(const String & volume_name, bool throw_when_not_exist) const
 {
     auto it = volume_index_by_volume_name.find(volume_name);
     if (it == volume_index_by_volume_name.end())
-        throw Exception("No such volume " + backQuote(volume_name) + " in storage policy " + backQuote(name), ErrorCodes::UNKNOWN_VOLUME);
+    {
+        if (throw_when_not_exist)
+            throw Exception("No such volume " + backQuote(volume_name) + " in storage policy " + backQuote(name), ErrorCodes::UNKNOWN_VOLUME);
+        else
+            return nullptr;
+    }
     return getVolume(it->second);
 }
 
@@ -318,7 +322,7 @@ void StoragePolicy::checkCompatibleWith(const StoragePolicyPtr & new_storage_pol
             throw Exception("New storage policy " + backQuote(name) + " shall contain volumes of old one", ErrorCodes::BAD_ARGUMENTS);
 
         std::unordered_set<String> new_disk_names;
-        for (const auto & disk : new_storage_policy->getVolumeByName(volume->getName())->getDisks())
+        for (const auto & disk : new_storage_policy->getVolumeByName(volume->getName(), true)->getDisks())
             new_disk_names.insert(disk->getName());
 
         for (const auto & disk : volume->getDisks())
@@ -415,20 +419,24 @@ StoragePolicySelector::StoragePolicySelector(
     if (policies.size() == 1)
     {
         StoragePolicyPtr policy = policies.begin()->second;
-
-        if (policy->getVolumes().size() == 2
-            && policy->getVolumeByName("local") != nullptr
-            && policy->getVolumeByName("hdfs") != nullptr)
+        if (policy->getVolumes().size() == 2)
         {
-            auto default_policy = std::make_shared<StoragePolicy>(DEFAULT_STORAGE_POLICY_NAME,
-                std::vector<VolumePtr>({policy->getVolumeByName("local")}), 0);
-            auto remote_policy = std::make_shared<StoragePolicy>(default_cnch_policy_name,
-                std::vector<VolumePtr>({policy->getVolumeByName("hdfs")}), 0);
+            if (VolumePtr local_vol = policy->getVolumeByName("local", false); local_vol != nullptr)
+            {
+                VolumePtr hdfs_vol = policy->getVolumeByName("hdfs", false);
+                VolumePtr s3_vol = policy->getVolumeByName("s3", false);
+                VolumePtr remote_vol = hdfs_vol == nullptr ? s3_vol : hdfs_vol;
 
-            policies.clear();
+                auto default_policy = std::make_shared<StoragePolicy>(DEFAULT_STORAGE_POLICY_NAME,
+                    std::vector<VolumePtr>({local_vol}), 0);
+                auto remote_policy = std::make_shared<StoragePolicy>(default_cnch_policy_name,
+                    std::vector<VolumePtr>({remote_vol}), 0);
 
-            policies[default_policy->getName()] = default_policy;
-            policies[remote_policy->getName()] = remote_policy;
+                policies.clear();
+
+                policies[default_policy->getName()] = default_policy;
+                policies[remote_policy->getName()] = remote_policy;
+            }
         }
     }
 }

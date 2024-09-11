@@ -76,20 +76,51 @@ void CnchKafkaConsumeManager::preStart()
         throw Exception(storage_id.getFullTableName() + " is not active now", ErrorCodes::LOGICAL_ERROR);
 }
 
-void CnchKafkaConsumeManager::stop()
+void CnchKafkaConsumeManager::clearData()
 {
-    ICnchBGThread::stop();
-
     std::lock_guard lock(consumer_info_mutex);
     stopConsumers();
     num_partitions_of_topics.clear();
 }
 
-[[maybe_unused]]void CnchKafkaConsumeManager::restartConsumers()
+/// The vw used for consumption of CnchKafka will have three possible settings:
+/// 1. the `cnch_vw_write` of CnchKafka setting param if it has been changed;
+/// 2. the `cnch_vw_write` of target table for CnchKafka;
+/// 3. the default common `vw_write`
+String CnchKafkaConsumeManager::getVWNameForConsumerTask(const StorageCnchKafka & kafka_table)
 {
-    stop();
+    const auto & kafka_settings = kafka_table.getSettings();
+    if (kafka_settings.cnch_vw_write.changed)
+        return kafka_settings.cnch_vw_write.value;
 
-    scheduled_task->activateAndSchedule();
+    try
+    {
+        /// TODO: Merge this code with `checkDependencies` to reduce code redundancy
+        auto local_dependencies = getDependenciesFromCatalog(kafka_table.getStorageID());
+        for (const auto & dependence : local_dependencies)
+        {
+            auto table = catalog->getTable(*createQueryContext(), dependence.getDatabaseName(), dependence.getTableName(), getContext()->getTimestamp());
+            if (auto *mv = dynamic_cast<StorageMaterializedView*>(table.get()))
+            {
+                auto target_table = mv->getTargetTable();
+                if (auto *cnch = dynamic_cast<StorageCnchMergeTree*>(target_table.get()))
+                {
+                    const auto & cnch_table_settings = cnch->getSettings();
+                    if (cnch_table_settings->cnch_vw_write.changed)
+                    {
+                        LOG_DEBUG(log, "'cnch_vw_write' of target table has been changed, will use it as vw for consumer");
+                        return cnch_table_settings->cnch_vw_write.value;
+                    }
+                }
+            }
+        }
+    }
+    catch(...)
+    {
+        tryLogCurrentException(log, "Failed to check `vw-write` of target table, will still use vw of CnchKafka");
+    }
+
+    return kafka_settings.cnch_vw_write.value;
 }
 
 void CnchKafkaConsumeManager::initConsumerScheduler()
@@ -101,8 +132,10 @@ void CnchKafkaConsumeManager::initConsumerScheduler()
     if (!kafka_table)
         throw Exception("Expected StorageCnchKafka, but got: " + storage->getName(), ErrorCodes::LOGICAL_ERROR);
 
-    auto vw_name = kafka_table->getSettings().cnch_vw_write.value;
+    auto vw_name = getVWNameForConsumerTask(*kafka_table);
     auto schedule_mode = kafka_table->getSettings().cnch_schedule_mode.value;
+    LOG_INFO(log, "Setting kafka consumer vw name: {} with schedule mode: {}", vw_name, schedule_mode);
+
     if (schedule_mode == "random")
         consumer_scheduler = std::make_shared<KafkaConsumerSchedulerRandom>(vw_name, KafkaConsumerScheduleMode::Random, getContext());
     else if (schedule_mode == "hash")
@@ -128,7 +161,7 @@ void CnchKafkaConsumeManager::runImpl()
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
         {
             std::lock_guard lock(last_exception_mutex);
-            last_exception = std::to_string(LocalDateTime(time(nullptr))) + " : " + getCurrentExceptionMessage(false);
+            last_exception = LocalDateTime(time(nullptr)).toString() + " : " + getCurrentExceptionMessage(false);
         }
 
         /// TODO: add settings of backoff strategy for table-level; now the longest wait time maybe 102s
@@ -172,14 +205,14 @@ void CnchKafkaConsumeManager::iterate(StorageCnchKafka & kafka_table)
     std::exception_ptr exception;
     for (auto & info : consumer_infos)
     {
-        std::lock_guard lock(info.mutex);
+        std::unique_lock lock(info.mutex);
 
         if (info.worker_client)
-            checkConsumerStatus(info);
+            checkConsumerStatus(info, lock);
 
         /// DO NOT use `else if`, worker_client may be reset in `checkConsumerStatus`
         if (!info.worker_client)
-            dispatchConsumerToWorker(kafka_table, info, exception);
+            dispatchConsumerToWorker(kafka_table, info, lock, exception);
     }
     if (exception)
         std::rethrow_exception(std::move(exception));
@@ -208,9 +241,9 @@ ContextPtr CnchKafkaConsumeManager::createQueryContext()
     return false;
 }
 
-bool CnchKafkaConsumeManager::checkTargetTable(const StorageCnchMergeTree * /*target_table*/)
+bool CnchKafkaConsumeManager::checkTargetTable(const StorageCnchMergeTree * target_table)
 {
-    cloud_table_has_unique_key = false; /// FIXME: target_table->hasUniqueKey();
+    cloud_table_has_unique_key = target_table->getInMemoryMetadataPtr()->hasUniqueKey();
     return true;
 }
 
@@ -298,7 +331,15 @@ CnchKafkaConsumeManager::ConsumerDependencies CnchKafkaConsumeManager::getDepend
         return {};
 
     for (auto & view : all_views_from_catalog)
-        init_dependencies.emplace(view->getStorageID());
+    {
+        if (auto * mv = dynamic_cast<StorageMaterializedView *>(view.get()))
+        {
+            if (mv->async())
+                continue;
+            init_dependencies.emplace(view->getStorageID());
+        }
+    }
+
 
     return init_dependencies;
 }
@@ -315,6 +356,8 @@ void CnchKafkaConsumeManager::updatePartitionCountOfTopics(StorageCnchKafka & ka
     {
         auto conf = Kafka::createConsumerConfiguration(getContext(), storage_id, kafka_table.getTopics(), kafka_table.getSettings());
         tool_consumer = std::make_shared<KafkaConsumer>(conf);
+        /// Set a longer timeout as it's easy to get timeout while calling `get_metadata` with default setting 1s
+        tool_consumer->set_timeout(std::chrono::milliseconds(5000));
     }
 
     try
@@ -366,6 +409,10 @@ void CnchKafkaConsumeManager::updatePartitionCountOfTopics(StorageCnchKafka & ka
 
 void CnchKafkaConsumeManager::assignPartitionsToConsumers(StorageCnchKafka & kafka_table)
 {
+    /// get sample consuming partitions list if has
+    const auto & sample_partitions_list = kafka_table.getSampleConsumingPartitionList(num_partitions_of_topics);
+    bool sample_consuming_enabled = !sample_partitions_list.empty();
+
     size_t consumers_num = kafka_table.getConsumersNum();
     consumers_num = std::min(consumers_num, max_needed_consumers);
 
@@ -378,6 +425,12 @@ void CnchKafkaConsumeManager::assignPartitionsToConsumers(StorageCnchKafka & kaf
         stopConsumers();
     }
 
+    /// We must ensure each consumer can be assigned a real partition to consume;
+    /// Or the offsets cannot be committed when all messages are discarded
+    if (unlikely(sample_consuming_enabled))
+        consumers_num = std::min(consumers_num, sample_partitions_list.size());
+
+    /// Assign the partitions not in the sample partition list to the consumers;
     for (size_t i = 0; i < consumers_num; ++i)
     {
         consumer_infos.emplace_back();
@@ -387,7 +440,26 @@ void CnchKafkaConsumeManager::assignPartitionsToConsumers(StorageCnchKafka & kaf
         for (auto & [topic, partition_cnt] : num_partitions_of_topics)
         {
             for (auto p = i; p < partition_cnt; p += consumers_num)
+            {
                 info.partitions.emplace_back(topic, p);
+                if (unlikely(sample_consuming_enabled) && sample_partitions_list.contains(info.partitions.back()))
+                    info.partitions.pop_back();
+            }
+        }
+    }
+
+    /// Assign the partitions in the sample partition list to the consuemrs specially
+    /// as we need ensure that each consumer should be assigned a real partition
+    if (unlikely(sample_consuming_enabled))
+    {
+        size_t sample_partition_idx = 0;
+        for (const auto & tp : sample_partitions_list)
+        {
+            size_t info_idx = sample_partition_idx % consumers_num;
+            ++sample_partition_idx;
+
+            consumer_infos[info_idx].sample_partitions.emplace(tp);
+            consumer_infos[info_idx].partitions.emplace_back(tp);
         }
     }
 }
@@ -411,6 +483,9 @@ static String replaceCreateTableQuery(ContextPtr context, String & query, const 
             engine->arguments = std::make_shared<ASTExpressionList>();
             engine->arguments->children.push_back(std::make_shared<ASTIdentifier>(create_query.database));
             engine->arguments->children.push_back(std::make_shared<ASTIdentifier>(create_query.table));
+            /// NOTE: Used to pass the version column for unique table here.
+            if (create_query.storage->unique_key && create_query.storage->engine->arguments && create_query.storage->engine->arguments->children.size())
+                engine->arguments->children.push_back(create_query.storage->engine->arguments->children[0]);
 
             /// set cnch uuid for CloudMergeTree to commit data on worker side
             if (!storage->settings)
@@ -465,12 +540,13 @@ static String replaceCreateTableQuery(ContextPtr context, String & query, const 
     return getTableDefinitionFromCreateQuery(ast, false);
 }
 
-void CnchKafkaConsumeManager::checkConsumerStatus(ConsumerInfo & info)
+void CnchKafkaConsumeManager::checkConsumerStatus(ConsumerInfo & info, std::unique_lock<std::mutex> & info_lock)
 {
     StorageID worker_storage_id(storage_id.getDatabaseName(),
                                 storage_id.getTableName() + info.table_suffix/* , storage_id.uuid */);
 
     CnchConsumerStatus status;
+    auto worker_client = info.worker_client;
     try
     {
         /// check running-status of consumer first in case of failure of stopping/starting consume
@@ -480,15 +556,28 @@ void CnchKafkaConsumeManager::checkConsumerStatus(ConsumerInfo & info)
             throw Exception("Consumer #" + toString(info.index) + " is not running now", ErrorCodes::LOGICAL_ERROR);
         }
 
-        status = info.worker_client->getConsumerStatus(worker_storage_id);
+        {
+            /// Do NOT hold lock for RPC call in case of some unexpected hang issues in rpc
+            SCOPE_EXIT({
+                info_lock.lock();
+            });
+            info_lock.unlock();
+
+            status = worker_client->getConsumerStatus(worker_storage_id);
+        }
+
+        /// Minor check again as we have unlocked for some time, during which the consumer job may be stopped by some reasons
+        if (!info.is_running || !info.worker_client)
+            throw Exception("Consumer #" + toString(info.index) + " is not running now", ErrorCodes::LOGICAL_ERROR);
+
         if (!status.last_exception.empty())
         {
             std::lock_guard lock(last_exception_mutex);
-            last_exception = std::to_string(LocalDateTime(time(nullptr))) + " : " + status.last_exception;
+            last_exception = LocalDateTime(time(nullptr)).toString() + " : " + status.last_exception;
         }
 
         LOG_DEBUG(log, "Check consumer status succ for {} on host {}", storage_id.getTableName() + info.table_suffix
-                  , info.worker_client->getRPCAddress());
+                  , info.worker_client->getHostWithPortsID());
 
         /// Check if need to reschedule consumer to new worker
         if (consumer_scheduler->shouldReschedule(info.worker_client, info.table_suffix, info.index))
@@ -500,7 +589,7 @@ void CnchKafkaConsumeManager::checkConsumerStatus(ConsumerInfo & info)
     }
     catch (...)
     {
-        consumer_scheduler->resetWorkerClient(info.worker_client);
+        consumer_scheduler->resetWorkerClient(worker_client);
 
         /// just reset worker client to restart consumer as consumer will check validity
         auto error_msg = "Check consumer status failed for " + worker_storage_id.getNameForLogs() + " due to: " \
@@ -529,8 +618,59 @@ void CnchKafkaConsumeManager::getOffsetsFromCatalog(
     getContext()->getCnchCatalog()->getKafkaOffsets(consumer_group, offsets);
 }
 
-void CnchKafkaConsumeManager::dispatchConsumerToWorker(StorageCnchKafka & kafka_table, ConsumerInfo & info, std::exception_ptr & exception)
+StoragePtr CnchKafkaConsumeManager::rewriteCreateTableSQL(const DB::StorageID & dependence,
+                                                    const StorageID & replace_storage_id,
+                                                    const String & table_suffix,
+                                                    std::vector<String> & create_commands,
+                                                    bool enable_staging_area)
 {
+    StoragePtr target_table = nullptr;
+
+    auto storage = getContext()->getCnchCatalog()->getTableByUUID(*getContext(), toString(dependence.uuid), getContext()->getTimestamp());
+    if (auto * mv = dynamic_cast<StorageMaterializedView*>(storage.get()))
+    {
+        LOG_DEBUG(log, "Rewrite sql for dependence: {}", dependence.getNameForLogs());
+
+        target_table = mv->getTargetTable();
+        /// All other Cnch**MergeTree can be dynamic_cast as CnchMergeTree
+        if (auto * cnch_table = dynamic_cast<StorageCnchMergeTree *>(target_table.get()))
+        {
+            auto crete_query = cnch_table->getCreateTableSql();
+            replaceCreateTableQuery(getContext(), crete_query, cnch_table->getTableName() + table_suffix, true, enable_staging_area);
+            create_commands.push_back(crete_query);
+
+            create_commands.push_back(replaceMaterializedViewQuery(mv, replace_storage_id, table_suffix));
+
+            if (!cnch_table->getInMemoryMetadataPtr()->hasUniqueKey())
+            {
+                /// The target table may have other MaterializedView tables and deeper sink tables,
+                /// e.g CnchKafka -> MV1 -> CnchMergeTree1 -> MV2 -> CnchMergeTree2
+                /// XXX: CnchUniqueKey don't support it now
+                auto target_dependencies = getDependenciesFromCatalog(target_table->getStorageID());
+                for (const auto & table_id : target_dependencies)
+                    rewriteCreateTableSQL(table_id, cnch_table->getStorageID(), table_suffix, create_commands, false);
+            }
+        }
+        else
+            throw Exception("Only CnchMergeTree family is supported now", ErrorCodes::LOGICAL_ERROR);
+    }
+
+    return target_table;
+}
+
+void CnchKafkaConsumeManager::dispatchConsumerToWorker(StorageCnchKafka & kafka_table, ConsumerInfo & info,
+                                                      std::unique_lock<std::mutex> & info_lock, std::exception_ptr & exception)
+{
+    /// When cnch-server is under high load, the transaction (RPC call) may need more time to execute commit action;
+    /// If ConsumeManager launches a new consumer during this period, duplication consumption may occur.
+    /// Thus, we need ensure that there is no active transactions before launching a new consumer to guarantee Exactly-Once.
+    /// This checker is consumer-level; there is no conflict between consumers if the table has more than one consumers
+    if (checkConsumerHasActiveTransaction(info.index))
+    {
+        LOG_WARNING(log, "Consumer #{} has active transaction now, we will retry after it finishes to avoid data duplication", info.index);
+        return;
+    }
+
     /// the suffix will be used to mark and check the uniqueness of consumer-table on worker client
     String table_suffix = '_' + toString(std::chrono::system_clock::now().time_since_epoch().count())
         + '_' + toString(info.index);
@@ -548,32 +688,12 @@ void CnchKafkaConsumeManager::dispatchConsumerToWorker(StorageCnchKafka & kafka_
     command.local_table_name = command.cnch_storage_id.table_name + table_suffix;
     command.create_table_commands.push_back(create_kafka_query);
 
+    bool enable_staging_area = cloud_table_has_unique_key && kafka_table.getSettings().enable_staging_area;
     StoragePtr target_table;
-    for (const auto & storage_id : dependencies)
-    {
-        LOG_TRACE(log, "Dependencies: {}", storage_id.getNameForLogs());
-
-        auto table = getContext()->getCnchCatalog()->getTableByUUID(
-            *getContext(), toString(storage_id.uuid), getContext()->getTimestamp());
-        if (auto * mv = dynamic_cast<StorageMaterializedView *>(table.get()))
-        {
-            target_table = mv->getTargetTable();
-
-            auto * cnch_merge = dynamic_cast<StorageCnchMergeTree *>(target_table.get());
-            if (!cnch_merge)
-                throw Exception("CnchMergeTree is expected for " + target_table->getTableName(), ErrorCodes::LOGICAL_ERROR);
-
-            auto create_target_query = target_table->getCreateTableSql();
-            /// FIXME: bool enable_staging_area = cloud_table_has_unique_key && kafka_table.getSettings().enable_staging_area;
-            replaceCreateTableQuery(getContext(), create_target_query, target_table->getTableName() + table_suffix, true, false);
-            //command.create_table_commands.push_back(
-            //    cnch_merge->getCreateQueryForCloudTable(create_target_query, target_table->getTableName() + table_suffix));
-            command.create_table_commands.push_back(create_target_query);
-
-            /// replace mv table
-            command.create_table_commands.push_back(replaceMaterializedViewQuery(mv, this->storage_id, table_suffix));
-        }
-    }
+    for (const auto & dependency : dependencies)
+        target_table = rewriteCreateTableSQL(dependency, this->storage_id, table_suffix, command.create_table_commands, enable_staging_area);
+    if (!target_table)
+        throw Exception("Unable to get target table for CnchKafka, this is unexpected", ErrorCodes::LOGICAL_ERROR);
 
     for (auto & query : command.create_table_commands)
     {
@@ -584,18 +704,28 @@ void CnchKafkaConsumeManager::dispatchConsumerToWorker(StorageCnchKafka & kafka_
     getOffsetsFromCatalog(info.partitions, target_table->getStorageID(), kafka_table.getGroupForBytekv());
 
     for (auto & tp : info.partitions)
-        LOG_DEBUG(log, "topic: {}, partition: {}, offsets: {}", tp.get_topic(), tp.get_partition(), tp.get_offset());
+        LOG_TRACE(log, "topic: {}, partition: {}, offsets: {}", tp.get_topic(), tp.get_partition(), tp.get_offset());
 
     command.assigned_consumer = info.index;
     command.tpl = info.partitions;
+    command.sample_partitions = info.sample_partitions;
 
     /// Send command to worker client to create local tables and start consume
     CnchWorkerClientPtr worker_client;
     try
     {
         worker_client = selectWorker(info.index, table_suffix);
-        LOG_TRACE(log, "Selected worker {} for consumer #{}", worker_client->getRPCAddress(), info.index);
-        worker_client->submitKafkaConsumeTask(command);
+        LOG_TRACE(log, "Selected worker {} for consumer #{}", worker_client->getHostWithPortsID(), info.index);
+
+        {
+            /// Do NOT hold lock for RPC call in case of some unexpected hang issues in rpc
+            SCOPE_EXIT({
+                info_lock.lock();
+            });
+            info_lock.unlock();
+
+            worker_client->submitKafkaConsumeTask(command);
+        }
     }
     catch (...)
     {
@@ -612,7 +742,7 @@ void CnchKafkaConsumeManager::dispatchConsumerToWorker(StorageCnchKafka & kafka_
     info.table_suffix = table_suffix;
     info.worker_client = worker_client;
     info.is_running = true;
-    LOG_TRACE(log, "Successfully send command 'START_CONSUME' to {}", worker_client->getRPCAddress());
+    LOG_DEBUG(log, "Successfully send command 'START_CONSUME' to {}", worker_client->getHostWithPortsID());
 }
 
 bool CnchKafkaConsumeManager::checkWorkerClient(const String & consumer_table_name, size_t index) const
@@ -643,6 +773,7 @@ void CnchKafkaConsumeManager::stopConsumerOnWorker(ConsumerInfo & info)
     command.type = KafkaTaskCommand::STOP_CONSUME;
     command.task_id = toString(info.index);
     command.rpc_port = getContext()->getRPCPort();
+    command.cnch_storage_id = storage_id;
     command.local_database_name = storage_id.getDatabaseName();
     command.local_table_name = storage_id.getTableName() + info.table_suffix;
 
@@ -659,7 +790,7 @@ void CnchKafkaConsumeManager::stopConsumerOnWorker(ConsumerInfo & info)
     /// send stop-command to worker
     worker_client->submitKafkaConsumeTask(command);
 
-    LOG_TRACE(log, "Successfully send command 'STOP_CONSUME' to {}", worker_client->getRPCAddress());
+    LOG_DEBUG(log, "Successfully send command 'STOP_CONSUME' to {}", worker_client->getHostWithPortsID());
 }
 
 void CnchKafkaConsumeManager::stopConsumers()
@@ -708,8 +839,11 @@ std::vector<KafkaConsumerRunningInfo> CnchKafkaConsumeManager::getConsumerInfos(
             info.is_running = consumer.is_running;
             info.table_suffix = consumer.table_suffix;
             info.partitions = consumer.partitions;
+            std::transform(consumer.sample_partitions.begin(), consumer.sample_partitions.end(),
+                    std::back_inserter(info.sample_partitions),
+                         [](auto & tp) { return tp; });
             if (consumer.worker_client)
-                info.worker_client_info = consumer.worker_client->getRPCAddress();///getHostWithPorts().toDebugString();
+                info.worker_client_info = consumer.worker_client->getHostWithPortsID();
         }
     }
 
@@ -752,6 +886,50 @@ void CnchKafkaConsumeManager::logExceptionToCnchKafkaLog(String msg, bool dedupl
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
+}
+
+void CnchKafkaConsumeManager::setCurrentTransactionForConsumer(size_t consumer_index, const TxnTimestamp & txn_id)
+{
+    catalog->setTransactionForKafkaConsumer(storage_id.uuid, txn_id, consumer_index);
+}
+
+bool CnchKafkaConsumeManager::checkConsumerHasActiveTransaction(size_t consumer_index)
+{
+    auto txn_id = catalog->getTransactionForKafkaConsumer(storage_id.uuid, consumer_index);
+    if (txn_id == TxnTimestamp::maxTS())
+        return false;
+
+    auto txn_record_ptr = catalog->tryGetTransactionRecord(txn_id);
+    if (!txn_record_ptr)
+    {
+        LOG_TRACE(log, "The latest transaction #{} for consumer #{} has finished", txn_id.toUInt64(), consumer_index);
+        return false;
+    }
+
+    auto txn_record = txn_record_ptr.value();
+    LOG_DEBUG(
+        log,
+        "Consumer #{} has the latest transaction: {} with status: {}",
+         consumer_index, txn_id.toUInt64(), txnStatusToString(txn_record.status())
+    );
+    if (txn_record.status() == CnchTransactionStatus::Finished || txn_record.status() == CnchTransactionStatus::Aborted)
+        return false;
+
+    const auto MAX_ACTIVE_KAFKA_TXN_SEC = 60;
+    auto txn_running_sec = time(nullptr) - txn_id.toSecond();
+    if (txn_running_sec > MAX_ACTIVE_KAFKA_TXN_SEC)
+    {
+        LOG_WARNING(
+            log,
+            "Active transaction {} has run for {} seconds. We will try to rollback it to launch a new consumer.",
+             txn_id.toUInt64(), txn_running_sec
+        );
+        /// Rollback transaction by API of catalog;
+        /// it won't end transaction now, but the transaction will failed while committing as CAS failed and trigger real Rollback action then
+        catalog->rollbackTransaction(txn_record);
+    }
+
+    return true;
 }
 
 } // namespace DB

@@ -22,13 +22,13 @@
 #pragma once
 
 #include <common/shared_ptr_helper.h>
-
 #include <Parsers/IAST_fwd.h>
-#include <Parsers/ASTSelectWithUnionQuery.h>
 
 #include <Storages/IStorage.h>
 #include <Storages/StorageInMemoryMetadata.h>
-
+#include <Storages/MaterializedView/RefreshSchedule.h>
+#include <Storages/MaterializedView/PartitionTransformer.h>
+#include <Storages/MaterializedView/MaterializedViewVersionedPartCache.h>
 
 namespace DB
 {
@@ -77,7 +77,7 @@ public:
 
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
 
-    Pipe alterPartition(const StorageMetadataPtr & metadata_snapshot, const PartitionCommands & commands, ContextPtr context) override;
+    Pipe alterPartition(const StorageMetadataPtr & metadata_snapshot, const PartitionCommands & commands, ContextPtr context, const ASTPtr & query = nullptr) override;
 
     void checkAlterPartitionIsPossible(const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const override;
 
@@ -87,8 +87,10 @@ public:
 
     void shutdown() override;
 
+    virtual bool supportsOptimizer() const override { return true; }
+
     QueryProcessingStage::Enum
-    getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageMetadataPtr &, SelectQueryInfo &) const override;
+    getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr & , SelectQueryInfo &) const override;
 
     StoragePtr getTargetTable() const;
     StoragePtr tryGetTargetTable() const;
@@ -96,12 +98,13 @@ public:
 
     String getTargetDatabaseName() const { return target_table_id.database_name;  }
     String getTargetTableName() const { return target_table_id.table_name;  }
+    std::unordered_map<StorageID, BaseTableInfoPtr> getDependBaseTables();
 
     ActionLock getActionLock(StorageActionBlockType type) override;
 
     Pipe read(
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
@@ -111,7 +114,7 @@ public:
     void read(
         QueryPlan & query_plan,
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
@@ -122,23 +125,70 @@ public:
 
     ASTPtr getInnerQuery() const { return getInMemoryMetadataPtr()->select.inner_query->clone(); }
     bool isRefreshable(bool cascading) const;
-    void refresh(const ASTPtr & partition, ContextPtr local_context, bool async);
-    bool isRefreshing() const { return refreshing; }
-    const String & getRefreshingPartition() const { return refreshing_partition_id; }
-    ASTPtr normalizeInnerQuery();
+    void refresh(const ASTPtr & partition, ContextMutablePtr local_context, bool async);
+    void refreshWhere(ASTPtr partition_expr, ContextMutablePtr local_context, bool async);
+    void refreshAsync(AsyncRefreshParamPtr param, ContextMutablePtr local_context) { refreshCnchAsyncImpl(param, local_context); }
+
+    /// get async refrsh params
+    AsyncRefreshParamPtrs getAsyncRefreshParams(ContextMutablePtr local_context, bool combine_params);
+    void validatePartitionBased(ContextMutablePtr local_context);
+    
+    void validateAndSyncBaseTablePartitions(
+        PartitionDiffPtr & partition_diff,
+        VersionPartContainerPtrs & latest_versioned_partitions,
+        ContextMutablePtr local_context,
+        bool for_rewrite = false);
+
+    void syncBaseTablePartitions(
+        PartitionDiffPtr & partition_diff,
+        VersionPartContainerPtrs & latest_versioned_partitions,
+        const std::unordered_set<StoragePtr> & depend_base_tables,
+        const std::unordered_set<StorageID> & non_depend_base_tables,
+        ContextMutablePtr local_context,
+        bool for_rewrite = false);
+    String versionPartitionToString(const VersionPart & part);
+    RefreshSchedule & getRefreshSchedule() { return refresh_schedule; }
+    PartitionTransformerPtr getPartitionTransformer() const { return partition_transformer; }
+
+    /// drop materialized view metadata 
+    void dropMvMeta(ContextMutablePtr local_context);
+
+    bool async() { return refresh_schedule.async(); }
+    bool sync() { return !async(); }
+    UInt64 checkAndCalRefreshSeconds() const { return refresh_schedule.prescribeNextElaps(); }
+    
 private:
-    void refreshImpl(const ASTPtr & partition, ContextPtr local_context, bool async);
+    bool checkPartitionExpr(StoragePtr target_table, ASTPtr partition_expr, ContextMutablePtr local_context);
+
+    void refreshLocalImpl(const ASTPtr & partition, ContextPtr local_context);
+
+    void refreshCnchSyncImpl(const ASTPtr & partition, ContextMutablePtr local_context);
+
+    void refreshCnchAsyncImpl(AsyncRefreshParamPtr param, ContextMutablePtr local_context);
+
+    void executeByDropInsert(AsyncRefreshParamPtr param, ContextMutablePtr local_context);
+
+    void executeByInsertOverwrite(AsyncRefreshParamPtr param, ContextMutablePtr local_context);
+
+    VersionPartContainerPtrs getPreviousPartitions(ContextMutablePtr local_context);
+
+    void insertRefreshTaskLog(AsyncRefreshParamPtr param, RefreshViewTaskStatus status,
+                            bool is_insert_overwrite, std::chrono::time_point<std::chrono::system_clock> start_time,
+                            ContextMutablePtr local_context, String exception = {});
 
     /// Will be initialized in constructor
     StorageID target_table_id = StorageID::createEmpty();
-
     bool has_inner_table = false;
-
-    std::atomic<bool> refreshing{false};
-    String refreshing_partition_id;
-    std::mutex inner_query_mutex;
-    ASTPtr normalized_inner_query;
     void checkStatementCanBeForwarded() const;
+    
+    // Async refresh task
+    RefreshSchedule refresh_schedule;
+    PartitionTransformerPtr partition_transformer;
+
+    // mv meta cache
+    MaterializedViewVersionedPartCache & cache;
+
+    Poco::Logger * log;
 
 protected:
     StorageMaterializedView(

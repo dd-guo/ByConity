@@ -12,9 +12,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
+#include <Common/Configurations.h>
 #include <TSO/TSOClient.h>
 
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 #include <Protos/tso.pb.h>
 #include <Protos/RPCHelpers.h>
 #include <TSO/TSOImpl.h>
@@ -25,6 +26,13 @@
 #include <chrono>
 #include <thread>
 
+namespace ProfileEvents
+{
+    extern const Event TSORequest;
+    extern const Event TSORequestMicroseconds;
+    extern const Event TSOError;
+}
+
 namespace DB
 {
 
@@ -32,6 +40,7 @@ namespace ErrorCodes
 {
     extern const int BRPC_TIMEOUT;
     extern const int TSO_INTERNAL_ERROR;
+    extern const int TSO_OPERATION_ERROR;
 }
 
 namespace TSO
@@ -79,15 +88,18 @@ GetTimestampsResp TSOClient::getTimestamps(UInt32 size)
 
 UInt64 getTSOResponse(const Context & context, TSORequestType type, size_t size)
 {
-    const auto & config = context.getConfigRef();
-    int tos_max_retry = config.getInt("tso_service.tso_max_retry_count", 3);
-    bool use_tso_fallback = config.getBool("tso_service.use_fallback", true);
+    static auto * log = &Poco::Logger::get("getTSOResponse");
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::TSORequestMicroseconds);
 
-    std::string new_leader;
-    int retry = tos_max_retry;
+    const auto & config = context.getRootConfig();
+    int tso_max_retry = config.tso_service.tso_max_retry_count;
+
+    int retry = tso_max_retry;
+    bool try_update_leader = true;
 
     while (retry--)
     {
+        ProfileEvents::increment(ProfileEvents::TSORequest);
         try
         {
             auto tso_client = context.getCnchTSOClient();
@@ -112,29 +124,28 @@ UInt64 getTSOResponse(const Context & context, TSORequestType type, size_t size)
 
             context.updateTSOLeaderHostPort();
         }
-        catch (Exception & e)
+        catch (...)
         {
-            if (use_tso_fallback && e.code() != ErrorCodes::BRPC_TIMEOUT)
+            ProfileEvents::increment(ProfileEvents::TSOError);
+            if (getCurrentExceptionCode() != ErrorCodes::BRPC_TIMEOUT)
             {
                 /// old leader may be unavailable
                 context.updateTSOLeaderHostPort();
-                throw;
+                try_update_leader = false;
             }
 
-            const auto error_string = fmt::format(
-                    "TSO request: {} failed. Retries: {}/{}, Error message: {}",
-                    typeToString(type),
-                    std::to_string(tos_max_retry - retry),
-                    std::to_string(tos_max_retry),
-                    e.displayText());
-
-            tryLogCurrentException(__PRETTY_FUNCTION__, error_string);
+            LOG_ERROR(
+                log,
+                "TSO request: {} failed. Retries: {}/{}, Error message: {}",
+                typeToString(type), tso_max_retry - retry, tso_max_retry, getCurrentExceptionMessage(false));
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 
-    context.updateTSOLeaderHostPort();
+    if (try_update_leader)
+        context.updateTSOLeaderHostPort();
+
     throw Exception(ErrorCodes::TSO_OPERATION_ERROR, "Can't get process TSO request, type: {}", typeToString(type));
 }
 

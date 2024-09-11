@@ -28,12 +28,22 @@
 #include <Common/setThreadName.h>
 #include <Common/MemoryTracker.h>
 #include <Processors/Executors/PipelineExecutor.h>
+
 #include <Processors/printPipeline.h>
 #include <Processors/ISource.h>
+#include <Processors/ReadProgressCallback.h>
+#include <Interpreters/DistributedStages/PlanSegmentProcessList.h>
+#include <Interpreters/DistributedStages/PlanSegmentReport.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/OpenTelemetrySpanLog.h>
+#include <Interpreters/ProcessorsProfileLog.h>
+#include <Protos/plan_segment_manager.pb.h>
 #include <common/scope_guard_safe.h>
+#include <Interpreters/sendPlanSegment.h>
+#include <Interpreters/DistributedStages/AddressInfo.h>
+#include <Processors/Exchange/DataTrans/RpcClient.h>
+#include <Processors/Exchange/DataTrans/RpcChannelPool.h>
 
 #ifndef NDEBUG
     #include <Common/Stopwatch.h>
@@ -58,9 +68,10 @@ static bool checkCanAddAdditionalInfoToException(const DB::Exception & exception
            && exception.code() != ErrorCodes::QUERY_WAS_CANCELLED;
 }
 
-PipelineExecutor::PipelineExecutor(Processors & processors_, QueryStatus * elem, bool need_processors_profiles_)
+PipelineExecutor::PipelineExecutor(Processors & processors_, QueryStatus * elem, const PipelineExecutorOptions & executor_options)
     : processors(processors_)
-    , need_processors_profiles(need_processors_profiles_)
+    , need_processors_profiles(executor_options.need_processors_profiles)
+    , report_processors_profile(executor_options.report_processors_profile)
     , cancelled(false)
     , finished(false)
     , num_processing_executors(0)
@@ -68,7 +79,11 @@ PipelineExecutor::PipelineExecutor(Processors & processors_, QueryStatus * elem,
     , process_list_element(elem)
 {
     if (process_list_element)
-        need_processors_profiles = process_list_element->getContext()->getSettingsRef().log_processors_profiles;
+    {
+        report_processors_profile = process_list_element->getContext()->getSettingsRef().report_processors_profiles;
+        need_processors_profiles = process_list_element->getContext()->getSettingsRef().log_processors_profiles || report_processors_profile;
+    }
+
     try
     {
         graph = std::make_unique<ExecutingGraph>(processors);
@@ -134,14 +149,31 @@ void PipelineExecutor::addJob(ExecutingGraph::Node * execution_state)
     {
         try
         {
-            // Stopwatch watch;
             executeJob(execution_state->processor);
-            // execution_state->execution_time_ns += watch.elapsed();
-
             ++execution_state->num_executed_jobs;
         }
         catch (...)
         {
+            auto query_context = DB::CurrentThread::get().getQueryContext();
+            if (query_context)
+            {
+                bool bsp_mode = query_context->getSettingsRef().bsp_mode;
+                auto segment_id = query_context->getPlanSegmentInstanceId().segment_id;
+                auto exception_handler = query_context->getPlanSegmentExHandler();
+                if (!bsp_mode && segment_id != std::numeric_limits<UInt32>::max() && segment_id != 0
+                    && exception_handler->setException(std::current_exception()))
+                {
+                    int exception_code = getCurrentExceptionCode();
+                    auto exception_message = getCurrentExceptionMessage(false);
+
+                    PlanSegmentExecutionInfo info{
+                        .execution_address
+                        = AddressInfo(getHostIPFromEnv(), query_context->getTCPPort(), "", "", query_context->getExchangePort())};
+                    auto result = convertFailurePlanSegmentStatusToResult(query_context, info, exception_code, exception_message);
+                    reportExecutionResult(result);
+                }
+            }
+
             execution_state->exception = std::current_exception();
         }
     };
@@ -308,6 +340,8 @@ bool PipelineExecutor::prepareProcessor(UInt64 pid, size_t thread_number, Queue 
             case IProcessor::Status::Finished:
             {
                 node.status = ExecutingGraph::ExecStatus::Finished;
+                if (report_processors_profile)
+                    reportProcessorProfile(node.processor);
                 break;
             }
             case IProcessor::Status::Ready:
@@ -427,12 +461,186 @@ bool PipelineExecutor::doExpandPipeline(ExpandPipelineTask * task, bool processi
     return result;
 }
 
+static UInt64 time_in_microseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(timepoint.time_since_epoch()).count();
+}
+
+static UInt64 time_in_seconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
+{
+    return std::chrono::duration_cast<std::chrono::seconds>(timepoint.time_since_epoch()).count();
+}
+
+void collectProfileMetricRequest(
+    Protos::ReportProcessorProfileMetricRequest & request,
+    const AddressInfo current_address,
+    const IProcessor * processor,
+    const String & query_id,
+    const std::chrono::time_point<std::chrono::system_clock> finish_time,
+    const size_t segment_id = 0)
+{
+    auto get_proc_id = [](const IProcessor & proc) -> UInt64 { return reinterpret_cast<std::uintptr_t>(&proc); };
+
+    std::vector<UInt64> parents;
+    for (const auto & port : processor->getOutputs())
+    {
+        if (!port.isConnected())
+            continue;
+        const IProcessor & next = port.getInputPort().getProcessor();
+        parents.push_back(get_proc_id(next));
+    }
+
+    request.set_query_id(query_id);
+    request.set_event_time(time_in_seconds(finish_time));
+    request.set_event_time_microseconds(time_in_microseconds(finish_time));
+    request.set_id(get_proc_id(*processor));
+    for (auto & parent_id : parents)
+    {
+        request.add_parent_ids(parent_id);
+    }
+    request.set_plan_step(reinterpret_cast<std::uintptr_t>(processor->getQueryPlanStep()));
+    uint64_t count = processor->getWorkCount();
+    request.set_plan_group(processor->getQueryPlanStepGroup() | (segment_id << 16) | (count << 32));
+
+    request.set_processor_name(processor->getName());
+
+    request.set_elapsed_us(processor->getElapsedUs());
+    request.set_input_wait_elapsed_us(processor->getInputWaitElapsedUs());
+    request.set_output_wait_elapsed_us(processor->getOutputWaitElapsedUs());
+
+    auto stats = processor->getProcessorDataStats();
+    request.set_input_rows(stats.input_rows);
+    request.set_input_bytes(stats.input_bytes);
+    request.set_output_rows(stats.output_rows);
+    request.set_output_bytes(stats.output_bytes);
+    request.set_step_id(processor->getStepId());
+    request.set_worker_address(extractExchangeHostPort(current_address));
+}
+
+void reportToCoordinator(
+    Poco::Logger * log,
+    const AddressInfo & coordinator_address,
+    const AddressInfo & current_address,
+    const IProcessor * processor,
+    const String & query_id,
+    const std::chrono::time_point<std::chrono::system_clock> finish_time,
+    const size_t segment_id = 0)
+{
+    try
+    {
+        auto address = extractExchangeHostPort(coordinator_address);
+        std::shared_ptr<RpcClient> rpc_client = RpcChannelPool::getInstance().getClient(address, BrpcChannelPoolOptions::DEFAULT_CONFIG_KEY);
+        Protos::PlanSegmentManagerService_Stub manager(&rpc_client->getChannel());
+        brpc::Controller cntl;
+        Protos::ReportProcessorProfileMetricRequest request;
+        Protos::ReportProcessorProfileMetricResponse response;
+        collectProfileMetricRequest(request, current_address, processor, query_id, finish_time, segment_id);
+        manager.reportProcessorProfileMetrics(&cntl, &request, &response, nullptr);
+        rpc_client->assertController(cntl);
+        LOG_TRACE(log, "Processor-{} send profile metrics to coordinator successfully.", request.id());
+    }
+    catch (...)
+    {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+    }
+}
+
+void reportToCoordinator(
+    Poco::Logger * log,
+    const AddressInfo & coordinator_address,
+    const AddressInfo & current_address,
+    const Processors & processors,
+    const String & query_id,
+    const std::chrono::time_point<std::chrono::system_clock> finish_time,
+    const size_t segment_id = 0)
+{
+    try
+    {
+        auto address = extractExchangeHostPort(coordinator_address);
+        std::shared_ptr<RpcClient> rpc_client = RpcChannelPool::getInstance().getClient(address, BrpcChannelPoolOptions::DEFAULT_CONFIG_KEY);
+        Protos::PlanSegmentManagerService_Stub manager(&rpc_client->getChannel());
+        brpc::Controller cntl;
+        Protos::BatchReportProcessorProfileMetricRequest requests;
+        Protos::ReportProcessorProfileMetricResponse response;
+        requests.set_query_id(query_id);
+        for (const auto & processor : processors)
+        {
+            auto * request_ptr = requests.add_request();
+            collectProfileMetricRequest(*request_ptr, current_address, processor.get(), query_id, finish_time, segment_id);
+        }
+        manager.batchReportProcessorProfileMetrics(&cntl, &requests, &response, nullptr);
+        rpc_client->assertController(cntl);
+        LOG_TRACE(log, "Batch processors send profile metrics to coordinator successfully.");
+    }
+    catch (...)
+    {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+    }
+}
+
+void PipelineExecutor::reportProcessorProfileOnCancel(const Processors & processors_) const
+{
+    String query_id;
+    size_t segment_id = 0;
+    AddressInfo coordinator_address;
+    AddressInfo current_address;
+    if (process_list_element)
+    {
+        query_id = process_list_element->getClientInfo().initial_query_id;
+        auto context = process_list_element->getContext();
+        auto weak_segment_process_list_entry = context->getPlanSegmentProcessListEntry().lock();
+        if (weak_segment_process_list_entry)
+        {
+            PlanSegmentProcessList::EntryPtr segment_process_list_entry = std::move(weak_segment_process_list_entry);
+            segment_id = segment_process_list_entry->getSegmentId();
+            coordinator_address = segment_process_list_entry->getCoordinatorAddress();
+            current_address = getLocalAddress(*context);
+        }
+
+        auto finish_time = std::chrono::system_clock::now();
+        if (segment_id > 0)
+            reportToCoordinator(log, coordinator_address, current_address, processors_, query_id, finish_time, segment_id);
+    }
+}
+
+void PipelineExecutor::reportProcessorProfile(const IProcessor * processor) const
+{
+    String query_id;
+    size_t segment_id = 0;
+    AddressInfo coordinator_address;
+    AddressInfo current_address;
+    if (process_list_element)
+    {
+        query_id = process_list_element->getClientInfo().initial_query_id;
+        auto context = process_list_element->getContext();
+        auto weak_segment_process_list_entry = context->getPlanSegmentProcessListEntry().lock();
+        if (weak_segment_process_list_entry)
+        {
+            PlanSegmentProcessList::EntryPtr segment_process_list_entry = std::move(weak_segment_process_list_entry);
+            segment_id = segment_process_list_entry->getSegmentId();
+            coordinator_address = segment_process_list_entry->getCoordinatorAddress();
+            current_address = getLocalAddress(*context);
+        }
+
+        if (segment_id > 0)
+            reportToCoordinator(log, coordinator_address, current_address, processor, query_id, std::chrono::system_clock::now(), segment_id);
+    }
+}
+
+void PipelineExecutor::setReadProgressCallback(ReadProgressCallbackPtr callback)
+{
+    read_progress_callback = std::move(callback);
+}
+
 void PipelineExecutor::cancel()
 {
     cancelled = true;
     finish();
 
     std::lock_guard guard(processors_mutex);
+
+    if (report_processors_profile)
+        reportProcessorProfileOnCancel(processors);
     for (auto & processor : processors)
         processor->cancel();
 }
@@ -553,8 +761,9 @@ void PipelineExecutor::finalizeExecution()
 
     LOG_TRACE(log, "Pipeline: {}", dumpPipeline());
 
-    if (process_list_element)
-        process_list_element->dumpPipelineInfo(this);
+    //This causes a performance down and has concurrency issues with QueryStatus::getInfo
+    //if (process_list_element)
+    //    process_list_element->dumpPipelineInfo(this);
 
     if (!all_processors_finished)
         throw Exception("Pipeline stuck. Current state:\n" + dumpPipeline(), ErrorCodes::LOGICAL_ERROR);
@@ -687,7 +896,10 @@ void PipelineExecutor::executeStepImpl(size_t thread_num, size_t num_threads, st
                 node->job();
 
                 if (need_processors_profiles)
+                {
                     node->processor->elapsed_us += execution_time_watch->elapsedMicroseconds();
+                    node->processor->work_count++;
+                }
 #ifndef NDEBUG
                 context->execution_time_ns += execution_time_watch->elapsed();
 #endif

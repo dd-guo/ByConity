@@ -21,6 +21,7 @@
 
 #include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnsCommon.h>
+#include <Columns/MaskOperations.h>
 #include <Common/assert_cast.h>
 #include <DataStreams/ColumnGathererStream.h>
 #include <IO/WriteBufferFromArena.h>
@@ -164,17 +165,17 @@ MutableColumnPtr ColumnAggregateFunction::convertToValues(MutableColumnPtr colum
     /// If there are references to states in final column, we must hold their ownership
     /// by holding arenas and source.
 
-    auto callback = [&](auto & subcolumn)
+    auto callback = [&](IColumn & subcolumn)
     {
-        if (auto * aggregate_subcolumn = typeid_cast<ColumnAggregateFunction *>(subcolumn.get()))
+        if (auto * aggregate_subcolumn = typeid_cast<ColumnAggregateFunction *>(&subcolumn))
         {
             aggregate_subcolumn->foreign_arenas = concatArenas(column_aggregate_func.foreign_arenas, column_aggregate_func.my_arena);
             aggregate_subcolumn->src = column_aggregate_func.getPtr();
         }
     };
 
-    callback(res);
-    res->forEachSubcolumn(callback);
+    callback(*res);
+    res->forEachSubcolumnRecursively(callback);
 
     for (auto * val : data)
         func->insertResultInto(val, *res, &column_aggregate_func.createOrGetArena());
@@ -349,7 +350,7 @@ ColumnPtr ColumnAggregateFunction::filter(const Filter & filter, ssize_t result_
 {
     size_t size = data.size();
     if (size != filter.size())
-        throw Exception("Size of filter doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of filter ({}) doesn't match size of column ({})", filter.size(), size);
 
     if (size == 0)
         return cloneEmpty();
@@ -371,6 +372,10 @@ ColumnPtr ColumnAggregateFunction::filter(const Filter & filter, ssize_t result_
     return res;
 }
 
+void ColumnAggregateFunction::expand(const Filter & mask, bool inverted)
+{
+    expandDataByMask<char *>(data, mask, inverted);
+}
 
 ColumnPtr ColumnAggregateFunction::permute(const Permutation & perm, size_t limit) const
 {
@@ -667,7 +672,8 @@ MutableColumns ColumnAggregateFunction::scatter(IColumn::ColumnIndex num_columns
     return columns;
 }
 
-void ColumnAggregateFunction::getPermutation(bool /*reverse*/, size_t /*limit*/, int /*nan_direction_hint*/, IColumn::Permutation & res) const
+void ColumnAggregateFunction::getPermutation(PermutationSortDirection /*direction*/, PermutationSortStability /*stability*/,
+                                            size_t /*limit*/, int /*nan_direction_hint*/, IColumn::Permutation & res) const
 {
     size_t s = data.size();
     res.resize(s);
@@ -675,7 +681,8 @@ void ColumnAggregateFunction::getPermutation(bool /*reverse*/, size_t /*limit*/,
         res[i] = i;
 }
 
-void ColumnAggregateFunction::updatePermutation(bool, size_t, int, Permutation &, EqualRanges&) const {}
+void ColumnAggregateFunction::updatePermutation(PermutationSortDirection, PermutationSortStability,
+                                            size_t, int, Permutation &, EqualRanges&) const {}
 
 void ColumnAggregateFunction::gather(ColumnGathererStream & gatherer)
 {

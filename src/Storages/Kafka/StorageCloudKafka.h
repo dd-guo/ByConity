@@ -48,7 +48,8 @@ public:
 
     void setCnchStorageID(const StorageID & storage_id) { cnch_storage_id = storage_id; }
 
-    void startConsume(size_t consumer_index, const cppkafka::TopicPartitionList & tpl);
+    void startConsume(size_t consumer_index, const cppkafka::TopicPartitionList & tpl,
+                     const std::set<cppkafka::TopicPartition> & sample_partitions);
     void stopConsume();
 
     bool getStreamStatus() const { return stream_run; }
@@ -73,12 +74,15 @@ private:
         cppkafka::TopicPartitionList assignment;
         cppkafka::TopicPartitionList latest_offsets;
 
-        bool error_event;
+        std::set<cppkafka::TopicPartition> sample_partitions;
+
+        std::atomic<bool> error_event;
 
         void reset();
     };
     ConsumerContext consumer_context;
     size_t assigned_consumer_index;
+    size_t number_tables_to_write{0};
 
     const SettingsChanges settings_adjustments;
 
@@ -86,6 +90,7 @@ private:
     HostWithPorts server_client_address;
 
     Poco::Logger * log;
+    mutable std::mutex last_exception_mutex;
     String last_exception;
     UInt64 rdkafka_exception_times{0};
 
@@ -110,14 +115,14 @@ private:
 
     cppkafka::Configuration createConsumerConfiguration();
     BufferPtr createBuffer();
-    void createStreamThread(const cppkafka::TopicPartitionList &);
+    void createStreamThread(const cppkafka::TopicPartitionList &, const std::set<cppkafka::TopicPartition> &);
     void stopStreamThread();
 
     void streamThread();
     bool streamToViews();
     void streamCopyData(IBlockInputStream & from, IBlockOutputStream & to, ContextMutablePtr consume_context);
 
-    bool checkDependencies(const String & database_name, const String & table_name, bool check_staged_area);
+    bool checkDependencies(const String & database_name, const String & table_name, bool check_staged_area, size_t & num_tables_to_write);
     Names filterVirtualNames(const Names & names) const;
 
     KafkaLogElement createKafkaLog(KafkaLogElement::Type type, size_t consumer_index);

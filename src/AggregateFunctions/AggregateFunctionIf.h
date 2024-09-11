@@ -44,7 +44,7 @@ public:
         if (num_arguments == 0)
             throw Exception("Aggregate function " + getName() + " require at least one argument", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-        if (!isUInt8(types.back()))
+        if (!isUInt8(types.back()) && !types.back()->onlyNull())
             throw Exception("Last argument for aggregate function " + getName() + " must be UInt8", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
@@ -66,6 +66,11 @@ public:
     void destroy(AggregateDataPtr __restrict place) const noexcept override
     {
         nested_func->destroy(place);
+    }
+
+     void destroyUpToState(AggregateDataPtr __restrict place) const noexcept override
+    {
+        nested_func->destroyUpToState(place);
     }
 
     bool hasTrivialDestructor() const override
@@ -147,6 +152,11 @@ public:
         nested_func->insertResultInto(place, to, arena);
     }
 
+    void insertMergeResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena * arena) const override
+    {
+        nested_func->insertMergeResultInto(place, to, arena);
+    }
+
     bool allocatesMemoryInArena() const override
     {
         return nested_func->allocatesMemoryInArena();
@@ -163,12 +173,16 @@ public:
 
     AggregateFunctionPtr getNestedFunction() const override { return nested_func; }
 
-
+    std::unordered_set<size_t> getArgumentsThatCanBeOnlyNull() const override
+    {
+        return {num_arguments - 1};
+    }
+    
 #if USE_EMBEDDED_COMPILER
 
     bool isCompilable() const override
     {
-        return nested_func->isCompilable();
+        return canBeNativeType(*this->argument_types.back()) && nested_func->isCompilable();
     }
 
     void compileCreate(llvm::IRBuilderBase & builder, llvm::Value * aggregate_data_ptr) const override

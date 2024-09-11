@@ -17,6 +17,7 @@
 
 #include <common/shared_ptr_helper.h>
 #include <Storages/IStorage.h>
+#include <Storages/System/StorageSystemCnchPartsInfoLocal.h>
 
 namespace DB
 {
@@ -31,15 +32,17 @@ public:
 
     Pipe read(
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
-        const size_t max_block_size,
-        const unsigned num_streams) override;
+        size_t max_block_size,
+        unsigned num_streams) override;
+
+    bool isSystemStorage() const override { return true; }
 
 protected:
-    StorageSystemCnchPartsInfo(const StorageID & table_id_);
+    explicit StorageSystemCnchPartsInfo(const StorageID & table_id_);
 };
 
 }

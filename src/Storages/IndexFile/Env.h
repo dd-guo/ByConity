@@ -115,7 +115,7 @@ public:
     // status.
     //
     // Safe for concurrent use by multiple threads.
-    virtual Status Read(uint64_t offset, size_t n, Slice * result, char * scratch) const = 0;
+    virtual Status Read(uint64_t offset, size_t n, Slice * result, char * scratch, bool * from_local) const = 0;
 };
 
 // A file abstraction for sequential writing.  The implementation
@@ -136,7 +136,7 @@ public:
     virtual Status Append(const Slice & data) = 0;
     virtual Status Close() = 0;
     virtual Status Flush() = 0;
-    virtual Status Sync() = 0;
+    virtual Status Sync(bool need_fsync = true) = 0;
 
     void calculateHash(const char * p, size_t n) { hashing_file.calculateHash(const_cast<char *>(p), n); }
 

@@ -31,16 +31,20 @@
 namespace DB
 {
 const std::unordered_set<String> RedundantSortVisitor::order_dependent_agg{"groupUniqArray","groupArray","groupArraySample","argMax","argMin","topK","topKWeighted","any","anyLast","anyHeavy",
-                                                                           "first_value","last_value","deltaSum","deltaSumTimestamp","groupArrayMovingSum","groupArrayMovingAvg"};
+                                                                           "first_value","last_value","deltaSum","deltaSumTimestamp","groupArrayMovingSum","groupArrayMovingAvg", "groupConcat"};
 
 void RemoveRedundantSort::rewrite(QueryPlan & plan, ContextMutablePtr context) const
 {
-    if (!context->getSettingsRef().enable_redundant_sort_removal)
-        return;
-    RedundantSortVisitor visitor{context, plan.getCTEInfo(), plan.getPlanNode()};
+    RedundantSortVisitor visitor{context, plan.getCTEInfo()};
     RedundantSortContext sort_context{.context = context, .can_sort_be_removed = false};
     auto result = VisitorUtil::accept(plan.getPlanNode(), visitor, sort_context);
     plan.update(result);
+}
+
+PlanNodePtr RedundantSortVisitor::visitPlanNode(PlanNodeBase & node, RedundantSortContext & sort_context)
+{
+    sort_context.can_sort_be_removed = false;
+    return SimplePlanRewriter::visitPlanNode(node, sort_context);
 }
 
 PlanNodePtr RedundantSortVisitor::processChildren(PlanNodeBase & node, RedundantSortContext & sort_context)
@@ -49,30 +53,19 @@ PlanNodePtr RedundantSortVisitor::processChildren(PlanNodeBase & node, Redundant
         return node.shared_from_this();
 
     PlanNodes children;
-    DataStreams inputs;
     for (const auto & item : node.getChildren())
     {
         RedundantSortContext child_context{.context = sort_context.context, .can_sort_be_removed = sort_context.can_sort_be_removed};
         PlanNodePtr child = VisitorUtil::accept(*item, *this, child_context);
         children.emplace_back(child);
-        inputs.push_back(child->getStep()->getOutputStream());
     }
 
-    auto new_step = node.getStep()->copy(context);
-    new_step->setInputStreams(inputs);
-    node.setStep(new_step);
     node.replaceChildren(children);
     return node.shared_from_this();
 }
 
-PlanNodePtr RedundantSortVisitor::resetChild(PlanNodeBase & node, PlanNodes & children, RedundantSortContext & sort_context)
+PlanNodePtr RedundantSortVisitor::resetChild(PlanNodeBase & node, PlanNodes & children, RedundantSortContext &)
 {
-    DataStreams inputs;
-    for (auto & child : children)
-        inputs.push_back(child->getStep()->getOutputStream());
-    auto new_step = node.getStep()->copy(sort_context.context);
-    new_step->setInputStreams(inputs);
-    node.setStep(new_step);
     node.replaceChildren(children);
     return node.shared_from_this();
 }
@@ -91,7 +84,7 @@ bool RedundantSortVisitor::isStateful(ConstASTPtr expression, ContextMutablePtr 
 
 PlanNodePtr RedundantSortVisitor::visitProjectionNode(ProjectionNode & node, RedundantSortContext & sort_context)
 {
-    auto step = std::dynamic_pointer_cast<ProjectionStep>(node.getStep()->copy(sort_context.context));
+    auto step = std::dynamic_pointer_cast<ProjectionStep>(node.getStep());
     const Assignments & assignments = step->getAssignments();
     if (sort_context.can_sort_be_removed)
     {
@@ -153,18 +146,6 @@ PlanNodePtr RedundantSortVisitor::visitExceptNode(ExceptNode & node, RedundantSo
     return processChildren(node, sort_context);
 }
 
-PlanNodePtr RedundantSortVisitor::visitLimitNode(LimitNode & node, RedundantSortContext & sort_context)
-{
-    sort_context.can_sort_be_removed = false;
-    return visitPlanNode(node, sort_context);
-}
-
-PlanNodePtr RedundantSortVisitor::visitLimitByNode(LimitByNode & node, RedundantSortContext & sort_context)
-{
-    sort_context.can_sort_be_removed = false;
-    return visitPlanNode(node, sort_context);
-}
-
 PlanNodePtr RedundantSortVisitor::visitSortingNode(SortingNode & node, RedundantSortContext & sort_context)
 {
     bool remove_current = sort_context.can_sort_be_removed;
@@ -193,13 +174,7 @@ PlanNodePtr RedundantSortVisitor::visitCTERefNode(CTERefNode & node, RedundantSo
     }
 
     RedundantSortContext child_context(cte_require_context.at(cte_id));
-    auto cte_plan = post_order_cte_helper.acceptAndUpdate(cte_id, *this, child_context);
-
-    auto new_step = std::dynamic_pointer_cast<CTERefStep>(node.getStep()->copy(sort_context.context));
-    DataStreams input_streams;
-    input_streams.emplace_back(cte_plan->getStep()->getOutputStream());
-    new_step->setInputStreams(input_streams);
-    node.setStep(new_step);
+    cte_helper.acceptAndUpdate(cte_id, *this, child_context);
     return node.shared_from_this();
 }
 

@@ -38,9 +38,13 @@ protected:
 public:
     SerializationLowCardinality(const DataTypePtr & dictionary_type);
 
-    void enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const override;
+    void enumerateStreams(
+        EnumerateStreamsSettings & settings,
+        const StreamCallback & callback,
+        const SubstreamData & data) const override;
 
     void serializeBinaryBulkStatePrefix(
+            const IColumn & column,
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
@@ -59,7 +63,7 @@ public:
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
-    void deserializeBinaryBulkWithMultipleStreams(
+    size_t deserializeBinaryBulkWithMultipleStreams(
             ColumnPtr & column,
             size_t limit,
             DeserializeBinaryBulkSettings & settings,
@@ -106,10 +110,11 @@ class SerializationFullLowCardinality : public SerializationLowCardinality
 {
 public:
     SerializationFullLowCardinality(const DataTypePtr & dictionary_type);
-    void enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const override;
-
+    
+    void enumerateStreams(EnumerateStreamsSettings & settings, const StreamCallback & callback, const SubstreamData & data) const override;
 
     void serializeBinaryBulkStatePrefix(
+            const IColumn & column,
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
@@ -128,7 +133,7 @@ public:
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
-    void deserializeBinaryBulkWithMultipleStreams(
+    size_t deserializeBinaryBulkWithMultipleStreams(
             ColumnPtr & column,
             size_t limit,
             DeserializeBinaryBulkSettings & settings,

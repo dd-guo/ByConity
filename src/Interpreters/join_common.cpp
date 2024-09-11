@@ -1,8 +1,10 @@
 #include <Interpreters/join_common.h>
 #include <Interpreters/TableJoin.h>
 #include <Interpreters/ActionsDAG.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnLowCardinality.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/getLeastSupertype.h>
@@ -65,6 +67,14 @@ void changeLowCardinalityInplace(ColumnWithTypeAndName & column)
     }
 }
 
+bool isNullable(const DataTypePtr & type)
+{
+    bool is_nullable = type->isNullable();
+    if (const auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+        is_nullable |= low_cardinality_type->getDictionaryType()->isNullable();
+    return is_nullable;
+}
+
 bool canBecomeNullable(const DataTypePtr & type)
 {
     bool can_be_inside = type->canBeInsideNullable();
@@ -77,13 +87,42 @@ bool canBecomeNullable(const DataTypePtr & type)
 /// Note: LowCardinality(T) transformed to LowCardinality(Nullable(T))
 DataTypePtr convertTypeToNullable(const DataTypePtr & type)
 {
+    if (isNullable(type))
+        return type;
+
     if (const auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type.get()))
     {
         const auto & dict_type = low_cardinality_type->getDictionaryType();
         if (dict_type->canBeInsideNullable())
             return std::make_shared<DataTypeLowCardinality>(makeNullable(dict_type));
     }
-    return makeNullable(type);
+
+    if (type->canBeInsideNullable())
+        return makeNullable(type);
+
+    return type;
+}
+
+
+DataTypePtr tryConvertTypeToNullable(const DataTypePtr & type)
+{
+    if (canBecomeNullable(type))
+        return convertTypeToNullable(type);
+    return type;
+}
+
+DataTypePtr removeTypeNullability(const DataTypePtr & type)
+{
+    if (const auto * local_type = typeid_cast<const DataTypeLowCardinality *>(type.get()))
+    {
+        const auto & dict_type = local_type->getDictionaryType();
+        return std::make_shared<DataTypeLowCardinality>(removeNullable(dict_type));
+    }
+    else if (type->isNullable())
+    {
+        return removeNullable(type);
+    }
+    return type;
 }
 
 void convertColumnToNullable(ColumnWithTypeAndName & column, bool remove_low_card)
@@ -119,6 +158,64 @@ void convertColumnsToNullable(Block & block, size_t starting_pos)
 {
     for (size_t i = starting_pos; i < block.columns(); ++i)
         convertColumnToNullable(block.getByPosition(i));
+}
+
+/// Convert column to nullable. If column LowCardinality or Const, convert nested column.
+/// Returns nullptr if conversion cannot be performed.
+ColumnPtr tryConvertColumnToNullable(ColumnPtr col)
+{
+    // todo aron sparse
+    // if (col->isSparse())
+    //     col = recursiveRemoveSparse(col);
+
+    if (isColumnNullable(*col) || col->canBeInsideNullable())
+        return makeNullable(col);
+
+    if (col->lowCardinality())
+    {
+        auto mut_col = IColumn::mutate(std::move(col));
+        ColumnLowCardinality * col_lc = assert_cast<ColumnLowCardinality *>(mut_col.get());
+        if (col_lc->nestedIsNullable())
+        {
+            return mut_col;
+        }
+        else if (col_lc->nestedCanBeInsideNullable())
+        {
+            col_lc->nestedToNullable();
+            return mut_col;
+        }
+    }
+    else if (const ColumnConst * col_const = checkAndGetColumn<ColumnConst>(*col))
+    {
+        const auto & nested = col_const->getDataColumnPtr();
+        if (nested->isNullable() || nested->canBeInsideNullable())
+        {
+            return makeNullable(col);
+        }
+        else if (nested->lowCardinality())
+        {
+            ColumnPtr nested_nullable = tryConvertColumnToNullable(nested);
+            if (nested_nullable)
+                return ColumnConst::create(nested_nullable, col_const->size());
+        }
+    }
+    return nullptr;
+}
+
+void convertColumnToNullable2(ColumnWithTypeAndName & column)
+{
+    if (!column.column)
+    {
+        column.type = convertTypeToNullable(column.type);
+        return;
+    }
+
+    ColumnPtr nullable_column = tryConvertColumnToNullable(column.column);
+    if (nullable_column)
+    {
+        column.type = convertTypeToNullable(column.type);
+        column.column = std::move(nullable_column);
+    }
 }
 
 /// @warning It assumes that every NULL has default value in nested column (or it does not matter)
@@ -205,29 +302,83 @@ ColumnPtr emptyNotNullableClone(const ColumnPtr & column)
     return column->cloneEmpty();
 }
 
-ColumnRawPtrs materializeColumnsInplace(Block & block, const Names & names)
+static inline int getNullSafeColumnCnts(const std::vector<bool> *null_safeColumns)
 {
-    ColumnRawPtrs ptrs;
-    ptrs.reserve(names.size());
+    return null_safeColumns ? std::count(null_safeColumns->cbegin(), null_safeColumns->cend(), true) : 0;
+}
 
+ColumnRawPtrs materializeColumnsInplace(Block & block, const Names & names,
+                                        const std::vector<bool> *null_safeColumns)
+{
+    ColumnsWithTypeAndName append;
+    ColumnRawPtrs ptrs;
+    size_t null_safe_size;
+    size_t names_size;
+
+    null_safe_size = getNullSafeColumnCnts(null_safeColumns);
+    names_size = names.size();
+    ptrs.reserve(names_size + null_safe_size);
+    append.reserve(null_safe_size);
+
+    // Note that names can duplicate, as of commit e912d058ea48c484d7465c865ed257ec8c851a0e
+    // Thus, we resolve names into columns first into columns_by_name so that indices with same name
+    // will also have the same column.
+    // And so that ptrs will not have a dangling ptr.
+    std::vector<std::reference_wrapper<ColumnPtr>> columns_by_name;
     for (const auto & column_name : names)
-    {
-        auto & column = block.getByName(column_name).column;
+        columns_by_name.push_back(std::ref(block.getByName(column_name).column));
+    
+    for (ColumnPtr & column : columns_by_name)
         column = recursiveRemoveLowCardinality(column->convertToFullColumnIfConst());
+
+    for (size_t i = 0; i < names_size; ++i)
+    {
+        const auto & column_name = names[i];
+        ColumnPtr & column = columns_by_name[i];
+        if (null_safeColumns && (*null_safeColumns)[i]) {
+            /* push extra nullmap column for null safe column */
+            if (const auto * nullable = checkAndGetColumn<ColumnNullable>(column.get())) {
+                ptrs.push_back(&nullable->getNullMapColumn());
+            } else {
+                const auto name = "null_safe_" + column_name + std::to_string(i);
+                ColumnWithTypeAndName col{ColumnUInt8::create(column->size(), 0), std::make_shared<DataTypeUInt8>(), name};
+
+                ptrs.push_back(col.column.get());
+                append.emplace_back(std::move(col));
+            }
+        }
+
         ptrs.push_back(column.get());
     }
+
+    for (auto &c : append)
+        block.insert(std::move(c));
 
     return ptrs;
 }
 
-Columns materializeColumns(const Block & block, const Names & names)
+Columns materializeColumns(const Block & block, const Names & names,
+                           const std::vector<bool> *null_safeColumns)
 {
     Columns materialized;
-    materialized.reserve(names.size());
+    size_t names_size;
 
-    for (const auto & column_name : names)
+    names_size = names.size();
+    materialized.reserve(names_size + getNullSafeColumnCnts(null_safeColumns));
+
+    for (size_t i = 0; i < names_size; ++i)
     {
+        const auto & column_name = names[i];
         const auto & src_column = block.getByName(column_name).column;
+
+        if (null_safeColumns && (*null_safeColumns)[i]) {
+            /* push extra nullmap column for null safe column */
+            if (const auto * nullable = checkAndGetColumn<ColumnNullable>(src_column.get()))
+                materialized.emplace_back(IColumn::mutate(nullable->getNullMapColumnPtr()));
+            else
+                materialized.emplace_back(ColumnUInt8::create(src_column->size(), 0));
+        }
+
         materialized.emplace_back(recursiveRemoveLowCardinality(src_column->convertToFullColumnIfConst()));
     }
 
@@ -276,19 +427,38 @@ void restoreLowCardinalityInplace(Block & block)
     }
 }
 
-ColumnRawPtrs extractKeysForJoin(const Block & block_keys, const Names & key_names)
+ColumnRawPtrs extractKeysForJoin(Block & block_keys, const Names & key_names,
+                                 const std::vector<bool> *null_safeColumns)
 {
-    size_t keys_size = key_names.size();
-    ColumnRawPtrs key_columns(keys_size);
+    ColumnRawPtrs key_columns;
+    size_t names_size;
 
-    for (size_t i = 0; i < keys_size; ++i)
+    names_size = key_names.size();
+    key_columns.reserve(names_size + getNullSafeColumnCnts(null_safeColumns));
+
+    for (size_t i = 0; i < names_size; ++i)
     {
         const String & column_name = key_names[i];
-        key_columns[i] = block_keys.getByName(column_name).column.get();
+        const IColumn *c = block_keys.getByName(column_name).column.get();
+        const auto * nullable = checkAndGetColumn<ColumnNullable>(*c);
 
-        /// We will join only keys, where all components are not NULL.
-        if (const auto * nullable = checkAndGetColumn<ColumnNullable>(*key_columns[i]))
-            key_columns[i] = &nullable->getNestedColumn();
+        if (null_safeColumns && (*null_safeColumns)[i]) {
+            /* push extra nullmap column for null safe column */
+            if (nullable) {
+                key_columns.push_back(&nullable->getNullMapColumn());
+                c = &nullable->getNestedColumn();
+            } else {
+                const auto name = "null_safe_" + column_name + std::to_string(i);
+                ColumnWithTypeAndName col{std::make_shared<DataTypeUInt8>(), name};
+
+                key_columns.push_back(col.column.get());
+                block_keys.insert(std::move(col));
+            }
+        } else if (nullable) {
+            /// We will join only keys, where all components are not NULL.
+            c = &nullable->getNestedColumn();
+        }
+        key_columns.push_back(c);
     }
 
     return key_columns;
@@ -309,6 +479,13 @@ void checkTypesOfKeys(const Block & block_left, const Names & key_names_left, co
                 + key_names_right[i] + " " + right_type->getName() + " at right",
                 ErrorCodes::TYPE_MISMATCH);
     }
+}
+
+bool isJoinCompatibleTypes(const DataTypePtr & left, const DataTypePtr & right)
+{
+    auto left_base = removeNullable(recursiveRemoveLowCardinality(left));
+    auto right_base = removeNullable(recursiveRemoveLowCardinality(right));
+    return left_base->equals(*right_base);
 }
 
 void createMissedColumns(Block & block)

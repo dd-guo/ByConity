@@ -7,10 +7,11 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Storages/HDFS/ReadBufferFromByteHDFS.h>
 #include <Storages/IndexFile/Env.h>
 #include <Common/Exception.h>
 #include <Common/Slice.h>
+#include "IO/ReadBufferFromFileBase.h"
+#include "IO/ReadSettings.h"
 
 #include <assert.h>
 #include <limits>
@@ -62,8 +63,11 @@ namespace
 
         virtual ~PosixRandomAccessFile() override { close(fd_); }
 
-        virtual Status Read(uint64_t offset, size_t n, Slice * result, char * scratch) const override
+        virtual Status Read(uint64_t offset, size_t n, Slice * result, char * scratch, bool * from_local) const override
         {
+            // Read from local unique index file
+            if (from_local)
+                *from_local = true;
             int fd = fd_;
             Status s;
             ssize_t r = pread(fd, scratch, n, static_cast<off_t>(offset));
@@ -82,7 +86,7 @@ namespace
     public:
         RemoteFileWithCache(RemoteFileInfo file_, RemoteFileCachePtr cache_) : file(std::move(file_)), cache(std::move(cache_)) {}
 
-        virtual Status Read(uint64_t offset, size_t n, Slice * result, char * scratch) const override
+        virtual Status Read(uint64_t offset, size_t n, Slice * result, char * scratch, bool * from_local) const override
         {
             Status s;
             int fd = -1;
@@ -91,42 +95,37 @@ namespace
             if (fd < 0)
             {
                 /// fallback to remote read
+                if (from_local)
+                    *from_local = false;
                 try
                 {
-                    ReadBufferFromByteHDFS buffer(
-                        file.path,
-                        /*pread=*/true,
-                        file.hdfs_params,
-                        /*buf_size=*/n,
-                        /*existing_memory=*/scratch,
-                        /*alignment=*/0,
-                        /*read_all_once=*/true);
+                    std::unique_ptr<ReadBufferFromFileBase> buffer = file.disk->readFile(
+                        file.rel_path, ReadSettings().initializeReadSettings(n)
+                    );
 
                     auto seek_off = static_cast<off_t>(file.start_offset + offset);
-                    auto res_off = buffer.seek(seek_off);
+                    auto res_off = buffer->seek(seek_off);
                     if (res_off != seek_off)
                         throw Exception(
-                            "Seek to " + file.path + " should return " + toString(seek_off) + " but got " + toString(res_off),
+                            "Seek to " + String(std::filesystem::path(file.disk->getPath()) / file.rel_path) + " should return " + toString(seek_off) + " but got " + toString(res_off),
                             ErrorCodes::LOGICAL_ERROR);
 
-                    auto is_eof = buffer.eof(); /// will trigger reading into scratch
-                    if (is_eof)
-                        throw Exception(
-                            "Unexpected EOF when reading " + file.path + ", off=" + toString(seek_off) + ", size=" + toString(n),
-                            ErrorCodes::LOGICAL_ERROR);
-                    assert(buffer.buffer().size() == n);
+                    buffer->readStrict(scratch, n);
 
                     *result = Slice(scratch, n);
                 }
                 catch (...)
                 {
                     *result = Slice(scratch, 0);
-                    s = Status::IOError(file.path, getCurrentExceptionMessage(false));
+                    s = Status::IOError(String(std::filesystem::path(file.disk->getPath()) / file.rel_path),
+                        getCurrentExceptionMessage(false));
                 }
             }
             else
             {
                 /// read from local cached file
+                if (from_local)
+                    *from_local = true;
                 ssize_t r = pread(fd, scratch, n, static_cast<off_t>(offset));
                 *result = Slice(scratch, (r < 0) ? 0 : r);
                 if (r < 0)
@@ -248,7 +247,7 @@ namespace
             return s;
         }
 
-        virtual Status Sync() override
+        virtual Status Sync(bool need_fsync) override
         {
             // Ensure new files referred to by the manifest are in the filesystem.
             Status s = SyncDirIfManifest();
@@ -260,7 +259,7 @@ namespace
 #if defined(OS_LINUX)
             if (s.ok())
             {
-                if (fdatasync(fd_) != 0)
+                if (need_fsync && fdatasync(fd_) != 0)
                 {
                     s = PosixError(filename_, errno);
                 }

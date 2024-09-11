@@ -28,6 +28,9 @@ INSERT INTO d VALUES (2, 'a2'), (3, 'a3');
 SELECT DISTINCT d_ids, id, name FROM f LEFT ARRAY JOIN d_ids LEFT JOIN d ON d.id = d_ids ORDER BY d_ids;
 SELECT DISTINCT did, id, name FROM f LEFT ARRAY JOIN d_ids as did LEFT JOIN d ON d.id = did ORDER BY did;
 
+-- optimizer won't reject id=id
+set enable_optimizer=0;
+set dialect_type='CLICKHOUSE';
 -- name clash, doesn't work yet
 SELECT id, name FROM f LEFT ARRAY JOIN d_ids as id LEFT JOIN d ON d.id = id ORDER BY id; -- { serverError 403 }
 

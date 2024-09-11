@@ -21,15 +21,17 @@
 
 #pragma once
 
-#include <Common/NamePrompter.h>
+#include <unordered_map>
+#include <Access/AccessType.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ConstraintsDescription.h>
+#include <Storages/ForeignKeysDescription.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/registerStorages.h>
-#include <Access/AccessType.h>
-#include <unordered_map>
-
+#include <Common/NamePrompter.h>
+#include <Storages/Hive/Metastore/IMetaClient.h>
 
 namespace DB
 {
@@ -64,14 +66,24 @@ public:
         ContextWeakMutablePtr context;
         const ColumnsDescription & columns;
         const ConstraintsDescription & constraints;
+        const ForeignKeysDescription & foreign_keys;
+        const UniqueNotEnforcedDescription & unique;
         bool attach;
         bool create;  /// for CnchHive
         bool has_force_restore_data_flag;
         const String & comment;
-
+        IMetaClientPtr hive_client = nullptr;
+        bool skip_unknown_settings; /// for dumper
         ContextMutablePtr getContext() const;
         ContextMutablePtr getLocalContext() const;
+        IMetaClientPtr getMetaClient() const;
     };
+
+    struct HiveParams
+    {
+        IMetaClientPtr hive_client = nullptr;
+    };
+    using HiveParamsPtr = std::unique_ptr<HiveParams>;
 
     /// Analog of the IStorage::supports*() helpers
     /// (But the former cannot be replaced with StorageFeatures due to nesting)
@@ -88,6 +100,7 @@ public:
         bool supports_deduplication = false;
         /// See also IStorage::supportsParallelInsert()
         bool supports_parallel_insert = false;
+        bool supports_schema_inference = false;
         AccessType source_access_type = AccessType::NONE;
     };
 
@@ -100,28 +113,36 @@ public:
 
     using Storages = std::unordered_map<std::string, Creator>;
 
-    StoragePtr get(
-        const ASTCreateQuery & query,
+    StoragePtr
+    get(const ASTCreateQuery & query,
         const String & relative_data_path,
         ContextMutablePtr local_context,
         ContextMutablePtr context,
         const ColumnsDescription & columns,
         const ConstraintsDescription & constraints,
-        bool has_force_restore_data_flag) const;
+        const ForeignKeysDescription & foreign_keys,
+        const UniqueNotEnforcedDescription & unique,
+        bool has_force_restore_data_flag,
+        HiveParamsPtr hive_params = nullptr,
+        bool skip_unknown_settings = false) const;
 
     /// Register a table engine by its name.
     /// No locking, you must register all engines before usage of get.
-    void registerStorage(const std::string & name, CreatorFn creator_fn, StorageFeatures features = StorageFeatures{
-        .supports_settings = false,
-        .supports_skipping_indices = false,
-        .supports_projections = false,
-        .supports_sort_order = false,
-        .supports_ttl = false,
-        .supports_replication = false,
-        .supports_deduplication = false,
-        .supports_parallel_insert = false,
-        .source_access_type = AccessType::NONE,
-    });
+    void registerStorage(
+        const std::string & name,
+        CreatorFn creator_fn,
+        StorageFeatures features = StorageFeatures{
+            .supports_settings = false,
+            .supports_skipping_indices = false,
+            .supports_projections = false,
+            .supports_sort_order = false,
+            .supports_ttl = false,
+            .supports_replication = false,
+            .supports_deduplication = false,
+            .supports_parallel_insert = false,
+            .supports_schema_inference = false,
+            .source_access_type = AccessType::NONE,
+        });
 
     const Storages & getAllStorages() const
     {
@@ -147,6 +168,13 @@ public:
     }
 
     AccessType getSourceAccessType(const String & table_engine) const;
+
+    bool checkIfStorageSupportsSchemaInference(const String & storage_name)
+    {
+        if (auto it = storages.find(storage_name); it != storages.end())
+            return it->second.features.supports_schema_inference;
+        return false;
+    }
 
 private:
     Storages storages;

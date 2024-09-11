@@ -71,8 +71,10 @@ IMergeTreeDataPart::MergeTreeReaderPtr MergeTreeDataPartWide::getReader(
     UncompressedCache * uncompressed_cache,
     MarkCache * mark_cache,
     const MergeTreeReaderSettings & reader_settings,
+    MergeTreeIndexExecutor * index_executor,
     const ValueSizeMap & avg_value_size_hints,
-    const ReadBufferFromFileBase::ProfileCallback & profile_callback) const
+    const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+    [[maybe_unused]] const ProgressCallback & internal_progress_cb) const
 {
     auto new_settings = reader_settings;
     new_settings.convert_nested_to_subcolumns = true;
@@ -80,7 +82,7 @@ IMergeTreeDataPart::MergeTreeReaderPtr MergeTreeDataPartWide::getReader(
     auto ptr = std::static_pointer_cast<const MergeTreeDataPartWide>(shared_from_this());
     return std::make_unique<MergeTreeReaderWide>(
         ptr, columns_to_read, metadata_snapshot, uncompressed_cache,
-        mark_cache, mark_ranges, new_settings,
+        mark_cache, mark_ranges, new_settings, index_executor,
         avg_value_size_hints, profile_callback);
 }
 
@@ -90,12 +92,13 @@ IMergeTreeDataPart::MergeTreeWriterPtr MergeTreeDataPartWide::getWriter(
     const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & writer_settings,
-    const MergeTreeIndexGranularity & computed_index_granularity) const
+    const MergeTreeIndexGranularity & computed_index_granularity,
+    const BitmapBuildInfo & bitmap_build_info) const
 {
     return std::make_unique<MergeTreeDataPartWriterWide>(
         shared_from_this(), columns_list, metadata_snapshot, indices_to_recalc,
         index_granularity_info.marks_file_extension,
-        default_codec_, writer_settings, computed_index_granularity);
+        default_codec_, writer_settings, computed_index_granularity, bitmap_build_info);
 }
 
 
@@ -110,7 +113,7 @@ ColumnSize MergeTreeDataPartWide::getColumnSizeImpl(
         return size;
 
     // Special handling flattened map type
-    if (column.type->isMap() && !column.type->isMapKVStore())
+    if (column.type->isByteMap())
         return getMapColumnSizeNotKV(checksums, column);
 
     auto serialization = getSerializationForColumn(column);
@@ -131,7 +134,7 @@ ColumnSize MergeTreeDataPartWide::getColumnSizeImpl(
         auto mrk_checksum = checksums->files.find(file_name + index_granularity_info.marks_file_extension);
         if (mrk_checksum != checksums->files.end())
             size.marks += mrk_checksum->second.file_size;
-    }, {});
+    });
 
     return size;
 }
@@ -151,7 +154,7 @@ void MergeTreeDataPartWide::loadIndexGranularity()
     std::string marks_file_path;
     for (auto & column: *columns_ptr)
     {
-        if (column.type->isMap() && !column.type->isMapKVStore())
+        if (column.type->isByteMap())
             continue;
         marks_file_path = index_granularity_info.getMarksFilePath(full_path + getFileNameForColumn(column));
         break;
@@ -168,7 +171,7 @@ void MergeTreeDataPartWide::loadIndexGranularity()
     }
     else
     {
-        auto buffer = volume->getDisk()->readFile(marks_file_path, {.buffer_size = marks_file_size});
+        auto buffer = volume->getDisk()->readFile(marks_file_path, ReadSettings().initializeReadSettings(marks_file_size));
         while (!buffer->eof())
         {
             buffer->seek(sizeof(size_t) * 2, SEEK_CUR); /// skip offset_in_compressed file and offset_in_decompressed_block
@@ -218,8 +221,7 @@ void MergeTreeDataPartWide::checkConsistency(bool require_part_metadata) const
         {
             for (const NameAndTypePair & name_type : *columns_ptr)
             {
-                //@ByteMap
-                if (name_type.type->isMap() && !name_type.type->isMapKVStore())
+                if (name_type.type->isByteMap())
                     continue;
 
                 auto serialization = getSerializationForColumn(name_type);
@@ -245,8 +247,7 @@ void MergeTreeDataPartWide::checkConsistency(bool require_part_metadata) const
         std::optional<UInt64> marks_size;
         for (const NameAndTypePair & name_type : *columns_ptr)
         {
-            //@ByteMap
-            if (name_type.type->isMap() && !name_type.type->isMapKVStore())
+            if (name_type.type->isByteMap())
                 continue;
 
             auto serialization = IDataType::getSerialization(name_type,
@@ -293,20 +294,12 @@ bool MergeTreeDataPartWide::hasColumnFiles(const NameAndTypePair & column) const
         return bin_checksum != checksums->files.end() && mrk_checksum != checksums->files.end();
     };
 
-    if (column.type->isMap() && !column.type->isMapKVStore())
+    if (column.type->isByteMap())
     {
         for (auto & [file, _] : getChecksums()->files)
         {
-            if (versions->enable_compact_map_data)
-            {
-                if (isMapCompactFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
-            else
-            {
-                if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
+            if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
+                return true;
         }
         return false;
     }
@@ -361,6 +354,11 @@ void MergeTreeDataPartWide::calculateEachColumnSizes(ColumnSizeByName & each_col
         }
 #endif
     }
+}
+
+bool MergeTreeDataPartWide::isStoredOnRemoteDisk() const
+{
+    return storage.isRemote();
 }
 
 }

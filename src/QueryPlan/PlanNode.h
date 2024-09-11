@@ -16,11 +16,13 @@
 #pragma once
 #include <Core/Types.h>
 #include <Optimizer/CardinalityEstimate/PlanNodeStatisticsEstimate.h>
+#include <Parsers/IAST_fwd.h>
 #include <QueryPlan/AggregatingStep.h>
 #include <QueryPlan/AnyStep.h>
 #include <QueryPlan/ApplyStep.h>
 #include <QueryPlan/ArrayJoinStep.h>
 #include <QueryPlan/AssignUniqueIdStep.h>
+#include <QueryPlan/BufferStep.h>
 #include <QueryPlan/CTERefStep.h>
 #include <QueryPlan/CreatingSetsStep.h>
 #include <QueryPlan/CubeStep.h>
@@ -28,6 +30,8 @@
 #include <QueryPlan/EnforceSingleRowStep.h>
 #include <QueryPlan/ExceptStep.h>
 #include <QueryPlan/ExchangeStep.h>
+#include <QueryPlan/ExpandStep.h>
+#include <QueryPlan/ExplainAnalyzeStep.h>
 #include <QueryPlan/ExpressionStep.h>
 #include <QueryPlan/ExtremesStep.h>
 #include <QueryPlan/FillingStep.h>
@@ -35,34 +39,43 @@
 #include <QueryPlan/FinalSampleStep.h>
 #include <QueryPlan/FinishSortingStep.h>
 #include <QueryPlan/IQueryPlanStep.h>
+#include <QueryPlan/IntersectOrExceptStep.h>
 #include <QueryPlan/IntersectStep.h>
 #include <QueryPlan/JoinStep.h>
 #include <QueryPlan/LimitByStep.h>
 #include <QueryPlan/LimitStep.h>
-#include <QueryPlan/SortingStep.h>
+#include <QueryPlan/LocalExchangeStep.h>
+#include <QueryPlan/MarkDistinctStep.h>
 #include <QueryPlan/MergeSortingStep.h>
 #include <QueryPlan/MergingAggregatedStep.h>
 #include <QueryPlan/MergingSortedStep.h>
+#include <QueryPlan/MultiJoinStep.h>
 #include <QueryPlan/OffsetStep.h>
 #include <QueryPlan/PartialSortingStep.h>
 #include <QueryPlan/PartitionTopNStep.h>
 #include <QueryPlan/PlanSegmentSourceStep.h>
 #include <QueryPlan/ProjectionStep.h>
-#include <QueryPlan/QueryCacheStep.h>
 #include <QueryPlan/ReadFromMergeTree.h>
 #include <QueryPlan/ReadFromPreparedSource.h>
 #include <QueryPlan/ReadNothingStep.h>
+#include <QueryPlan/ReadStorageRowCountStep.h>
 #include <QueryPlan/RemoteExchangeSourceStep.h>
+#include <QueryPlan/IntermediateResultCacheStep.h>
 #include <QueryPlan/RollupStep.h>
 #include <QueryPlan/SettingQuotaAndLimitsStep.h>
+#include <QueryPlan/SortingStep.h>
 #include <QueryPlan/SymbolAllocator.h>
+#include <QueryPlan/TableFinishStep.h>
 #include <QueryPlan/TableScanStep.h>
+#include <QueryPlan/TableWriteStep.h>
+#include <QueryPlan/OutfileWriteStep.h>
+#include <QueryPlan/OutfileFinishStep.h>
+#include <QueryPlan/TopNFilteringStep.h>
 #include <QueryPlan/TotalsHavingStep.h>
 #include <QueryPlan/UnionStep.h>
 #include <QueryPlan/ValuesStep.h>
 #include <QueryPlan/Void.h>
 #include <QueryPlan/WindowStep.h>
-#include <Parsers/IAST_fwd.h>
 
 #include <memory>
 #include <utility>
@@ -76,7 +89,7 @@ class PlanNodeBase;
 using PlanNodePtr = std::shared_ptr<PlanNodeBase>;
 using PlanNodes = std::vector<PlanNodePtr>;
 
-using ConstQueryPlanStepPtr = std::shared_ptr<const IQueryPlanStep>;
+using QueryPlanStepPtr = std::shared_ptr<IQueryPlanStep>;
 using PlanNodeId = UInt32;
 
 class PlanNodeBase : public std::enable_shared_from_this<PlanNodeBase>
@@ -87,12 +100,11 @@ public:
     PlanNodeId getId() const { return id; }
 
     PlanNodes & getChildren() { return children; }
+    const PlanNodes & getChildren() const { return children; }
     void replaceChildren(const PlanNodes & children_) { replaceChildrenImpl(children_); }
-
-    void replaceChildren(PlanNodes && children_) { children = std::move(children_); }
     void setStatistics(const PlanNodeStatisticsEstimate & statistics_) { statistics = statistics_; }
     const PlanNodeStatisticsEstimate & getStatistics() const { return statistics; }
-    ConstQueryPlanStepPtr getStep() const { return getStepImpl(); }
+    QueryPlanStepPtr getStep() const { return getStepImpl(); }
     void setStep(QueryPlanStepPtr & step_) { setStepImpl(step_); }
 
 
@@ -104,10 +116,12 @@ public:
     NamesAndTypes getOutputNamesAndTypes() const { return getCurrentDataStream().header.getNamesAndTypes(); }
     NameToType getOutputNamesToTypes() const { return getCurrentDataStream().header.getNamesToTypes(); }
     Names getOutputNames() const { return getCurrentDataStream().header.getNames(); }
+    PlanNodePtr getNodeById(PlanNodeId node_id) const;
+    void prepare(const PreparedStatementContext & prepared_context);
 
     static PlanNodePtr createPlanNode(
         [[maybe_unused]] PlanNodeId id_,
-        [[maybe_unused]] ConstQueryPlanStepPtr step_,
+        [[maybe_unused]] QueryPlanStepPtr step_,
         [[maybe_unused]] const PlanNodes & children_ = {},
         [[maybe_unused]] const PlanNodeStatisticsEstimate & statistics_ = {})
     {
@@ -115,12 +129,13 @@ public:
 #define CREATE_PLAN_NODE(TYPE) \
     if (step_->getType() == IQueryPlanStep::Type::TYPE) \
     { \
-        auto spec_step = std::dynamic_pointer_cast<const TYPE##Step>(step_); \
+        auto spec_step = std::dynamic_pointer_cast<TYPE##Step>(step_); \
         plan_node = std::dynamic_pointer_cast<PlanNodeBase>(std::make_shared<PlanNode<TYPE##Step>>(id_, std::move(spec_step), children_)); \
     }
 
-    APPLY_STEP_TYPES(CREATE_PLAN_NODE)
-    CREATE_PLAN_NODE(Any)
+        APPLY_STEP_TYPES(CREATE_PLAN_NODE)
+        CREATE_PLAN_NODE(Any)
+        CREATE_PLAN_NODE(MultiJoin)
 #undef CREATE_PLAN_NODE
         plan_node->setStatistics(statistics_);
         return plan_node;
@@ -132,18 +147,15 @@ protected:
     PlanNodeStatisticsEstimate statistics;
 
 private:
-
-    virtual ConstQueryPlanStepPtr getStepImpl() const = 0;
+    virtual QueryPlanStepPtr getStepImpl() const = 0;
     virtual void setStepImpl(QueryPlanStepPtr & step_) = 0;
     virtual void replaceChildrenImpl(const PlanNodes & children_) = 0;
-
 };
 
 template <class Step>
 class PlanNode : public PlanNodeBase
 {
 public:
-    using ConstStepPtr = std::shared_ptr<const Step>;
     using StepPtr = std::shared_ptr<Step>;
     PlanNode(const PlanNode &) = delete;
     PlanNode(const PlanNode &&) = delete;
@@ -152,13 +164,13 @@ public:
     PlanNode & operator=(PlanNode &&) = delete;
 
     IQueryPlanStep::Type getType() const override { return step->getType(); }
-    ConstStepPtr & getStep() { return step; }
+    StepPtr & getStep() { return step; }
 
     void setStep(StepPtr & step_) { step = step_; }
     const DataStream & getCurrentDataStream() const override { return step->getOutputStream(); }
 
-    static PlanNodePtr createPlanNode(
-        PlanNodeId id_, ConstStepPtr step_, const PlanNodes & children_ = {}, const PlanNodeStatisticsEstimate & statistics_ = {})
+    static PlanNodePtr
+    createPlanNode(PlanNodeId id_, StepPtr step_, const PlanNodes & children_ = {}, const PlanNodeStatisticsEstimate & statistics_ = {})
     {
         PlanNodePtr plan_node = std::make_shared<PlanNode<Step>>(id_, std::move(step_), children_);
         plan_node->setStatistics(statistics_);
@@ -188,10 +200,10 @@ public:
         return PlanNodeBase::createPlanNode(new_id, std::move(new_step), new_children);
     }
 
-    PlanNode(PlanNodeId id_, ConstStepPtr step_, PlanNodes children_ = {}) : PlanNodeBase(id_, children_), step(std::move(step_)) { }
+    PlanNode(PlanNodeId id_, StepPtr step_, PlanNodes children_ = {}) : PlanNodeBase(id_, children_), step(std::move(step_)) { }
 
 private:
-    ConstQueryPlanStepPtr getStepImpl() const override { return step; }
+    QueryPlanStepPtr getStepImpl() const override { return step; }
 
     void replaceChildrenImpl(const PlanNodes & children_) override
     {
@@ -202,6 +214,8 @@ private:
         {
             inputs.emplace_back(child->getCurrentDataStream());
         }
+
+        getStep()->setInputStreams(inputs);
     }
 
     void setStepImpl(QueryPlanStepPtr & step_) override
@@ -213,7 +227,7 @@ private:
         }
     }
 
-    ConstStepPtr step;
+    StepPtr step;
 };
 
 #define PLAN_NODE_DEF(TYPE) \
@@ -222,6 +236,7 @@ private:
 
 APPLY_STEP_TYPES(PLAN_NODE_DEF)
 PLAN_NODE_DEF(Any)
+PLAN_NODE_DEF(MultiJoin)
 #undef PLAN_NODE_DEF
 
 }

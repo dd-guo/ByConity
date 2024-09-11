@@ -15,12 +15,14 @@
 
 #include <Optimizer/Rule/Rewrite/SimplifyExpressionRules.h>
 
+#include <Interpreters/join_common.h>
 #include <Optimizer/ExpressionInterpreter.h>
+#include <Optimizer/LiteralEncoder.h>
 #include <Optimizer/PredicateUtils.h>
+#include <Optimizer/Property/ConstantsDeriver.h>
 #include <Optimizer/Rule/Patterns.h>
 #include <Optimizer/SimplifyExpressions.h>
 #include <Optimizer/UnwrapCastInComparison.h>
-#include <Optimizer/LiteralEncoder.h>
 #include <Optimizer/Utils.h>
 #include <Parsers/formatAST.h>
 #include <QueryPlan/FilterStep.h>
@@ -28,19 +30,15 @@
 
 namespace DB
 {
-PatternPtr CommonPredicateRewriteRule::getPattern() const
+ConstRefPatternPtr CommonPredicateRewriteRule::getPattern() const
 {
-    return Patterns::filter();
+    static auto pattern = Patterns::filter().result();
+    return pattern;
 }
 
 TransformResult CommonPredicateRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
 {
     auto & context = rule_context.context;
-    if (!context->getSettingsRef().enable_common_predicate_rewrite)
-    {
-        return {};
-    }
-
     auto * old_filter_node = dynamic_cast<FilterNode *>(node.get());
     if (!old_filter_node)
         return {};
@@ -61,9 +59,55 @@ TransformResult CommonPredicateRewriteRule::transformImpl(PlanNodePtr node, cons
     return filter_node;
 }
 
-PatternPtr SwapPredicateRewriteRule::getPattern() const
+ConstRefPatternPtr CommonJoinFilterRewriteRule::getPattern() const
 {
-    return Patterns::filter();
+    static auto pattern = Patterns::join().matchingStep<JoinStep>([&](const JoinStep & s) { return !PredicateUtils::isTruePredicate(s.getFilter()); }).result();
+    return pattern;
+}
+
+TransformResult CommonJoinFilterRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
+{
+    auto & context = rule_context.context;
+    const auto & step_ptr = node->getStep();
+    const auto & step = dynamic_cast<const JoinStep &>(*step_ptr);
+
+    auto filter = step.getFilter();
+    ConstASTPtr rewritten = CommonPredicatesRewriter::rewrite(filter, context);
+
+    if (rewritten->getColumnName() == filter->getColumnName())
+    {
+        return {};
+    }
+
+    QueryPlanStepPtr join_step = std::make_shared<JoinStep>(
+       step.getInputStreams(),
+        step.getOutputStream(),
+        step.getKind(),
+        step.getStrictness(),
+        step.getMaxStreams(),
+        step.getKeepLeftReadInOrder(),
+        step.getLeftKeys(),
+        step.getRightKeys(),
+        rewritten,
+        step.isHasUsing(),
+        step.getRequireRightKeys(),
+        step.getAsofInequality(),
+        step.getDistributionType(),
+        JoinAlgorithm::AUTO,
+        false,
+        step.isOrdered(),
+        step.isSimpleReordered(),
+        step.getRuntimeFilterBuilders(),
+        step.getHints());
+
+    PlanNodePtr join_node = PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(join_step), node->getChildren());
+    return join_node;
+}
+
+ConstRefPatternPtr SwapPredicateRewriteRule::getPattern() const
+{
+    static auto pattern = Patterns::filter().result();
+    return pattern;
 }
 
 TransformResult SwapPredicateRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
@@ -88,14 +132,15 @@ TransformResult SwapPredicateRewriteRule::transformImpl(PlanNodePtr node, const 
 
     auto filter_step
         = std::make_shared<FilterStep>(node->getChildren()[0]->getStep()->getOutputStream(), rewritten, step.removesFilterColumn());
-    auto filter_node = PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
+    auto filter_node = PlanNodeBase::createPlanNode(node->getId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
 
     return filter_node;
 }
 
-PatternPtr SimplifyPredicateRewriteRule::getPattern() const
+ConstRefPatternPtr SimplifyPredicateRewriteRule::getPattern() const
 {
-    return Patterns::filter();
+    static auto pattern = Patterns::filter().result();
+    return pattern;
 }
 
 TransformResult SimplifyPredicateRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
@@ -108,7 +153,15 @@ TransformResult SimplifyPredicateRewriteRule::transformImpl(PlanNodePtr node, co
     const auto & step = *old_filter_node->getStep();
     auto predicate = step.getFilter();
 
-    ConstASTPtr rewritten = ExpressionInterpreter::optimizePredicate(predicate, step.getOutputStream().header.getNamesToTypes(), context);
+    ExpressionInterpreter::IdentifierValues constants;
+    if (context->getSettingsRef().enable_simplify_expression_by_derived_constant)
+    {
+        auto derived_constants = ConstantsDeriver::deriveConstantsFromTree(node->getChildren().at(0), rule_context.cte_info, context);
+        for (const auto & [name, field_with_type] : derived_constants.getValues())
+            constants.emplace(name, field_with_type.value);
+    }
+    ConstASTPtr rewritten
+        = ExpressionInterpreter::optimizePredicate(predicate, step.getOutputStream().header.getNamesToTypes(), context, constants);
 
     if (PredicateUtils::isTruePredicate(rewritten))
         return node->getChildren()[0];
@@ -118,23 +171,20 @@ TransformResult SimplifyPredicateRewriteRule::transformImpl(PlanNodePtr node, co
 
     auto filter_step
         = std::make_shared<FilterStep>(node->getChildren()[0]->getStep()->getOutputStream(), rewritten, step.removesFilterColumn());
-    auto filter_node = PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
+    auto filter_node = PlanNodeBase::createPlanNode(node->getId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
 
     return filter_node;
 }
 
-PatternPtr UnWarpCastInPredicateRewriteRule::getPattern() const
+ConstRefPatternPtr UnWarpCastInPredicateRewriteRule::getPattern() const
 {
-    return Patterns::filter();
+    static auto pattern = Patterns::filter().result();
+    return pattern;
 }
 
 TransformResult UnWarpCastInPredicateRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
 {
     auto & context = rule_context.context;
-    if (!context->getSettingsRef().enable_unwarp_cast_in)
-    {
-        return {};
-    }
     auto * old_filter_node = dynamic_cast<FilterNode *>(node.get());
     if (!old_filter_node)
         return {};
@@ -156,14 +206,17 @@ TransformResult UnWarpCastInPredicateRewriteRule::transformImpl(PlanNodePtr node
 
     auto filter_step
         = std::make_shared<FilterStep>(node->getChildren()[0]->getStep()->getOutputStream(), rewritten, step.removesFilterColumn());
-    auto filter_node = PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
+    auto filter_node = PlanNodeBase::createPlanNode(node->getId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
 
     return filter_node;
 }
 
-PatternPtr SimplifyJoinFilterRewriteRule::getPattern() const
+ConstRefPatternPtr SimplifyJoinFilterRewriteRule::getPattern() const
 {
-    return Patterns::join()->matchingStep<JoinStep>([&](const JoinStep & s) { return !PredicateUtils::isTruePredicate(s.getFilter()); });
+    static auto pattern = Patterns::join()
+        .matchingStep<JoinStep>([](const JoinStep & s) { return !PredicateUtils::isTruePredicate(s.getFilter()); })
+        .result();
+    return pattern;
 }
 
 TransformResult SimplifyJoinFilterRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
@@ -188,9 +241,9 @@ TransformResult SimplifyJoinFilterRewriteRule::transformImpl(PlanNodePtr node, c
         {
             for (const auto & column : header)
             {
-                if (column.type->canBeInsideNullable())
+                if (JoinCommon::canBecomeNullable(column.type))
                 {
-                    NameAndTypePair name_and_type{column.name, makeNullable(column.type)};
+                    NameAndTypePair name_and_type{column.name, JoinCommon::tryConvertTypeToNullable(column.type)};
                     column_types.emplace_back(name_and_type);
                 }
                 else
@@ -209,7 +262,7 @@ TransformResult SimplifyJoinFilterRewriteRule::transformImpl(PlanNodePtr node, c
     type_with_nullable(make_nullable_for_right, step.getInputStreams()[1].header.getNamesAndTypes());
 
     NameToType name_to_type;
-    for (const auto & item: column_types)
+    for (const auto & item : column_types)
         name_to_type.emplace(item.name, item.type);
 
     ASTPtr rewritten = ExpressionInterpreter::optimizePredicate(filter, name_to_type, context);
@@ -219,26 +272,34 @@ TransformResult SimplifyJoinFilterRewriteRule::transformImpl(PlanNodePtr node, c
         return {};
     }
 
-    QueryPlanStepPtr join_step = std::make_shared<JoinStep>(
+    auto join_step = std::make_shared<JoinStep>(
         step.getInputStreams(),
         step.getOutputStream(),
         step.getKind(),
         step.getStrictness(),
+        step.getMaxStreams(),
+        step.getKeepLeftReadInOrder(),
         step.getLeftKeys(),
         step.getRightKeys(),
         rewritten,
         step.isHasUsing(),
         step.getRequireRightKeys(),
         step.getAsofInequality(),
-        step.getDistributionType());
-
-    PlanNodePtr join_node = PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(join_step), node->getChildren());
+        step.getDistributionType(),
+        JoinAlgorithm::AUTO,
+        false,
+        step.isOrdered(),
+        step.isSimpleReordered(),
+        step.getRuntimeFilterBuilders(),
+        step.getHints());
+    PlanNodePtr join_node = PlanNodeBase::createPlanNode(node->getId(), std::move(join_step), node->getChildren());
     return join_node;
 }
 
-PatternPtr SimplifyExpressionRewriteRule::getPattern() const
+ConstRefPatternPtr SimplifyExpressionRewriteRule::getPattern() const
 {
-    return Patterns::project();
+    static auto pattern = Patterns::project().result();
+    return pattern;
 }
 
 TransformResult SimplifyExpressionRewriteRule::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
@@ -252,7 +313,10 @@ TransformResult SimplifyExpressionRewriteRule::transformImpl(PlanNodePtr node, c
     Assignments assignments;
     NameToType name_to_type;
     auto column_types = node->getChildren()[0]->getCurrentDataStream().header.getNamesToTypes();
-    auto interpreter = ExpressionInterpreter::basicInterpreter(std::move(column_types), context);
+
+    auto interpreter = rule_context.context->getSettingsRef().enable_simplify_predicate_in_projection
+        ? ExpressionInterpreter::optimizedInterpreter(std::move(column_types), {}, context)
+        : ExpressionInterpreter::basicInterpreter(std::move(column_types), context);
     bool rewrite = false;
     for (const auto & assignment : project->getAssignments())
     {
@@ -268,50 +332,51 @@ TransformResult SimplifyExpressionRewriteRule::transformImpl(PlanNodePtr node, c
         return {};
 
     return PlanNodeBase::createPlanNode(
-        context->nextNodeId(),
+        node->getId(),
         std::make_shared<ProjectionStep>(
             node->getChildren()[0]->getStep()->getOutputStream(),
             assignments,
             name_to_type,
             project->isFinalProject(),
-            project->getDynamicFilters()),
+            project->isIndexProject()),
         PlanNodes{node->getChildren()[0]});
 }
 
-PatternPtr MergePredicatesUsingDomainTranslator::getPattern() const
+ConstRefPatternPtr MergePredicatesUsingDomainTranslator::getPattern() const
 {
-    return Patterns::filter();
+    static auto pattern = Patterns::filter().result();
+    return pattern;
 }
 
 TransformResult MergePredicatesUsingDomainTranslator::transformImpl(PlanNodePtr node, const Captures &, RuleContext & rule_context)
 {
     auto & context = rule_context.context;
-    auto * old_filter_node = dynamic_cast<FilterNode *>(node.get());
-    if (!old_filter_node)
+    const auto & settings = context->getSettingsRef();
+    if (!settings.rewrite_predicate_by_domain)
         return {};
 
+    auto * old_filter_node = dynamic_cast<FilterNode *>(node.get());
     const auto & step = *old_filter_node->getStep();
     auto predicate = step.getFilter()->clone();
 
-    using ExtractionReuslt = DB::Predicate::ExtractionResult;
-    using DomainTranslator = DB::Predicate::DomainTranslator;
+    using ExtractionReuslt = DB::Predicate::ExtractionResult<ASTPtr>;
+    using DomainTranslator = DB::Predicate::DomainTranslator<ASTPtr>;
 
-    DomainTranslator domain_translator = DomainTranslator(context);
+    DomainTranslator domain_translator{context};
     ExtractionReuslt rewritten = domain_translator.getExtractionResult(predicate, step.getOutputStream().header.getNamesAndTypes());
 
-    if (domain_translator.isIgnored() || predicate->getColumnName() == rewritten.remaining_expression->getColumnName())
+    if (domain_translator.isIgnored() && !context->getSettingsRef().rewrite_complex_predicate_by_domain)
         return {};
 
-    ASTPtr combine_extraction_result = PredicateUtils::combineConjuncts({
-        domain_translator.toPredicate(rewritten.tuple_domain),
-        rewritten.remaining_expression});
+    ASTPtr combine_extraction_result
+        = PredicateUtils::combineConjuncts(ASTs{domain_translator.toPredicate(rewritten.tuple_domain), rewritten.remaining_expression});
 
     if (combine_extraction_result->getColumnName() == predicate->getColumnName())
         return {};
 
-    auto filter_step
-        = std::make_shared<FilterStep>(node->getChildren()[0]->getStep()->getOutputStream(), combine_extraction_result, step.removesFilterColumn());
-    auto filter_node = PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
+    auto filter_step = std::make_shared<FilterStep>(
+        node->getChildren()[0]->getStep()->getOutputStream(), combine_extraction_result, step.removesFilterColumn());
+    auto filter_node = PlanNodeBase::createPlanNode(node->getId(), std::move(filter_step), PlanNodes{node->getChildren()[0]});
 
     return filter_node;
 }

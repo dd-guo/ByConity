@@ -136,6 +136,7 @@ namespace
         std::shared_ptr<Quota> quota;
         std::shared_ptr<SettingsProfile> profile;
         AccessEntityPtr res;
+        bool sensitive_tenant = false;
 
         for (const auto & query : queries)
         {
@@ -176,12 +177,16 @@ namespace
             }
             else if (auto * grant_query = query->as<ASTGrantQuery>())
             {
+                /* sensitive permissions were serialized first */
+                if (grant_query->is_sensitive)
+                    sensitive_tenant = true;
+
                 if (!user && !role)
                     throw Exception("A user or role should be attached before grant in file " + file_path, ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
                 if (user)
-                    InterpreterGrantQuery::updateUserFromQuery(*user, *grant_query);
+                    InterpreterGrantQuery::updateUserFromQuery(*user, *grant_query, sensitive_tenant);
                 else
-                    InterpreterGrantQuery::updateRoleFromQuery(*role, *grant_query);
+                    InterpreterGrantQuery::updateRoleFromQuery(*role, *grant_query, sensitive_tenant);
             }
             else
                 throw Exception("No interpreter found for query " + query->getID(), ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
@@ -215,7 +220,11 @@ namespace
         ASTs queries;
         queries.push_back(InterpreterShowCreateAccessEntityQuery::getAttachQuery(entity));
         if ((entity.getType() == EntityType::USER) || (entity.getType() == EntityType::ROLE))
-            boost::range::push_back(queries, InterpreterShowGrantsQuery::getAttachGrantQueries(entity));
+        {
+            /* The true/false order must be kept, to be used for detecting sensitive tenant in KVAccessStorage.cpp */
+            boost::range::push_back(queries, InterpreterShowGrantsQuery::getAttachGrantQueries(entity, true));
+            boost::range::push_back(queries, InterpreterShowGrantsQuery::getAttachGrantQueries(entity, false));
+        }
 
         /// Serialize the list of ATTACH queries to a string.
         WriteBufferFromOwnString buf;
@@ -396,6 +405,8 @@ void DiskAccessStorage::clear()
 {
     entries_by_id.clear();
     for (auto type : collections::range(EntityType::MAX))
+        // collections::range(MAX_CONDITION_TYPE) give us a range of [0, MAX_CONDITION_TYPE)
+        // coverity[overrun-local]
         entries_by_name_and_type[static_cast<size_t>(type)].clear();
 }
 
@@ -601,12 +612,17 @@ bool DiskAccessStorage::existsImpl(const UUID & id) const
 }
 
 
-AccessEntityPtr DiskAccessStorage::readImpl(const UUID & id) const
+AccessEntityPtr DiskAccessStorage::readImpl(const UUID & id, bool throw_if_not_exists) const
 {
     std::lock_guard lock{mutex};
     auto it = entries_by_id.find(id);
     if (it == entries_by_id.end())
-        throwNotFound(id);
+    {
+        if (throw_if_not_exists)
+            throwNotFound(id);
+        else
+            return nullptr;
+    }
 
     const auto & entry = it->second;
     if (!entry.entity)
@@ -615,13 +631,18 @@ AccessEntityPtr DiskAccessStorage::readImpl(const UUID & id) const
 }
 
 
-String DiskAccessStorage::readNameImpl(const UUID & id) const
+std::optional<std::pair<String, AccessEntityType>> DiskAccessStorage::readNameWithTypeImpl(const UUID & id, bool throw_if_not_exists) const
 {
     std::lock_guard lock{mutex};
     auto it = entries_by_id.find(id);
     if (it == entries_by_id.end())
-        throwNotFound(id);
-    return String{it->second.name};
+    {
+        if (throw_if_not_exists)
+            throwNotFound(id);
+        else
+            return std::nullopt;
+    }
+    return std::make_pair(it->second.name, it->second.type);
 }
 
 

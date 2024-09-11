@@ -32,6 +32,11 @@ void DropRangeAction::appendPart(MutableMergeTreeDataPartCNCHPtr part)
     parts.push_back(std::move(part));
 }
 
+void DropRangeAction::appendStagedPart(MutableMergeTreeDataPartCNCHPtr part)
+{
+    staged_parts.push_back(std::move(part));
+}
+
 void DropRangeAction::appendDeleteBitmap(DeleteBitmapMetaPtr delete_bitmap)
 {
     delete_bitmaps.push_back(std::move(delete_bitmap));
@@ -52,36 +57,43 @@ void DropRangeAction::executeV1(TxnTimestamp commit_time)
         throw Exception("CNCH table ptr is null in DropRange Action", ErrorCodes::LOGICAL_ERROR);
 
     auto catalog = global_context.getCnchCatalog();
-    catalog->finishCommit(table, txn_id, commit_time, {parts.begin(), parts.end()}, delete_bitmaps, false, /*preallocate_mode=*/ false);
+    bool write_manifest = cnch_table->getSettings()->enable_publish_version_on_commit;
+    catalog->finishCommit(table, txn_id, commit_time, {parts.begin(), parts.end()}, delete_bitmaps, false, /*preallocate_mode=*/ false, write_manifest);
 
-    ServerPartLog::addNewParts(getContext(), ServerPartLogElement::DROP_RANGE, parts, txn_id, false);
+    ServerPartLog::addNewParts(getContext(), table->getStorageID(), ServerPartLogElement::DROP_RANGE, parts, {}, txn_id, /*error=*/ false);
 }
 
 void DropRangeAction::executeV2()
 {
+    if (executed)
+        return;
+
+    executed = true;
+
     auto * cnch_table = dynamic_cast<StorageCnchMergeTree *>(table.get());
     if (!cnch_table)
         throw Exception("Expected StorageCnchMergeTree, but got: " + table->getName(), ErrorCodes::LOGICAL_ERROR);
 
     auto catalog = global_context.getCnchCatalog();
-    catalog->writeParts(table, txn_id, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, /*staged_parts*/{}}, false, /*preallocate_mode=*/ false);
+    bool write_manifest = cnch_table->getSettings()->enable_publish_version_on_commit;
+    catalog->writeParts(table, txn_id, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, {staged_parts.begin(), staged_parts.end()}}, false, /*preallocate_mode=*/ false, write_manifest);
 }
 
 /// Post progressing
 void DropRangeAction::postCommit(TxnTimestamp commit_time)
 {
     /// set commit time for part
-    global_context.getCnchCatalog()->setCommitTime(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, /*staged_parts*/{}}, commit_time);
+    global_context.getCnchCatalog()->setCommitTime(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps, {staged_parts.begin(), staged_parts.end()}}, commit_time);
 
-    ServerPartLog::addNewParts(getContext(), ServerPartLogElement::DROP_RANGE, parts, txn_id, false);
+    ServerPartLog::addNewParts(getContext(), table->getStorageID(), ServerPartLogElement::DROP_RANGE, parts, staged_parts, txn_id, /*error=*/ false);
 }
 
 void DropRangeAction::abort()
 {
     // clear parts in kv
-    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps,  /*staged_parts*/ {}}, true);
+    global_context.getCnchCatalog()->clearParts(table, Catalog::CommitItems{{parts.begin(), parts.end()}, delete_bitmaps,  {staged_parts.begin(), staged_parts.end()}});
 
-    ServerPartLog::addNewParts(getContext(), ServerPartLogElement::DROP_RANGE, parts, txn_id, true);
+    ServerPartLog::addNewParts(getContext(), table->getStorageID(), ServerPartLogElement::DROP_RANGE, parts, staged_parts, txn_id, /*error=*/ true);
 }
 
 }

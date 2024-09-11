@@ -70,11 +70,13 @@ private:
     ColumnBitMap64() = default;
     ColumnBitMap64(const ColumnBitMap64 & src);
 
-    template <typename Comparator>
-    void getPermutationImpl(size_t limit, Permutation & res, Comparator cmp) const;
+    struct ComparatorBase;
 
-    template <typename Comparator>
-    void updatePermutationImpl(size_t limit, Permutation & res, EqualRanges & equal_ranges, Comparator cmp) const;
+    using ComparatorAscendingUnstable = ComparatorAscendingUnstableImpl<ComparatorBase>;
+    using ComparatorAscendingStable = ComparatorAscendingStableImpl<ComparatorBase>;
+    using ComparatorDescendingUnstable = ComparatorDescendingUnstableImpl<ComparatorBase>;
+    using ComparatorDescendingStable = ComparatorDescendingStableImpl<ComparatorBase>;
+    using ComparatorEqual = ComparatorEqualImpl<ComparatorBase>;
 
 public:
     const char * getFamilyName() const override { return "BitMap64"; }
@@ -118,6 +120,11 @@ public:
         assert(n < size());
         auto s = roaring::Roaring64Map::readSafe(reinterpret_cast<const char *>(&chars[offsetAt(n)]), sizeAt(n) - 1);
         res = Field(std::move(s));
+    }
+
+    bool isDefaultAt(size_t ) const override
+    {
+        throw Exception("Method isDefaultAt is not supported for ColumnBitMap", ErrorCodes::NOT_IMPLEMENTED);
     }
 
     StringRef getDataAt(size_t n) const override
@@ -255,6 +262,23 @@ public:
 
     ColumnPtr filter(const Filter & filt, ssize_t result_size_hint) const override;
 
+    void expand(const Filter & /*mask*/, bool /*inverted*/) override;
+
+    double getRatioOfDefaultRows(double) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getRatioOfDefaultRows is not supported for {}", getName());
+    }
+
+    UInt64 getNumberOfDefaultRows() const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getNumberOfDefaultRows is not supported for {}", getName());
+    }
+
+    void getIndicesOfNonDefaultRows(Offsets &, size_t, size_t) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getIndicesOfNonDefaultRows is not supported for {}", getName());
+    }
+
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
 
     ColumnPtr index(const IColumn & indexes, size_t limit) const override;
@@ -282,14 +306,14 @@ public:
     /// Variant of compareAt for string comparison with respect of collation.
     int compareAtWithCollation(size_t n, size_t m, const IColumn & rhs_, int, const Collator & collator) const override;
 
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
-
-    void updatePermutation(bool reverse, size_t limit, int, Permutation & res, EqualRanges & equal_ranges) const override;
-
-    /// Sorting with respect of collation.
-    void getPermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int, Permutation & res) const override;
-
-    void updatePermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int, Permutation & res, EqualRanges & equal_ranges) const override;
+    void getPermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                            size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void updatePermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                            size_t limit, int nan_direction_hint, Permutation & res, EqualRanges & equal_ranges) const override;
+    void getPermutationWithCollation(const Collator & collator, PermutationSortDirection direction, PermutationSortStability stability,
+                                    size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void updatePermutationWithCollation(const Collator & collator, PermutationSortDirection direction, PermutationSortStability stability,
+                                    size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_ranges) const override;
 
     ColumnPtr replicate(const Offsets & replicate_offsets) const override;
 
@@ -320,6 +344,7 @@ public:
 
     // Throws an exception if offsets/chars are messed up
     void validate() const;
+
 };
 
 }

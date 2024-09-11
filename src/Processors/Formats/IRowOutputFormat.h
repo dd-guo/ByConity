@@ -63,6 +63,8 @@ public:
     virtual void writeAfterExtremes() {}
     virtual void writeLastSuffix() {}  /// Write something after resultset, totals end extremes.
 
+    String getName() const override { return {}; }
+
 private:
     bool prefix_written = false;
     bool suffix_written = false;

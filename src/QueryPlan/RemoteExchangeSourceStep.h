@@ -15,9 +15,11 @@
 
 #pragma once
 
+#include <memory>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/DistributedStages/AddressInfo.h>
 #include <Processors/Exchange/DataTrans/Brpc/BrpcRemoteBroadcastReceiver.h>
+#include <Processors/Exchange/DataTrans/Local/LocalChannelOptions.h>
 #include <Processors/Exchange/ExchangeOptions.h>
 #include <QueryPlan/ISourceStep.h>
 #include <Poco/Logger.h>
@@ -29,10 +31,17 @@ using PlanSegmentInputPtr = std::shared_ptr<PlanSegmentInput>;
 using PlanSegmentInputs = std::vector<PlanSegmentInputPtr>;
 
 class PlanSegment;
+
+class RemoteExchangeSourceStepXXX
+{
+    DataStream input_stream;
+    String step_description;
+    PlanSegmentInputs inputs;
+};
 class RemoteExchangeSourceStep : public ISourceStep
 {
 public:
-    explicit RemoteExchangeSourceStep(PlanSegmentInputs inputs_, DataStream input_stream_);
+    explicit RemoteExchangeSourceStep(PlanSegmentInputs inputs_, DataStream input_stream_, bool is_add_totals_, bool is_add_extremes_);
 
     String getName() const override { return "RemoteExchangeSource"; }
     Type getType() const override { return Type::RemoteExchangeSource; }
@@ -41,19 +50,38 @@ public:
 
     PlanSegmentInputs getInput() const { return inputs; }
 
-    void setPlanSegment(PlanSegment * plan_segment_);
+    void setPlanSegment(PlanSegment * plan_segment_, ContextPtr context_);
     PlanSegment * getPlanSegment() const { return plan_segment; }
+    size_t getPlanSegmentId() const { return plan_segment_id; }
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
+    void toProto(Protos::RemoteExchangeSourceStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<RemoteExchangeSourceStep> fromProto(const Protos::RemoteExchangeSourceStep & proto, ContextPtr context);
 
     void describePipeline(FormatSettings & settings) const override;
 
     void setExchangeOptions(ExchangeOptions options_) { options = options_; }
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
 
+    bool isAddTotals() const { return is_add_totals; }
+    bool isAddExtremes() const  { return is_add_extremes; }
+
 private:
     void registerAllReceivers(BrpcReceiverPtrs receivers, UInt32 timeout_ms);
+    BroadcastReceiverPtr createReceiver(
+        DiskExchangeDataManagerPtr disk_mgr,
+        bool is_local_exchange,
+        const LocalChannelOptions & local_options,
+        size_t write_plan_segment_id,
+        size_t exchange_id,
+        size_t partition_id,
+        ExchangeDataKeyPtr data_key,
+        const Block & exchange_header,
+        bool keep_order,
+        bool enable_metrics,
+        const String & write_address_info,
+        MultiPathQueuePtr collector,
+        BrpcExchangeReceiverRegistryService::RegisterMode register_mode,
+        std::shared_ptr<QueryExchangeLog> query_exchange_log);
     PlanSegmentInputs inputs;
     PlanSegment * plan_segment = nullptr;
     Poco::Logger * logger;
@@ -63,5 +91,7 @@ private:
     AddressInfo read_address_info;
     ContextPtr context;
     ExchangeOptions options;
+    bool is_add_totals;
+    bool is_add_extremes;
 };
 }

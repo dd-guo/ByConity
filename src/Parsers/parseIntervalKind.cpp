@@ -7,6 +7,26 @@ namespace DB
 {
 bool parseIntervalKind(IParser::Pos & pos, Expected & expected, IntervalKind & result)
 {
+    if (ParserKeyword("NANOSECOND").ignore(pos, expected) || ParserKeyword("SQL_TSI_NANOSECOND").ignore(pos, expected)
+        || ParserKeyword("NS").ignore(pos, expected))
+    {
+        result = IntervalKind::Nanosecond;
+        return true;
+    }
+
+    if (ParserKeyword("MICROSECOND").ignore(pos, expected) || ParserKeyword("SQL_TSI_MICROSECOND").ignore(pos, expected)
+        || ParserKeyword("MCS").ignore(pos, expected))
+    {
+        result = IntervalKind::Microsecond;
+        return true;
+    }
+
+    if (ParserKeyword("MILLISECOND").ignore(pos, expected) || ParserKeyword("SQL_TSI_MILLISECOND").ignore(pos, expected)
+        || ParserKeyword("MS").ignore(pos, expected))
+    {
+        result = IntervalKind::Millisecond;
+        return true;
+    }
     if (ParserKeyword("SECOND").ignore(pos, expected) || ParserKeyword("SQL_TSI_SECOND").ignore(pos, expected)
         || ParserKeyword("SS").ignore(pos, expected) || ParserKeyword("S").ignore(pos, expected))
     {
@@ -60,6 +80,55 @@ bool parseIntervalKind(IParser::Pos & pos, Expected & expected, IntervalKind & r
         || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected))
     {
         result = IntervalKind::Year;
+        return true;
+    }
+
+    if (ParserKeyword("MINUTE_SECOND").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::MinuteSecond;
+        return true;
+    }
+
+    if (ParserKeyword("HOUR_SECOND").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::HourSecond;
+        return true;
+    }
+
+    if (ParserKeyword("HOUR_MINUTE").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::HourMinute;
+        return true;
+    }
+
+    if (ParserKeyword("DAY_SECOND").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::DaySecond;
+        return true;
+    }
+
+    if (ParserKeyword("DAY_MINUTE").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::DayMinute;
+        return true;
+    }
+
+    if (ParserKeyword("DAY_HOUR").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::DayHour;
+        return true;
+    }
+
+    if (ParserKeyword("YEAR_MONTH").ignore(pos, expected) /*|| ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+        || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected)*/)
+    {
+        result = IntervalKind::YearMonth;
         return true;
     }
 

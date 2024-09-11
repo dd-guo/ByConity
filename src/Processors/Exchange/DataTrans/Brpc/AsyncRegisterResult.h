@@ -15,21 +15,37 @@
 
 #pragma once
 
+#include <Processors/Exchange/DataTrans/RpcClient.h>
 #include <Protos/registry.pb.h>
 #include <brpc/stream.h>
-#include <Processors/Exchange/DataTrans/RpcClient.h>
+#include <Common/Brpc/BrpcAsyncResultHolder.h>
 
 #include <memory>
 
-
 namespace DB
 {
-struct AsyncRegisterResult
-{
-    std::shared_ptr<RpcClient> channel;
-    std::unique_ptr<brpc::Controller> cntl;
-    std::unique_ptr<Protos::RegistryRequest> request;
-    std::unique_ptr<Protos::RegistryResponse> response;
-};
-
+using AsyncRegisterResult = BrpcAsyncResultHolder<Protos::RegistryRequest, Protos::RegistryResponse>;
 }
+
+template <>
+struct fmt::formatter<DB::Protos::RegistryRequest>
+{
+    constexpr auto parse(format_parse_context & ctx)
+    {
+        const auto it = ctx.begin();
+        const auto end = ctx.end();
+
+        /// Only support {}.
+        if (it != end && *it != '}')
+            throw format_error("Invalid format for struct Protos::RegistryRequest");
+
+        return it;
+    }
+
+    template <typename FormatContext>
+    auto format(const DB::Protos::RegistryRequest & request, FormatContext & ctx)
+    {
+        return format_to(
+            ctx.out(), "[{}_{}_{}-{}]", request.query_unique_id(), request.exchange_id(), request.parallel_id(), request.query_id());
+    }
+};

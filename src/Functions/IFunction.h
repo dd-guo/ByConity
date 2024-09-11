@@ -24,7 +24,9 @@
 #include <Core/ColumnNumbers.h>
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Names.h>
+#include <Common/MySqlEnums.h>
 #include <DataTypes/IDataType.h>
+#include <Interpreters/JIT/JITContext.h>
 
 #if !defined(ARCADIA_BUILD)
 #    include "config_core.h"
@@ -78,6 +80,8 @@ protected:
         return executeImpl(arguments, result_type, input_rows_count);
     }
 
+    virtual bool isPreviledgedFunction() const { return false; }
+
     /** Default implementation in presence of Nullable arguments or NULL constants as arguments is the following:
       *  if some of arguments are NULL constants then return NULL constant,
       *  if some of arguments are Nullable, then execute function as usual for columns,
@@ -85,6 +89,15 @@ protected:
       *   and wrap result in Nullable column where NULLs are in all rows where any of arguments are NULL.
       */
     virtual bool useDefaultImplementationForNulls() const { return true; }
+
+    /** If useDefaultImplementationForNothing() is true, then change arguments for getReturnType() and build():
+      *  if some of arguments are Nothing then don't call getReturnType(), call build() with return_type = Nothing,
+      * Otherwise build returns build(arguments, getReturnType(arguments));
+      */
+    virtual bool useDefaultImplementationForNothing() const
+    {
+        return true;
+    }
 
     /** If the function have non-zero number of arguments,
       *  and if all arguments are constant, that we could automatically provide default implementation:
@@ -115,6 +128,9 @@ private:
 
     ColumnPtr defaultImplementationForNulls(
             const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run) const;
+
+    ColumnPtr
+    defaultImplementationForNothing(const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count) const;
 
     ColumnPtr executeWithoutLowCardinalityColumns(
             const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run) const;
@@ -147,7 +163,16 @@ public:
 
     /// Do preparations and return executable.
     /// sample_columns should contain data types of arguments and values of constants, if relevant.
-    virtual ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName & arguments) const = 0;
+    virtual ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName & /*arguments*/) const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "prepare is not implemented for function {}", getName());
+    }
+
+    /// Do preparations with extra parameters and return executable.
+    virtual ExecutableFunctionPtr prepareWithParameters(const ColumnsWithTypeAndName & /*arguments*/, const Array & /*parameters*/) const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "prepare with extra parameters is not implemented for function {}", getName());
+    }
 
 #if USE_EMBEDDED_COMPILER
 
@@ -161,7 +186,7 @@ public:
       *       templates with default arguments is impossible and including LLVM in such a generic header
       *       as this one is a major pain.
       */
-    virtual llvm::Value * compile(llvm::IRBuilderBase & /*builder*/, Values /*values*/) const
+    virtual llvm::Value * compile(llvm::IRBuilderBase & /*builder*/, Values /*values*/, JITContext & /*jit_context*/) const
     {
         throw Exception(getName() + " is not JIT-compilable", ErrorCodes::NOT_IMPLEMENTED);
     }
@@ -179,7 +204,7 @@ public:
     /** If function isSuitableForConstantFolding then, this method will be called during query analyzis
       * if some arguments are constants. For example logical functions (AndFunction, OrFunction) can
       * return they result based on some constant arguments.
-      * Arguments are passed without modifications, useDefaultImplementationForNulls, useDefaultImplementationForConstants,
+      * Arguments are passed without modifications, useDefaultImplementationForNulls, useDefaultImplementationForNothing, useDefaultImplementationForConstants,
       * useDefaultImplementationForLowCardinality are not applied.
       */
     virtual ColumnPtr getConstantResultForNonConstArguments(const ColumnsWithTypeAndName & /* arguments */, const DataTypePtr & /* result_type */) const { return nullptr; }
@@ -230,6 +255,43 @@ public:
       */
     virtual bool hasInformationAboutMonotonicity() const { return false; }
 
+
+    struct ShortCircuitSettings
+    {
+        /// Should we enable lazy execution for the first argument of short-circuit function?
+        /// Example: if(cond, then, else), we don't need to execute cond lazily.
+        bool enable_lazy_execution_for_first_argument;
+        /// Should we enable lazy execution for functions, that are common descendants of
+        /// different short-circuit function arguments?
+        /// Example 1: if (cond, expr1(..., expr, ...), expr2(..., expr, ...)), we don't need
+        /// to execute expr lazily, because it's used in both branches.
+        /// Example 2: and(expr1, expr2(..., expr, ...), expr3(..., expr, ...)), here we
+        /// should enable lazy execution for expr, because it must be filtered by expr1.
+        bool enable_lazy_execution_for_common_descendants_of_arguments;
+        /// Should we enable lazy execution without checking isSuitableForShortCircuitArgumentsExecution?
+        /// Example: toTypeName(expr), even if expr contains functions that are not suitable for
+        /// lazy execution (because of their simplicity), we shouldn't execute them at all.
+        bool force_enable_lazy_execution;
+    };
+
+    /** Function is called "short-circuit" if it's arguments can be evaluated lazily
+      * (examples: and, or, if, multiIf). If function is short circuit, it should be
+      *  able to work with lazy executed arguments,
+      *  this method will be called before function execution.
+      *  If function is short circuit, it must define all fields in settings for
+      *  appropriate preparations. Number of arguments is provided because some settings might depend on it.
+      *  Example: multiIf(cond, else, then) and multiIf(cond1, else1, cond2, else2, ...), the first
+      *  version can enable enable_lazy_execution_for_common_descendants_of_arguments setting, the second - not.
+      */
+    virtual bool isShortCircuit(ShortCircuitSettings & /*settings*/, size_t /*number_of_arguments*/) const { return false; }
+
+    /** Should we evaluate this function lazily in short-circuit function arguments?
+      * If function can throw an exception or it's computationally heavy, then
+      * it's suitable, otherwise it's not (due to the overhead of lazy execution).
+      * Suitability may depend on function arguments.
+      */
+    virtual bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const { return false; }
+
     /// The property of monotonicity for a certain range.
     struct Monotonicity
     {
@@ -261,7 +323,7 @@ class IFunctionOverloadResolver
 public:
     virtual ~IFunctionOverloadResolver() = default;
 
-    FunctionBasePtr build(const ColumnsWithTypeAndName & arguments) const;
+    virtual FunctionBasePtr build(const ColumnsWithTypeAndName & arguments) const;
 
     DataTypePtr getReturnType(const ColumnsWithTypeAndName & arguments) const;
 
@@ -306,7 +368,10 @@ public:
     friend class ExpressionInterpreter;
 protected:
 
-    virtual FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const = 0;
+    virtual FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & /*arguments*/, const DataTypePtr & /*result_type*/) const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "buildImpl is not implemented for {}", getName());
+    }
 
     virtual DataTypePtr getReturnTypeImpl(const DataTypes & /*arguments*/) const
     {
@@ -332,6 +397,15 @@ protected:
       * Otherwise build returns build(arguments, getReturnType(arguments));
       */
     virtual bool useDefaultImplementationForNulls() const { return true; }
+
+    /** If useDefaultImplementationForNothing() is true, then change arguments for getReturnType() and build():
+      *  if some of arguments are Nothing then don't call getReturnType(), call build() with return_type = Nothing,
+      * Otherwise build returns build(arguments, getReturnType(arguments));
+      */
+    virtual bool useDefaultImplementationForNothing() const
+    {
+        return true;
+    }
 
     /** If useDefaultImplementationForNulls() is true, then change arguments for getReturnType() and build().
       * If function arguments has low cardinality types, convert them to ordinary types.
@@ -359,12 +433,15 @@ public:
 
     virtual String getName() const = 0;
 
+    virtual ArgType getArgumentsType() const { return ArgType::UNDEFINED; }
+
     virtual ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const = 0;
     virtual ColumnPtr executeImplDryRun(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
     {
         return executeImpl(arguments, result_type, input_rows_count);
     }
 
+    virtual bool isPreviledgedFunction() const { return false; }
     /** Default implementation in presence of Nullable arguments or NULL constants as arguments is the following:
       *  if some of arguments are NULL constants then return NULL constant,
       *  if some of arguments are Nullable, then execute function as usual for columns,
@@ -372,6 +449,14 @@ public:
       *   and wrap result in Nullable column where NULLs are in all rows where any of arguments are NULL.
       */
     virtual bool useDefaultImplementationForNulls() const { return true; }
+
+    /** Default implementation in presence of arguments with type Nothing is the following:
+      *  If some of arguments have type Nothing then default implementation is to return constant column with type Nothing
+      */
+    virtual bool useDefaultImplementationForNothing() const
+    {
+        return true;
+    }
 
     /** If the function have non-zero number of arguments,
       *  and if all arguments are constant, that we could automatically provide default implementation:
@@ -405,6 +490,11 @@ public:
     virtual bool isDeterministic() const { return true; }
     virtual bool isDeterministicInScopeOfQuery() const { return true; }
     virtual bool isStateful() const { return false; }
+
+    using ShortCircuitSettings = IFunctionBase::ShortCircuitSettings;
+    virtual bool isShortCircuit(ShortCircuitSettings & /*settings*/, size_t /*number_of_arguments*/) const { return false; }
+    virtual bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const { return false; }
+
     virtual bool hasInformationAboutMonotonicity() const { return false; }
 
     using Monotonicity = IFunctionBase::Monotonicity;
@@ -445,7 +535,7 @@ public:
 
     bool isCompilable(const DataTypes & arguments) const;
 
-    llvm::Value * compile(llvm::IRBuilderBase &, const DataTypes & arguments, Values values) const;
+    llvm::Value * compile(llvm::IRBuilderBase &, const DataTypes & arguments, Values values, JITContext & jit_context) const;
 
 #endif
 
@@ -455,7 +545,7 @@ protected:
 
     virtual bool isCompilableImpl(const DataTypes &) const { return false; }
 
-    virtual llvm::Value * compileImpl(llvm::IRBuilderBase &, const DataTypes &, Values) const
+    virtual llvm::Value * compileImpl(llvm::IRBuilderBase &, const DataTypes &, Values, JITContext & ) const
     {
         throw Exception(getName() + " is not JIT-compilable", ErrorCodes::NOT_IMPLEMENTED);
     }

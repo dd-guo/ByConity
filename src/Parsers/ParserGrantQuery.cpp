@@ -128,6 +128,10 @@ namespace
 
                 String database_name, table_name;
                 bool any_database = false, any_table = false;
+
+                /// mysql allows such statement: grant alter on TABLE mytb to 'hello'
+                ParserKeyword{"TABLE"}.ignore(pos, expected);
+
                 if (!parseDatabaseAndTableNameOrAsterisks(pos, expected, database_name, any_database, table_name, any_table))
                     return false;
 
@@ -216,13 +220,13 @@ namespace
         });
     }
 
-    bool parseOnCluster(IParserBase::Pos & pos, Expected & expected, String & cluster)
-    {
-        return IParserBase::wrapParseImpl(pos, [&]
-        {
-            return ParserKeyword{"ON"}.ignore(pos, expected) && ASTQueryWithOnCluster::parse(pos, cluster, expected);
-        });
-    }
+    // bool parseOnCluster(IParserBase::Pos & pos, Expected & expected, String & cluster)
+    // {
+    //     return IParserBase::wrapParseImpl(pos, [&]
+    //     {
+    //         return ParserKeyword{"ON"}.ignore(pos, expected) && ASTQueryWithOnCluster::parse(pos, cluster, expected);
+    //     });
+    // }
 }
 
 
@@ -237,13 +241,19 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     else if (!ParserKeyword{"GRANT"}.ignore(pos, expected))
         return false;
 
-    String cluster;
-    parseOnCluster(pos, expected, cluster);
+    // String cluster;
+    // parseOnCluster(pos, expected, cluster);
+    bool is_sensitive = false;
+    if (ParserKeyword{"SENSITIVE"}.ignore(pos, expected))
+        is_sensitive = true;
 
+    bool if_exists = false;
     bool grant_option = false;
     bool admin_option = false;
     if (is_revoke)
     {
+        if (ParserKeyword{"IF EXISTS"}.ignore(pos, expected))
+            if_exists = true;
         if (ParserKeyword{"GRANT OPTION FOR"}.ignore(pos, expected))
             grant_option = true;
         else if (ParserKeyword{"ADMIN OPTION FOR"}.ignore(pos, expected))
@@ -255,15 +265,15 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     if (!parseElementsWithoutOptions(pos, expected, elements) && !parseRoles(pos, expected, is_revoke, attach_mode, roles))
         return false;
 
-    if (cluster.empty())
-        parseOnCluster(pos, expected, cluster);
+    // if (cluster.empty())
+        // parseOnCluster(pos, expected, cluster);
 
     std::shared_ptr<ASTRolesOrUsersSet> grantees;
     if (!parseToGrantees(pos, expected, is_revoke, grantees))
         return false;
 
-    if (cluster.empty())
-        parseOnCluster(pos, expected, cluster);
+    // if (cluster.empty())
+        // parseOnCluster(pos, expected, cluster);
 
     if (!is_revoke)
     {
@@ -273,8 +283,8 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             admin_option = true;
     }
 
-    if (cluster.empty())
-        parseOnCluster(pos, expected, cluster);
+    // if (cluster.empty())
+        // parseOnCluster(pos, expected, cluster);
 
     if (grant_option && roles)
         throw Exception("GRANT OPTION should be specified for access types", ErrorCodes::SYNTAX_ERROR);
@@ -293,13 +303,16 @@ bool ParserGrantQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     auto query = std::make_shared<ASTGrantQuery>();
     node = query;
 
+    query->is_sensitive = is_sensitive;
+    query->if_exists = if_exists;
     query->is_revoke = is_revoke;
     query->attach_mode = attach_mode;
-    query->cluster = std::move(cluster);
+    // query->cluster = std::move(cluster);
     query->access_rights_elements = std::move(elements);
     query->roles = std::move(roles);
     query->grantees = std::move(grantees);
     query->admin_option = admin_option;
+    query->rewriteNamesWithTenant(pos.getContext());
 
     return true;
 }

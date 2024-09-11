@@ -66,14 +66,26 @@ public:
     virtual std::vector<std::pair<String, UInt64>> multiGet(const std::vector<String> & keys) = 0;
 
     /***
-     * Commit record in batch. For both write and delete.
+     * Commit records in batch within one transaction. For both write and delete.
      */
     virtual bool batchWrite(const BatchCommitRequest & req, BatchCommitResponse & response) = 0;
 
     /***
+     * Write records in batch. May split into multiple transactions.
+    */
+    virtual void adaptiveBatchWrite(const BatchCommitRequest & req);
+
+    /***
      * Delete a specific record from metastore;
+     * bytekv api, drop by expected version (UInt64)
      */
-    virtual void drop(const String & key, const String & expected = {}) = 0;
+    virtual void drop(const String & key, const UInt64 & expected = 0) = 0;
+
+    /***
+     * Delete a specific record from metastore;
+     * fdb api, drop by expected value (String)
+     */
+    virtual void drop(const String & key, const String & expected_value) = 0;
 
     /***
      * Get all records from metastore;
@@ -82,8 +94,9 @@ public:
 
     /***
      * Range scan by specific prefix; limit the number of result
+     * @param start_key If provided, it'll be used as the start key, and `key_prefix` will only be used to generate `end_key`.
      */
-    virtual IteratorPtr getByPrefix(const String & key_prefix, const size_t & limit = 0, uint32_t scan_batch_size = DEFAULT_SCAN_BATCH_COUNT) = 0;
+    virtual IteratorPtr getByPrefix(const String & key_prefix, const size_t & limit = 0, uint32_t scan_batch_size = DEFAULT_SCAN_BATCH_COUNT, const String & start_key = "") = 0;
 
     /***
      * Scan a range of records by start and end key;
@@ -99,6 +112,16 @@ public:
      * Close metastore;
      */
     virtual void close() = 0;
+
+    /***
+     * get limitations of the kv store
+    */
+    virtual uint32_t getMaxBatchSize() = 0;
+
+    /***
+     * get limitation single a KV size
+    */
+    virtual uint32_t getMaxKVSize() = 0;
 };
 
 }

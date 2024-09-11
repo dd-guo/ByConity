@@ -17,6 +17,7 @@
 
 #include <Optimizer/Cascades/Group.h>
 #include <Optimizer/Cascades/GroupExpression.h>
+#include <Common/Exception.h>
 
 #include <vector>
 
@@ -37,13 +38,25 @@ public:
 
     GroupPtr getCTEDefGroupByCTEId(size_t id) const { return getGroupById(getCTEDefGroupId(id)); }
 
-    void recordCTEDefGroupId(size_t cte_id, GroupId group_id) { cte_group_id_map[cte_id] = group_id;}
+    void recordCTEDefGroupId(size_t cte_id, GroupId group_id) { cte_group_id_map[cte_id] = group_id; }
 
+    const std::unordered_map<GroupExprPtr, GroupId, GroupExprPtrHash, GroupExprPtrEq> & getExprs() const { return group_expressions; }
+
+    UInt32 nextJoinRootId() { return ++join_root_index; }
+    void setJoinRootId(GroupId source_id, UInt32 root_id) 
+    {
+        source_to_join_root[source_id].set(root_id, true);
+    }
+
+    const auto & getSourceToJoinRoot() { return source_to_join_root; }
+    static const UInt32 MAX_JOIN_ROOT_ID = 64;
 private:
     GroupId addNewGroup()
     {
         auto new_group_id = groups.size();
         groups.emplace_back(std::make_shared<Group>(new_group_id));
+        if (groups.size() > 10000)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Memo has so many group");
         return new_group_id;
     }
     /**
@@ -60,6 +73,8 @@ private:
      * Vector of tracked GroupExpressions
      * Group owns GroupExpressions, not the memo
      */
-    std::unordered_set<GroupExprPtr, GroupExprPtrHash, GroupExprPtrEq> group_expressions;
+    std::unordered_map<GroupExprPtr, GroupId, GroupExprPtrHash, GroupExprPtrEq> group_expressions;
+    std::unordered_map<GroupId, std::bitset<MAX_JOIN_ROOT_ID>> source_to_join_root;
+    UInt32 join_root_index = 0;
 };
 }

@@ -23,7 +23,7 @@
 #include <Interpreters/DistributedStages/InterpreterDistributedStages.h>
 #include <Interpreters/DistributedStages/InterpreterPlanSegment.h>
 #include <Interpreters/DistributedStages/PlanSegmentSplitter.h>
-#include <Interpreters/DistributedStages/executePlanSegment.h>
+#include <Interpreters/DistributedStages/MPPQueryCoordinator.h>
 #include <Interpreters/InterpreterSelectWithUnionQuery.h>
 #include <Interpreters/InterpreterSetQuery.h>
 #include <Interpreters/RewriteDistributedQueryVisitor.h>
@@ -35,6 +35,7 @@
 #include <Parsers/IAST.h>
 #include <Storages/IStorage.h>
 #include <Storages/SelectQueryInfo.h>
+
 
 namespace DB
 {
@@ -117,18 +118,19 @@ PlanSegmentPtr MockPlanSegment(ContextPtr context)
 
     plan_segment->appendPlanSegmentInput(left);
     plan_segment->appendPlanSegmentInput(right);
-    plan_segment->setPlanSegmentOutput(output);
+    plan_segment->appendPlanSegmentOutput(output);
 
     /***
      * only read from system.one
      */
     StorageID table_id = StorageID("system", "one");
     StoragePtr storage = DatabaseCatalog::instance().getTable(table_id, context);
-
+    auto metadata_snapshot = storage->getInMemoryMetadataPtr();
+    auto storage_snapshot = storage->getStorageSnapshot(metadata_snapshot, context);
 
     QueryPlan query_plan;
     SelectQueryInfo select_query_info;
-    storage->read(query_plan, {"dummy"}, storage->getInMemoryMetadataPtr(), select_query_info, context, {}, 0, 0);
+    storage->read(query_plan, {"dummy"}, storage_snapshot, select_query_info, context, {}, 0, 0);
 
     plan_segment->setQueryPlan(std::move(query_plan));
 
@@ -197,8 +199,8 @@ void MockTestQuery(PlanSegmentTree * plan_segment_tree, ContextMutablePtr contex
 
     for (size_t i = 0; i < plan_size; ++i)
     {
-        auto plan = std::make_shared<PlanSegment>(context);
-        plan->deserialize(read_buffer);
+        auto plan = std::make_shared<PlanSegment>();
+        plan->deserialize(read_buffer, context);
         plansegments.push_back(plan);
     }
 
@@ -219,7 +221,8 @@ void MockTestQuery(PlanSegmentTree * plan_segment_tree, ContextMutablePtr contex
 
 BlockIO InterpreterDistributedStages::executePlanSegment()
 {
-    return executePlanSegmentTree(plan_segment_tree, context);
+    auto coodinator = std::make_shared<MPPQueryCoordinator>(std::move(plan_segment_tree), context, MPPQueryOptions());
+    return coodinator->execute();
 }
 
 void InterpreterDistributedStages::initSettings()

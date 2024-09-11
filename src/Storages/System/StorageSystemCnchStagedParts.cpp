@@ -18,6 +18,7 @@
 #include <Catalog/Catalog.h>
 #include <CloudServices/CnchPartsHelper.h>
 #include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Context.h>
 #include <Storages/StorageCnchMergeTree.h>
@@ -50,25 +51,17 @@ NamesAndTypesList StorageSystemCnchStagedParts::getNamesAndTypes()
         {"partition_id", std::make_shared<DataTypeString>()},
         {"bucket_number", std::make_shared<DataTypeInt64>()},
         {"hdfs_path", std::make_shared<DataTypeString>()},
+        {"part_id", std::make_shared<DataTypeUUID>()},
     };
 }
 
-ColumnsDescription StorageSystemCnchStagedParts::getColumnsAndAlias()
+NamesAndAliases StorageSystemCnchStagedParts::getNamesAndAliases()
 {
-    auto columns = ColumnsDescription(getNamesAndTypes());
-
-    auto add_alias = [&](const String & alias_name, const String & column_name) {
-        ColumnDescription column(alias_name, columns.get(column_name).type);
-        column.default_desc.kind = ColumnDefaultKind::Alias;
-        column.default_desc.expression = std::make_shared<ASTIdentifier>(column_name);
-        columns.add(column);
+    return
+    {
+        {"bytes", {std::make_shared<DataTypeUInt64>()}, "bytes_on_disk"},
+        {"rows", {std::make_shared<DataTypeUInt64>()}, "rows_count"}
     };
-
-    /// Add aliases for column names for align with table system.parts.
-    add_alias("bytes", "bytes_on_disk");
-    add_alias("rows", "rows_count");
-
-    return columns;
 }
 
 void StorageSystemCnchStagedParts::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo & query_info) const
@@ -79,7 +72,7 @@ void StorageSystemCnchStagedParts::fillData(MutableColumns & res_columns, Contex
 
     // check for required structure of WHERE clause for cnch_staged_parts
     ASTPtr where_expression = query_info.query->as<ASTSelectQuery>()->where();
-    const std::vector<std::map<String,String>> value_by_column_names = collectWhereORClausePredicate(where_expression, context);
+    const std::vector<std::map<String,Field>> value_by_column_names = collectWhereORClausePredicate(where_expression, context);
 
     String only_selected_db;
     String only_selected_table;
@@ -93,8 +86,8 @@ void StorageSystemCnchStagedParts::fillData(MutableColumns & res_columns, Contex
         if ((db_it != value_by_column_name.end()) &&
             (table_it != value_by_column_name.end()))
         {
-            only_selected_db = db_it->second;
-            only_selected_table = table_it->second;
+            only_selected_db = db_it->second.getType() == Field::Types::String ? db_it->second.get<String>() : "";
+            only_selected_table = table_it->second.getType() == Field::Types::String ? table_it->second.get<String>() : "";
             enable_filter_by_table = true;
             LOG_TRACE(&Poco::Logger::get("StorageSystemCnchStagedParts"),
                     "filtering from catalog by table with db name {} and table name {}",
@@ -124,45 +117,43 @@ void StorageSystemCnchStagedParts::fillData(MutableColumns & res_columns, Contex
     auto current_visible = visible_parts.cbegin();
 
     //get CNCH staged parts
-    for (size_t i = 0, size = all_parts.size(); i != size; ++i)
+    for (const auto & part : all_parts)
     {
-        if (all_parts[i]->deleted)
+        if (part->deleted)
             continue;
         size_t col_num = 0;
         {
             WriteBufferFromOwnString out;
-            all_parts[i]->partition.serializeText(*data, out, format_settings);
+            part->partition.serializeText(*data, out, format_settings);
             res_columns[col_num++]->insert(out.str());
         }
-        res_columns[col_num++]->insert(all_parts[i]->name);
+        res_columns[col_num++]->insert(part->name);
         res_columns[col_num++]->insert(only_selected_db);
         res_columns[col_num++]->insert(only_selected_table);
 
         /// all_parts and visible_parts are both ordered by info.
         /// For each part within all_parts, we find the first part greater than or equal to it in visible_parts,
         /// which means the part is visible if they are equal to each other
-        while (current_visible != visible_parts.cend() && (*current_visible)->info < all_parts[i]->info)
+        while (current_visible != visible_parts.cend() && (*current_visible)->info < part->info)
             ++current_visible;
-        bool to_publish = current_visible != visible_parts.cend() && all_parts[i]->info == (*current_visible)->info;
+        bool to_publish = current_visible != visible_parts.cend() && part->info == (*current_visible)->info;
         res_columns[col_num++]->insert(to_publish);
         res_columns[col_num++]->insert(!to_publish);
 
-        res_columns[col_num++]->insert(all_parts[i]->getBytesOnDisk());
-        res_columns[col_num++]->insert(all_parts[i]->rows_count);
-        res_columns[col_num++]->insert(all_parts[i]->getColumnsPtr()->toString());
-        res_columns[col_num++]->insert(all_parts[i]->getMarksCount());
+        res_columns[col_num++]->insert(part->getBytesOnDisk());
+        res_columns[col_num++]->insert(part->rows_count);
+        res_columns[col_num++]->insert(part->getColumnsPtr()->toString());
+        res_columns[col_num++]->insert(part->getMarksCount());
 
-        String ttl = std::to_string(all_parts[i]->ttl_infos.table_ttl.min) + "," + std::to_string(all_parts[i]->ttl_infos.table_ttl.max);
+        String ttl = std::to_string(part->ttl_infos.table_ttl.min) + "," + std::to_string(part->ttl_infos.table_ttl.max);
         res_columns[col_num++]->insert(ttl);
-
-        // first 48 bits represent times
-        res_columns[col_num++]->insert((all_parts[i]->commit_time.toUInt64() >> 18) / 1000);
-        res_columns[col_num++]->insert((all_parts[i]->columns_commit_time.toUInt64() >> 18) / 1000);
-
-        res_columns[col_num++]->insert(all_parts[i]->info.hint_mutation);
-        res_columns[col_num++]->insert(all_parts[i]->info.partition_id);
-        res_columns[col_num++]->insert(all_parts[i]->bucket_number);
-        res_columns[col_num++]->insert(all_parts[i]->getFullPath());
+        res_columns[col_num++]->insert(part->commit_time.toSecond());
+        res_columns[col_num++]->insert(part->columns_commit_time.toSecond());
+        res_columns[col_num++]->insert(part->info.hint_mutation);
+        res_columns[col_num++]->insert(part->info.partition_id);
+        res_columns[col_num++]->insert(part->bucket_number);
+        res_columns[col_num++]->insert(part->getFullPath());
+        res_columns[col_num++]->insert(part->get_uuid());
     }
 }
 }

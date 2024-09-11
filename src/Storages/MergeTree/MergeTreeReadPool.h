@@ -32,6 +32,14 @@
 namespace DB
 {
 
+struct PerPartParams
+{
+    NameSet column_name_set;
+    MergeTreeReadTaskColumns task_columns;
+    bool should_reorder;
+    MergeTreeBlockSizePredictorPtr size_predictor;
+};
+
 using MergeTreeReadTaskPtr = std::unique_ptr<MergeTreeReadTask>;
 
 /**   Provides read tasks for MergeTreeThreadSelectBlockInputStream`s in fine-grained batches, allowing for more
@@ -93,11 +101,13 @@ public:
     MergeTreeReadPool(
         const size_t threads_, const size_t sum_marks_, const size_t min_marks_for_concurrent_read_,
         RangesInDataParts && parts_, MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter,
-        const MergeTreeMetaBase & data_, const StorageMetadataPtr & metadata_snapshot_,
-        const PrewhereInfoPtr & prewhere_info_,
+        const MergeTreeMetaBase & data_, const StorageSnapshotPtr & storage_snapshot_,
+        const SelectQueryInfo & query_info_,
         const bool check_columns_, const Names & column_names_,
         const BackoffSettings & backoff_settings_, size_t preferred_block_size_bytes_,
         const bool do_not_steal_tasks_ = false);
+
+    ~MergeTreeReadPool();
 
     MergeTreeReadTaskPtr getTask(const size_t min_marks_to_read, const size_t thread, const Names & ordered_names);
 
@@ -107,41 +117,41 @@ public:
       */
     void profileFeedback(const ReadBufferFromFileBase::ProfileInfo info);
 
-    /// This method tells which mark ranges we have to read if we start from @from mark range
-    MarkRanges getRestMarks(const IMergeTreeDataPart & part, const MarkRange & from) const;
-
     Block getHeader() const;
+
+    void updateGranuleStats(const std::unordered_map<String, size_t> & stats);
+
 
 private:
     std::vector<size_t> fillPerPartInfo(
-        const RangesInDataParts & parts, MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter, const bool check_columns);
+        const RangesInDataParts & parts, MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter, const MergeTreeIndexContextPtr & index_context, const bool check_columns);
 
     void fillPerThreadInfo(
         const size_t threads, const size_t sum_marks, std::vector<size_t> per_part_sum_marks,
         const RangesInDataParts & parts, const size_t min_marks_for_concurrent_read);
 
     const MergeTreeMetaBase & data;
-    StorageMetadataPtr metadata_snapshot;
+    StorageSnapshotPtr storage_snapshot;
     const Names column_names;
     bool do_not_steal_tasks;
     bool predict_block_size_bytes;
-    std::vector<NameSet> per_part_column_name_set;
-    std::vector<NamesAndTypesList> per_part_columns;
-    std::vector<NamesAndTypesList> per_part_pre_columns;
-    std::vector<char> per_part_should_reorder;
-    std::vector<MergeTreeBlockSizePredictorPtr> per_part_size_predictor;
+    std::vector<PerPartParams> per_part_params;
     PrewhereInfoPtr prewhere_info;
-
+    std::deque<AtomicPredicatePtr> atomic_predicates;
     struct Part
     {
-        MergeTreeMetaBase::DataPartPtr data_part;
-        size_t part_index_in_query;
+        RangesInDataPart part_detail;
+        MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter;
+        /// Lazy init, need to use getDeleteBitmap() interface rather than use delete_bitmap directly
         ImmutableDeleteBitmapPtr delete_bitmap;
+        bool delete_bitmap_initialized = false;
 
-        Part(MergeTreeMetaBase::DataPartPtr data_part_, size_t part_index_in_query_, ImmutableDeleteBitmapPtr delete_bitmap_)
-            : data_part(data_part_), part_index_in_query(part_index_in_query_), delete_bitmap(delete_bitmap_)
+        Part(const RangesInDataPart & part_detail_, MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter_)
+            : part_detail(part_detail_), delete_bitmap_getter(std::move(delete_bitmap_getter_))
         {
         }
+
+        ImmutableDeleteBitmapPtr getDeleteBitmap();
     };
 
     std::vector<Part> parts_with_idx;
@@ -163,6 +173,8 @@ private:
     std::set<size_t> remaining_thread_tasks;
 
     RangesInDataParts parts_ranges;
+
+    std::unordered_map<String, size_t> per_column_read_granules;
 
     mutable std::mutex mutex;
 

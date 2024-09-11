@@ -1,5 +1,6 @@
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
+#include "Columns/ColumnsCommon.h"
 #include <Columns/FilterDescription.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnNullable.h>
@@ -87,4 +88,21 @@ FilterDescription::FilterDescription(const IColumn & column_)
         ErrorCodes::ILLEGAL_TYPE_OF_COLUMN_FOR_FILTER);
 }
 
+bool FilterDescription::hasOnes() const
+{
+    if (has_one >= 0)
+        return has_one;
+
+    return data ? (has_one = !memoryIsZero(data->data(), 0, data->size())) : false;
 }
+
+ConstantFilterDescription merge(const ConstantFilterDescription & lhs, const ConstantFilterDescription & rhs)
+{
+    ConstantFilterDescription res;
+    res.always_false = lhs.always_false || rhs.always_false;
+    res.always_true = lhs.always_true && rhs.always_true;
+    return res;
+}
+
+}
+

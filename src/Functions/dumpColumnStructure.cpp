@@ -25,6 +25,10 @@ public:
     }
 
     bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNothing() const override { return false; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     size_t getNumberOfArguments() const override
     {
@@ -49,7 +53,7 @@ public:
 
 }
 
-void registerFunctionDumpColumnStructure(FunctionFactory & factory)
+REGISTER_FUNCTION(DumpColumnStructure)
 {
     factory.registerFunction<FunctionDumpColumnStructure>();
 }

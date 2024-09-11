@@ -13,109 +13,144 @@
  * limitations under the License.
  */
 
-#include <Storages/SelectQueryInfo.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
+#include <Optimizer/PredicateUtils.h>
 #include <Parsers/ASTSerDerHelper.h>
+#include <Protos/PreparedStatementHelper.h>
+#include <Protos/plan_node_utils.pb.h>
+#include <Storages/SelectQueryInfo.h>
+#include <Interpreters/InterpreterSelectQuery.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTSelectQuery.h>
 
 namespace DB
 {
 
-void PrewhereInfo::serialize(WriteBuffer & buf) const
+void InputOrderInfo::toProto(Protos::InputOrderInfo & proto) const
 {
-    if (alias_actions)
+    for (const auto & element : order_key_prefix_descr)
+        element.toProto(*proto.add_order_key_prefix_descr());
+    proto.set_direction(direction);
+}
+
+std::shared_ptr<InputOrderInfo> InputOrderInfo::fromProto(const Protos::InputOrderInfo & proto)
+{
+    SortDescription order_key_prefix_descr;
+    for (const auto & proto_element : proto.order_key_prefix_descr())
     {
-        writeBinary(true, buf);
-        alias_actions->serialize(buf);
+        SortColumnDescription element;
+        element.fillFromProto(proto_element);
+        order_key_prefix_descr.emplace_back(std::move(element));
+    }
+    auto direction = proto.direction();
+    auto res = std::make_shared<InputOrderInfo>(std::move(order_key_prefix_descr), direction);
+
+    return res;
+}
+
+void SelectQueryInfo::toProto(Protos::SelectQueryInfo & proto) const
+{
+    serializeASTToProto(query, *proto.mutable_query());
+    serializeASTToProto(view_query, *proto.mutable_view_query());
+    serializeASTToProto(partition_filter, *proto.mutable_partition_filter());
+    cache_info.toProto(*proto.mutable_cache_info());
+    if (input_order_info)
+        input_order_info->toProto(*proto.mutable_input_order_info());
+}
+
+void SelectQueryInfo::fillFromProto(const Protos::SelectQueryInfo & proto)
+{
+    query = deserializeASTFromProto(proto.query());
+    view_query = deserializeASTFromProto(proto.view_query());
+    partition_filter = deserializeASTFromProto(proto.partition_filter());
+    input_order_info = proto.has_input_order_info() ? InputOrderInfo::fromProto(proto.input_order_info()) : nullptr;
+    cache_info.fillFromProto(proto.cache_info());
+}
+
+ASTPtr getFilterFromQueryInfo(const SelectQueryInfo & query_info, bool clone)
+{
+    const ASTSelectQuery & select = query_info.query->as<ASTSelectQuery &>();
+    ASTs conjuncts;
+    if (select.where())
+        conjuncts.emplace_back(clone ? select.where()->clone() : select.where());
+    if (select.prewhere())
+        conjuncts.emplace_back(clone ? select.prewhere()->clone() : select.prewhere());
+    if (!conjuncts.empty())
+        return PredicateUtils::combineConjuncts(conjuncts);
+    if (!query_info.atomic_predicates_expr.empty())
+    {
+        ASTPtr filter_query;
+        if (query_info.atomic_predicates_expr.size() == 1)
+        {
+            filter_query =  query_info.atomic_predicates_expr[0];
+        }
+        else
+        {
+            auto function = std::make_shared<ASTFunction>();
+            function->name = "and";
+            function->arguments = std::make_shared<ASTExpressionList>();
+            function->children.push_back(function->arguments);
+            for (const auto & expr : query_info.atomic_predicates_expr)
+            {
+                function->arguments->children.push_back(expr);
+            }
+            filter_query = filter_query ? makeASTFunction("and", std::move(filter_query), std::move(function)) : std::move(function);
+        }
+        return clone ? filter_query->clone() : filter_query;
+    }
+    return nullptr;
+}
+
+String AtomicPredicate::dump() const
+{
+    std::stringstream ss;
+    if (predicate_actions)
+        ss << "Predicate: \n" << predicate_actions->dumpDAG() << "\n";
+    ss << "Filter column name: " << filter_column_name << "\n";
+    ss << "Is row filter: " << is_row_filter << "\n";
+    if (index_context)
+        ss << "Index context: \n" << index_context->toString() << "\n";
+    ss << "Remove filter column: " << remove_filter_column << "\n";
+    return ss.str();
+}
+
+const PrewhereInfoPtr & getPrewhereInfo(const SelectQueryInfo & query_info)
+{
+    return query_info.projection ? query_info.projection->prewhere_info : query_info.prewhere_info;
+}
+
+const std::deque<AtomicPredicatePtr> & getAtomicPredicates(const SelectQueryInfo & query_info)
+{
+    return query_info.atomic_predicates;
+}
+
+MergeTreeIndexContextPtr getIndexContext(const SelectQueryInfo & query_info)
+{
+    /// Projection shouldn't have bitmap index
+    return query_info.projection ? nullptr : query_info.index_context;
+}
+
+void SelectQueryInfo::appendPartitonFilters(ASTs conjuncts)
+{
+    ASTPtr new_partition_filter;
+
+    if (partition_filter)
+    {
+        conjuncts.push_back(partition_filter);
+        new_partition_filter = PredicateUtils::combineConjuncts(conjuncts);
     }
     else
-        writeBinary(false, buf);
-
-    if (row_level_filter)
     {
-        writeBinary(true, buf);
-        row_level_filter->serialize(buf);
+        new_partition_filter = PredicateUtils::combineConjuncts<false>(conjuncts);
     }
-    else
-        writeBinary(false, buf);
 
-    if (prewhere_actions)
-    {
-        writeBinary(true, buf);
-        prewhere_actions->serialize(buf);
-    }
-    else
-        writeBinary(false, buf);
-
-    writeBinary(row_level_column_name, buf);
-    writeBinary(prewhere_column_name, buf);
-    writeBinary(remove_prewhere_column, buf);
-    writeBinary(need_filter, buf);
+    if (!PredicateUtils::isTruePredicate(new_partition_filter))
+        partition_filter = std::move(new_partition_filter);
 }
 
-PrewhereInfoPtr PrewhereInfo::deserialize(ReadBuffer & buf, ContextPtr context)
+TableScanCacheInfo getTableScanCacheInfo(const SelectQueryInfo & query_info)
 {
-    ActionsDAGPtr alias_actions;
-    ActionsDAGPtr row_level_filter;
-    ActionsDAGPtr prewhere_actions;
-
-    bool has_alias_actions;
-    readBinary(has_alias_actions, buf);
-    if (has_alias_actions)
-        alias_actions = ActionsDAG::deserialize(buf, context);
-
-    bool has_row_level_filter;
-    readBinary(has_row_level_filter, buf);
-    if (has_row_level_filter)
-        row_level_filter = ActionsDAG::deserialize(buf, context);
-
-    bool has_prewhere_actions;
-    readBinary(has_prewhere_actions, buf);
-    if (has_prewhere_actions)
-        prewhere_actions = ActionsDAG::deserialize(buf, context);
-
-    String row_level_column_name;
-    String prewhere_column_name;
-    bool remove_prewhere_column;
-    bool need_filter;
-
-    readBinary(row_level_column_name, buf);
-    readBinary(prewhere_column_name, buf);
-    readBinary(remove_prewhere_column, buf);
-    readBinary(need_filter, buf);
-
-    auto prewhere_info_ptr = std::make_shared<PrewhereInfo>(prewhere_actions, prewhere_column_name);
-    prewhere_info_ptr->alias_actions = alias_actions;
-    prewhere_info_ptr->row_level_filter = row_level_filter;
-    prewhere_info_ptr->row_level_column_name = row_level_column_name;
-    prewhere_info_ptr->remove_prewhere_column = remove_prewhere_column;
-    prewhere_info_ptr->need_filter = need_filter;
-
-    return prewhere_info_ptr;
+    return query_info.cache_info;
 }
-
-void InputOrderInfo::serialize(WriteBuffer & buf) const
-{
-    serializeSortDescription(order_key_prefix_descr, buf);
-    writeBinary(direction, buf);
-}
-
-void InputOrderInfo::deserialize(ReadBuffer & buf)
-{
-    deserializeSortDescription(order_key_prefix_descr, buf);
-    readBinary(direction, buf);
-}
-
-void SelectQueryInfo::serialize(WriteBuffer & buf) const
-{
-    serializeAST(query, buf);
-    serializeAST(view_query, buf);
-}
-
-void SelectQueryInfo::deserialize(ReadBuffer & buf)
-{
-    query = deserializeAST(buf);
-    view_query = deserializeAST(buf);
-}
-
 }

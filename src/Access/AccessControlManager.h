@@ -5,7 +5,7 @@
 #include <Common/ZooKeeper/Common.h>
 #include <boost/container/flat_set.hpp>
 #include <memory>
-
+#include <Interpreters/Context_fwd.h>
 
 namespace Poco
 {
@@ -21,6 +21,7 @@ namespace Poco
 
 namespace DB
 {
+class Context;
 class ContextAccess;
 struct ContextAccessParams;
 struct User;
@@ -32,15 +33,14 @@ class RowPolicyCache;
 class EnabledQuota;
 class QuotaCache;
 struct QuotaUsage;
-struct SettingsProfile;
-using SettingsProfilePtr = std::shared_ptr<const SettingsProfile>;
+struct SettingsProfilesInfo;
 class EnabledSettings;
 class SettingsProfilesCache;
 class SettingsProfileElements;
 class ClientInfo;
 class ExternalAuthenticators;
 struct Settings;
-
+using SensitiveResourcePtr = std::shared_ptr<Protos::DataModelSensitiveDatabase>;
 
 /// Manages access control entities.
 class AccessControlManager : public MultipleAccessStorage
@@ -48,6 +48,10 @@ class AccessControlManager : public MultipleAccessStorage
 public:
     AccessControlManager();
     ~AccessControlManager() override;
+
+    /// Initializes access storage (user directories).
+    void setUpFromMainConfig(const Poco::Util::AbstractConfiguration & config_, const String & config_path_,
+                             const zkutil::GetZooKeeper & get_zookeeper_function_);
 
     /// Parses access entities from a configuration loaded from users.xml.
     /// This function add UsersConfigAccessStorage if it wasn't added before.
@@ -72,6 +76,9 @@ public:
 
     void reloadUsersConfigs();
     void startPeriodicReloadingUsersConfigs();
+
+    /// Loads access entities from KV
+    void addKVStorage(const ContextPtr & context);
 
     /// Loads access entities from the directory on the local disk.
     /// Use that directory to keep created users/roles/etc.
@@ -108,17 +115,30 @@ public:
     void setCustomSettingsPrefixes(const String & comma_separated_prefixes);
     bool isSettingNameAllowed(const std::string_view & name) const;
     void checkSettingNameIsAllowed(const std::string_view & name) const;
+    void setSensitivePermissionTenants(const String & comma_separated_tenants);
 
     UUID login(const Credentials & credentials, const Poco::Net::IPAddress & address) const;
     void setExternalAuthenticatorsConfig(const Poco::Util::AbstractConfiguration & config);
 
-    std::shared_ptr<const ContextAccess> getContextAccess(
+    void setSelectFromSystemDatabaseRequiresGrant(bool enable) { select_from_system_db_requires_grant = enable; }
+    bool doesSelectFromSystemDatabaseRequireGrant() const { return select_from_system_db_requires_grant; }
+
+    void setSelectFromInformationSchemaRequiresGrant(bool enable) { select_from_information_schema_requires_grant = enable; }
+    bool doesSelectFromInformationSchemaRequireGrant() const { return select_from_information_schema_requires_grant; }
+
+    void setSelectFromMySQLRequiresGrant(bool enable) { select_from_mysql_requires_grant = enable; }
+    bool doesSelectFromMySQLRequireGrant() const { return select_from_mysql_requires_grant; }
+
+    ContextAccessParams getContextAccessParams(
         const UUID & user_id,
         const std::vector<UUID> & current_roles,
         bool use_default_roles,
         const Settings & settings,
         const String & current_database,
-        const ClientInfo & client_info) const;
+        const ClientInfo & client_info,
+        const String & tenant,
+        bool has_tenant_id_in_username,
+        bool load_roles) const;
 
     std::shared_ptr<const ContextAccess> getContextAccess(const ContextAccessParams & params) const;
 
@@ -145,13 +165,21 @@ public:
                                                               const boost::container::flat_set<UUID> & enabled_roles,
                                                               const SettingsProfileElements & settings_from_enabled_roles) const;
 
-    std::shared_ptr<const SettingsChanges> getProfileSettings(const String & profile_name) const;
+    std::shared_ptr<const SettingsProfilesInfo> getSettingsProfileInfo(const UUID & profile_id);
 
     const ExternalAuthenticators & getExternalAuthenticators() const;
+
+    bool isSensitiveGrantee(const String & grantee) const;
+
+    std::function<SensitiveResourcePtr(String)> sensitive_resource_getter;
+
+private:
+    bool isSensitiveTenant(const String & tenant) const;
 
 private:
     class ContextAccessCache;
     class CustomSettingsPrefixes;
+    class SensitivePermissionTenants;
 
     std::unique_ptr<ContextAccessCache> context_access_cache;
     std::unique_ptr<RoleCache> role_cache;
@@ -160,6 +188,11 @@ private:
     std::unique_ptr<SettingsProfilesCache> settings_profiles_cache;
     std::unique_ptr<ExternalAuthenticators> external_authenticators;
     std::unique_ptr<CustomSettingsPrefixes> custom_settings_prefixes;
+    std::unique_ptr<SensitivePermissionTenants> sensitive_permission_tenants;
+
+    std::atomic_bool select_from_system_db_requires_grant = false;
+    std::atomic_bool select_from_information_schema_requires_grant = false;
+    std::atomic_bool select_from_mysql_requires_grant = false;
 };
 
 }

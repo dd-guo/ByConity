@@ -22,22 +22,27 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/array/arrayElement.h>
+#include <Functions/castTypeToEither.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeMap.h>
-#include <DataTypes/DataTypeByteMap.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/MapHelpers.h>
 #include <Core/ColumnNumbers.h>
 #include <Columns/ColumnArray.h>
 #include <Core/Field.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnMap.h>
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
+#include <Parsers/ASTLiteral.h>
 
 
 namespace DB
@@ -53,134 +58,63 @@ namespace ErrorCodes
 
 namespace ArrayImpl
 {
-    class NullMapBuilder;
-}
 
-/** arrayElement(arr, i) - get the array element by index. If index is not constant and out of range - return default value of data type.
-  * The index begins with 1. Also, the index can be negative - then it is counted from the end of the array.
-  */
-class FunctionArrayElement : public IFunction
-{
-public:
-    static constexpr auto name = "arrayElement";
-    static FunctionPtr create(ContextPtr context);
-
-    String getName() const override;
-
-    bool useDefaultImplementationForConstants() const override { return true; }
-    size_t getNumberOfArguments() const override { return 2; }
-
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override;
-
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override;
-
-private:
-    ColumnPtr perform(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
-                      ArrayImpl::NullMapBuilder & builder, size_t input_rows_count) const;
-
-    template <typename DataType>
-    static ColumnPtr executeNumberConst(const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder);
-
-    template <typename IndexType, typename DataType>
-    static ColumnPtr executeNumber(const ColumnsWithTypeAndName & arguments, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder);
-
-    static ColumnPtr executeStringConst(const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder);
-
-    template <typename IndexType>
-    static ColumnPtr executeString(const ColumnsWithTypeAndName & arguments, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder);
-
-    static ColumnPtr executeGenericConst(const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder);
-
-    template <typename IndexType>
-    static ColumnPtr executeGeneric(const ColumnsWithTypeAndName & arguments, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder);
-
-    template <typename IndexType>
-    static ColumnPtr executeConst(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
-                                  const PaddedPODArray <IndexType> & indices, ArrayImpl::NullMapBuilder & builder,
-                                  size_t input_rows_count);
-
-    template <typename IndexType>
-    ColumnPtr executeArgument(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
-                              ArrayImpl::NullMapBuilder & builder, size_t input_rows_count) const;
-
-    /** For a tuple array, the function is evaluated component-wise for each element of the tuple.
-      */
-    ColumnPtr executeTuple(const ColumnsWithTypeAndName & arguments, size_t input_rows_count) const;
-
-    /** For a map the function finds the matched value for a key.
-     *  Currently implemented just as linear search in array.
-     *  However, optimizations are possible.
-     */
-    ColumnPtr executeMap(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const;
-
-    using Offsets = ColumnArray::Offsets;
-
-    static bool matchKeyToIndex(const IColumn & data, const Offsets & offsets,
-        const ColumnsWithTypeAndName & arguments, PaddedPODArray<UInt64> & matched_idxs);
-
-    static bool matchKeyToIndexConst(const IColumn & data, const Offsets & offsets,
-        const Field & index, PaddedPODArray<UInt64> & matched_idxs);
-
-    template <typename DataType>
-    static bool matchKeyToIndexNumber(const IColumn & data, const Offsets & offsets,
-        const ColumnsWithTypeAndName & arguments, PaddedPODArray<UInt64> & matched_idxs);
-
-    template <typename DataType>
-    static bool matchKeyToIndexNumberConst(const IColumn & data, const Offsets & offsets,
-        const Field & index, PaddedPODArray<UInt64> & matched_idxs);
-
-    static bool matchKeyToIndexString(const IColumn & data, const Offsets & offsets,
-        const ColumnsWithTypeAndName & arguments, PaddedPODArray<UInt64> & matched_idxs);
-
-    static bool matchKeyToIndexStringConst(const IColumn & data, const Offsets & offsets,
-        const Field & index, PaddedPODArray<UInt64> & matched_idxs);
-
-    template <typename Matcher>
-    static void executeMatchKeyToIndex(const Offsets & offsets,
-        PaddedPODArray<UInt64> & matched_idxs, const Matcher & matcher);
-};
-
-
-namespace ArrayImpl
-{
-
+/// under MySQL, element_at always return nullable result.
+/// NullMapBuilder is used to mark NULL source elements and result/sink elements
 class NullMapBuilder
 {
 public:
-    explicit operator bool() const { return src_null_map; }
-    bool operator!() const { return !src_null_map; }
+    explicit operator bool() const { return is_mysql || src_null_map; }
+    bool operator!() const { return !(is_mysql || src_null_map); }
 
-    void initSource(const UInt8 * src_null_map_)
+    void initSource(const UInt8 * src_null_map_, bool is_mysql_)
     {
         src_null_map = src_null_map_;
+        is_mysql = is_mysql_;
     }
 
-    void initSink(size_t size)
+    /// pass the index null map to check if the index is 0 or null.
+    /// if the index is null, the result is null
+    /// if the index is 0, throw error
+    void initSink(size_t size, ColumnPtr index_null_map)
     {
-        auto sink = ColumnUInt8::create(size);
+        auto sink = ColumnUInt8::create(0);
+        if (index_null_map)
+        {
+            auto index_full_col = index_null_map->convertToFullColumnIfConst();
+            assert(size == index_full_col->size());
+            sink->assumeMutable()->insertRangeFrom(*index_full_col, 0, size);
+        }
+        else
+        {
+            sink->assumeMutable()->insertManyDefaults(size);
+        }
         sink_null_map = sink->getData().data();
         sink_null_map_holder = std::move(sink);
     }
 
     void update(size_t from)
     {
-        sink_null_map[index] = bool(src_null_map && src_null_map[from]);
+        sink_null_map[index] |= bool(src_null_map && src_null_map[from]);
         ++index;
     }
 
     void update()
     {
-        sink_null_map[index] = bool(src_null_map);
+        sink_null_map[index] |= is_mysql | bool(src_null_map);
         ++index;
     }
 
     ColumnPtr getNullMapColumnPtr() && { return std::move(sink_null_map_holder); }
+
+    bool notNullUnderMySql(size_t i) { return !sink_null_map[i] && is_mysql; }
 
 private:
     const UInt8 * src_null_map = nullptr;
     UInt8 * sink_null_map = nullptr;
     MutableColumnPtr sink_null_map_holder;
     size_t index = 0;
+    bool is_mysql = false;
 };
 
 }
@@ -198,7 +132,7 @@ struct ArrayElementNumImpl
     template <bool negative>
     static void vectorConst(
         const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const ColumnArray::Offset index,
+        const ColumnArray::Offset index, const DataTypePtr value_type,
         PaddedPODArray<T> & result, ArrayImpl::NullMapBuilder & builder)
     {
         size_t size = offsets.size();
@@ -218,7 +152,7 @@ struct ArrayElementNumImpl
             }
             else
             {
-                result[i] = T();
+                result[i] = value_type->getDefault().get<T>();
 
                 if (builder)
                     builder.update();
@@ -233,7 +167,7 @@ struct ArrayElementNumImpl
     template <typename TIndex>
     static void vector(
         const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const PaddedPODArray<TIndex> & indices,
+        const PaddedPODArray<TIndex> & indices, const DataTypePtr value_type,
         PaddedPODArray<T> & result, ArrayImpl::NullMapBuilder & builder)
     {
         size_t size = offsets.size();
@@ -261,9 +195,13 @@ struct ArrayElementNumImpl
                 if (builder)
                     builder.update(j);
             }
+            else if (index == 0 && builder && builder.notNullUnderMySql(i))
+            {
+                throw Exception("Array indices are 1-based", ErrorCodes::ZERO_ARRAY_OR_TUPLE_INDEX);
+            }
             else
             {
-                result[i] = T();
+                result[i] = value_type->getDefault().get<T>();
 
                 if (builder)
                     builder.update();
@@ -353,6 +291,8 @@ struct ArrayElementStringImpl
                 adjusted_index = index - 1;
             else if (index < 0 && -static_cast<size_t>(index) <= array_size)
                 adjusted_index = array_size + index;
+            else if (index == 0 && builder && builder.notNullUnderMySql(i))
+                throw Exception("Array indices are 1-based", ErrorCodes::ZERO_ARRAY_OR_TUPLE_INDEX);
             else
                 adjusted_index = array_size;    /// means no element should be taken
 
@@ -456,6 +396,10 @@ struct ArrayElementGenericImpl
                 if (builder)
                     builder.update(j);
             }
+            else if (index == 0 && builder && builder.notNullUnderMySql(i))
+            {
+                throw Exception("Array indices are 1-based", ErrorCodes::ZERO_ARRAY_OR_TUPLE_INDEX);
+            }
             else
             {
                 result.insertDefault();
@@ -471,9 +415,9 @@ struct ArrayElementGenericImpl
 }
 
 
-FunctionPtr FunctionArrayElement::create(ContextPtr)
+FunctionPtr FunctionArrayElement::create(ContextPtr context)
 {
-    return std::make_shared<FunctionArrayElement>();
+    return std::make_shared<FunctionArrayElement>(context);
 }
 
 
@@ -491,12 +435,16 @@ ColumnPtr FunctionArrayElement::executeNumberConst(
     if (!col_nested)
         return nullptr;
 
+    const DataTypeArray * array_type = typeid_cast<const DataTypeArray *>(arguments[0].type.get());
+    if (!array_type)
+        return nullptr;
+
     auto col_res = ColumnVector<DataType>::create();
 
     if (index.getType() == Field::Types::UInt64)
     {
         ArrayElementNumImpl<DataType>::template vectorConst<false>(
-            col_nested->getData(), col_array->getOffsets(), safeGet<UInt64>(index) - 1, col_res->getData(), builder);
+            col_nested->getData(), col_array->getOffsets(), safeGet<UInt64>(index) - 1, array_type->getNestedType(), col_res->getData(), builder);
     }
     else if (index.getType() == Field::Types::Int64)
     {
@@ -510,7 +458,7 @@ ColumnPtr FunctionArrayElement::executeNumberConst(
         /// arr[-2] is the element at offset 1 from the last and so on.
 
         ArrayElementNumImpl<DataType>::template vectorConst<true>(
-            col_nested->getData(), col_array->getOffsets(), -(UInt64(safeGet<Int64>(index)) + 1), col_res->getData(), builder);
+            col_nested->getData(), col_array->getOffsets(), -(UInt64(safeGet<Int64>(index)) + 1), array_type->getNestedType(), col_res->getData(), builder);
     }
     else
         throw Exception("Illegal type of array index", ErrorCodes::LOGICAL_ERROR);
@@ -532,10 +480,14 @@ ColumnPtr FunctionArrayElement::executeNumber(
     if (!col_nested)
         return nullptr;
 
+    const DataTypeArray * array_type = typeid_cast<const DataTypeArray *>(arguments[0].type.get());
+    if (!array_type)
+        return nullptr;
+
     auto col_res = ColumnVector<DataType>::create();
 
     ArrayElementNumImpl<DataType>::template vector<IndexType>(
-        col_nested->getData(), col_array->getOffsets(), indices, col_res->getData(), builder);
+        col_nested->getData(), col_array->getOffsets(), indices, array_type->getNestedType(), col_res->getData(), builder);
 
     return col_res;
 }
@@ -701,9 +653,6 @@ ColumnPtr FunctionArrayElement::executeArgument(
         return nullptr;
     const auto & index_data = index->getData();
 
-    if (builder)
-        builder.initSink(index_data.size());
-
     ColumnPtr res;
     if (!((res = executeNumber<IndexType, UInt8>(arguments, index_data, builder))
         || (res = executeNumber<IndexType, UInt16>(arguments, index_data, builder))
@@ -736,6 +685,9 @@ ColumnPtr FunctionArrayElement::executeTuple(const ColumnsWithTypeAndName & argu
     if (!col_nested)
         return nullptr;
 
+    if (is_mysql_dialect)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "arrayElement(col, idx) where col is Array(Tuple(T)) is not supported under MySQL.");
+
     const auto & tuple_columns = col_nested->getColumns();
     size_t tuple_size = tuple_columns.size();
 
@@ -765,7 +717,7 @@ ColumnPtr FunctionArrayElement::executeTuple(const ColumnsWithTypeAndName & argu
         array_of_tuple_section.type = std::make_shared<DataTypeArray>(tuple_types[i]);
         temporary_results[0] = array_of_tuple_section;
 
-        auto type = getReturnTypeImpl({temporary_results[0].type, temporary_results[1].type});
+        auto type = getReturnTypeImpl(temporary_results);
         auto col = executeImpl(temporary_results, type, input_rows_count);
         result_tuple_columns[i] = std::move(col);
     }
@@ -776,10 +728,11 @@ ColumnPtr FunctionArrayElement::executeTuple(const ColumnsWithTypeAndName & argu
 namespace
 {
 
+template<typename DataColumn, typename IndexColumn>
 struct MatcherString
 {
-    const ColumnString & data;
-    const ColumnString & index;
+    const DataColumn & data;
+    const IndexColumn & index;
 
     bool match(size_t row_data, size_t row_index) const
     {
@@ -789,9 +742,10 @@ struct MatcherString
     }
 };
 
+template<typename DataColumn>
 struct MatcherStringConst
 {
-    const ColumnString & data;
+    const DataColumn & data;
     const String & index;
 
     bool match(size_t row_data, size_t /* row_index */) const
@@ -801,23 +755,23 @@ struct MatcherStringConst
     }
 };
 
-template <typename T>
+template <typename DataType, typename IndexType>
 struct MatcherNumber
 {
-    const PaddedPODArray<T> & data;
-    const PaddedPODArray<T> & index;
+    const PaddedPODArray<DataType> & data;
+    const PaddedPODArray<IndexType> & index;
 
     bool match(size_t row_data, size_t row_index) const
     {
-        return data[row_data] == index[row_index];
+        return data[row_data] == static_cast<DataType>(index[row_index]);
     }
 };
 
-template <typename T>
+template <typename DataType>
 struct MatcherNumberConst
 {
-    const PaddedPODArray<T> & data;
-    T index;
+    const PaddedPODArray<DataType> & data;
+    DataType index;
 
     bool match(size_t row_data, size_t /* row_index */) const
     {
@@ -852,128 +806,160 @@ void FunctionArrayElement::executeMatchKeyToIndex(
     }
 }
 
+template <typename Matcher>
+void FunctionArrayElement::executeMatchConstKeyToIndex(
+    size_t num_rows, size_t num_values,
+    PaddedPODArray<UInt64> & matched_idxs, const Matcher & matcher)
+{
+    for (size_t i = 0; i < num_rows; ++i)
+    {
+        bool matched = false;
+        for (size_t j = 0; j < num_values; ++j)
+        {
+            if (matcher.match(j, i))
+            {
+                matched_idxs.push_back(j + 1);
+                matched = true;
+                break;
+            }
+        }
+
+        if (!matched)
+            matched_idxs.push_back(0);
+    }
+}
+
+template <typename F>
+static bool castColumnString(const IColumn * column, F && f)
+{
+    return castTypeToEither<ColumnString, ColumnFixedString>(column, std::forward<F>(f));
+}
+
 bool FunctionArrayElement::matchKeyToIndexStringConst(
     const IColumn & data, const Offsets & offsets,
     const Field & index, PaddedPODArray<UInt64> & matched_idxs)
 {
-    const auto * data_string = checkAndGetColumn<ColumnString>(&data);
-    if (!data_string)
-        return false;
+    return castColumnString(&data, [&](const auto & data_column)
+    {
+        using DataColumn = std::decay_t<decltype(data_column)>;
 
-    if (index.getType() != Field::Types::String)
-        return false;
-
-    MatcherStringConst matcher{*data_string, get<const String &>(index)};
-    executeMatchKeyToIndex(offsets, matched_idxs, matcher);
-    return true;
+        MatcherStringConst<DataColumn> matcher{data_column, get<const String &>(index)};
+        executeMatchKeyToIndex(offsets, matched_idxs, matcher);
+        return true;
+    });
 }
 
 bool FunctionArrayElement::matchKeyToIndexString(
-    const IColumn & data, const Offsets & offsets,
-    const ColumnsWithTypeAndName & arguments, PaddedPODArray<UInt64> & matched_idxs)
+    const IColumn & data, const Offsets & offsets, bool is_key_const,
+    const IColumn & index, PaddedPODArray<UInt64> & matched_idxs)
 {
-    const auto * index_string = checkAndGetColumn<ColumnString>(arguments[1].column.get());
-    if (!index_string)
-        return false;
+    return castColumnString(&data, [&](const auto & data_column)
+    {
+        return castColumnString(&index, [&](const auto & index_column)
+        {
+            using DataColumn = std::decay_t<decltype(data_column)>;
+            using IndexColumn = std::decay_t<decltype(index_column)>;
 
-    const auto * data_string = checkAndGetColumn<ColumnString>(&data);
-    if (!data_string)
-        return false;
+            MatcherString<DataColumn, IndexColumn> matcher{data_column, index_column};
+            if (is_key_const)
+                executeMatchConstKeyToIndex(index.size(), data.size(), matched_idxs, matcher);
+            else
+                executeMatchKeyToIndex(offsets, matched_idxs, matcher);
 
-    MatcherString matcher{*data_string, *index_string};
-    executeMatchKeyToIndex(offsets, matched_idxs, matcher);
-    return true;
+            return true;
+        });
+    });
 }
 
-template <typename DataType>
+template <typename F>
+static bool castColumnNumeric(const IColumn * column, F && f)
+{
+    return castTypeToEither<
+        ColumnVector<UInt8>,
+        ColumnVector<UInt16>,
+        ColumnVector<UInt32>,
+        ColumnVector<UInt64>,
+        ColumnVector<UInt128>,
+        ColumnVector<UInt256>,
+        ColumnVector<Int8>,
+        ColumnVector<Int16>,
+        ColumnVector<Int32>,
+        ColumnVector<Int64>,
+        ColumnVector<Int128>,
+        ColumnVector<Int256>,
+        ColumnVector<UUID>,
+        ColumnVector<IPv4>,
+        ColumnVector<IPv6>,
+        ColumnVector<Float32>,
+        ColumnVector<Float64>
+    >(column, std::forward<F>(f));
+}
+
 bool FunctionArrayElement::matchKeyToIndexNumberConst(
     const IColumn & data, const Offsets & offsets,
     const Field & index, PaddedPODArray<UInt64> & matched_idxs)
 {
-    const auto * data_numeric = checkAndGetColumn<ColumnVector<DataType>>(&data);
-    if (!data_numeric)
-        return false;
-
-    std::optional<DataType> index_as_integer;
-    Field::dispatch([&](const auto & value)
+    return castColumnNumeric(&data, [&](const auto & data_column)
     {
-        using FieldType = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<FieldType, DataType> || (is_integer_v<FieldType> && std::is_convertible_v<FieldType, DataType>))
-            index_as_integer = static_cast<DataType>(value);
-    }, index);
+        using DataType = typename std::decay_t<decltype(data_column)>::ValueType;
+        std::optional<DataType> index_as_number;
 
-    if (!index_as_integer)
-        return false;
+        Field::dispatch([&](const auto & value)
+        {
+            using FieldType = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<FieldType, DataType>
+                || ((is_integer_v<FieldType> || std::is_floating_point_v<FieldType>) && std::is_convertible_v<FieldType, DataType>))
+                index_as_number = static_cast<DataType>(value);
+        }, index);
 
-    MatcherNumberConst<DataType> matcher{data_numeric->getData(), *index_as_integer};
-    executeMatchKeyToIndex(offsets, matched_idxs, matcher);
-    return true;
+        if (!index_as_number)
+            return false;
+
+        MatcherNumberConst<DataType> matcher{data_column.getData(), *index_as_number};
+        executeMatchKeyToIndex(offsets, matched_idxs, matcher);
+        return true;
+    });
 }
 
-template <typename DataType>
 bool FunctionArrayElement::matchKeyToIndexNumber(
-    const IColumn & data, const Offsets & offsets,
-    const ColumnsWithTypeAndName & arguments, PaddedPODArray<UInt64> & matched_idxs)
+    const IColumn & data, const Offsets & offsets, bool is_key_const,
+    const IColumn & index, PaddedPODArray<UInt64> & matched_idxs)
 {
-    const auto * index_numeric = checkAndGetColumn<ColumnVector<DataType>>(arguments[1].column.get());
-    if (!index_numeric)
-        return false;
+    return castColumnNumeric(&data, [&](const auto & data_column)
+    {
+        return castColumnNumeric(&index, [&](const auto & index_column)
+        {
+            using DataType = typename std::decay_t<decltype(data_column)>::ValueType;
+            using IndexType = typename std::decay_t<decltype(index_column)>::ValueType;
 
-    const auto * data_numeric = checkAndGetColumn<ColumnVector<DataType>>(&data);
-    if (!data_numeric)
-        return false;
+            if constexpr (std::is_same_v<IndexType, DataType>
+                || ((is_integer_v<IndexType> || std::is_floating_point_v<IndexType>) && std::is_convertible_v<IndexType, DataType>))
+            {
+                MatcherNumber<DataType, IndexType> matcher{data_column.getData(), index_column.getData()};
+                if (is_key_const)
+                    executeMatchConstKeyToIndex(index_column.size(), data_column.size(), matched_idxs, matcher);
+                else
+                    executeMatchKeyToIndex(offsets, matched_idxs, matcher);
 
-    MatcherNumber<DataType> matcher{data_numeric->getData(), index_numeric->getData()};
-    executeMatchKeyToIndex(offsets, matched_idxs, matcher);
-    return true;
-}
+                return true;
+            }
 
-bool FunctionArrayElement::matchKeyToIndex(
-    const IColumn & data, const Offsets & offsets,
-    const ColumnsWithTypeAndName & arguments, PaddedPODArray<UInt64> & matched_idxs)
-{
-    return matchKeyToIndexNumber<UInt8>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<UInt16>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<UInt32>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<UInt64>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<UInt128>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<UInt256>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<Int8>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<Int16>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<Int32>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<Int64>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<Int128>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<Int256>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexNumber<UUID>(data, offsets, arguments, matched_idxs)
-        || matchKeyToIndexString(data, offsets, arguments, matched_idxs);
-}
-
-bool FunctionArrayElement::matchKeyToIndexConst(
-    const IColumn & data, const Offsets & offsets,
-    const Field & index, PaddedPODArray<UInt64> & matched_idxs)
-{
-    return matchKeyToIndexNumberConst<UInt8>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<UInt16>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<UInt32>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<UInt64>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<UInt128>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<UInt256>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<Int8>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<Int16>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<Int32>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<Int64>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<Int128>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<Int256>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexNumberConst<UUID>(data, offsets, index, matched_idxs)
-        || matchKeyToIndexStringConst(data, offsets, index, matched_idxs);
+            return false;
+        });
+    });
 }
 
 ColumnPtr FunctionArrayElement::executeMap(
-    const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
+    const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count, ColumnPtr index_null_map_col) const
 {
-    const ColumnMap * col_map = typeid_cast<const ColumnMap *>(arguments[0].column.get());
-    if (!col_map)
+    const auto * col_map = checkAndGetColumn<ColumnMap>(arguments[0].column.get());
+    const auto * col_const_map = checkAndGetColumnConst<ColumnMap>(arguments[0].column.get());
+    const DataTypeMap * map_type = checkAndGetDataType<DataTypeMap>(arguments[0].type.get());
+    if ((!col_map && !col_const_map) || !map_type)
         return nullptr;
+
+    if (col_const_map)
+        col_map = typeid_cast<const ColumnMap *>(&col_const_map->getDataColumn());
 
     const auto & nested_column = col_map->getNestedColumn();
     const auto & keys_data = col_map->getNestedData().getColumn(0);
@@ -985,30 +971,53 @@ ColumnPtr FunctionArrayElement::executeMap(
     indices_column->reserve(input_rows_count);
     auto & indices_data = assert_cast<ColumnVector<UInt64> &>(*indices_column).getData();
 
+    bool executed = false;
     if (!isColumnConst(*arguments[1].column))
     {
-        if (input_rows_count > 0 && !matchKeyToIndex(keys_data, offsets, arguments, indices_data))
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "Illegal types of arguments: {}, {} for function {}",
-                arguments[0].type->getName(), arguments[1].type->getName(), getName());
+        executed = matchKeyToIndexNumber(keys_data, offsets, !!col_const_map, *arguments[1].column, indices_data)
+            || matchKeyToIndexString(keys_data, offsets, !!col_const_map, *arguments[1].column, indices_data);
     }
     else
     {
         Field index = (*arguments[1].column)[0];
 
-        // Get Matched key's value
-        if (input_rows_count > 0 && !matchKeyToIndexConst(keys_data, offsets, index, indices_data))
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
-                "Illegal types of arguments: {}, {} for function {}",
-                arguments[0].type->getName(), arguments[1].type->getName(), getName());
+        /// try convert const index to right type
+        auto index_lit = std::make_shared<ASTLiteral>(index);
+        Field key_field = tryConvertToMapKeyField(map_type->getKeyType(), index_lit->getColumnName());
+        if (!key_field.isNull())
+            index = key_field;
+
+        executed = matchKeyToIndexNumberConst(keys_data, offsets, index, indices_data)
+            || matchKeyToIndexStringConst(keys_data, offsets, index, indices_data);
     }
+
+    if (!executed)
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "Illegal types of arguments: {}, {} for function {}",
+            arguments[0].type->getName(), arguments[1].type->getName(), getName());
+
+    ColumnPtr values_array_nested = values_data.getPtr();
+    DataTypePtr result_value_type = map_type->getValueType();
+
+    // TODO(shiyuze): Map can be nested in Map but cannot wrapped in Nullable
+    if (is_mysql_dialect && result_type->isNullable())
+    {
+        /// In MYSQL dialect type, non-exists indices will return Null, so we need to wrap
+        /// new arguments in nullable
+        values_array_nested = makeNullable(values_array_nested);
+        result_value_type = makeNullable(result_value_type);
+    }
+
+    ColumnPtr values_array = ColumnArray::create(values_array_nested, nested_column.getOffsetsPtr());
+    if (col_const_map)
+        values_array = ColumnConst::create(values_array, input_rows_count);
 
     /// Prepare arguments to call arrayElement for array with values and calculated indices at previous step.
     ColumnsWithTypeAndName new_arguments =
     {
         {
-            ColumnArray::create(values_data.getPtr(), nested_column.getOffsetsPtr()),
-            std::make_shared<DataTypeArray>(result_type),
+            values_array,
+            std::make_shared<DataTypeArray>(result_value_type),
             ""
         },
         {
@@ -1018,7 +1027,23 @@ ColumnPtr FunctionArrayElement::executeMap(
         }
     };
 
-    return executeImpl(new_arguments, result_type, input_rows_count);
+    /// In MYSQL dialect type, we also need to set is_mysql to false to get Null result of all non-exists
+    /// indices. Indices returned by matchKeyToIndexXXX using 0 for mismatched, after we set is_mysql to false
+    /// and wrap array nested column in nullable, so all the indices with value 0 will return default value
+    /// of Nullable (which is Null).
+    auto res = executeImpl(new_arguments, result_type, input_rows_count, false);
+
+    /// If index is nullable, we need to update its null map to result column
+    if (is_mysql_dialect && result_type->isNullable() && index_null_map_col)
+    {
+        UInt8 * res_null_map_data = typeid_cast<ColumnNullable &>(*(res->assumeMutable())).getNullMapData().data();
+        const UInt8 * index_null_map_data = typeid_cast<const ColumnUInt8 &>(*index_null_map_col).getData().data();
+
+        for (size_t i = 0; i < index_null_map_col->size(); i++)
+            res_null_map_data[i] |= index_null_map_data[i];
+    }
+
+    return res;
 }
 
 String FunctionArrayElement::getName() const
@@ -1026,72 +1051,128 @@ String FunctionArrayElement::getName() const
     return name;
 }
 
-DataTypePtr FunctionArrayElement::getReturnTypeImpl(const DataTypes & arguments) const
+DataTypePtr FunctionArrayElement::getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const
 {
-    if (const auto * map_type = checkAndGetDataType<DataTypeMap>(arguments[0].get()))
-        return map_type->getValueType();
+    NullPresence null_presence = getNullPresense(arguments);
+    if (null_presence.has_null_constant)
+        return makeNullable(std::make_shared<DataTypeNothing>());
 
-    if (const auto * byte_map_type = checkAndGetDataType<DataTypeByteMap>(arguments[0].get()))
-        return byte_map_type->getValueType();
+    auto arg0_no_null = arguments[0].type;
+    if (is_mysql_dialect)
+        arg0_no_null = removeNullable(arguments[0].type);
 
-    const auto * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
+    if (const auto * map_type = checkAndGetDataType<DataTypeMap>(arg0_no_null.get()))
+        return is_mysql_dialect ? makeNullable(map_type->getValueType()) : map_type->getValueType();
+
+    const auto * array_type = checkAndGetDataType<DataTypeArray>(arg0_no_null.get());
     if (!array_type)
     {
         throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             "First argument for function '{}' must be array, got '{}' instead",
-            getName(), arguments[0]->getName());
+            getName(), arguments[0].type->getName());
     }
 
-    if (!isInteger(arguments[1]))
+    auto arg1_type = arguments[1].type;
+    if (!(isInteger(arg1_type) || (is_mysql_dialect && (isInteger(removeNullable(arg1_type)) || arg1_type->onlyNull()))))
     {
         throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             "Second argument for function '{}' must be integer, got '{}' instead",
-            getName(), arguments[1]->getName());
+            getName(), arg1_type->getName());
     }
 
-    return array_type->getNestedType();
+    auto ret_type = array_type->getNestedType();
+    if (is_mysql_dialect)
+        ret_type = makeNullable(ret_type);
+    return ret_type;
 }
 
 ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
 {
+    return executeImpl(arguments, result_type, input_rows_count, is_mysql_dialect);
+}
+
+ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count, bool is_mysql) const
+{
+    ColumnsWithTypeAndName tmp_args = arguments;
+    DataTypePtr tmp_result_type = result_type;
+
+    ColumnPtr index_null_map_col = nullptr;
+    NullPresence null_presence;
+    if (is_mysql)
+    {
+        /// ref IExecutableFunction::defaultImplementationForNulls
+        /// additionally, we extract the index null map if exists
+        null_presence = getNullPresense(arguments);
+        if (null_presence.has_nullable)
+        {
+            /// if index is const null -> return directly
+            if (null_presence.has_null_constant)
+            {
+                // Default implementation for nulls returns null result for null arguments,
+                // so the result type must be nullable.
+                if (!result_type->isNullable())
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "Function {} with Null argument and default implementation for Nulls "
+                            "is expected to return Nullable result, got {}", getName(), result_type->getName());
+
+                return result_type->createColumnConstWithDefaultValue(input_rows_count);
+            }
+
+            tmp_args = createBlockWithNestedColumns(arguments);
+            tmp_result_type = removeNullable(result_type);
+
+            /// if index is const but not null, the index_null_map_col would be all 0s, no need to get it.
+            /// if index is nullable column -> get the null map to apply to the result
+            if (const auto * index_null_col = checkAndGetColumn<ColumnNullable>(*arguments[1].column); index_null_col)
+                index_null_map_col = index_null_col->getNullMapColumnPtr();
+        }
+    }
+
+    const auto * col_map = checkAndGetColumn<ColumnMap>(tmp_args[0].column.get());
+    const auto * col_const_map = checkAndGetColumnConst<ColumnMap>(tmp_args[0].column.get());
+
+    if (col_map || col_const_map)
+    {
+        /// In MYSQL dialect, arrayElement will always return Nullable(ValueType) is args0 is Map,
+        /// so we need to use result_type here.
+        return executeMap(tmp_args, result_type, input_rows_count, index_null_map_col);
+    }
+
     /// Check nullability.
     bool is_array_of_nullable = false;
-
-    const ColumnMap * col_map = checkAndGetColumn<ColumnMap>(arguments[0].column.get());
-    if (col_map)
-        return executeMap(arguments, result_type, input_rows_count);
-
     const ColumnArray * col_array = nullptr;
     const ColumnArray * col_const_array = nullptr;
 
-    col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
+    col_array = checkAndGetColumn<ColumnArray>(tmp_args[0].column.get());
     if (col_array)
+    {
         is_array_of_nullable = isColumnNullable(col_array->getData());
+    }
     else
     {
-        col_const_array = checkAndGetColumnConstData<ColumnArray>(arguments[0].column.get());
+        col_const_array = checkAndGetColumnConstData<ColumnArray>(tmp_args[0].column.get());
         if (col_const_array)
             is_array_of_nullable = isColumnNullable(col_const_array->getData());
         else
             throw Exception("Illegal column " + arguments[0].column->getName()
-            + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN);
+                    + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN);
     }
 
-    if (!is_array_of_nullable)
+    if (!is_array_of_nullable && !is_mysql)
     {
         ArrayImpl::NullMapBuilder builder;
         return perform(arguments, result_type, builder, input_rows_count);
     }
-    else
+    else if (is_array_of_nullable)
     {
         /// Perform initializations.
         ArrayImpl::NullMapBuilder builder;
         ColumnsWithTypeAndName source_columns;
 
         const DataTypePtr & input_type = typeid_cast<const DataTypeNullable &>(
-            *typeid_cast<const DataTypeArray &>(*arguments[0].type).getNestedType()).getNestedType();
+            *typeid_cast<const DataTypeArray &>(*tmp_args[0].type).getNestedType()).getNestedType();
 
-        DataTypePtr tmp_ret_type = removeNullable(result_type);
+        DataTypePtr tmp_ret_type = removeNullable(tmp_result_type);
 
         if (col_array)
         {
@@ -1106,10 +1187,10 @@ ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & argum
                     std::make_shared<DataTypeArray>(input_type),
                     ""
                 },
-                arguments[1],
+                tmp_args[1],
             };
 
-            builder.initSource(nullable_col.getNullMapData().data());
+            builder.initSource(nullable_col.getNullMapData().data(), is_mysql);
         }
         else
         {
@@ -1124,16 +1205,37 @@ ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & argum
                     std::make_shared<DataTypeArray>(input_type),
                     ""
                 },
-                arguments[1],
+                tmp_args[1],
             };
 
-            builder.initSource(nullable_col.getNullMapData().data());
+            builder.initSource(nullable_col.getNullMapData().data(), is_mysql);
         }
 
-        auto res = perform(source_columns, tmp_ret_type, builder, input_rows_count);
+        builder.initSink(input_rows_count, index_null_map_col);
 
-        /// Store the result.
-        return ColumnNullable::create(res, builder ? std::move(builder).getNullMapColumnPtr() : ColumnUInt8::create());
+        auto res = perform(source_columns, tmp_ret_type, builder, input_rows_count);
+        res = ColumnNullable::create(res, builder ? std::move(builder).getNullMapColumnPtr() : ColumnUInt8::create());
+
+        if (null_presence.has_nullable)
+            /// apply the null map from the original arguments
+            return wrapInNullable(res, arguments, result_type, input_rows_count);
+        else
+            return res;
+    }
+    else
+    {
+        ArrayImpl::NullMapBuilder builder;
+        builder.initSource(nullptr, is_mysql);
+        builder.initSink(input_rows_count, index_null_map_col);
+
+        auto res = perform(tmp_args, tmp_result_type, builder, input_rows_count);
+        res = ColumnNullable::create(res, builder ? std::move(builder).getNullMapColumnPtr() : ColumnUInt8::create());
+
+        if (null_presence.has_nullable)
+            /// apply the null map from the original arguments
+            return wrapInNullable(res, arguments, result_type, input_rows_count);
+        else
+            return res;
     }
 }
 
@@ -1160,9 +1262,6 @@ ColumnPtr FunctionArrayElement::perform(const ColumnsWithTypeAndName & arguments
     {
         Field index = (*arguments[1].column)[0];
 
-        if (builder)
-            builder.initSink(input_rows_count);
-
         if (index == 0u)
             throw Exception("Array indices are 1-based", ErrorCodes::ZERO_ARRAY_OR_TUPLE_INDEX);
 
@@ -1187,9 +1286,10 @@ ColumnPtr FunctionArrayElement::perform(const ColumnsWithTypeAndName & arguments
 }
 
 
-void registerFunctionArrayElement(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayElement)
 {
     factory.registerFunction<FunctionArrayElement>();
+    factory.registerAlias("element_at", FunctionArrayElement::name, FunctionFactory::CaseInsensitive);
 }
 
 }

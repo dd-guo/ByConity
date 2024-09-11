@@ -19,6 +19,7 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <Disks/IDisk.h>
 #if !defined(ARCADIA_BUILD)
     #include <Common/config.h>
 #endif
@@ -33,6 +34,7 @@
 
 #include <aws/core/client/DefaultRetryStrategy.h> // Y_IGNORE
 #include <IO/S3Common.h>
+#include <IO/S3/AWSOptionsConfig.h>
 #include "DiskS3.h"
 #include "Disks/DiskCacheWrapper.h"
 #include "Storages/StorageS3Settings.h"
@@ -60,7 +62,7 @@ void checkWriteAccess(IDisk & disk)
 
 void checkReadAccess(const String & disk_name, IDisk & disk)
 {
-    auto file = disk.readFile("test_acl", {.buffer_size = DBMS_DEFAULT_BUFFER_SIZE});
+    auto file = disk.readFile("test_acl", ReadSettings().initializeReadSettings(4));
     String buf(4, '0');
     file->readStrict(buf.data(), 4);
     if (buf != "test")
@@ -134,25 +136,30 @@ std::shared_ptr<S3::ProxyConfiguration> getProxyConfiguration(const String & pre
 std::shared_ptr<Aws::S3::S3Client>
 getClient(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, ContextPtr context)
 {
-    S3::PocoHTTPClientConfiguration client_configuration = S3::ClientFactory::instance().createClientConfiguration(
+    std::shared_ptr<Aws::Client::ClientConfiguration> client_configuration = S3::ClientFactory::instance().createClientConfiguration(
         config.getString(config_prefix + ".region", ""),
-        context->getRemoteHostFilter(), context->getGlobalContext()->getSettingsRef().s3_max_redirects);
+        context->getRemoteHostFilter(), context->getGlobalContext()->getSettingsRef().s3_max_redirects,
+        config.getUInt(config_prefix + ".http_keep_alive_timeout_ms", 5000),
+        config.getUInt(config_prefix + ".http_connection_pool_size", 1024), false);
 
     S3::URI uri(Poco::URI(config.getString(config_prefix + ".endpoint")));
     if (uri.key.back() != '/')
         throw Exception("S3 path must ends with '/', but '" + uri.key + "' doesn't.", ErrorCodes::BAD_ARGUMENTS);
 
-    client_configuration.connectTimeoutMs = config.getUInt(config_prefix + ".connect_timeout_ms", 10000);
-    client_configuration.requestTimeoutMs = config.getUInt(config_prefix + ".request_timeout_ms", 5000);
-    client_configuration.maxConnections = config.getUInt(config_prefix + ".max_connections", 100);
-    client_configuration.endpointOverride = uri.endpoint;
+    client_configuration->connectTimeoutMs = config.getUInt(config_prefix + ".connect_timeout_ms", 10000);
+    client_configuration->requestTimeoutMs = config.getUInt(config_prefix + ".request_timeout_ms", 5000);
+    client_configuration->maxConnections = config.getUInt(config_prefix + ".max_connections", 100);
+    client_configuration->endpointOverride = uri.endpoint;
 
     auto proxy_config = getProxyConfiguration(config_prefix, config);
-    if (proxy_config)
-        client_configuration.perRequestConfiguration
+    if (proxy_config && !DB::S3::AWSOptionsConfig::instance().use_crt_http_client) {
+        std::shared_ptr<DB::S3::PocoHTTPClientConfiguration> poco_config =
+            std::static_pointer_cast<DB::S3::PocoHTTPClientConfiguration>(client_configuration);
+        poco_config->per_request_configuration
             = [proxy_config](const auto & request) { return proxy_config->getConfiguration(request); };
+    }
 
-    client_configuration.retryStrategy
+    client_configuration->retryStrategy
         = std::make_shared<Aws::Client::DefaultRetryStrategy>(config.getUInt(config_prefix + ".retry_attempts", 10));
 
     return S3::ClientFactory::instance().create(
@@ -162,8 +169,13 @@ getClient(const Poco::Util::AbstractConfiguration & config, const String & confi
         config.getString(config_prefix + ".secret_access_key", ""),
         config.getString(config_prefix + ".server_side_encryption_customer_key_base64", ""),
         {},
-        config.getBool(config_prefix + ".use_environment_credentials", config.getBool("s3.use_environment_credentials", false)),
-        config.getBool(config_prefix + ".use_insecure_imds_request", config.getBool("s3.use_insecure_imds_request", false)));
+        S3::CredentialsConfiguration
+        {
+            config.getBool(config_prefix + ".use_environment_credentials", config.getBool("s3.use_environment_credentials", true)),
+            config.getBool(config_prefix + ".use_insecure_imds_request", config.getBool("s3.use_insecure_imds_request", false)),
+            config.getUInt64(config_prefix + ".expiration_window_seconds", config.getUInt64("s3.expiration_window_seconds", S3::DEFAULT_EXPIRATION_WINDOW_SECONDS)),
+            config.getBool(config_prefix + ".no_sign_request", config.getBool("s3.no_sign_request", false))
+        });
 }
 
 std::unique_ptr<DiskS3Settings> getSettings(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, ContextPtr context)
@@ -223,7 +235,7 @@ void registerDiskS3(DiskFactory & factory)
             if (metadata_path == cache_path)
                 throw Exception("Metadata and cache path should be different: " + metadata_path, ErrorCodes::BAD_ARGUMENTS);
 
-            auto cache_disk = std::make_shared<DiskLocal>("s3-cache", cache_path, 0);
+            auto cache_disk = std::make_shared<DiskLocal>("s3-cache", cache_path, DiskStats{});
             auto cache_file_predicate = [] (const String & path)
             {
                 return path.ends_with("idx") // index files.

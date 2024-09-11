@@ -73,7 +73,10 @@ MergingAggregatedStep::MergingAggregatedStep(
     bool memory_efficient_aggregation_,
     size_t max_threads_,
     size_t memory_efficient_merge_threads_)
-    : ITransformingStep(input_stream_, appendGroupingColumns(params_->getHeader(), groupings_), getTraits(!(params_->final) && memory_efficient_aggregation_))
+    : ITransformingStep(
+        input_stream_,
+        appendGroupingColumns(params_->getCustomHeader(params_->final), groupings_),
+        getTraits(!(params_->final) && memory_efficient_aggregation_))
     , keys(std::move(keys_))
     , grouping_sets_params(std::move(grouping_sets_params_))
     , groupings(std::move(groupings_))
@@ -81,8 +84,17 @@ MergingAggregatedStep::MergingAggregatedStep(
     , memory_efficient_aggregation(memory_efficient_aggregation_)
     , max_threads(max_threads_)
     , memory_efficient_merge_threads(memory_efficient_merge_threads_)
-    , should_produce_results_in_order_of_bucket_number (!(params->final) && memory_efficient_aggregation)
+    , should_produce_results_in_order_of_bucket_number(!(params->final) && memory_efficient_aggregation)
 {
+    NameSet output_names;
+    for (const auto & key : keys)
+        if (!output_names.emplace(key).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "duplicate group by key: {}", key);
+
+    for (const auto & aggregate : params->params.aggregates)
+        if (!output_names.emplace(aggregate.column_name).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "duplicate aggreagte function output name: {}", aggregate.column_name);
+
     /// Aggregation keys are distinct
     for (auto key : params->params.keys)
         output_stream->distinct_columns.insert(params->params.intermediate_header.getByPosition(key).name);
@@ -97,7 +109,31 @@ void MergingAggregatedStep::setInputStreams(const DataStreams & input_streams_)
 
 void MergingAggregatedStep::transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings & build_settings)
 {
-    if (!memory_efficient_aggregation)
+    if (hasNonParallelAggregateFunctions(params->params.aggregates))
+    {
+        pipeline.resize(1);
+    }
+
+    // optimizer use MergingAggregateStep in by-name style, regenerate aggregator params of by-position style
+    if (!keys.empty())
+    {
+        ColumnNumbers key_positions;
+        const auto & header = pipeline.getHeader();
+        for (const auto & key : keys)
+            key_positions.emplace_back(header.getPositionByName(key));
+
+        Aggregator::Params new_params(
+            header,
+            key_positions,
+            params->params.aggregates,
+            params->params.overflow_row,
+            build_settings.context->getSettingsRef().max_threads);
+        params = std::make_shared<AggregatingTransformParams>(new_params, params->final);
+    }
+
+    // @FIXME: grouping sets + two-level aggregation is incompatible with memory efficient merge
+    // see also: https://meego.feishu.cn/clickhousech/story/detail/14744099
+    if (!memory_efficient_aggregation || input_streams.front().header.has("__grouping_set"))
     {
         /// We union several sources into one, paralleling the work.
         pipeline.resize(1);
@@ -132,81 +168,57 @@ void MergingAggregatedStep::describeActions(JSONBuilder::JSONMap & map) const
     params->params.explain(map);
 }
 
-void MergingAggregatedStep::serialize(WriteBuffer & buf) const
+void MergingAggregatedStep::toProto(Protos::MergingAggregatedStep & proto, bool) const
 {
-    IQueryPlanStep::serializeImpl(buf);
-    serializeAggregatingTransformParams(params, buf);
-    writeBinary(memory_efficient_aggregation, buf);
-    writeBinary(max_threads, buf);
-    writeBinary(memory_efficient_merge_threads, buf);
+    ITransformingStep::serializeToProtoBase(*proto.mutable_query_plan_base());
+    for (const auto & element : keys)
+        proto.add_keys(element);
+    for (const auto & element : grouping_sets_params)
+        element.toProto(*proto.add_grouping_sets_params());
+    for (const auto & element : groupings)
+        element.toProto(*proto.add_groupings());
 
-    serializeStrings(keys, buf);
-
-    writeVarUInt(groupings.size(), buf);
-    for (const auto & item : groupings)
-    {
-        writeBinary(item.argument_names, buf);
-        writeStringBinary(item.output_name, buf);
-    }
-
-    writeVarUInt(grouping_sets_params.size(), buf);
-    for (const auto & grouping_sets_param : grouping_sets_params)
-    {
-        writeBinary(grouping_sets_param.used_key_names, buf);
-        writeBinary(grouping_sets_param.used_keys, buf);
-        writeBinary(grouping_sets_param.missing_keys, buf);
-    }
+    if (!params)
+        throw Exception("params cannot be nullptr", ErrorCodes::LOGICAL_ERROR);
+    params->toProto(*proto.mutable_params());
+    proto.set_memory_efficient_aggregation(memory_efficient_aggregation);
+    proto.set_max_threads(max_threads);
+    proto.set_memory_efficient_merge_threads(memory_efficient_merge_threads);
 }
 
-QueryPlanStepPtr MergingAggregatedStep::deserialize(ReadBuffer & buf, ContextPtr context)
+std::shared_ptr<MergingAggregatedStep> MergingAggregatedStep::fromProto(const Protos::MergingAggregatedStep & proto, ContextPtr context)
 {
-    String step_description;
-    readBinary(step_description, buf);
-
-    DataStream input_stream = deserializeDataStream(buf);
-
-    auto transform_params = deserializeAggregatingTransformParams(buf, context);
-
-    bool memory_efficient_aggregation;
-    readBinary(memory_efficient_aggregation, buf);
-
-    size_t max_threads, memory_efficient_merge_threads;
-    readBinary(max_threads, buf);
-    readBinary(memory_efficient_merge_threads, buf);
-
-    auto keys = deserializeStrings(buf);
-
-    size_t size;
-    readVarUInt(size, buf);
-    GroupingDescriptions groupings;
-    for (size_t i = 0; i < size; ++i)
-    {
-        GroupingDescription item;
-        readBinary(item.argument_names, buf);
-        readStringBinary(item.output_name, buf);
-        groupings.emplace_back(std::move(item));
-    }
-
-    readVarUInt(size, buf);
+    auto [step_description, base_input_stream] = ITransformingStep::deserializeFromProtoBase(proto.query_plan_base());
+    Names keys;
+    for (const auto & element : proto.keys())
+        keys.emplace_back(element);
     GroupingSetsParamsList grouping_sets_params;
-    for (size_t i = 0; i < size; ++i)
+    for (const auto & proto_element : proto.grouping_sets_params())
     {
-        GroupingSetsParams param;
-        readBinary(param.used_key_names, buf);
-        readBinary(param.used_keys, buf);
-        readBinary(param.missing_keys, buf);
-        grouping_sets_params.emplace_back(param);
+        GroupingSetsParams element;
+        element.fillFromProto(proto_element);
+        grouping_sets_params.emplace_back(std::move(element));
     }
-
-    auto step = std::make_unique<MergingAggregatedStep>(input_stream,
-                                                        std::move(keys),
-                                                        std::move(grouping_sets_params),
-                                                        std::move(groupings),
-                                                        std::move(transform_params),
-                                                        memory_efficient_aggregation,
-                                                        max_threads,
-                                                        memory_efficient_merge_threads);
-
+    GroupingDescriptions groupings;
+    for (const auto & proto_element : proto.groupings())
+    {
+        GroupingDescription element;
+        element.fillFromProto(proto_element);
+        groupings.emplace_back(std::move(element));
+    }
+    auto params = AggregatingTransformParams::fromProto(proto.params(), context);
+    auto memory_efficient_aggregation = proto.memory_efficient_aggregation();
+    auto max_threads = proto.max_threads();
+    auto memory_efficient_merge_threads = proto.memory_efficient_merge_threads();
+    auto step = std::make_shared<MergingAggregatedStep>(
+        base_input_stream,
+        std::move(keys),
+        std::move(grouping_sets_params),
+        std::move(groupings),
+        std::move(params),
+        memory_efficient_aggregation,
+        max_threads,
+        memory_efficient_merge_threads);
     step->setStepDescription(step_description);
     return step;
 }

@@ -33,6 +33,7 @@
 #include <DataStreams/NativeBlockInputStream.h>
 #include <DataStreams/NativeBlockOutputStream.h>
 #include <Client/Connection.h>
+#include "common/types.h"
 #include <Common/ClickHouseRevision.h>
 #include <Common/Exception.h>
 #include <Common/NetException.h>
@@ -43,7 +44,6 @@
 #include <Common/randomSeed.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/DistributedStages/PlanSegment.h>
-#include <Interpreters/CnchQueryMetrics/QueryWorkerMetricLog.h>
 #include <Compression/CompressionFactory.h>
 #include <Processors/Pipe.h>
 #include <Processors/QueryPipeline.h>
@@ -204,9 +204,9 @@ void Connection::sendHello()
         throw Exception("Parameters 'default_database', 'user' and 'password' must not contain ASCII control characters", ErrorCodes::BAD_ARGUMENTS);
 
     writeVarUInt(Protocol::Client::Hello, *out);
-    writeStringBinary((DBMS_NAME " ") + client_name, *out);
-    writeVarUInt(DBMS_VERSION_MAJOR, *out);
-    writeVarUInt(DBMS_VERSION_MINOR, *out);
+    writeStringBinary(std::string(VERSION_NAME) + " " + client_name, *out);
+    writeVarUInt(VERSION_MAJOR, *out);
+    writeVarUInt(VERSION_MINOR, *out);
     // NOTE For backward compatibility of the protocol, client cannot send its version_patch.
     writeVarUInt(DBMS_TCP_PROTOCOL_VERSION, *out);
     writeStringBinary(default_database, *out);
@@ -274,7 +274,7 @@ void Connection::receiveHello()
 
 void Connection::setDefaultDatabase(const String & database)
 {
-    default_database = database;
+    default_database = formatTenantConnectDefaultDatabaseName(database);
 }
 
 const String & Connection::getDefaultDatabase() const
@@ -553,6 +553,7 @@ void Connection::sendQuery(
 }
 
 void Connection::sendCnchQuery(
+    UInt64 primary_txn_id,
     UInt64 txn_id,
     const ConnectionTimeouts & timeouts,
     const String & query,
@@ -590,6 +591,7 @@ void Connection::sendCnchQuery(
     query_id = query_id_;
 
     writeVarUInt(Protocol::Client::CnchQuery, *out);
+    writeIntBinary(primary_txn_id, *out);
     writeIntBinary(txn_id, *out);
     writeStringBinary(query_id, *out);
 
@@ -664,7 +666,8 @@ void Connection::sendPlanSegment(
     const ConnectionTimeouts & timeouts,
     const PlanSegment * plan_segment,
     const Settings * settings,
-    const ClientInfo * client_info)
+    const ClientInfo * client_info,
+    UInt16 server_rpc_port)
 {
      if (!connected)
         connect(timeouts);
@@ -692,9 +695,9 @@ void Connection::sendPlanSegment(
     if (server_revision >= DBMS_MIN_REVISION_WITH_CLIENT_INFO)
     {
         if (client_info && !client_info->empty())
-            client_info->write(*out, server_revision);
+            client_info->write(*out, server_revision, server_rpc_port);
         else
-            ClientInfo().write(*out, server_revision);
+            ClientInfo().write(*out, server_revision, server_rpc_port);
     }
 
     /// Per query settings.
@@ -1020,10 +1023,6 @@ Packet Connection::receivePacket()
                 res.profile_info = receiveProfileInfo();
                 return res;
 
-            case Protocol::Server::QueryMetrics:
-                res.query_worker_metric_elements = receiveQueryWorkerMetrics();
-                return res;
-
             case Protocol::Server::Log:
                 res.block = receiveLogData();
                 return res;
@@ -1171,20 +1170,6 @@ BlockStreamProfileInfo Connection::receiveProfileInfo() const
     BlockStreamProfileInfo profile_info;
     profile_info.read(*in);
     return profile_info;
-}
-
-QueryWorkerMetricElements Connection::receiveQueryWorkerMetrics()
-{
-    QueryWorkerMetricElements elements;
-    size_t num;
-    readVarUInt(num, *in);
-    for (size_t i = 0; i < num; ++i)
-    {
-        QueryWorkerMetricElement element;
-        element.read(*in);
-        elements.emplace_back(std::make_shared<QueryWorkerMetricElement>(element));
-    }
-    return elements;
 }
 
 void Connection::throwUnexpectedPacket(UInt64 packet_type, const char * expected) const

@@ -38,6 +38,16 @@ void ASTQueryWithOutput::cloneOutputOptions(ASTQueryWithOutput & cloned) const
         cloned.format = format->clone();
         cloned.children.push_back(cloned.format);
     }
+    if (compression_method)
+    {
+        cloned.compression_method = compression_method->clone();
+        cloned.children.push_back(cloned.compression_method);
+    }
+    if (compression_level)
+    {
+        cloned.compression_level= compression_level->clone();
+        cloned.children.push_back(cloned.compression_level);
+    }
     if (settings_ast)
     {
         cloned.settings_ast = settings_ast->clone();
@@ -45,10 +55,8 @@ void ASTQueryWithOutput::cloneOutputOptions(ASTQueryWithOutput & cloned) const
     }
 }
 
-void ASTQueryWithOutput::formatImpl(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const
+void ASTQueryWithOutput::formatOutput(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const
 {
-    formatQueryImpl(s, state, frame);
-
     std::string indent_str = s.one_line ? "" : std::string(4u * frame.indent, ' ');
 
     if (out_file)
@@ -63,11 +71,30 @@ void ASTQueryWithOutput::formatImpl(const FormatSettings & s, FormatState & stat
         format->formatImpl(s, state, frame);
     }
 
+    if (compression_method)
+    {
+        s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "COMPRESSION " << (s.hilite ? hilite_none : "");
+        compression_method->formatImpl(s, state, frame);
+    }
+
+    if (compression_level)
+    {
+        s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "LEVEL " << (s.hilite ? hilite_none : "");
+        compression_level->formatImpl(s, state, frame);
+    }
+
     if (settings_ast)
     {
         s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "SETTINGS " << (s.hilite ? hilite_none : "");
         settings_ast->formatImpl(s, state, frame);
     }
+}
+
+void ASTQueryWithOutput::formatImpl(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const
+{
+    formatQueryImpl(s, state, frame);
+
+    formatOutput(s, state, frame);
 }
 
 bool ASTQueryWithOutput::resetOutputASTIfExist(IAST & ast)
@@ -77,6 +104,8 @@ bool ASTQueryWithOutput::resetOutputASTIfExist(IAST & ast)
     {
         ast_with_output->format.reset();
         ast_with_output->out_file.reset();
+        ast_with_output->compression_method.reset();
+        ast_with_output->compression_level.reset();
         ast_with_output->settings_ast.reset();
         return true;
     }
@@ -88,6 +117,8 @@ void ASTQueryWithOutput::serialize(WriteBuffer & buf) const
 {
     serializeAST(out_file, buf);
     serializeAST(format, buf);
+    serializeAST(compression_method, buf);
+    serializeAST(compression_level, buf);
     serializeAST(settings_ast, buf);
 }
 
@@ -95,6 +126,8 @@ void ASTQueryWithOutput::deserializeImpl(ReadBuffer & buf)
 {
     out_file = deserializeASTWithChildren(children, buf);
     format = deserializeASTWithChildren(children, buf);
+    compression_method = deserializeASTWithChildren(children, buf);
+    compression_level = deserializeASTWithChildren(children, buf);
     settings_ast = deserializeASTWithChildren(children, buf);
 }
 

@@ -30,9 +30,19 @@ ICnchBGThread::ICnchBGThread(ContextPtr global_context_, CnchBGThreadType thread
     , storage_id(storage_id_)
     , catalog(global_context_->getCnchCatalog())
     , log(&Poco::Logger::get(storage_id.getNameForLogs() + "(" + toString(thread_type) + ")"))
-    , scheduled_task(global_context_->getSchedulePool().createTask(log->name(), [this] { run(); }))
     , startup_time(time(nullptr))
 {
+    switch (thread_type)
+    {
+        case CnchBGThreadType::MergeMutate:
+            scheduled_task = global_context_->getMergeSelectSchedulePool().createTask(log->name(), [this] { run(); });
+            break;
+        case CnchBGThreadType::Consumer:
+            scheduled_task = global_context_->getConsumeSchedulePool().createTask(log->name(), [this] { run(); });
+            break;
+        default:
+            scheduled_task = global_context_->getSchedulePool().createTask(log->name(), [this] { run(); });
+    }
 }
 
 ICnchBGThread::~ICnchBGThread()
@@ -49,15 +59,16 @@ ICnchBGThread::~ICnchBGThread()
 
 void ICnchBGThread::start()
 {
-    LOG_TRACE(log, "Starting");
     /// FIXME
     preStart();
+    LOG_DEBUG(log, "Starting {} for {} {}", toString(thread_type), (storage_id.isDatabase()? "database": "table"), storage_id.getNameForLogs());
+    thread_status = CnchBGThread::Running;
     scheduled_task->activateAndSchedule();
 }
 
 void ICnchBGThread::wakeup()
 {
-    LOG_DEBUG(log, "Waking up");
+    LOG_DEBUG(log, "Waking up {} for {} {}", toString(thread_type), (storage_id.isDatabase()? "database": "table"), storage_id.getNameForLogs());
 
     {
         std::lock_guard lock(wakeup_mutex);
@@ -73,16 +84,21 @@ void ICnchBGThread::wakeup()
         std::unique_lock lock(wakeup_mutex);
         wakeup_cv.wait(lock);
         if (wakeup_finished)
+        {
+            thread_status = CnchBGThread::Running;
             break;
+        }
     }
 
-    LOG_DEBUG(log, "Woke up");
+    LOG_DEBUG(log, "Woke up {} for {} {}", toString(thread_type), (storage_id.isDatabase()? "database": "table"), storage_id.getNameForLogs());
 }
 
 void ICnchBGThread::stop()
 {
-    LOG_TRACE(log, "Stopping");
+    LOG_DEBUG(log, "Stopping {} for {} {}", toString(thread_type), (storage_id.isDatabase()? "database": "table"), storage_id.getNameForLogs());
     scheduled_task->deactivate();
+    thread_status = CnchBGThread::Stopped;
+    clearData();
 }
 
 void ICnchBGThread::run()
@@ -151,7 +167,7 @@ TxnTimestamp ICnchBGThread::calculateMinActiveTimestamp() const
     {
         try
         {
-            if (auto ts = c->getMinActiveTimestamp(storage_id))
+            if (auto ts = c->getMinActiveTimestamp(storage_id); ts && ts.value())
                 min_active_ts = std::min(*ts, min_active_ts);
         }
         catch (...)

@@ -19,26 +19,47 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <cstddef>
 #include <Parsers/formatAST.h>
 
 
 namespace DB
 {
 
-void formatAST(const IAST & ast, WriteBuffer & buf, bool hilite, bool one_line, bool always_quote_identifiers)
+void formatAST(const IAST & ast, WriteBuffer & buf, bool hilite, bool one_line, bool always_quote_identifiers, DialectType dialect)
 {
     IAST::FormatSettings settings(buf, one_line);
     settings.hilite = hilite;
     settings.always_quote_identifiers = always_quote_identifiers;
+    settings.dialect_type = dialect;
 
     ast.format(settings);
 }
 
-String serializeAST(const IAST & ast, bool one_line)
+String serializeAST(const IAST & ast, bool one_line, bool always_quote_identifiers)
 {
     WriteBufferFromOwnString buf;
-    formatAST(ast, buf, false, one_line);
+    formatAST(ast, buf, false, one_line, always_quote_identifiers);
     return buf.str();
+}
+
+String serializeASTWithOutAlias(const IAST & ast)
+{
+    WriteBufferFromOwnString buf;
+    IAST::FormatSettings settings(buf, true);
+    settings.hilite = false;
+    settings.without_alias = true;
+    ast.format(settings);
+    return buf.str();
+}
+
+String getSerializedASTWithLimit(const IAST & ast, size_t max_text_length)
+{
+    String res = serializeAST(ast);
+    if (res.size() <= max_text_length)
+        return res;
+    else
+        return res.substr(0, max_text_length);
 }
 
 }

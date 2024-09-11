@@ -62,13 +62,15 @@ BGJobInfos DaemonManagerClient::getAllBGThreadServers(CnchBGThreadType type)
     return res;
 }
 
-std::optional<BGJobInfo> DaemonManagerClient::getDMBGJobInfo(const UUID & storage_uuid, CnchBGThreadType type)
+std::optional<BGJobInfo> DaemonManagerClient::getDMBGJobInfo(const UUID & storage_uuid, CnchBGThreadType type, String query_id)
 {
     brpc::Controller cntl;
     Protos::GetDMBGJobInfoReq req;
     Protos::GetDMBGJobInfoResp resp;
     RPCHelpers::fillUUID(storage_uuid, *req.mutable_storage_uuid());
     req.set_job_type(type);
+    if (!query_id.empty())
+        req.set_query_id(std::move(query_id));
     stub_ptr->GetDMBGJobInfo(&cntl, &req, &resp, nullptr);
     assertController(cntl);
     RPCHelpers::checkResponse(resp);
@@ -84,15 +86,20 @@ std::optional<BGJobInfo> DaemonManagerClient::getDMBGJobInfo(const UUID & storag
     };
 }
 
-void DaemonManagerClient::controlDaemonJob(const StorageID & storage_id, CnchBGThreadType job_type, CnchBGThreadAction action)
+void DaemonManagerClient::controlDaemonJob(const StorageID & storage_id, CnchBGThreadType job_type, CnchBGThreadAction action, String query_id)
 {
     brpc::Controller cntl;
     Protos::ControlDaemonJobReq req;
     Protos::ControlDaemonJobResp resp;
 
-    RPCHelpers::fillStorageID(storage_id, *req.mutable_storage_id());
+    if (!storage_id.empty())
+        RPCHelpers::fillStorageID(storage_id, *req.mutable_storage_id());
+    else
+        cntl.set_timeout_ms(360 * 1000);
     req.set_job_type(job_type);
     req.set_action(action);
+    if (!query_id.empty())
+        req.set_query_id(std::move(query_id));
 
     stub_ptr->ControlDaemonJob(&cntl, &req, &resp, nullptr);
 

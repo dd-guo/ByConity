@@ -46,6 +46,7 @@ public:
 
     explicit FunctionCaseWithExpression(ContextPtr context_) : context(context_) {}
     bool isVariadic() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
     String getName() const override { return name; }
     bool useDefaultImplementationForNulls() const override { return false; }
@@ -76,7 +77,7 @@ public:
             types_of_conditions.emplace_back(arg);
         });
 
-        auto condition_super_type = getLeastSupertype(types_of_conditions);
+        auto condition_super_type = getLeastSupertypeOrString(types_of_conditions);
 
         DataTypes types_of_branches;
         types_of_branches.reserve(args.size() / 2);
@@ -85,7 +86,7 @@ public:
             types_of_branches.emplace_back(arg);
         });
 
-        return getLeastSupertype(types_of_branches);
+        return getLeastSupertypeOrString(types_of_branches);
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count) const override
@@ -100,19 +101,24 @@ public:
 
         auto multi_if = FunctionFactory::instance().get("multiIf", context);
         auto equals = FunctionFactory::instance().get("equals", context);
+        auto is_null = FunctionFactory::instance().get("isNull", context);
         auto eq_type = std::make_shared<DataTypeUInt8>();
 
         ColumnsWithTypeAndName eq_args(2);
+        eq_args[0] = args[0];
         ColumnsWithTypeAndName v;
 
-        eq_args[0] =args[0]; /* push expr */
+        ColumnsWithTypeAndName is_null_args(1);
+        is_null_args[0] = args[0];
         v.reserve(args.size() - 1);
 
         /* prepare (expr = caseX, thenX) pair */
         for (size_t i = 1; i < args.size() - 1; i += 2) {
             eq_args[1] = args[i]; /* push current case */
-
-            v.push_back({equals->build(eq_args)->execute(eq_args, eq_type, input_rows_count), eq_type, ""});
+            if (eq_args[1].name == "NULL" && eq_args[1].type->getName() == "Nullable(Nothing)")
+                v.push_back({is_null->build(is_null_args)->execute(is_null_args, eq_type, input_rows_count), eq_type, ""});
+            else
+                v.push_back({equals->build(eq_args)->execute(eq_args, eq_type, input_rows_count), eq_type, ""});
             v.push_back(args[i + 1]);
         }
 
@@ -128,7 +134,7 @@ private:
 
 }
 
-void registerFunctionCaseWithExpression(FunctionFactory & factory)
+REGISTER_FUNCTION(CaseWithExpression)
 {
     factory.registerFunction<FunctionCaseWithExpression>();
 

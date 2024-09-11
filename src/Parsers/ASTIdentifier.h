@@ -36,10 +36,10 @@ struct IdentifierSemanticImpl;
 struct StorageID;
 
 class ASTTableIdentifier;
+class Context;
 
 /// FIXME: rewrite code about params - they should be substituted at the parsing stage,
 ///        or parsed as a separate AST entity.
-
 /// Generic identifier. ASTTableIdentifier - for table identifier.
 class ASTIdentifier : public ASTWithAlias
 {
@@ -81,12 +81,26 @@ public:
     void deserializeImpl(ReadBuffer & buf) override;
     static ASTPtr deserialize(ReadBuffer & buf);
 
+    void toLowerCase() override;
+
+    void toUpperCase() override;
+
+    /// All the global identifiers will be rewritten in multi-tenant context settings.
+    /// Todo: we will rewrite all the global identifiers one by one: database name, user name, vw name...
+    virtual void rewriteCnchDatabaseName(const Context * context = nullptr);
+
+    virtual void appendCatalogName(const std::string& catalog_name);
+
+    virtual void appendTenantId(const Context * context, bool is_datbase_name);
+
     String full_name;
     std::vector<String> name_parts;
     std::shared_ptr<IdentifierSemanticImpl> semantic; /// pimpl
-
+    bool cnch_rewritten = false;
+    bool cnch_append_catalog = false;
     void formatImplWithoutAlias(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
     void appendColumnNameImpl(WriteBuffer & ostr) const override;
+    void resetFullName();
 
 private:
     using ASTWithAlias::children; /// ASTIdentifier is child free
@@ -95,7 +109,6 @@ private:
     friend struct IdentifierSemantic;
     friend void setIdentifierSpecial(ASTPtr & ast);
 
-    void resetFullName();
 };
 
 class ASTTableIdentifier : public ASTIdentifier
@@ -116,6 +129,7 @@ public:
 
     StorageID getTableId() const;
     String getDatabaseName() const;
+    String getTableName() const;
 
     // FIXME: used only when it's needed to rewrite distributed table name to real remote table name.
     void resetTable(const String & database_name, const String & table_name);  // TODO(ilezhankin): get rid of this
@@ -125,6 +139,12 @@ public:
     void serialize(WriteBuffer & buf) const override;
     void deserializeImpl(ReadBuffer & buf) override;
     static ASTPtr deserialize(ReadBuffer & buf);
+
+    // void rewriteCnchDatabaseOrCatalog(const Context *context) override;
+    void rewriteCnchDatabaseName(const Context * context = nullptr) override;
+    virtual void appendCatalogName(const std::string& catalog_name) override;
+    virtual void appendTenantId(const Context * context, bool is_datbase_name) override;
+
 };
 
 
@@ -135,9 +155,14 @@ void setIdentifierSpecial(ASTPtr & ast);
 String getIdentifierName(const IAST * ast);
 std::optional<String> tryGetIdentifierName(const IAST * ast);
 bool tryGetIdentifierNameInto(const IAST * ast, String & name);
+void tryRewriteCnchDatabaseName(ASTPtr & ast_database, const Context *context);
+void tryAppendCatalogName(ASTPtr & ast_catalog, ASTPtr & ast_database);
+void tryRewriteHiveCatalogName(ASTPtr & ast_catalog, const Context *context);
+// void tryRewriteCnchDatabaseOrCatalog(ASTPtr & ast, const Context *context);
 
 inline String getIdentifierName(const ASTPtr & ast) { return getIdentifierName(ast.get()); }
 inline std::optional<String> tryGetIdentifierName(const ASTPtr & ast) { return tryGetIdentifierName(ast.get()); }
 inline bool tryGetIdentifierNameInto(const ASTPtr & ast, String & name) { return tryGetIdentifierNameInto(ast.get(), name); }
 
+inline std::shared_ptr<ASTIdentifier> makeASTIdentifier(const String & name) { return std::make_shared<ASTIdentifier>(name); }
 }

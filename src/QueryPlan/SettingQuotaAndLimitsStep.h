@@ -51,9 +51,6 @@ public:
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
-    void serialize(WriteBuffer & buf) const override;
-
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr context);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 

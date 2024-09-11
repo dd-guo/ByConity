@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Interpreters/SystemLog.h>
+#include "common/types.h"
 
 
 namespace DB
@@ -16,12 +17,15 @@ struct PartLogElement
         REMOVE_PART = 4,
         MUTATE_PART = 5,
         MOVE_PART = 6,
+        PRELOAD_PART = 7,
+        DROPCACHE_PART = 8,
     };
 
     String query_id;
 
     Type event_type = NEW_PART;
 
+    time_t start_time = 0;
     time_t event_time = 0;
     Decimal64 event_time_microseconds = 0;
     UInt64 duration_ms = 0;
@@ -30,10 +34,13 @@ struct PartLogElement
     String table_name;
     String part_name;
     String partition_id;
+    String partition;
     String path_on_disk;
 
     /// Size of the part
     UInt64 rows = 0;
+    UInt64 segments = 0;
+    UInt64 preload_level = 0;
 
     /// Size of files in filesystem
     UInt64 bytes_compressed_on_disk = 0;
@@ -74,6 +81,8 @@ public:
                            const ExecutionStatus & execution_status = {});
     static bool addNewParts(ContextPtr context, const MutableDataPartsVector & parts, UInt64 elapsed_ns,
                             const ExecutionStatus & execution_status = {});
+    static PartLogElement createElement(PartLogElement::Type event_type, const IMergeTreeDataPartPtr & part,
+                            UInt64 elapsed_ns = 0, const String & exception = "", UInt64 submit_ts = 0, UInt64 segments = 0, UInt64 preload_level = 0);
 };
 
 }

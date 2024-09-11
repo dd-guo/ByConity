@@ -16,6 +16,7 @@
 #include <common/getPageSize.h>
 
 #include <Common/Exception.h>
+#include <Common/JeprofControl.h>
 #include <Common/randomSeed.h>
 #include <Common/formatReadable.h>
 
@@ -174,18 +175,31 @@ private:
     {
         void * ptr;
         size_t size;
+        bool use_mmap_directly {true};
 
         Chunk(size_t size_, void * address_hint) : size(size_)
         {
-            ptr = mmap(address_hint, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (MAP_FAILED == ptr)
-                DB::throwFromErrno(fmt::format("Allocator: Cannot mmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+            if (use_mmap_directly = DB::canUseMmapDirectly(); !use_mmap_directly)
+            {
+                ptr = ::malloc(size);
+            }
+            else
+            {
+                ptr = mmap(address_hint, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (MAP_FAILED == ptr)
+                    DB::throwFromErrno(fmt::format("Allocator: Cannot mmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY);
+            }
         }
 
         ~Chunk()
         {
-            if (ptr && 0 != munmap(ptr, size))
-                DB::throwFromErrno(fmt::format("Allocator: Cannot munmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_MUNMAP);
+            if (ptr)
+            {
+                if (!use_mmap_directly)
+                    ::free(ptr)
+                else if (0 != munmap(ptr, size))
+                    DB::throwFromErrno(fmt::format("Allocator: Cannot munmap {}.", ReadableSize(size)), DB::ErrorCodes::CANNOT_MUNMAP);
+            }
         }
 
         Chunk(Chunk && other) : ptr(other.ptr), size(other.size)

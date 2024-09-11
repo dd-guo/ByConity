@@ -2,6 +2,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/IFunctionMySql.h>
 #include <common/find_symbols.h>
 
 
@@ -21,10 +22,14 @@ class FunctionRegexpQuoteMeta : public IFunction
 public:
     static constexpr auto name = "regexpQuoteMeta";
 
-    static FunctionPtr create(ContextPtr)
+    static FunctionPtr create(ContextPtr context)
     {
+        if (context && context->getSettingsRef().enable_implicit_arg_type_convert)
+            return std::make_shared<IFunctionMySql>(std::make_unique<FunctionRegexpQuoteMeta>());
         return std::make_shared<FunctionRegexpQuoteMeta>();
     }
+
+    ArgType getArgumentsType() const override { return ArgType::STRINGS; }
 
     String getName() const override
     {
@@ -40,6 +45,8 @@ public:
     {
         return true;
     }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -110,7 +117,7 @@ public:
 
 }
 
-void registerFunctionRegexpQuoteMeta(FunctionFactory & factory)
+REGISTER_FUNCTION(RegexpQuoteMeta)
 {
     factory.registerFunction<FunctionRegexpQuoteMeta>();
 }

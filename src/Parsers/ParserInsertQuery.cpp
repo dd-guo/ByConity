@@ -30,6 +30,7 @@
 #include <Parsers/ParserWatchQuery.h>
 #include <Parsers/ParserInsertQuery.h>
 #include <Parsers/ParserSetQuery.h>
+#include <Parsers/ParserPartition.h>
 #include <Parsers/InsertQuerySettingsPushDownVisitor.h>
 #include <Common/typeid_cast.h>
 
@@ -46,6 +47,8 @@ namespace ErrorCodes
 bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     ParserKeyword s_insert_into("INSERT INTO");
+    ParserKeyword s_replace_into("REPLACE INTO");
+    ParserKeyword s_insert_overwrite("INSERT OVERWRITE");
     ParserKeyword s_table("TABLE");
     ParserKeyword s_function("FUNCTION");
     ParserToken s_dot(TokenType::Dot);
@@ -56,12 +59,19 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserKeyword s_watch("WATCH");
     ParserKeyword s_with("WITH");
     ParserKeyword s_infile("INFILE");
+    ParserKeyword s_compression("COMPRESSION");
+    ParserKeyword s_partition_by("PARTITION BY");
+    ParserKeyword s_overwrite_partition("PARTITION");
+    ParserPartition parser_overwrite_partition(dt);
     ParserToken s_lparen(TokenType::OpeningRoundBracket);
     ParserToken s_rparen(TokenType::ClosingRoundBracket);
     ParserIdentifier name_p;
     ParserList columns_p(std::make_unique<ParserInsertElement>(dt), std::make_unique<ParserToken>(TokenType::Comma), false);
     ParserFunction table_function_p{dt, false};
+    ParserExpressionWithOptionalAlias exp_elem_p(false, ParserSettings::CLICKHOUSE);
 
+    /// create ASTPtr variables (result of parsing will be put in them).
+    /// They will be used to initialize ASTInsertQuery's fields.
     ASTPtr database;
     ASTPtr table;
     ASTPtr columns;
@@ -70,31 +80,75 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ASTPtr watch;
     ASTPtr table_function;
     ASTPtr in_file;
+    ASTPtr compression;
     ASTPtr settings_ast;
+    ASTPtr partition_by_expr;
+    bool is_overwrite {false};
+    bool is_replace {false};
+    ASTPtr overwrite_partition;
+
     /// Insertion data
     const char * data = nullptr;
 
-    if (!s_insert_into.ignore(pos, expected))
-        return false;
+    // Check for key words `INSERT INTO` or `REPLACE INTO` or `INSERT OVERWRITE`. If it isn't found, the query can't be parsed as insert query.
+    if (s_insert_overwrite.ignore(pos, expected))
+        is_overwrite = true;
+    else if (s_replace_into.ignore(pos, expected))
+        is_replace = true;
+    else
+    {
+        if (!s_insert_into.ignore(pos, expected))
+            return false;
+    }
 
+    // try to find 'TABLE'
     s_table.ignore(pos, expected);
 
+    /// Search for 'FUNCTION'. If this key word is in query, read fields for insertion into 'TABLE FUNCTION'.
+    /// Word table is optional for table functions. (for example, s3 table function)
+    /// Otherwise fill 'TABLE' fields.
     if (s_function.ignore(pos, expected))
     {
+        /// Read function name
         if (!table_function_p.parse(pos, table_function, expected))
             return false;
+
+        /// Support insertion values with partition by.
+        if (s_partition_by.ignore(pos, expected))
+        {
+            if (!exp_elem_p.parse(pos, partition_by_expr, expected))
+                return false;
+        }
     }
     else
     {
+        /// Read one word. It can be table or database name.
         if (!name_p.parse(pos, table, expected))
             return false;
 
+        /// If there is a dot, previous name was database name, 
+        /// so read table name after dot.
         if (s_dot.ignore(pos, expected))
         {
             database = table;
+            tryRewriteCnchDatabaseName(database, pos.getContext());
             if (!name_p.parse(pos, table, expected))
                 return false;
         }
+    }
+
+    /// insert overwrite partition
+    if (is_overwrite && s_overwrite_partition.ignore(pos, expected))
+    {
+        if (!s_lparen.ignore(pos, expected))
+            return false;
+            
+        if (!ParserList{std::make_unique<ParserPartition>(), std::make_unique<ParserToken>(TokenType::Comma), false}.parse(
+                pos, overwrite_partition, expected))
+            return false;
+
+        if (!s_rparen.ignore(pos, expected))
+            return false;
     }
 
     /// Is there a list of columns
@@ -112,10 +166,12 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     /// VALUES or FORMAT or SELECT
     if (s_values.ignore(pos, expected))
     {
+        /// If VALUES is defined in query, everything except setting will be parsed as data
         data = pos->begin;
     }
     else if (s_format.ignore(pos, expected))
     {
+        /// If FORMAT is defined, read format name
         if (!name_p.parse(pos, format, expected))
             return false;
 
@@ -124,9 +180,20 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             if (!ParserStringLiteral().parse(pos, in_file, expected))
                 return false;
         }
+
+        /// Check for 'COMPRESSION' parameter (optional)
+        if (s_compression.ignore(pos, expected))
+        {
+            /// Read compression name. Create parser for this purpose.
+            ParserStringLiteral compression_p;
+            if (!compression_p.parse(pos, compression, expected))
+                return false;
+        }
     }
     else if (s_select.ignore(pos, expected) || s_with.ignore(pos,expected))
     {
+        /// If SELECT is defined, return to position before select and parse
+        /// rest of query as SELECT query.
         pos = before_values;
         ParserSelectWithUnionQuery select_p(dt);
         select_p.parse(pos, select, expected);
@@ -135,10 +202,21 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         if (s_format.ignore(pos, expected) && !name_p.parse(pos, format, expected))
             return false;
     }
+    /// Check if file is a source of data.
     else if (s_infile.ignore(pos, expected))
     {
+        /// Read file name to process it later
         if (!ParserStringLiteral().parse(pos, in_file, expected))
             return false;
+
+        /// Check for 'COMPRESSION' parameter (optional)
+        if (s_compression.ignore(pos, expected))
+        {
+            /// Read compression name. Create parser for this purpose.
+            ParserStringLiteral compression_p;
+            if (!compression_p.parse(pos, compression, expected))
+                return false;
+        }
     }
     else if (s_watch.ignore(pos, expected))
     {
@@ -152,11 +230,14 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     }
     else
     {
+        /// If all previous conditions were false, query is incorrect
         return false;
     }
 
+    /// Read SETTINGS if they are defined
     if (s_settings.ignore(pos, expected))
     {
+        /// Settings are written like SET query, so parse them with ParserSetQuery
         ParserSetQuery parser_settings(true);
         if (!parser_settings.parse(pos, settings_ast, expected))
             return false;
@@ -169,13 +250,14 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         InsertQuerySettingsPushDownVisitor(visitor_data).visit(select);
     }
 
-
+    /// In case of defined format, data follows it.
     if (!in_file && format)
     {
         Pos last_token = pos;
         --last_token;
         data = last_token->end;
 
+        /// If format name is followed by ';' (end of query symbol) there is no data to insert.
         if (data < end && *data == ';')
             throw Exception("You have excessive ';' symbol before data for INSERT.\n"
                                     "Example:\n\n"
@@ -198,12 +280,14 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             ++data;
     }
 
+    /// Create query and fill its fields.
     auto query = std::make_shared<ASTInsertQuery>();
     node = query;
 
     if (table_function)
     {
         query->table_function = table_function;
+        query->partition_by = partition_by_expr;
     }
     else
     {
@@ -213,16 +297,28 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 
     tryGetIdentifierNameInto(format, query->format);
 
+    query->is_overwrite = is_overwrite;
+    query->is_replace = is_replace;
+    query->overwrite_partition = overwrite_partition;
     query->columns = columns;
     query->select = select;
     query->watch = watch;
     query->settings_ast = settings_ast;
     query->data = data != end ? data : nullptr;
     query->end = end;
-    query->in_file = in_file;
 
     if (in_file)
+    {
+        query->in_file = in_file;
         query->data = nullptr;
+
+        query->children.push_back(in_file);
+        if (compression)
+        {
+            query->compression = compression;
+            query->children.push_back(compression);
+        }
+    }
 
     if (columns)
         query->children.push_back(columns);
@@ -232,7 +328,8 @@ bool ParserInsertQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         query->children.push_back(watch);
     if (settings_ast)
         query->children.push_back(settings_ast);
-
+    if (overwrite_partition)
+        query->children.push_back(overwrite_partition);
     return true;
 }
 

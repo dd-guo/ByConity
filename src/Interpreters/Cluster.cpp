@@ -117,8 +117,8 @@ Cluster::Address::Address(
 {
     host_name = config.getString(config_prefix + ".host");
     port = static_cast<UInt16>(config.getInt(config_prefix + ".port"));
-    exchange_port = static_cast<UInt16>(config.getInt(config_prefix + ".exchange_port", 0));
-    exchange_status_port = static_cast<UInt16>(config.getInt(config_prefix + ".exchange_status_port", 0));
+    exchange_port = static_cast<UInt16>(config.getInt(config_prefix + ".rpc_port", 0));
+    exchange_status_port = static_cast<UInt16>(config.getInt(config_prefix + ".rpc_port", 0));
     if (config.has(config_prefix + ".user"))
         user_specified = true;
 
@@ -272,6 +272,8 @@ Cluster::Address Cluster::Address::fromFullString(const String & full_string)
         address.password = has_pw ? unescapeForFileName(std::string(colon + 1, user_pw_end)) : std::string();
         address.default_database = has_db ? unescapeForFileName(std::string(has_db + 1, address_end)) : std::string();
         // address.priority ignored
+        // address.exchange_port is uninitialized but it's unused
+        // coverity[uninit_use]
         return address;
     }
 }

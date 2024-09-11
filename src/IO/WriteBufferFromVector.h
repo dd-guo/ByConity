@@ -14,6 +14,8 @@ namespace ErrorCodes
     extern const int CANNOT_WRITE_AFTER_END_OF_BUFFER;
 }
 
+struct AppendModeTag {};
+
 /** Writes data to existing std::vector or similar type. When not enough space, it doubles vector size.
   *
   * In destructor, vector is cut to the size of written data.
@@ -39,7 +41,10 @@ private:
         size_t old_size = vector.size();
         /// pos may not be equal to vector.data() + old_size, because WriteBuffer::next() can be used to flush data
         size_t pos_offset = pos - reinterpret_cast<Position>(vector.data());
-        vector.resize(old_size * size_multiplier);
+        if (pos_offset == old_size)
+        {
+            vector.resize(old_size * size_multiplier);
+        }
         internal_buffer = Buffer(reinterpret_cast<Position>(vector.data() + pos_offset), reinterpret_cast<Position>(vector.data() + vector.size()));
         working_buffer = internal_buffer;
     }
@@ -56,7 +61,6 @@ public:
     }
 
     /// Append to vector instead of rewrite.
-    struct AppendModeTag {};
     WriteBufferFromVector(VectorType & vector_, AppendModeTag)
         : WriteBuffer(nullptr, 0), vector(vector_)
     {
@@ -96,7 +100,14 @@ public:
     {
         /// FIXME move final flush into the caller
         MemoryTracker::LockExceptionInThread lock(VariableContext::Global);
-        finalize();
+        try
+        {
+            finalize();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+        }
     }
 };
 

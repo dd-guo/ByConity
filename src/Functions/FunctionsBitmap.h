@@ -35,9 +35,10 @@
 #include <DataTypes/DataTypeBitMap64.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
+#include <Functions/IFunctionAdaptors.h>
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
-
+#include <common/map.h>
 
 // TODO include this last because of a broken roaring header. See the comment
 // inside.
@@ -121,6 +122,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 1; }
 
@@ -244,7 +247,7 @@ class FunctionArrayToBitmapImpl : public IFunction
 public:
     static constexpr auto name = Name::name;
 
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayToBitmapImpl>(); }
+    static FunctionPtr create() { return std::make_shared<FunctionArrayToBitmapImpl>(); }
 
     String getName() const override { return name; }
 
@@ -354,6 +357,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 1; }
 
@@ -474,6 +479,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 3; }
 
@@ -713,6 +720,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 3; }
 
@@ -961,6 +970,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 1; }
 
@@ -1212,6 +1223,8 @@ public:
 
     bool isVariadic() const override { return false; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     size_t getNumberOfArguments() const override { return 2; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
@@ -1343,6 +1356,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 2; }
 
@@ -1534,6 +1549,8 @@ public:
     String getName() const override { return name; }
 
     bool isVariadic() const override { return false; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 2; }
 
@@ -1771,5 +1788,35 @@ using FunctionBitmapOr = FunctionBitmap<BitmapOrImpl, NameBitmapOr>;
 using FunctionBitmapXor = FunctionBitmap<BitmapXorImpl, NameBitmapXor>;
 using FunctionBitmapAndnot = FunctionBitmap<BitmapAndnotImpl, NameBitmapAndnot>;
 
+class ArrayToBitmapOverloadResolver : public IFunctionOverloadResolver
+{
+public:
+    static constexpr auto name = "arrayToBitmap";
+    static FunctionOverloadResolverPtr create(ContextPtr) { return std::make_unique<ArrayToBitmapOverloadResolver>(); }
+    explicit ArrayToBitmapOverloadResolver() = default;
+    String getName() const override { return name; }
+    size_t getNumberOfArguments() const override { return 1; }
+    FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & return_type) const override
+    {
+        return std::make_unique<FunctionToFunctionBaseAdaptor>(
+            FunctionArrayToBitmap::create(),
+            collections::map<DataTypes>(arguments, [](const auto & elem) { return elem.type; }),
+            return_type);
+    }
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        const auto * array_type = typeid_cast<const DataTypeArray *>(arguments[0].get());
+        if (!array_type)
+            throw Exception(
+                "First argument for function " + getName() + " must be an array but it has type " + arguments[0]->getName() + ".",
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        auto nested_type = array_type->getNestedType();
+        WhichDataType which(nested_type);
+        if (!which.isNativeInt() && !which.isNativeUInt())
+            throw Exception(
+                "Unexpected type " + array_type->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        return std::make_shared<DataTypeBitMap64>();
+    }
+};
 
 }

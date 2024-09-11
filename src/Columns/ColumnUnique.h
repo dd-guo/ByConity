@@ -37,7 +37,7 @@
 #include <common/range.h>
 
 #include <common/unaligned.h>
-#include "Columns/ColumnConst.h"
+#include <Columns/ColumnConst.h>
 
 
 namespace DB
@@ -90,6 +90,7 @@ public:
 
     Field operator[](size_t n) const override { return (*getNestedColumn())[n]; }
     void get(size_t n, Field & res) const override { getNestedColumn()->get(n, res); }
+    bool isDefaultAt(size_t n) const override { return n == 0; }
     StringRef getDataAt(size_t n) const override { return getNestedColumn()->getDataAt(n); }
     StringRef getDataAtWithTerminatingZero(size_t n) const override
     {
@@ -110,7 +111,6 @@ public:
     }
 
     int compareAt(size_t n, size_t m, const IColumn & rhs, int nan_direction_hint) const override;
-    void updatePermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_range) const override;
 
     void getExtremes(Field & min, Field & max) const override { column_holder->getExtremes(min, max); }
     bool valuesHaveFixedSize() const override { return column_holder->valuesHaveFixedSize(); }
@@ -129,9 +129,36 @@ public:
         return column_holder->allocatedBytes() + reverse_index.allocatedBytes()
             + (nested_null_mask ? nested_null_mask->allocatedBytes() : 0);
     }
-    void forEachSubcolumn(IColumn::ColumnCallback callback) override
+    
+    void forEachSubcolumn(IColumn::ColumnCallback callback) const override { callback(column_holder); }
+
+    void forEachSubcolumn(IColumn::MutableColumnCallback callback) override
     {
         callback(column_holder);
+        reverse_index.setColumn(getRawColumnPtr());
+        if (is_nullable)
+            nested_column_nullable = ColumnNullable::create(column_holder, nested_null_mask);
+    }
+
+    void forEachSubcolumnRecursively(IColumn::RecursiveColumnCallback callback) const override
+    {
+        callback(*column_holder);
+        column_holder->forEachSubcolumnRecursively(callback);
+    }
+
+    void forEachSubcolumnRecursively(IColumn::RecursiveMutableColumnCallback callback) override
+    {
+        callback(*column_holder);
+        column_holder->forEachSubcolumnRecursively(callback);
+        reverse_index.setColumn(getRawColumnPtr());
+        if (is_nullable)
+            nested_column_nullable = ColumnNullable::create(column_holder, nested_null_mask);
+    }
+
+    void forEachSubcolumnRecursively(IColumn::ColumnCallback callback) override
+    {
+        callback(column_holder);
+        column_holder->forEachSubcolumnRecursively(callback);
         reverse_index.setColumn(getRawColumnPtr());
         if (is_nullable)
             nested_column_nullable = ColumnNullable::create(column_holder, nested_null_mask);
@@ -443,42 +470,6 @@ int ColumnUnique<ColumnType>::compareAt(size_t n, size_t m, const IColumn & rhs,
 
     const auto & column_unique = static_cast<const IColumnUnique &>(rhs);
     return getNestedColumn()->compareAt(n, m, *column_unique.getNestedColumn(), nan_direction_hint);
-}
-
-template <typename ColumnType>
-void ColumnUnique<ColumnType>::updatePermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_ranges) const
-{
-    if (equal_ranges.empty())
-        return;
-
-    bool found_null_value_index = false;
-    for (size_t i = 0; i < equal_ranges.size() && !found_null_value_index; ++i)
-    {
-        auto & [first, last] = equal_ranges[i];
-        for (auto j = first; j < last; ++j)
-        {
-            if (res[j] == getNullValueIndex())
-            {
-                if ((nan_direction_hint > 0) != reverse)
-                {
-                    std::swap(res[j], res[last - 1]);
-                    --last;
-                }
-                else
-                {
-                    std::swap(res[j], res[first]);
-                    ++first;
-                }
-                if (last - first <= 1)
-                {
-                    equal_ranges.erase(equal_ranges.begin() + i);
-                }
-                found_null_value_index = true;
-                break;
-            }
-        }
-    }
-    getNestedColumn()->updatePermutation(reverse, limit, nan_direction_hint, res, equal_ranges);
 }
 
 template <typename IndexType>

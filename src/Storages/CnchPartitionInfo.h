@@ -18,65 +18,91 @@
 #include <atomic>
 #include <Core/Types.h>
 #include <Protos/data_models.pb.h>
+#include <Storages/CnchTablePartitionMetrics.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/MergeTreePartition.h>
+#include <Common/RWLock.h>
+#include <common/getThreadId.h>
 
 namespace DB
 {
-struct PartitionMetrics
+namespace CacheStatus
 {
-    std::atomic_int64_t total_parts_size{0};
-    std::atomic_int64_t total_parts_number{0};
-    std::atomic_int64_t total_rows_count{0};
+    static constexpr UInt32 UINIT = 0;
+    static constexpr UInt32 LOADING = 1;
+    static constexpr UInt32 LOADED = 2;
+}
 
-    void update(const Protos::DataModelPart & part_model)
+struct DataCacheStatus
+{
+    std::atomic<UInt32> load_status = CacheStatus::UINIT;
+    std::atomic<UInt64> loading_thread_id = 0;
+
+    bool isUnInit()
     {
-        auto is_partial_part = part_model.part_info().hint_mutation();
-        /// do not count partial part
-        if (is_partial_part)
-            return;
-
-        auto is_deleted_part = part_model.has_deleted() && part_model.deleted();
-
-        /// To minimize costs, we don't calculate part visibility when updating PartitionMetrics. For those parts marked as delete,
-        /// just subtract them from statistics. And the non-deleted parts added into statistics. The non-deleted parts are added into
-        /// statistics. For drop range, we have save all coreved parts info into it, it can be processed as deleted part directly.
-
-        if (is_deleted_part)
-        {
-            total_rows_count -= (part_model.has_covered_parts_rows() ? part_model.covered_parts_rows() : part_model.rows_count());
-            total_parts_size -= (part_model.has_covered_parts_size() ? part_model.covered_parts_size() : part_model.size());
-            total_parts_number -= (part_model.has_covered_parts_count() ? part_model.covered_parts_count() : 1);
-        }
-        else
-        {
-            total_rows_count += part_model.rows_count();
-            total_parts_size += part_model.size();
-            total_parts_number += 1;
-        }
+        return load_status == CacheStatus::UINIT;
+    }
+    bool isLoaded()
+    {
+        return load_status == CacheStatus::LOADED;
+    }
+    bool isLoading()
+    {
+        return load_status == CacheStatus::LOADING;
+    }
+    bool isLoadingByCurrentThread()
+    {
+        return load_status == CacheStatus::LOADING && loading_thread_id == getThreadId();
     }
 
-    bool validateMetrics() { return total_rows_count >= 0 && total_parts_size >= 0 && total_parts_number >= 0; }
-};
-
-enum class CacheStatus
-{
-    UINIT,
-    LOADING,
-    LOADED
+    /// calls to setXXX should always be protected by partition write lock
+    void setToLoading()
+    {
+        load_status = CacheStatus::LOADING;
+        loading_thread_id = getThreadId();
+    }
+    void setToLoaded()
+    {
+        load_status = CacheStatus::LOADED;
+        loading_thread_id = 0;
+    }
+    void reset()
+    {
+        load_status = CacheStatus::UINIT;
+        loading_thread_id = 0;
+    }
 };
 
 class CnchPartitionInfo
 {
 public:
-    explicit CnchPartitionInfo(const std::shared_ptr<MergeTreePartition> & partition_)
-        : partition_ptr(partition_)
+    explicit CnchPartitionInfo(
+        const String & table_uuid_, const std::shared_ptr<MergeTreePartition> & partition_, const std::string & partition_id_, bool newly_inserted = false)
+        : partition_ptr(partition_), partition_id(partition_id_), metrics_ptr(std::make_shared<PartitionMetrics>(table_uuid_, partition_id, newly_inserted))
     {
     }
 
+    using PartitionLockHolder = RWLockImpl::LockHolder;
+
     std::shared_ptr<MergeTreePartition> partition_ptr;
-    CacheStatus cache_status {CacheStatus::UINIT};
-    std::shared_ptr<PartitionMetrics> metrics_ptr = std::make_shared<PartitionMetrics>();
+    std::string partition_id;
+    DataCacheStatus part_cache_status;
+    DataCacheStatus delete_bitmap_cache_status;
+    std::atomic<UInt64> gctime = {0};
+    std::shared_ptr<PartitionMetrics> metrics_ptr;
+
+    inline PartitionLockHolder readLock() const
+    {
+        return partition_mutex->getLock(RWLockImpl::Read, RWLockImpl::NO_QUERY);
+    }
+
+    inline PartitionLockHolder writeLock() const
+    {
+        return partition_mutex->getLock(RWLockImpl::Write, RWLockImpl::NO_QUERY);
+    }
+
+private:
+    RWLock partition_mutex = RWLockImpl::create();
 };
 
 /***
@@ -94,7 +120,6 @@ public:
     std::shared_ptr<CnchPartitionInfo> partition_info_ptr;
 };
 
-using PartitionMetricsPtr = std::shared_ptr<PartitionMetrics>;
 using PartitionInfoPtr = std::shared_ptr<CnchPartitionInfo>;
 using PartitionFullPtr = std::shared_ptr<CnchPartitionInfoFull>;
 }

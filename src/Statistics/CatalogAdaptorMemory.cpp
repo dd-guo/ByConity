@@ -34,7 +34,7 @@ class CatalogAdaptorMemory : public CatalogAdaptor
 {
 public:
     CatalogAdaptorMemory(ContextPtr context_, std::shared_ptr<StatisticsMemoryStore> sms_ptr)
-        : context(context_), statistics_memory_store(sms_ptr)
+        : CatalogAdaptor(context_), statistics_memory_store(sms_ptr)
     {
     }
 
@@ -59,6 +59,27 @@ public:
         }
 
         return sms.entries.at(key)->data;
+    }
+
+
+    std::vector<String> readStatsColumnsKey(const StatsTableIdentifier & table) override
+    {
+        std::vector<String> res;
+
+        auto & sms = getStatisticsMemoryStore();
+        std::shared_lock lck(sms.mtx);
+        auto key = table.getUniqueKey();
+
+        if (!sms.entries.count(key))
+        {
+            return {};
+        }
+
+        for (auto & [k, v] : sms.entries.at(key)->data.column_stats)
+        {
+            res.emplace_back(k);
+        }
+        return res;
     }
 
     StatsCollection readSingleStats(const StatsTableIdentifier & table, const std::optional<String> & column_name_opt) override
@@ -93,21 +114,6 @@ public:
         }
     }
 
-    ColumnDescVector getCollectableColumns(const StatsTableIdentifier & identifier) const override
-    {
-        ColumnDescVector result;
-        auto storage = getStorageByTableId(identifier);
-        auto snapshot = storage->getInMemoryMetadataPtr();
-        for (const auto & name_type_pr : snapshot->getColumns().getAll())
-        {
-            if (!Statistics::isCollectableType(name_type_pr.type))
-            {
-                continue;
-            }
-            result.emplace_back(name_type_pr);
-        }
-        return result;
-    }
 
     // note: new
     void writeStatsData(const StatsTableIdentifier & table, const StatsData & stats_data) override
@@ -165,44 +171,30 @@ public:
         sms.entries.erase(key);
     }
 
-    void dropStatsDataAll(const String & database) override
-    {
-        auto tables = getAllTablesID(database);
-        for (auto & table : tables)
-        {
-            dropStatsData(table);
-        }
-    }
 
-    void invalidateClusterStatsCache(const StatsTableIdentifier & table) override
-    {
-        // for memory catalog, there should be only a single server
-        Statistics::CacheManager::invalidate(context, table);
-    }
-
-    void invalidateServerStatsCache(const StatsTableIdentifier & table) const override
-    {
-        Statistics::CacheManager::invalidate(context, table);
-    }
-
-
-    std::vector<StatsTableIdentifier> getAllTablesID(const String & database_name) const override
+    std::vector<StatsTableIdentifier> getAllTablesID(const String & database_name) override
     {
         std::vector<StatsTableIdentifier> results;
-        auto db = DatabaseCatalog::instance().getDatabase(database_name);
+        auto db = DatabaseCatalog::instance().getDatabase(database_name, context);
         for (auto iter = db->getTablesIterator(context); iter->isValid(); iter->next())
         {
             auto table = iter->table();
+            if (!table)
+                continue;
             StatsTableIdentifier table_id(table->getStorageID());
+            if (!isTableCollectable(table_id))
+                continue;
+
             results.emplace_back(table_id);
         }
         return results;
     }
 
-    std::optional<StatsTableIdentifier> getTableIdByName(const String & database_name, const String & table_name) const override
+
+    std::optional<StatsTableIdentifier> getTableIdByName(const String & database_name, const String & table_name) override
     {
         auto & ins = DatabaseCatalog::instance();
-        auto db_storage = ins.getDatabase(database_name);
+        auto db_storage = ins.getDatabase(database_name, context);
         auto table = db_storage->tryGetTable(table_name, context);
         if (!table)
         {
@@ -213,11 +205,25 @@ public:
         return StatsTableIdentifier(result);
     }
 
-    StoragePtr getStorageByTableId(const StatsTableIdentifier & identifier) const override
+    std::optional<StatsTableIdentifier> getTableIdByUUID(const UUID & uuid) override
+    {
+        (void)uuid;
+        // this should be called only in daemon manager
+        throw Exception("Unimplemented", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    StoragePtr getStorageByTableId(const StatsTableIdentifier & identifier) override
     {
         auto & ins = DatabaseCatalog::instance();
         return ins.getTable(identifier.getStorageID(), context);
     }
+
+    StoragePtr tryGetStorageByUUID(const UUID & uuid) override
+    {
+        (void)uuid;
+        throw Exception("Unimplemented", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
 
     UInt64 getUpdateTime() override
     {
@@ -225,11 +231,35 @@ public:
         return 0;
     }
 
-    const Settings & getSettingsRef() const override { return context->getSettingsRef(); }
+    const Settings & getSettingsRef() override { return context->getSettingsRef(); }
+
+    UInt64 fetchAddUdiCount(const StatsTableIdentifier &, UInt64) override
+    {
+        throw Exception("Unimplemented", ErrorCodes::NOT_IMPLEMENTED);
+        // auto & sms = getStatisticsMemoryStore();
+        // std::unique_lock lck(sms.mtx);
+        // auto unique_key = table_identifier.getUniqueKey();
+        // UInt64 old_count = 0;
+        // if (sms.udi_counters.count(unique_key))
+        // {
+        //     old_count = sms.udi_counters.at(unique_key);
+        // }
+        // //
+        // if (count != 0)
+        // {
+        //     auto new_count = old_count + count;
+        //     sms.udi_counters[unique_key] = new_count;
+        // }
+        // return old_count;
+    }
+
+    void removeUdiCount(const StatsTableIdentifier &) override
+    {
+        // DO NOTHING
+    }
 
 private:
     StatisticsMemoryStore & getStatisticsMemoryStore() { return *statistics_memory_store; }
-    ContextPtr context;
     std::shared_ptr<StatisticsMemoryStore> statistics_memory_store;
 };
 

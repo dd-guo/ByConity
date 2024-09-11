@@ -22,7 +22,10 @@
 #pragma once
 #include <cstddef>
 #include <Core/Settings.h>
+#include <IO/ReadSettings.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include "common/types.h"
+#include "Core/NamesAndTypes.h"
 
 
 namespace DB
@@ -31,13 +34,10 @@ namespace DB
 class MMappedFileCache;
 using MMappedFileCachePtr = std::shared_ptr<MMappedFileCache>;
 
-
 struct MergeTreeReaderSettings
 {
-    size_t min_bytes_to_use_direct_io = 0;
-    size_t min_bytes_to_use_mmap_io = 0;
-    MMappedFileCachePtr mmap_cache;
-    size_t max_read_buffer_size = DBMS_DEFAULT_BUFFER_SIZE;
+    /// Common settings
+    ReadSettings read_settings;
     /// If save_marks_in_cache is false, then, if marks are not in cache,
     ///  we will load them but won't save in the cache, to avoid evicting other data.
     bool save_marks_in_cache = false;
@@ -45,6 +45,47 @@ struct MergeTreeReaderSettings
     bool convert_nested_to_subcolumns = false;
     /// Validate checksums on reading (should be always enabled in production).
     bool checksum_on_read = true;
+
+    /// whether read the original bitmap columns in BitEngine mode
+    bool read_source_bitmap = true;
+
+    void setDiskCacheSteaing(UInt64 stealing_disk_cache)
+    {
+        if (stealing_disk_cache == 0)
+            remote_disk_cache_stealing = StealingCacheMode::DISABLE;
+        else if (stealing_disk_cache == 1)
+            remote_disk_cache_stealing = StealingCacheMode::READ_ONLY;
+        else if (stealing_disk_cache == 2)
+            remote_disk_cache_stealing = StealingCacheMode::WRITE_ONLY;
+        else if (stealing_disk_cache == 3)
+            remote_disk_cache_stealing = StealingCacheMode::READ_WRITE;
+    }
+
+    StealingCacheMode remote_disk_cache_stealing = StealingCacheMode::DISABLE;
+};
+
+struct BitmapBuildInfo
+{
+    // set to false when
+    // 1. disenable bitmap index build in insert/merge
+    // 2. or modify dependent columns
+    bool build_all_bitmap_index = true;
+    // set to true when executing `alter table build bitmap of partition`
+    bool only_bitmap_index = false;
+    // set to true when other columns mutated
+    bool not_build_bitmap_index = false;
+
+    // when dependent columns changed, We build indices for columns in bitmap_index_columns
+    NamesAndTypes bitmap_index_columns;
+
+    // same meaning of those of bitmap index
+    // added for the independence of segment index
+    // this ensures that a table can hold columns with both original bitmap and segment bitmap
+    bool build_all_segment_bitmap_index = true;
+    bool only_segment_bitmap_index = false;
+    bool not_build_segment_bitmap_index = false;
+
+    NamesAndTypes segment_bitmap_index_columns;
 };
 
 struct MergeTreeWriterSettings
@@ -80,6 +121,6 @@ struct MergeTreeWriterSettings
 
     bool optimize_map_column_serialization = false;
     bool enable_disk_based_key_index = false;
+    bool is_merge = false;
 };
-
 }

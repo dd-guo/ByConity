@@ -54,13 +54,17 @@ public:
         GroupExprPtr local_exchange_,
         PropertySet require_children_,
         Property actual_,
-        double cost_)
+        double cost_,
+        std::map<CTEId, std::pair<Property, double>> cte_actual_props_,
+        std::vector<CTEId> cte_ancestor_)
         : group_expr(std::move(group_expr_))
         , remote_exchange(std::move(remote_exchange_))
         , local_exchange(std::move(local_exchange_))
         , require_children(std::move(require_children_))
         , actual(std::move(actual_))
         , cost(cost_)
+        , cte_actual_props(std::move(cte_actual_props_))
+        , cte_ancestor(std::move(cte_ancestor_))
     {
     }
 
@@ -74,6 +78,9 @@ public:
 
     double getCost() const { return cost; }
 
+    const std::map<CTEId, std::pair<Property, double>> & getCTEActualProperties() const { return cte_actual_props; }
+    const std::vector<CTEId> & getCTEAncestors() const { return cte_ancestor; }
+
     PlanNodePtr buildPlanNode(CascadesContext & context, PlanNodes & children);
 
 private:
@@ -84,18 +91,24 @@ private:
     PropertySet require_children;
     Property actual;
     double cost;
+
+    std::map<CTEId, std::pair<Property, double>> cte_actual_props;
+    /**
+     * This group expressions is ancestor node of these CTEs. Only used for debug now.
+     */
+    std::vector<CTEId> cte_ancestor;
 };
 
 class GroupExpression
 {
 public:
-    GroupExpression(ConstQueryPlanStepPtr step_, std::vector<GroupId> child_groups_,
+    GroupExpression(QueryPlanStepPtr step_, std::vector<GroupId> child_groups_,
                     RuleType produce_rule_ = RuleType::UNDEFINED, GroupId group_id_ = UNDEFINED_GROUP)
         : step(std::move(step_)), group_id(group_id_), child_groups(std::move(child_groups_)), produce_rule(produce_rule_)
     {
     }
 
-    ConstQueryPlanStepPtr & getStep() { return step; }
+    QueryPlanStepPtr & getStep() { return step; }
 
     void setGroupId(GroupId group_id_) { group_id = group_id_; }
     GroupId getGroupId() const { return group_id; }
@@ -123,6 +136,11 @@ public:
      */
     void setRuleExplored(RuleType type) { rule_mask.set(static_cast<UInt32>(type), true); }
 
+    bool isCostDerived() const { return cost_derived; }
+    double getCost() const { return cost; }
+
+    void setCost(double cost_) { this->cost = cost_; }
+
     /**
      * Hashes GroupExpression
      * @returns hash code of GroupExpression
@@ -137,12 +155,11 @@ public:
     bool operator==(const GroupExpression & r) const
     {
         // Having an undefined group id is considered equal to any group id
-        return (*step == *r.step) && (child_groups == r.child_groups)
-            && ((group_id == UNDEFINED_GROUP) || (r.group_id == UNDEFINED_GROUP) || (r.group_id == group_id));
+        return (child_groups == r.child_groups) && ((group_id == UNDEFINED_GROUP) || (r.group_id == UNDEFINED_GROUP) || (r.group_id == group_id)) && (*step == *r.step);
     }
 
 private:
-    ConstQueryPlanStepPtr step;
+    QueryPlanStepPtr step;
     GroupId group_id;
 
     /**
@@ -156,6 +173,9 @@ private:
     std::bitset<static_cast<UInt32>(RuleType::NUM_RULES)> rule_mask;
 
     bool deleted = false;
+
+    bool cost_derived = false;
+    double cost;
 
     RuleType produce_rule;
 };
@@ -213,7 +233,7 @@ public:
      * @param id_ ID of the Group for binding
      * @param pattern_ Pattern to bind
      */
-    GroupBindingIterator(const Memo & memo_, GroupId id_, PatternPtr pattern_, OptContextPtr context_);
+    GroupBindingIterator(const Memo & memo_, GroupId id_, PatternRawPtr pattern_, OptContextPtr context_);
 
     /**
      * Virtual function for whether a binding exists
@@ -236,7 +256,7 @@ private:
     /**
      * Pattern to try binding to
      */
-    PatternPtr pattern;
+    PatternRawPtr pattern;
 
     /**
      * Pointer to the group with GroupID group_id_
@@ -272,7 +292,7 @@ public:
      * @param group_expr_ GroupExpression to bind to
      * @param pattern_ Pattern to bind
      */
-    GroupExprBindingIterator(const Memo & memo, GroupExprPtr group_expr_, const PatternPtr & pattern_, OptContextPtr context_);
+    GroupExprBindingIterator(const Memo & memo, GroupExprPtr group_expr_, PatternRawPtr pattern_, OptContextPtr context_);
 
     /**
      * Virtual function for whether a binding exists
@@ -317,6 +337,8 @@ private:
      * Position indicators tracking progress within children_bindings
      */
     std::vector<size_t> children_bindings_pos;
+
+    static PatternPtr any;
 };
 
 /**

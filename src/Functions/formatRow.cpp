@@ -45,6 +45,7 @@ public:
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
@@ -116,7 +117,7 @@ private:
 
 }
 
-void registerFunctionFormatRow(FunctionFactory & factory)
+REGISTER_FUNCTION(FormatRow)
 {
     factory.registerFunction<FormatRowOverloadResolver<true>>();
     factory.registerFunction<FormatRowOverloadResolver<false>>();

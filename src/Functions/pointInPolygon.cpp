@@ -81,6 +81,8 @@ public:
         return 0;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.size() < 2)
@@ -572,7 +574,7 @@ private:
 
 }
 
-void registerFunctionPointInPolygon(FunctionFactory & factory)
+REGISTER_FUNCTION(PointInPolygon)
 {
     factory.registerFunction<FunctionPointInPolygon<PointInPolygonWithGrid<Float64>>>();
 }

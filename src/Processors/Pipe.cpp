@@ -19,17 +19,20 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Processors/Pipe.h>
+#include <Columns/ColumnConst.h>
 #include <IO/WriteHelpers.h>
-#include <Processors/Sources/SourceFromInputStream.h>
-#include <Processors/ResizeProcessor.h>
 #include <Processors/ConcatProcessor.h>
+#include <Processors/Formats/IOutputFormat.h>
 #include <Processors/LimitTransform.h>
 #include <Processors/NullSink.h>
 #include <Processors/Transforms/ExtremesTransform.h>
+#include <Processors/Transforms/StreamInQueryCacheTransform.h>
 #include <Processors/Formats/IOutputFormat.h>
 #include <Processors/Sources/NullSource.h>
 #include <Columns/ColumnConst.h>
+#include <Processors/QueryPipeline.cpp>
+#include <Storages/IStorage.h>
+
 
 namespace DB
 {
@@ -37,6 +40,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 static void checkSource(const IProcessor & source)
@@ -128,6 +132,21 @@ Pipe::Holder & Pipe::Holder::operator=(Holder && rhs)
         query_plans.emplace_back(std::move(plan));
 
     query_id_holder = std::move(rhs.query_id_holder);
+
+    if (rhs.cache_holder)
+    {
+        if (!cache_holder)
+            cache_holder = std::move(rhs.cache_holder);
+        else
+        {
+            cache_holder->write_cache.insert(rhs.cache_holder->write_cache.begin(), rhs.cache_holder->write_cache.end());
+            cache_holder->read_cache.insert(rhs.cache_holder->read_cache.begin(), rhs.cache_holder->read_cache.end());
+            if (!rhs.cache_holder->all_part_in_cache)
+                cache_holder->all_part_in_cache = false;
+            if (rhs.cache_holder->all_part_in_storage)
+                cache_holder->all_part_in_storage = true;
+        }
+    }
 
     return *this;
 }
@@ -626,6 +645,89 @@ void Pipe::addTransform(ProcessorPtr transform, InputPort * totals, InputPort * 
     max_parallel_streams = std::max<size_t>(max_parallel_streams, output_ports.size());
 }
 
+void Pipe::readFromQueryCache(
+    std::unique_ptr<SourceFromChunks> source,
+    std::unique_ptr<SourceFromChunks> source_totals,
+    std::unique_ptr<SourceFromChunks> source_extremes)
+{
+    /// Construct the pipeline from the input source processors. The processors are provided by the query cache to produce chunks of a
+    /// previous query result.
+    addSource(std::move(source));
+    auto add_stream_from_query_cache_source = [&](OutputPort *& out_port, std::unique_ptr<SourceFromChunks> source_)
+    {
+        if (!source_)
+            return;
+
+        out_port = &source_->getPort();
+        processors.emplace_back(std::shared_ptr<SourceFromChunks>(std::move(source_)));
+    };
+
+    add_stream_from_query_cache_source(totals_port, std::move(source_totals));
+    add_stream_from_query_cache_source(extremes_port, std::move(source_extremes));
+}
+
+void Pipe::addQueryCacheTransform(std::shared_ptr<QueryCache::Writer> query_cache_writer)
+{
+    if (numOutputPorts() != 1)
+        throw Exception("Cannot add QueryCacheTransform to Pipes because the number of ouput port is not 1 {}", numOutputPorts(),
+                        ErrorCodes::LOGICAL_ERROR);
+
+    /// Attach a special transform to all output ports (result + possibly totals/extremes). The only purpose of the transform is
+    /// to write each chunk into the query cache. All transforms hold a refcounted reference to the same query cache writer object.
+    /// This ensures that all transforms write to the single same cache entry. The writer object synchronizes internally, the
+    /// expensive stuff like cloning chunks happens outside lock scopes).
+
+    auto add_stream_in_query_cache_transform = [&](OutputPort *& out_port, QueryCache::Writer::ChunkType chunk_type)
+    {
+        if (!out_port)
+            return;
+
+        auto transform = std::make_shared<StreamInQueryCacheTransform>(out_port->getHeader(), query_cache_writer, chunk_type);
+        connect(*out_port, transform->getInputPort());
+        out_port = &transform->getOutputPort();
+        processors.emplace_back(std::move(transform));
+    };
+
+    add_stream_in_query_cache_transform(output_ports[0], QueryCache::Writer::ChunkType::Result);
+    add_stream_in_query_cache_transform(totals_port, QueryCache::Writer::ChunkType::Totals);
+    add_stream_in_query_cache_transform(extremes_port, QueryCache::Writer::ChunkType::Extremes);
+}
+
+void Pipe::finalizeWriteInQueryCache()
+{
+    auto it = std::find_if(
+        processors.begin(), processors.end(),
+        [](ProcessorPtr processor){ return dynamic_cast<StreamInQueryCacheTransform *>(&*processor); });
+
+    /// The pipeline can contain up to three StreamInQueryCacheTransforms which all point to the same query cache writer object.
+    /// We can call finalize() on any of them.
+    if (it != processors.end())
+        dynamic_cast<StreamInQueryCacheTransform &>(**it).finalizeWriteInQueryCache();
+}
+
+void Pipe::addSimpleTransformToPort(ProcessorPtr transform, OutputPort * port)
+{
+    if (port == nullptr)
+        throw Exception("addSimpleTransformToPort does not accept null port", ErrorCodes::LOGICAL_ERROR);
+    auto & input_port = transform->getInputs().front();
+    if (port == totals_port)
+    {
+        connect(*totals_port, input_port);
+        totals_port = nullptr;
+    }
+    else if (port == extremes_port)
+    {
+        connect(*extremes_port, input_port);
+        extremes_port = nullptr;
+    }
+    else
+    {
+        throw Exception("Cannot add simple transform to a single output port.", ErrorCodes::NOT_IMPLEMENTED);
+    }
+    output_ports.emplace_back(&transform->getOutputs().front());
+    processors.emplace_back(std::move(transform));
+}
+
 void Pipe::addSimpleTransform(const ProcessorGetterWithStreamKind & getter)
 {
     if (output_ports.empty())
@@ -898,6 +1000,11 @@ void Pipe::setQuota(const std::shared_ptr<const EnabledQuota> & quota)
         if (auto * source_with_progress = dynamic_cast<ISourceWithProgress *>(processor.get()))
             source_with_progress->setQuota(quota);
     }
+}
+
+void Pipe::addStorageHolder(StoragePtr storage)
+{
+    holder.storage_holders.emplace_back(std::move(storage));
 }
 
 }

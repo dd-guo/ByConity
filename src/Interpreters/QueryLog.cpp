@@ -24,6 +24,7 @@
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnMap.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeDate.h>
@@ -32,7 +33,6 @@
 #include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeMap.h>
-#include <DataTypes/DataTypeByteMap.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -71,6 +71,7 @@ NamesAndTypesList QueryLogElement::getNamesAndTypes()
 
         {"read_rows", std::make_shared<DataTypeUInt64>()},
         {"read_bytes", std::make_shared<DataTypeUInt64>()},
+        {"disk_cache_read_bytes", std::make_shared<DataTypeUInt64>()},
         {"written_rows", std::make_shared<DataTypeUInt64>()},
         {"written_bytes", std::make_shared<DataTypeUInt64>()},
         {"result_rows", std::make_shared<DataTypeUInt64>()},
@@ -88,6 +89,8 @@ NamesAndTypesList QueryLogElement::getNamesAndTypes()
         {"columns", std::make_shared<DataTypeArray>(
             std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()))},
         {"projections", std::make_shared<DataTypeArray>(
+            std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()))},
+        {"materialized_views", std::make_shared<DataTypeArray>(
             std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()))},
         {"exception_code", std::make_shared<DataTypeInt32>()},
         {"exception", std::make_shared<DataTypeString>()},
@@ -123,14 +126,13 @@ NamesAndTypesList QueryLogElement::getNamesAndTypes()
         {"log_comment", std::make_shared<DataTypeString>()},
 
         {"thread_ids", std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>())},
+        {"max_io_thread_name", std::make_shared<DataTypeString>()},
+        {"max_io_thread_query_ms", std::make_shared<DataTypeUInt64>()},
 
-#ifdef USE_COMMUNITY_MAP
         {"ProfileEvents", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
+        {"MaxIOThreadProfileEvents", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
         {"Settings", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>())},
-#else
-        {"ProfileEvents", std::make_shared<DataTypeByteMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
-        {"Settings", std::make_shared<DataTypeByteMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>())},
-#endif
+        {"Graphviz", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>())},
 
         {"used_aggregate_functions", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
         {"used_aggregate_function_combinators", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
@@ -140,7 +142,16 @@ NamesAndTypesList QueryLogElement::getNamesAndTypes()
         {"used_formats", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
         {"used_functions", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
         {"used_storages", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
-        {"used_table_functions", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}
+        {"used_table_functions", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+        {"partition_ids", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+        {"segment_id", std::make_shared<DataTypeInt64>()},
+        {"segment_parallel", std::make_shared<DataTypeInt64>()},
+        {"segment_parallel_index", std::make_shared<DataTypeInt64>()},
+        {"fallback_reason", std::make_shared<DataTypeString>()},
+        {"segment_profiles", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
+        {"virtual_warehouse", std::make_shared<DataTypeString>()},
+        {"worker_group", std::make_shared<DataTypeString>()},
+        {"query_plan", std::make_shared<DataTypeString>()}
     };
 
 }
@@ -152,7 +163,9 @@ NamesAndAliases QueryLogElement::getNamesAndAliases()
         {"ProfileEvents.Names", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapKeys(ProfileEvents)"},
         {"ProfileEvents.Values", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>())}, "mapValues(ProfileEvents)"},
         {"Settings.Names", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapKeys(Settings)" },
-        {"Settings.Values", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapValues(Settings)"}
+        {"Settings.Values", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapValues(Settings)"},
+        {"Graphviz.Names", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapKeys(Graphviz)"},
+        {"Graphviz.Values", {std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}, "mapValues(Graphviz)"}
     };
 }
 
@@ -170,6 +183,7 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
 
     columns[i++]->insert(read_rows);
     columns[i++]->insert(read_bytes);
+    columns[i++]->insert(disk_cache_read_bytes);
     columns[i++]->insert(written_rows);
     columns[i++]->insert(written_bytes);
     columns[i++]->insert(result_rows);
@@ -187,7 +201,7 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
         auto & column_tables = typeid_cast<ColumnArray &>(*columns[i++]);
         auto & column_columns = typeid_cast<ColumnArray &>(*columns[i++]);
         auto & column_projections = typeid_cast<ColumnArray &>(*columns[i++]);
-
+        auto & column_materialized_views = typeid_cast<ColumnArray &>(*columns[i++]);
         auto fill_column = [](const std::set<String> & data, ColumnArray & column)
         {
             size_t size = 0;
@@ -204,6 +218,7 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
         fill_column(query_tables, column_tables);
         fill_column(query_columns, column_columns);
         fill_column(query_projections, column_projections);
+        fill_column(query_materialized_views, column_materialized_views);
     }
 
     columns[i++]->insert(exception_code);
@@ -224,10 +239,23 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
         columns[i++]->insert(threads_array);
     }
 
+    columns[i++]->insert(max_io_time_thread_name);
+    columns[i++]->insert(max_io_time_thread_ms);
+
     if (profile_counters)
     {
         auto * column = columns[i++].get();
         ProfileEvents::dumpToMapColumn(*profile_counters, column, true);
+    }
+    else
+    {
+        columns[i++]->insertDefault();
+    }
+
+    if (max_thread_io_profile_counters)
+    {
+        auto * column = columns[i++].get();
+        ProfileEvents::dumpToMapColumn(*max_thread_io_profile_counters, column, true);
     }
     else
     {
@@ -244,6 +272,32 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
         columns[i++]->insertDefault();
     }
 
+    if (graphviz && !graphviz->empty())
+    {
+        auto * column = columns[i++].get();
+        /// Convert ptr and make simple check
+        auto * column_map = column ? &typeid_cast<ColumnMap &>(*column) : nullptr;
+        if (column_map)
+        {
+            auto & offsets = column_map->getNestedColumn().getOffsets();
+            auto & tuple_column = column_map->getNestedData();
+            auto & key_column = tuple_column.getColumn(0);
+            auto & value_column = tuple_column.getColumn(1);
+            size_t size = 0;
+            for (const auto& entry : *graphviz)
+            {
+                key_column.insertData(entry.first.c_str(), strlen(entry.first.c_str()));
+                value_column.insert(entry.second);
+                size++;
+            }
+
+            offsets.push_back((offsets.empty() ? 0 : offsets.back()) + size);
+        }
+    }
+    else {
+        columns[i++]->insertDefault();
+    }
+
     {
         auto & column_aggregate_function_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
         auto & column_aggregate_function_combinator_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
@@ -254,6 +308,7 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
         auto & column_function_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
         auto & column_storage_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
         auto & column_table_function_factory_objects = typeid_cast<ColumnArray &>(*columns[i++]);
+        auto & column_partition_ids = typeid_cast<ColumnArray &>(*columns[i++]);
 
         auto fill_column = [](const std::unordered_set<String> & data, ColumnArray & column)
         {
@@ -276,7 +331,30 @@ void QueryLogElement::appendToBlock(MutableColumns & columns) const
         fill_column(used_functions, column_function_factory_objects);
         fill_column(used_storages, column_storage_factory_objects);
         fill_column(used_table_functions, column_table_function_factory_objects);
+        fill_column(partition_ids, column_partition_ids);
     }
+
+    columns[i++]->insert(segment_id);
+    columns[i++]->insert(segment_parallel);
+    columns[i++]->insert(segment_parallel_index);
+    columns[i++]->insert(fallback_reason);
+
+    if (segment_profiles && !segment_profiles->empty())
+    {
+        auto & column = typeid_cast<ColumnArray &>(*columns[i++]);
+        for (const auto & profile : *segment_profiles)
+            column.getData().insertData(profile.data(), profile.size());
+        auto & offsets = column.getOffsets();
+        offsets.push_back(offsets.back() + segment_profiles->size());
+    }
+    else 
+    {
+        columns[i++]->insertDefault();
+    }
+
+    columns[i++]->insert(virtual_warehouse);
+    columns[i++]->insert(worker_group);
+    columns[i++]->insert(query_plan);
 }
 
 void QueryLogElement::appendClientInfo(const ClientInfo & client_info, MutableColumns & columns, size_t & i)

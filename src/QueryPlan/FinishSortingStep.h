@@ -40,11 +40,16 @@ public:
     void describeActions(JSONBuilder::JSONMap & map) const override;
     void describeActions(FormatSettings & settings) const override;
 
+    SortDescription getPrefixDescription() const { return prefix_description; }
+    SortDescription getResultDescription() const { return result_description; }
+    size_t getMaxBlockSize() const { return max_block_size; }
+    UInt64 getLimit() const { return limit; }
+
     /// Add limit or change it to lower value.
     void updateLimit(size_t limit_);
 
-    void serialize(WriteBuffer &) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer &, ContextPtr context_ = nullptr);
+    void toProto(Protos::FinishSortingStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<FinishSortingStep> fromProto(const Protos::FinishSortingStep & proto, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 

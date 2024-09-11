@@ -1,0 +1,7 @@
+[0-9a-zA-Z]*-[0-9a-zA-Z]*-[0-9a-zA-Z]*-[0-9a-zA-Z]*-[0-9a-zA-Z]*
+task.log*
+*.csv
+*.txt
+disks
+part-merger
+*.ini

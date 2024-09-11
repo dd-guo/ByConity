@@ -12,27 +12,77 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#pragma once
 
+#include <memory>
+#include <Core/BackgroundSchedulePool.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DistributedStages/MPPQueryCoordinator.h>
+#include <Interpreters/DistributedStages/MPPQueryManager.h>
+#include <Interpreters/ProcessList.h>
+#include <Interpreters/ProcessorsProfileLog.h>
 #include <Interpreters/SegmentScheduler.h>
+#include <Interpreters/profile/ProfileLogHub.h>
 #include <Protos/plan_segment_manager.pb.h>
+#include <ResourceManagement/CommonData.h>
 #include <brpc/server.h>
+#include <Common/Brpc/BrpcServiceDefines.h>
+#include <Common/ResourceMonitor.h>
 #include <common/logger_useful.h>
+#include <common/types.h>
 
 namespace DB
 {
+class SegmentScheduler;
+class Context;
+
+class ResourceMonitorTimer : public RepeatedTimerTask {
+public:
+    ResourceMonitorTimer(ContextMutablePtr & global_context_, UInt64 interval_, const std::string& name_, Poco::Logger* log_) :
+        RepeatedTimerTask(global_context_->getSchedulePool(), interval_, name_), resource_monitor(global_context_) {
+        log = log_;
+    }
+    virtual ~ResourceMonitorTimer() override {}
+    virtual void run() override;
+    WorkerNodeResourceData getResourceData() const;
+    void updateResourceData();
+
+private:
+    ResourceMonitor resource_monitor;
+    WorkerNodeResourceData cached_resource_data;
+    mutable std::mutex resource_data_mutex;
+    Poco::Logger * log;
+};
+
 class PlanSegmentManagerRpcService : public Protos::PlanSegmentManagerService
 {
 public:
     explicit PlanSegmentManagerRpcService(ContextMutablePtr context_)
-        : context(context_), log(&Poco::Logger::get("PlanSegmentManagerRpcService"))
+        : context(context_)
+        , log(&Poco::Logger::get("PlanSegmentManagerRpcService"))
     {
+        report_metrics_timer = std::make_unique<ResourceMonitorTimer>(context, 1000, "ResourceMonitorTimer", log);
+        report_metrics_timer->start();
     }
 
-    /// execute query described by plan segment
-    void executeQuery(
+    ~PlanSegmentManagerRpcService() override
+    {
+        try
+        {
+            LOG_DEBUG(log, "Waiting report metrics timer finishing");
+            report_metrics_timer->stop();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+        }
+
+    }
+
+    /// submit query described by plan segment
+    void submitPlanSegment(
         ::google::protobuf::RpcController * controller,
-        const ::DB::Protos::ExecutePlanSegmentRequest * request,
+        const ::DB::Protos::SubmitPlanSegmentRequest * request,
         ::DB::Protos::ExecutePlanSegmentResponse * response,
         ::google::protobuf::Closure * done) override;
 
@@ -41,47 +91,47 @@ public:
         ::google::protobuf::RpcController * /*controller*/,
         const ::DB::Protos::CancelQueryRequest * request,
         ::DB::Protos::CancelQueryResponse * response,
-        ::google::protobuf::Closure * done) override
-    {
-        brpc::ClosureGuard done_guard(done);
-        auto cancel_code
-            = context->getPlanSegmentProcessList().tryCancelPlanSegmentGroup(request->query_id(), request->coordinator_address());
-        response->set_ret_code(std::to_string(static_cast<int>(cancel_code)));
-    }
+        ::google::protobuf::Closure * done) override;
 
     /// send plan segment status (segment executor host --> coordinator host)
     void sendPlanSegmentStatus(
         ::google::protobuf::RpcController * /*controller*/,
         const ::DB::Protos::SendPlanSegmentStatusRequest * request,
         ::DB::Protos::SendPlanSegmentStatusResponse * /*response*/,
-        ::google::protobuf::Closure * done) override
-    {
-        brpc::ClosureGuard done_guard(done);
-        RuntimeSegmentsStatus status(
-            request->query_id(), request->segment_id(), request->is_succeed(), request->is_canceled(), request->message(), request->code());
-        const SegmentSchedulerPtr & scheduler = context->getSegmentScheduler();
-        scheduler->updateSegmentStatus(status);
-        // this means exception happened during execution.
-        if (!request->is_succeed() && !request->is_canceled())
-        {
-            scheduler->updateException(
-                request->query_id(),
-                "Segment:" + std::to_string(request->segment_id()) + ", exception:" + request->message(),
-                request->code());
-            try
-            {
-                scheduler->cancelPlanSegmentsFromCoordinator(request->query_id(), request->message(), context);
-            }
-            catch (...)
-            {
-                LOG_WARNING(log, "Call cancelPlanSegmentsFromCoordinator failed: " + getCurrentExceptionMessage(true));
-            }
-        }
-        // todo  scheduler.cancelSchedule
-    }
+        ::google::protobuf::Closure * done) override;
+
+    /// only report plan segment error, used by bsp mode upstream reader
+    void reportPlanSegmentError(
+        ::google::protobuf::RpcController * /*controller*/,
+        const ::DB::Protos::ReportPlanSegmentErrorRequest * request,
+        ::DB::Protos::ReportPlanSegmentErrorResponse * /*response*/,
+        ::google::protobuf::Closure * done) override;
+
+    void reportProcessorProfileMetrics(
+        ::google::protobuf::RpcController * /*controller*/,
+        const ::DB::Protos::ReportProcessorProfileMetricRequest * request,
+        ::DB::Protos::ReportProcessorProfileMetricResponse * /*response*/,
+        ::google::protobuf::Closure * done) override;
+
+    void batchReportProcessorProfileMetrics(
+        ::google::protobuf::RpcController * /*controller*/,
+        const ::DB::Protos::BatchReportProcessorProfileMetricRequest * request,
+        ::DB::Protos::ReportProcessorProfileMetricResponse * /*response*/,
+        ::google::protobuf::Closure * done) override;
+
+    void sendProgress(
+        ::google::protobuf::RpcController * /*controller*/,
+        const ::DB::Protos::SendProgressRequest * request,
+        ::DB::Protos::SendProgressResponse * response,
+        ::google::protobuf::Closure * done) override;
+
 
 private:
     ContextMutablePtr context;
+    std::unique_ptr<ResourceMonitorTimer> report_metrics_timer;
     Poco::Logger * log;
 };
+
+REGISTER_SERVICE_IMPL(PlanSegmentManagerRpcService);
+
 }

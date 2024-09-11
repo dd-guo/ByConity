@@ -26,6 +26,7 @@
 #include <Parsers/ASTQueryWithTableAndOutput.h>
 #include <Parsers/ASTTTLElement.h>
 #include <Parsers/IAST.h>
+#include "Parsers/IAST_fwd.h"
 
 
 namespace DB
@@ -74,6 +75,12 @@ public:
         ADD_CONSTRAINT,
         DROP_CONSTRAINT,
 
+        ADD_FOREIGN_KEY,
+        DROP_FOREIGN_KEY,
+
+        ADD_UNIQUE_NOT_ENFORCED,
+        DROP_UNIQUE_NOT_ENFORCED,
+
         ADD_PROJECTION,
         DROP_PROJECTION,
         MATERIALIZE_PROJECTION,
@@ -92,9 +99,11 @@ public:
         FREEZE_ALL,
         UNFREEZE_PARTITION,
         UNFREEZE_ALL,
+        PREATTACH_PARTITION,
 
         DROP_PARTITION_WHERE,
         FETCH_PARTITION_WHERE,
+        RECLUSTER_PARTITION_WHERE,
 
         BUILD_BITMAP_OF_PARTITION_WHERE,
         BUILD_BITMAP_OF_PARTITION,
@@ -117,6 +126,14 @@ public:
         LIVE_VIEW_REFRESH,
 
         SAMPLE_PARTITION_WHERE,
+
+        CHANGE_ENGINE,
+
+        MODIFY_DATABASE_SETTING,
+
+        RENAME_TABLE,
+
+        PARTITION_BY,
     };
 
     Type type = NO_TYPE;
@@ -161,9 +178,25 @@ public:
     */
     ASTPtr constraint_decl;
 
+    /** The ADD FOREIGN KEY query stores the ForeignKeyDeclaration there.
+    */
+    ASTPtr foreign_key_decl;
+
+    /** The ADD UNIQUE query stores the ForeignKeyDeclaration there.
+    */
+    ASTPtr unique_not_enforced_decl;
+
     /** The DROP CONSTRAINT query stores the name for deletion.
     */
     ASTPtr constraint;
+
+    /** The DROP FOREIGN KEY query stores the name for deletion.
+    */
+    ASTPtr foreign_key;
+
+    /** The DROP UNIQUE query stores the name for deletion.
+    */
+    ASTPtr unique_not_enforced;
 
     /** The ADD PROJECTION query stores the ProjectionDeclaration there.
      */
@@ -209,13 +242,18 @@ public:
     /// For CLEAR MAP KEY map_column('map_key1', 'map_key2'...)
     ASTPtr map_keys;
 
-    /// For FASTDELETE / INGESTION query, the optional list of columns to overwrite
+    /// For INGESTION query, the optional list of columns to overwrite
     ASTPtr columns;
     /// For Ingestion columns
     ASTPtr keys;
+    /// The INGEST PARTITION query here optionally stores the buckets that going to be ingested
+    ASTPtr buckets;
 
     /// For sample / split / resharding expression
     ASTPtr with_sharding_exp;
+
+    /// For Engine = EngineName(...), the name with optional parameters is stored here.
+    ASTPtr engine;
 
     bool detach = false;        /// true for DETACH PARTITION
 
@@ -238,6 +276,8 @@ public:
     bool first = false;         /// option for ADD_COLUMN, MODIFY_COLUMN
 
     bool cascading = false; /// true for DROP/DETACH PARTITION [WHERE]
+
+    bool staging_area = false;  /// true for DETACH/DROP STAGED PARTITION/PART, only used by unique table
 
     DataDestinationType move_destination_type; /// option for MOVE PART/PARTITION
 
@@ -262,17 +302,45 @@ public:
     String to_database;
     String to_table;
 
-    /// Target column name
+    /// Target column namea
     ASTPtr rename_to;
+
+    ASTPtr rename_table_to;
+    ASTPtr partition_by;
+    ASTPtr storage_policy;
+    ASTPtr hot_partition_count;
+    ASTPtr rt_engine;
+    ASTPtr life_cycle;
+    bool all = false;
 
     /// Which property user want to remove
     String remove_property;
+
+    /// For DETACH/ATTACH PARTITION commands
+    bool specify_bucket = false;
+    UInt64 bucket_number;
 
     String getID(char delim) const override { return "AlterCommand" + (delim + std::to_string(static_cast<int>(type))); }
 
     ASTPtr clone() const override;
 
     ASTType getType() const override { return ASTType::ASTAlterCommand; }
+
+    void toLowerCase() override
+    {
+        boost::to_lower(from_database);
+        boost::to_lower(from_table);
+        boost::to_lower(to_database);
+        boost::to_lower(to_table);
+    }
+
+    void toUpperCase() override
+    {
+        boost::to_upper(from_database);
+        boost::to_upper(from_table);
+        boost::to_upper(to_database);
+        boost::to_upper(to_table);
+    }
 
 protected:
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
@@ -281,7 +349,15 @@ protected:
 class ASTAlterQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnCluster
 {
 public:
-    bool is_live_view{false}; /// true for ALTER LIVE VIEW
+    enum class AlterObjectType
+    {
+        TABLE,
+        DATABASE,
+        LIVE_VIEW,
+        UNKNOWN,
+    };
+
+    AlterObjectType alter_object = AlterObjectType::UNKNOWN;
 
     ASTExpressionList * command_list = nullptr;
 
@@ -304,6 +380,10 @@ protected:
     void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 
     bool isOneCommandTypeOnly(const ASTAlterCommand::Type & type) const;
+};
+
+class ASTAlterAnalyticalMySQLQuery : public ASTAlterQuery
+{
 };
 
 }

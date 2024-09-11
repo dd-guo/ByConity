@@ -30,13 +30,17 @@ class WriteBuffer;
 
 struct CnchMergeTreeMutationEntry
 {
+
     void writeText(WriteBuffer & out) const;
     void readText(ReadBuffer & in);
 
     String toString() const;
     static CnchMergeTreeMutationEntry parse(const String & str);
     bool isReclusterMutation() const;
+    bool isModifyClusterBy() const;
+    void setPartitionIDs(const Strings & _partition_ids);
 
+    String query_id;
     TxnTimestamp txn_id;
     TxnTimestamp commit_time;
 
@@ -49,6 +53,7 @@ struct CnchMergeTreeMutationEntry
 
     /// Mutation commands which will give to MUTATE_PART entries
     MutationCommands commands;
+    std::optional<Strings> partition_ids;
 };
 
 }

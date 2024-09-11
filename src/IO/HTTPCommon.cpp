@@ -139,8 +139,9 @@ namespace
                 UInt16 proxy_port_,
                 bool proxy_https_,
                 size_t max_pool_size_,
+                bool wait_on_pool_size_limit_,
                 bool resolve_host_ = true)
-            : Base(max_pool_size_, &Poco::Logger::get("HTTPSessionPool"))
+            : Base(max_pool_size_, &Poco::Logger::get("HTTPSessionPool"), wait_on_pool_size_limit_ ? BehaviourOnLimit::Wait : BehaviourOnLimit::AllocateNewBypassingPool)
             , host(host_)
             , port(port_)
             , https(https_)
@@ -185,6 +186,8 @@ namespace
                 s.update(k.is_target_https);
                 s.update(k.proxy_host);
                 s.update(k.proxy_port);
+                //Bit access will be bounded by its size so it won't overrun
+                //coverity[overrun-buffer-val]
                 s.update(k.is_proxy_https);
                 return s.get64();
             }
@@ -208,6 +211,7 @@ namespace
             const Poco::URI & proxy_uri,
             const ConnectionTimeouts & timeouts,
             size_t max_connections_per_endpoint,
+            bool wait_on_pool_size_limit,
             bool resolve_host = true)
         {
             std::unique_lock lock(mutex);
@@ -230,9 +234,13 @@ namespace
             auto pool_ptr = endpoints_pool.find(key);
             if (pool_ptr == endpoints_pool.end())
                 std::tie(pool_ptr, std::ignore) = endpoints_pool.emplace(
-                    key, std::make_shared<SingleEndpointHTTPSessionPool>(host, port, https, proxy_host, proxy_port, proxy_https, max_connections_per_endpoint, resolve_host));
+                    key, std::make_shared<SingleEndpointHTTPSessionPool>(host, port, https,
+                    proxy_host, proxy_port, proxy_https, max_connections_per_endpoint,
+                    wait_on_pool_size_limit, resolve_host));
 
             auto retry_timeout = timeouts.connection_timeout.totalMicroseconds();
+            // pool_ptr gets reassigned to a valid position if it's at the end
+            // coverity[deref_iterator]
             auto session = pool_ptr->second->get(retry_timeout);
 
             /// We store exception messages in session data.
@@ -288,14 +296,14 @@ HTTPSessionPtr makeHTTPSession(const Poco::URI & uri, const ConnectionTimeouts &
 }
 
 
-PooledHTTPSessionPtr makePooledHTTPSession(const Poco::URI & uri, const ConnectionTimeouts & timeouts, size_t per_endpoint_pool_size, bool resolve_host)
+PooledHTTPSessionPtr makePooledHTTPSession(const Poco::URI & uri, const ConnectionTimeouts & timeouts, size_t per_endpoint_pool_size, bool wait_on_pool_size_limit, bool resolve_host)
 {
-    return makePooledHTTPSession(uri, {}, timeouts, per_endpoint_pool_size, resolve_host);
+    return makePooledHTTPSession(uri, {}, timeouts, per_endpoint_pool_size, wait_on_pool_size_limit, resolve_host);
 }
 
-PooledHTTPSessionPtr makePooledHTTPSession(const Poco::URI & uri, const Poco::URI & proxy_uri, const ConnectionTimeouts & timeouts, size_t per_endpoint_pool_size, bool resolve_host)
+PooledHTTPSessionPtr makePooledHTTPSession(const Poco::URI & uri, const Poco::URI & proxy_uri, const ConnectionTimeouts & timeouts, size_t per_endpoint_pool_size, bool wait_on_pool_size_limit, bool resolve_host)
 {
-    return HTTPSessionPool::instance().getSession(uri, proxy_uri, timeouts, per_endpoint_pool_size, resolve_host);
+    return HTTPSessionPool::instance().getSession(uri, proxy_uri, timeouts, per_endpoint_pool_size, wait_on_pool_size_limit, resolve_host);
 }
 
 bool isRedirect(const Poco::Net::HTTPResponse::HTTPStatus status) { return status == Poco::Net::HTTPResponse::HTTP_MOVED_PERMANENTLY  || status == Poco::Net::HTTPResponse::HTTP_FOUND || status == Poco::Net::HTTPResponse::HTTP_SEE_OTHER  || status == Poco::Net::HTTPResponse::HTTP_TEMPORARY_REDIRECT; }

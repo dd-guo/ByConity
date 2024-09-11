@@ -63,7 +63,7 @@ public:
     bool remove(const std::string& path, bool recursive = false) const;
     ssize_t getFileSize(const std::string& path) const;
     ssize_t getCapacity() const;
-    void list(const std::string& path, std::vector<std::string>& files) const;
+    void list(const std::string& path, std::vector<std::string>& files, std::vector<size_t> & sizes) const;
     int64_t getLastModifiedInSeconds(const std::string& path) const;
     bool renameTo(const std::string& path, const std::string& rpath) const;
     bool createFile(const std::string& path) const;
@@ -145,20 +145,19 @@ void setSize(const std::string& path, uint64_t size);
 // This class is for File abstraction.
 class File {
 public:
-    File(const char* path) : path_(path)
-    {
-    }
-
-    File(const std::string& path) : path_(path)
-    {
-    }
-
-    File(const Poco::Path& path) : path_(path.toString())
-    {
-    }
-
     File() = default;
-    ~File() = default;
+
+    explicit File(const char* path) : path_(path)
+    {
+    }
+
+    explicit File(const std::string& path) : path_(path)
+    {
+    }
+
+    explicit File(const Poco::Path& path) : path_(path.toString())
+    {
+    }
 
     File& operator = (const Poco::Path& rpath) {
         path_ = rpath.toString();

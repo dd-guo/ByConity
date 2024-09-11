@@ -17,8 +17,10 @@
 
 #include <Core/Names.h>
 #include <Interpreters/Context_fwd.h>
+#include <Interpreters/prepared_statement.h>
 #include <QueryPlan/CTEInfo.h>
 #include <QueryPlan/PlanNodeIdAllocator.h>
+#include <Interpreters/StorageID.h>
 #include <Poco/Logger.h>
 
 #include <list>
@@ -58,6 +60,11 @@ namespace JSONBuilder
     using ItemPtr = std::unique_ptr<IItem>;
 }
 
+namespace Protos
+{
+    class QueryPlan;
+}
+
 /// A tree of query steps.
 /// The goal of QueryPlan is to build QueryPipeline.
 /// QueryPlan let delay pipeline creation which is helpful for pipeline-level optimizations.
@@ -72,8 +79,9 @@ public:
 
     QueryPlan & operator=(QueryPlan &&);
 
-    void allocateLocalTable(ContextPtr context);
+    std::set<StorageID> allocateLocalTable(ContextPtr context);
     PlanNodeIdAllocatorPtr & getIdAllocator() { return id_allocator; }
+    void createIdAllocator() { id_allocator = std::make_shared<PlanNodeIdAllocator>(); }
     void update(PlanNodePtr plan) { plan_node = std::move(plan); }
 
     void unitePlans(QueryPlanStepPtr step, std::vector<QueryPlanPtr> plans);
@@ -89,6 +97,8 @@ public:
         const QueryPlanOptimizationSettings & optimization_settings,
         const BuildQueryPipelineSettings & build_pipeline_settings);
 
+    /// add step_id for processors
+    static void updatePipelineStepInfo(QueryPipelinePtr & pipeline_ptr, QueryPlanStepPtr & step,size_t step_id);
     /// If initialized, build pipeline and convert to pipe. Otherwise, return empty pipe.
     Pipe convertToPipe(
         const QueryPlanOptimizationSettings & optimization_settings,
@@ -115,11 +125,21 @@ public:
     JSONBuilder::ItemPtr explainPlan(const ExplainPlanOptions & options);
     void explainPlan(WriteBuffer & buffer, const ExplainPlanOptions & options) const;
     void explainPipeline(WriteBuffer & buffer, const ExplainPipelineOptions & options) const;
+    void explainPipelineWithOptimizer(WriteBuffer & buffer, const ExplainPipelineOptions & options) const;
 
     /// Set upper limit for the recommend number of threads. Will be applied to the newly-created pipelines.
     /// TODO: make it in a better way.
     void setMaxThreads(size_t max_threads_) { max_threads = max_threads_; }
     size_t getMaxThreads() const { return max_threads; }
+
+    void setShortCircuit(bool short_circuit_)
+    {
+        short_circuit = short_circuit_;
+    }
+    bool isShortCircuit() const
+    {
+        return short_circuit;
+    }
 
     void addInterpreterContext(std::shared_ptr<Context> context);
 
@@ -144,8 +164,9 @@ public:
     Nodes & getNodes() { return nodes; }
 
     Node * getRoot() { return root; }
-    void setRoot(Node * root_) { root = root_; }
-    CTENodes & getCTENodes() { return cte_nodes; }
+    const Node * getRoot() const { return root; }
+        void setRoot(Node * root_) { root = root_; }
+        CTENodes & getCTENodes() { return cte_nodes; }
 
     Node * getLastNode() { return &nodes.back(); }
 
@@ -154,22 +175,46 @@ public:
     void addRoot(QueryPlan::Node && node_);
     UInt32 newPlanNodeId() { return (*max_node_id)++; }
     PlanNodePtr & getPlanNode() { return plan_node; }
+    PlanNodePtr getPlanNode() const { return plan_node; }
+    void setPlanNode(PlanNodePtr new_plan_node) { plan_node = std::move(new_plan_node); }
     CTEInfo & getCTEInfo() { return cte_info; }
+    const CTEInfo & getCTEInfo() const { return cte_info; }
+    PlanNodePtr getPlanNodeById(PlanNodeId node_id) const;
+    static UInt32 getPlanNodeCount(PlanNodePtr node);
 
     QueryPlan getSubPlan(QueryPlan::Node * node_);
+
+    void toProto(Protos::QueryPlan & proto) const;
+    void fromProto(const Protos::QueryPlan & proto);
+
+    // handle when plan is tree-like, i.e., plan_node + cte_info
+    void toProtoTreeLike(Protos::QueryPlan & proto) const;
+    void fromProtoTreeLike(const Protos::QueryPlan & proto);
+
+    // handle when plan is flatten, i.e., root + nodes + cte_nodes
+    void toProtoFlatten(Protos::QueryPlan & proto) const;
+    void fromProtoFlatten(const Protos::QueryPlan & proto);
 
     void freshPlan();
 
     size_t getSize() const { return nodes.size(); }
 
+    void setResetStepId(bool reset_id) { reset_step_id = reset_id; }
+
+    QueryPlanPtr copy(ContextMutablePtr context);
+    void prepare(const PreparedStatementContext & prepared_context);
+
 private:
     Poco::Logger * log = &Poco::Logger::get("QueryPlan");
+    // Flatten, in segment only
     Nodes nodes;
-    CTENodes cte_nodes;
-
+    CTENodes cte_nodes; // won't serialize
     Node * root = nullptr;
+
+    // Tree-Like, for optimizer
     PlanNodePtr plan_node = nullptr;
     CTEInfo cte_info;
+
     PlanNodeIdAllocatorPtr id_allocator;
 
     void checkInitialized() const;
@@ -179,6 +224,10 @@ private:
     size_t max_threads = 0;
     std::vector<std::shared_ptr<Context>> interpreter_context;
     std::shared_ptr<UInt32> max_node_id;
+    //Whether reset step id in serialize()，use for explain analyze.
+    bool reset_step_id = true;
+
+    bool short_circuit = false;
 };
 
 std::string debugExplainStep(const IQueryPlanStep & step);

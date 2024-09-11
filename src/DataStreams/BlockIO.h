@@ -21,10 +21,12 @@
 
 #pragma once
 
-#include <Client/Connection.h>
-#include <DataStreams/IBlockStream_fwd.h>
 #include <functional>
+#include <memory>
+#include <DataStreams/IBlockStream_fwd.h>
+
 #include <Processors/QueryPipeline.h>
+#include <Client/Connection.h>
 
 
 namespace DB
@@ -32,6 +34,7 @@ namespace DB
 
 class ProcessListEntry;
 class PlanSegmentProcessListEntry;
+class MPPQueryCoordinator;
 
 struct BlockIO
 {
@@ -44,8 +47,12 @@ struct BlockIO
     BlockIO(const BlockIO &) = delete;
     BlockIO & operator= (const BlockIO & rhs) = delete;
 
+    std::shared_ptr<MPPQueryCoordinator> coordinator;
     std::shared_ptr<ProcessListEntry> process_list_entry;
     std::shared_ptr<PlanSegmentProcessListEntry> plan_segment_process_entry;
+
+    /// NOTE: make sure it's destructed after streams and pipeline.
+    ConnectionPtr remote_execution_conn;
 
     BlockOutputStreamPtr out;
     BlockInputStreamPtr in;
@@ -53,15 +60,13 @@ struct BlockIO
     QueryPipeline pipeline;
 
     /// Callbacks for query logging could be set here.
-    std::function<void(IBlockInputStream *, IBlockOutputStream *, QueryPipeline *, UInt64)>    finish_callback;
-    std::function<void(UInt64)>                                                                exception_callback;
+    std::function<void(IBlockInputStream *, IBlockOutputStream *, QueryPipeline *)>    finish_callback;
+    std::function<void()>                                                                exception_callback;
 
     /// When it is true, don't bother sending any non-empty blocks to the out stream
     bool null_format = false;
 
     Stopwatch watch;
-
-    ConnectionPtr remote_execution_conn;
 
     /// Call these functions if you want to log the request.
     void onFinish()
@@ -73,7 +78,7 @@ struct BlockIO
             if (pipeline.initialized())
                 pipeline_ptr = &pipeline;
 
-            finish_callback(in.get(), out.get(), pipeline_ptr, watch.elapsedMilliseconds());
+            finish_callback(in.get(), out.get(), pipeline_ptr);
         }
     }
 
@@ -81,7 +86,7 @@ struct BlockIO
     {
         watch.stop();
         if (exception_callback)
-            exception_callback(watch.elapsedMilliseconds());
+            exception_callback();
     }
 
     /// Returns in or converts pipeline to stream. Throws if out is not empty.

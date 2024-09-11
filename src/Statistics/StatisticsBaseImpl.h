@@ -16,11 +16,12 @@
 #pragma once
 #include <Statistics/StatisticsBase.h>
 #include <Common/Exception.h>
+#include <Statistics/SerdeUtils.h>
 
 namespace DB::Statistics
 {
 template <class StatsDerived>
-inline void CheckTag(StatisticsTag tag)
+inline void checkTag(StatisticsTag tag)
 {
     if (StatsDerived::tag != tag)
     {

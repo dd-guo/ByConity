@@ -54,8 +54,11 @@ NamesAndTypesList StorageSystemRowPolicies::getNamesAndTypes()
 
 void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
 {
-    context->checkAccess(AccessType::SHOW_ROW_POLICIES);
+    /// If "select_from_system_db_requires_grant" is enabled the access rights were already checked in InterpreterSelectQuery.
     const auto & access_control = context->getAccessControlManager();
+    if (!access_control.doesSelectFromSystemDatabaseRequireGrant())
+        context->checkAccess(AccessType::SHOW_ROW_POLICIES);
+
     std::vector<UUID> ids = access_control.findAll<RowPolicy>();
 
     size_t column_index = 0;
@@ -70,7 +73,10 @@ void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, ContextPtr
     NullMap * column_condition_null_map[MAX_CONDITION_TYPE];
     for (auto condition_type : collections::range(MAX_CONDITION_TYPE))
     {
+        // collections::range is end exclusive, hence we can ignore all below
+        // coverity[overrun-local]
         column_condition[condition_type] = &assert_cast<ColumnString &>(assert_cast<ColumnNullable &>(*res_columns[column_index]).getNestedColumn());
+        // coverity[overrun-local]
         column_condition_null_map[condition_type] = &assert_cast<ColumnNullable &>(*res_columns[column_index++]).getNullMapData();
     }
 
@@ -101,7 +107,10 @@ void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, ContextPtr
             const String & condition = conditions[condition_type];
             if (condition.empty())
             {
+                // collections::range is end exclusive, hence we can ignore all below
+                // coverity[overrun-local]
                 column_condition[condition_type]->insertDefault();
+                // coverity[overrun-local]    
                 column_condition_null_map[condition_type]->push_back(true);
             }
             else

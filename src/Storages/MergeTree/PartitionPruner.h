@@ -31,6 +31,12 @@
 namespace DB
 {
 
+struct PrunedPartitions
+{
+    Strings partitions;
+    UInt64 total_partition_number;
+};
+
 /// Pruning partitions in verbatim way using KeyCondition
 class PartitionPruner
 {
@@ -57,6 +63,8 @@ public:
     bool canBePruned(const DataPart & part);
 
     bool canBePruned(const ServerDataPart & part);
+
+    bool canBePruned(const String & partition_id, const Row & value);
 
     bool isUseless() const { return useless; }
 

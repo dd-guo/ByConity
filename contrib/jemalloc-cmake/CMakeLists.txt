@@ -1,10 +1,9 @@
+# Disabled under OSX until https://github.com/ClickHouse/ClickHouse/issues/27568 is fixed
 if (SANITIZE OR NOT (
-    ((OS_LINUX OR OS_FREEBSD) AND (ARCH_AMD64 OR ARCH_ARM OR ARCH_PPC64LE)) OR
-    (OS_DARWIN AND (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR CMAKE_BUILD_TYPE STREQUAL "Debug"))
-))
+    ((OS_LINUX OR OS_FREEBSD) AND (ARCH_AMD64 OR ARCH_ARM OR ARCH_PPC64LE))))
     if (ENABLE_JEMALLOC)
         message (${RECONFIGURE_MESSAGE_LEVEL}
-                 "jemalloc is disabled implicitly: it doesn't work with sanitizers and can only be used with x86_64, aarch64, or ppc64le Linux or FreeBSD builds and RelWithDebInfo macOS builds.")
+                 "jemalloc is disabled implicitly: it doesn't work with sanitizers and can only be used with x86_64, aarch64, or ppc64le Linux or FreeBSD builds")
     endif ()
     set (ENABLE_JEMALLOC OFF)
 else ()
@@ -42,8 +41,8 @@ if (OS_LINUX)
     # Enable background thread to recycle memory
     #
     # Since the percpu_arena will increase malloc lock race condition,
-    # keep the percpu_arena the default value to leverage 4*CPU cores arena
-    set (JEMALLOC_CONFIG_MALLOC_CONF "percpu_arena:disabled,oversize_threshold:0,muzzy_decay_ms:100,dirty_decay_ms:100,background_thread:true")
+    # keep the percpu_arena the default value to leverage 4*CPU cores arena 
+    set (JEMALLOC_CONFIG_MALLOC_CONF "metadata_thp:auto,percpu_arena:disabled,oversize_threshold:0,muzzy_decay_ms:5000,dirty_decay_ms:5000")
 else()
     set (JEMALLOC_CONFIG_MALLOC_CONF "oversize_threshold:0,muzzy_decay_ms:5000,dirty_decay_ms:5000")
 endif()
@@ -136,8 +135,8 @@ endif ()
 target_compile_definitions(jemalloc PRIVATE -DJEMALLOC_PROF=1)
 
 if (USE_UNWIND)
-    target_compile_definitions (jemalloc PRIVATE -DJEMALLOC_PROF_LIBUNWIND=1)
-    target_link_libraries (jemalloc PRIVATE unwind)
+    target_compile_definitions (jemalloc PRIVATE -DJEMALLOC_PROF_LIBUNWIND_OLD=1)
+    target_link_libraries (jemalloc PRIVATE unwind-old)
 endif ()
 
 target_compile_options(jemalloc PRIVATE -Wno-redundant-decls)

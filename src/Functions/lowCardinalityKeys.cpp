@@ -10,6 +10,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace
@@ -28,12 +29,13 @@ public:
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
     bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         const auto * type = typeid_cast<const DataTypeLowCardinality *>(arguments[0].get());
         if (!type)
-            throw Exception("First first argument of function lowCardinalityKeys must be ColumnLowCardinality, but got "
+            throw Exception("First argument of function lowCardinalityKeys must be ColumnLowCardinality, but got "
                             + arguments[0]->getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
 
         return type->getDictionaryType();
@@ -43,13 +45,15 @@ public:
     {
         const auto & arg = arguments[0];
         const auto * low_cardinality_column = typeid_cast<const ColumnLowCardinality *>(arg.column.get());
+        if (low_cardinality_column->isFullState())
+            throw Exception("Function lowCardinalityKeys is not supported for full state", ErrorCodes::NOT_IMPLEMENTED);
         return low_cardinality_column->getDictionary().getNestedColumn()->cloneResized(arg.column->size());
     }
 };
 
 }
 
-void registerFunctionLowCardinalityKeys(FunctionFactory & factory)
+REGISTER_FUNCTION(LowCardinalityKeys)
 {
     factory.registerFunction<FunctionLowCardinalityKeys>();
 }

@@ -24,8 +24,11 @@ namespace DB
 class RemoveRedundantSort : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveRedundantSort"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_redundant_sort_removal; }
 };
 
 struct RedundantSortContext
@@ -37,32 +40,30 @@ struct RedundantSortContext
 class RedundantSortVisitor : public SimplePlanRewriter<RedundantSortContext>
 {
 public:
-    explicit RedundantSortVisitor(ContextMutablePtr context_, CTEInfo & cte_info_, PlanNodePtr & root)
-        : SimplePlanRewriter(context_, cte_info_), post_order_cte_helper(cte_info_, root)
-    {}
+    explicit RedundantSortVisitor(ContextMutablePtr context_, CTEInfo & cte_info_)
+        : SimplePlanRewriter(context_, cte_info_)
+    {
+    }
 
     static bool isStateful(ConstASTPtr expression, ContextMutablePtr context);
-    static bool isOrderDependentAggregateFunction(const String& aggname);
+    static bool isOrderDependentAggregateFunction(const String & aggname);
     const static std::unordered_set<String> order_dependent_agg;
 
 private:
+    PlanNodePtr visitPlanNode(PlanNodeBase & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitProjectionNode(ProjectionNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitAggregatingNode(AggregatingNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitJoinNode(JoinNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitUnionNode(UnionNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitIntersectNode(IntersectNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitExceptNode(ExceptNode & node, RedundantSortContext & sort_context) override;
-    PlanNodePtr visitLimitNode(LimitNode & node, RedundantSortContext & sort_context) override;
-    PlanNodePtr visitLimitByNode(LimitByNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitSortingNode(SortingNode & node, RedundantSortContext & sort_context) override;
     PlanNodePtr visitCTERefNode(CTERefNode & node, RedundantSortContext & sort_context) override;
 
     PlanNodePtr processChildren(PlanNodeBase & node, RedundantSortContext & sort_context);
     PlanNodePtr resetChild(PlanNodeBase & node, PlanNodes & children, RedundantSortContext & sort_context);
 
-    CTEPostorderVisitHelper post_order_cte_helper;
     std::unordered_map<CTEId, RedundantSortContext> cte_require_context{};
-
 };
 
 class StatefulVisitor : public ConstASTVisitor<void, ContextMutablePtr>

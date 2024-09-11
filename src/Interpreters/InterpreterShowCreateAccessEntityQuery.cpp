@@ -69,8 +69,8 @@ namespace
         query->names->push_back(user.getName());
         query->attach = attach_mode;
 
-        if (user.allowed_client_hosts != AllowedClientHosts::AnyHostTag{})
-            query->hosts = user.allowed_client_hosts;
+        // if (user.allowed_client_hosts != AllowedClientHosts::AnyHostTag{})
+        //     query->hosts = user.allowed_client_hosts;
 
         if (user.default_roles != RolesOrUsersSet::AllTag{})
         {
@@ -81,10 +81,7 @@ namespace
         }
 
         if (user.authentication.getType() != Authentication::NO_PASSWORD)
-        {
             query->authentication = user.authentication;
-            query->show_password = attach_mode; /// We don't show password unless it's an ATTACH statement.
-        }
 
         if (!user.settings.empty())
         {
@@ -173,6 +170,8 @@ namespace
             create_query_limits.duration = limits.duration;
             create_query_limits.randomize_interval = limits.randomize_interval;
             for (auto resource_type : collections::range(Quota::MAX_RESOURCE_TYPE))
+                // collections::range is end exclusive
+                // coverity[overrun-local]
                 create_query_limits.max[resource_type] = limits.max[resource_type];
             query->all_limits.push_back(create_query_limits);
         }
@@ -267,19 +266,12 @@ BlockInputStreamPtr InterpreterShowCreateAccessEntityQuery::executeImpl()
 
     /// Build the result column.
     MutableColumnPtr column = ColumnString::create();
-    WriteBufferFromOwnString create_query_buf;
     for (const auto & create_query : create_queries)
-    {
-        formatAST(*create_query, create_query_buf, false, true);
-        column->insert(create_query_buf.str());
-        create_query_buf.restart();
-    }
+        column->insert(create_query->formatWithHiddenSecrets());
 
     /// Prepare description of the result column.
-    WriteBufferFromOwnString desc_buf;
     const auto & show_query = query_ptr->as<const ASTShowCreateAccessEntityQuery &>();
-    formatAST(show_query, desc_buf, false, true);
-    String desc = desc_buf.str();
+    String desc = serializeAST(show_query);
     String prefix = "SHOW ";
     if (startsWith(desc, prefix))
         desc = desc.substr(prefix.length()); /// `desc` always starts with "SHOW ", so we can trim this prefix.

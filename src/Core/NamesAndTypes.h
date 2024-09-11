@@ -36,6 +36,11 @@
 namespace DB
 {
 
+namespace Protos
+{
+    class NameAndTypePair;
+}
+
 struct NameAndTypePair
 {
 public:
@@ -67,6 +72,8 @@ public:
 
     void serialize(WriteBuffer & buf) const;
     void deserialize(ReadBuffer & buf);
+    void toProto(Protos::NameAndTypePair & proto) const;
+    void fillFromProto(const Protos::NameAndTypePair & proto);
 
 private:
     DataTypePtr type_in_storage;
@@ -127,8 +134,12 @@ public:
     /// Leave only the columns whose names are in the `names`. In `names` there can be superfluous columns.
     NamesAndTypesList filter(const Names & names) const;
 
+    /// Leave only the column `name`
+    NamesAndTypesList filter(const String & name) const;
+
     /// Unlike `filter`, returns columns in the order in which they go in `names`.
-    NamesAndTypesList addTypes(const Names & names) const;
+    /// bitengine_read_type is used in BitEngineDictionaryManager or BiEngine parts merging job
+    NamesAndTypesList addTypes(const Names & names, BitEngineReadType bitengine_read_type = BitEngineReadType::ONLY_SOURCE) const;
 
     /// Check that column contains in list
     bool contains(const String & name) const;
@@ -138,9 +149,6 @@ public:
 
     /// Try to get column position by name, returns number of columns if column isn't found
     size_t getPosByName(const std::string & name) const noexcept;
-
-    void serialize(WriteBuffer & buf) const;
-    void deserialize(ReadBuffer & buf);
 };
 
 using NamesAndTypesListPtr = std::shared_ptr<NamesAndTypesList>;

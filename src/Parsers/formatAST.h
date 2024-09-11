@@ -32,9 +32,18 @@ class WriteBuffer;
 /** Takes a syntax tree and turns it back into text.
   * In case of INSERT query, the data will be missing.
   */
-void formatAST(const IAST & ast, WriteBuffer & buf, bool hilite = true, bool one_line = false, bool always_quote_identifiers = false);
+void formatAST(const IAST &ast,
+               WriteBuffer &buf,
+               bool hilite = true,
+               bool one_line = false,
+	       bool always_quote_identifiers = false,
+               DialectType dialect = DialectType::CLICKHOUSE);
 
-String serializeAST(const IAST & ast, bool one_line = true);
+String serializeAST(const IAST & ast, bool one_line = true, bool always_quote_identifiers = false);
+
+String serializeASTWithOutAlias(const IAST & ast);
+
+String getSerializedASTWithLimit(const IAST & ast, size_t max_text_length);
 
 inline WriteBuffer & operator<<(WriteBuffer & buf, const IAST & ast)
 {

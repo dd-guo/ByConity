@@ -16,7 +16,6 @@
 #pragma once
 
 #include <Catalog/DataModelPartWrapper_fwd.h>
-#include <CloudServices/Checkpoint.h>
 #include <CloudServices/ICnchBGThread.h>
 #include <Core/Names.h>
 #include <Storages/IStorage_fwd.h>
@@ -28,6 +27,8 @@
 
 namespace DB
 {
+class CnchBGThreadPartitionSelector;
+using PartitionSelectorPtr = std::shared_ptr<CnchBGThreadPartitionSelector>;
 
 /// A thread clean up the stale stuff (like parts, deleted bitmaps, labels) for table
 /// Also, mark expired parts accord to table level TTL
@@ -37,44 +38,63 @@ class CnchPartGCThread : public ICnchBGThread
 public:
     CnchPartGCThread(ContextPtr context_, const StorageID & id);
 
+    /**
+     * Synchronousely perform GC by SYSTEM GC command, useful in sql tests.
+     * User should run SYSTEM STOP GC before SYSTEM GC to avoid contention with the bg thread.
+     */
+    void executeManually(const ASTPtr & partition, ContextPtr local_context);
+
 private:
+    void stop() override;
     CnchBGThreadPtr getMergeThread();
 
     void runImpl() override;
+    void clearData() override;
 
-    void clearOldParts(const StoragePtr & istorage, StorageCnchMergeTree & storage);
+    /**
+     * @brief Try select valid invisible parts/delete bitmaps and move their metadata to trash.
+     *
+     * @param partitions Partitions to be selected.
+     * @return Return `true` if any items removed.
+     */
+    bool doPhaseOneGC(const StoragePtr & istorage, StorageCnchMergeTree & storage, const Strings & partitions);
+    /**
+     * @param items_removed A reference to a boolean variable that will be set to true if any items were removed.
+     * @return total items count (that are still) in partition.
+     */
+    size_t doPhaseOnePartitionGC(
+        const StoragePtr & istorage,
+        StorageCnchMergeTree & storage,
+        const String & partition_id,
+        bool in_wakeup,
+        TxnTimestamp gc_timestamp,
+        bool & items_removed);
+    void movePartsToTrash(const StoragePtr & storage, const ServerDataPartsVector & parts, bool is_staged, String log_type, size_t pool_size, size_t batch_size, bool is_zombie_with_staging_txn_id = false);
+    void moveDeleteBitmapsToTrash(const StoragePtr & storage, const DeleteBitmapMetaPtrVector & bitmaps, size_t pool_size, size_t batch_size);
     void clearOldInsertionLabels(const StoragePtr & istorage, StorageCnchMergeTree & storage);
 
+    void clearEmptyPartitions(const StoragePtr & istorage, StorageCnchMergeTree & storage, const Strings & partitions);
+
+    /**
+     * @brief Try to delete the actual data and trashed metadata for a table.
+     *
+     * @return total number of items deleted.
+     */
+    size_t doPhaseTwoGC(const StoragePtr & istorage, StorageCnchMergeTree & storage);
+
+    /**
+     * @brief Task to remove data in the trash. Executed by `data_remover`.
+     *
+     * If there are no parts to remove, the pace will be adaptively slowed down.
+     */
+    void runDataRemoveTask();
+
     TxnTimestamp calculateGCTimestamp(UInt64 delay_second, bool in_wakeup);
+    Strings selectPartitions(const StoragePtr & istorage);
 
-    static void tryMarkExpiredPartitions(StorageCnchMergeTree & storage, const ServerDataPartsVector & visible_parts);
+    void tryMarkExpiredPartitions(StorageCnchMergeTree & storage, const ServerDataPartsVector & visible_parts);
 
-    void pushToRemovingQueue(
-        StorageCnchMergeTree & storage, const ServerDataPartsVector & parts, const String & part_type, bool is_staged_part = false);
-    void removeDeleteBitmaps(StorageCnchMergeTree & storage, const DeleteBitmapMetaPtrVector & bitmaps, const String & reason);
-
-    void collectStaleParts(
-        ServerDataPartPtr parent_part,
-        TxnTimestamp begin,
-        TxnTimestamp end,
-        bool has_visible_ancestor,
-        ServerDataPartsVector & stale_parts) const;
-
-    void collectStaleBitmaps(
-        DeleteBitmapMetaPtr parent_bitmap,
-        TxnTimestamp begin,
-        TxnTimestamp end,
-        bool has_visible_ancestor,
-        DeleteBitmapMetaPtrVector & stale_bitmaps);
-
-    std::vector<TxnTimestamp> getCheckpoints(StorageCnchMergeTree & storage, TxnTimestamp max_timestamp);
-
-    void collectBetweenCheckpoints(
-        StorageCnchMergeTree & storage,
-        const ServerDataPartsVector & visible_parts,
-        const DeleteBitmapMetaPtrVector & visible_bitmaps,
-        TxnTimestamp begin,
-        TxnTimestamp end);
+    std::pair<ServerDataPartsVector, ServerDataPartsVector> processIntermediateParts(ServerDataPartsVector & parts, TxnTimestamp gc_timestamp);
 
     // void updatePartCache(const String & partition_id, Int64 part_num) override
     // {
@@ -82,7 +102,16 @@ private:
     //         merge->updatePartCache(partition_id, -1 * part_num);
     // }
 
-private:
+    /// Remove parts/delete bitmaps from remote storage and clear trash.
+    size_t round_removing_no_data = 0;
+    size_t phase_one_continuous_hits = 0;
+    size_t phase_two_continuous_hits = 0;
+
+
+    /// Delete data files in the trash state in background.
+    BackgroundSchedulePool::TaskHolder data_remover;
+
+    PartitionSelectorPtr partition_selector;
     BackgroundSchedulePool::TaskHolder checkpoint_task;
 
     pcg64 rng;
@@ -92,7 +121,7 @@ private:
 
     std::weak_ptr<ICnchBGThread> merge_thread;
 
-    time_t gc_labels_last_time{0};
+    String phase_two_start_key;
 };
 
 

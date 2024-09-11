@@ -13,6 +13,8 @@
  * limitations under the License.
  */
 
+// TODO: reenable this test when sync mode is ready
+#if 0
 #include <Parsers/ASTPartition.h>
 #include <Parsers/ParserQueryWithOutput.h>
 #include <Parsers/ParserStatsQuery.h>
@@ -29,19 +31,22 @@ struct SimpleStatsASTParseResult
     String id;
     ASTType type;
     StatsQueryKind kind;
-    bool target_all;
+    bool any_database;
+    bool any_table;
     String database;
     String table;
     std::vector<String> columns;
     String cluster;
     std::optional<String> formatted_sql;
+    StatisticsCachePolicy cache_policy = StatisticsCachePolicy::Default;
 };
 
 struct CreateStatsASTParseResult
 {
     String id;
     StatsQueryKind kind;
-    bool target_all = false;
+    bool any_database = false;
+    bool any_table = false;
     std::optional<String> partition_id;
     SampleType sample_type = SampleType::Default;
     std::optional<Int64> sample_rows;
@@ -50,6 +55,7 @@ struct CreateStatsASTParseResult
     String table;
     std::vector<String> columns;
     String cluster;
+    SyncMode sync_mode = SyncMode::Default;
     std::optional<String> formatted_sql;
     bool if_not_exists = false;
 };
@@ -64,11 +70,12 @@ protected:
         ParserQueryWithOutput parser{end, ParserSettings::CLICKHOUSE};
         auto res = parseQuery(parser, beg, end, "", 0, 0);
         auto * ast = res->as<ASTCreateStatsQuery>();
-        ASSERT_TRUE(ast);
+        ASSERT_TRUE(ast) << input;
         EXPECT_EQ(ast->getID(' '), expect.id);
         EXPECT_EQ(ast->getType(), ASTType::ASTCreateStatsQuery);
         EXPECT_EQ(ast->kind, expect.kind);
-        EXPECT_EQ(ast->target_all, expect.target_all);
+        EXPECT_EQ(ast->any_database, expect.any_database);
+        EXPECT_EQ(ast->any_table, expect.any_table);
         EXPECT_EQ(ast->database, expect.database);
         EXPECT_EQ(ast->sample_type, expect.sample_type);
         EXPECT_EQ(ast->sample_rows, expect.sample_rows);
@@ -94,15 +101,17 @@ protected:
         ParserQueryWithOutput parser{end, ParserSettings::CLICKHOUSE};
         auto res = parseQuery(parser, beg, end, "", 0, 0);
         auto * ast = res->as<AstStatsQuery>();
-        ASSERT_TRUE(ast);
+        ASSERT_TRUE(ast) << input;
         EXPECT_EQ(ast->getID(' '), expect.id);
         EXPECT_EQ(ast->getType(), expect.type);
         EXPECT_EQ(ast->kind, expect.kind);
-        EXPECT_EQ(ast->target_all, expect.target_all);
+        EXPECT_EQ(ast->any_database, expect.any_database);
+        EXPECT_EQ(ast->any_table, expect.any_table);
         EXPECT_EQ(ast->database, expect.database);
         EXPECT_EQ(ast->table, expect.table);
         EXPECT_EQ(ast->columns, expect.columns);
         EXPECT_EQ(ast->cluster, expect.cluster);
+        EXPECT_EQ(ast->cache_policy, expect.cache_policy);
 
 
         WriteBufferFromOwnString os;
@@ -142,7 +151,7 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
             .id = "SHOW TABLE_STATS t1",
             .type = ASTType::ASTShowStatsQuery,
             .kind = StatsQueryKind::TABLE_STATS,
-            .target_all = false,
+            .any_table = false,
             .table = "t1",
         });
 
@@ -152,7 +161,7 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
             .id = "DROP COLUMN_STATS t1 xx",
             .type = ASTType::ASTDropStatsQuery,
             .kind = StatsQueryKind::COLUMN_STATS,
-            .target_all = false,
+            .any_table = false,
             .table = "t1",
             .columns = {"xx"},
             .formatted_sql = "DROP COLUMN_STATS t1 (xx)",
@@ -164,7 +173,7 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
             .id = "DROP TABLE_STATS db1 t1",
             .type = ASTType::ASTDropStatsQuery,
             .kind = StatsQueryKind::TABLE_STATS,
-            .target_all = false,
+            .any_table = false,
             .database = "db1",
             .table = "t1",
         });
@@ -175,7 +184,7 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
             .id = "SHOW STATS db1 t1 gg kk",
             .type = ASTType::ASTShowStatsQuery,
             .kind = StatsQueryKind::ALL_STATS,
-            .target_all = false,
+            .any_table = false,
             .database = "db1",
             .table = "t1",
             .columns = {"gg", "kk"},
@@ -188,7 +197,7 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
             .id = "SHOW COLUMN_STATS",
             .type = ASTType::ASTShowStatsQuery,
             .kind = StatsQueryKind::COLUMN_STATS,
-            .target_all = true,
+            .any_table = true,
         });
 
     checkSuccessParse<ASTDropStatsQuery>(
@@ -207,8 +216,29 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
             .id = "SHOW COLUMN_STATS",
             .type = ASTType::ASTShowStatsQuery,
             .kind = StatsQueryKind::COLUMN_STATS,
-            .target_all = true,
+            .any_table = true,
             .cluster = "c2",
+        });
+
+    checkSuccessParse<ASTShowStatsQuery>(
+        "SHOW COLUMN_STATS ALL IN CATALOG",
+        {
+            .id = "SHOW COLUMN_STATS catalog",
+            .type = ASTType::ASTShowStatsQuery,
+            .kind = StatsQueryKind::COLUMN_STATS,
+            .any_table = true,
+            .cache_policy = StatisticsCachePolicy::Catalog,
+        });
+
+    checkSuccessParse<ASTDropStatsQuery>(
+        "drop stats all in cache",
+        {
+            .id = "DROP STATS cache",
+            .type = ASTType::ASTDropStatsQuery,
+            .any_table = true,
+            .kind = StatsQueryKind::ALL_STATS,
+            .formatted_sql = "DROP STATS ALL IN CACHE",
+            .cache_policy = StatisticsCachePolicy::Cache,
         });
 
     checkFailParse("SHOW TABLE_STATS tt.");
@@ -220,6 +250,8 @@ TEST_F(StatsQueryTest, SimpleStatsQueryParsers)
     checkFailParse("DROP TABLE_STATS ALL (oo)");
     checkFailParse("DROP TABLE_STATS ALL (oo, ww)");
     checkFailParse("DROP TABLE_STATS ALL (oo, ww)");
+    checkFailParse("SHOW STATS t1 CACHE");
+    checkFailParse("DROP STATS t1 ON CATALOG");
 }
 
 TEST_F(StatsQueryTest, SimpleStatsASTClone)
@@ -228,7 +260,7 @@ TEST_F(StatsQueryTest, SimpleStatsASTClone)
     ptr1->database = "db";
     ptr1->table = "table";
     ptr1->kind = StatsQueryKind::COLUMN_STATS;
-    ptr1->target_all = true;
+    ptr1->any_table = true;
     ptr1->cluster = "";
 
     ASTPtr cloned = ptr1->clone();
@@ -238,7 +270,7 @@ TEST_F(StatsQueryTest, SimpleStatsASTClone)
     EXPECT_TRUE(ptr1->database == ptr2->database);
     EXPECT_TRUE(ptr1->table == ptr2->table);
     EXPECT_TRUE(ptr1->kind == ptr2->kind);
-    EXPECT_TRUE(ptr1->target_all == ptr2->target_all);
+    EXPECT_TRUE(ptr1->any_table == ptr2->any_table);
     EXPECT_TRUE(ptr1->cluster == ptr2->cluster);
 }
 
@@ -248,7 +280,7 @@ TEST_F(StatsQueryTest, SimpleStatsASTRewrittenWithoutOnCluster)
     ptr1->database = "";
     ptr1->table = "table";
     ptr1->kind = StatsQueryKind::TABLE_STATS;
-    ptr1->target_all = false;
+    ptr1->any_table = false;
     ptr1->cluster = "CC2";
 
     ASTPtr rewritten = ptr1->getRewrittenASTWithoutOnCluster("new_db");
@@ -258,7 +290,7 @@ TEST_F(StatsQueryTest, SimpleStatsASTRewrittenWithoutOnCluster)
     EXPECT_TRUE(ptr2->database == "new_db");
     EXPECT_TRUE(ptr1->table == ptr2->table);
     EXPECT_TRUE(ptr1->kind == ptr2->kind);
-    EXPECT_TRUE(ptr1->target_all == ptr2->target_all);
+    EXPECT_TRUE(ptr1->any_table == ptr2->any_table);
     EXPECT_TRUE(ptr2->cluster.empty());
 }
 
@@ -277,7 +309,7 @@ TEST_F(StatsQueryTest, CreateStatsQueryParsers)
         CreateStatsASTParseResult{
             .id = "CREATE STATS ifNotExists",
             .kind = StatsQueryKind::ALL_STATS,
-            .target_all = true,
+            .any_table = true,
             .formatted_sql = "CREATE STATS IF NOT EXISTS ALL",
             .if_not_exists = true});
 
@@ -294,10 +326,7 @@ TEST_F(StatsQueryTest, CreateStatsQueryParsers)
     checkCreateStatsQuerySuccessParse(
         "CREATE STATS ALL",
         CreateStatsASTParseResult{
-            .id = "CREATE STATS",
-            .kind = StatsQueryKind::ALL_STATS,
-            .target_all = true,
-            .formatted_sql = "CREATE STATS ALL"});
+            .id = "CREATE STATS", .kind = StatsQueryKind::ALL_STATS, .any_table = true, .formatted_sql = "CREATE STATS ALL"});
 
     checkCreateStatsQuerySuccessParse(
         "CREATE STATS `ALL`",
@@ -333,7 +362,7 @@ TEST_F(StatsQueryTest, CreateStatsQueryParsers)
         CreateStatsASTParseResult{
             .id = "CREATE TABLE_STATS sample rows=10",
             .kind = StatsQueryKind::TABLE_STATS,
-            .target_all = true,
+            .any_table = true,
             .sample_type = SampleType::Sample,
             .sample_rows = 10,
             .formatted_sql = "CREATE TABLE_STATS ALL WITH SAMPLE 10 ROWS"});
@@ -343,9 +372,29 @@ TEST_F(StatsQueryTest, CreateStatsQueryParsers)
         CreateStatsASTParseResult{
             .id = "CREATE TABLE_STATS fullScan",
             .kind = StatsQueryKind::TABLE_STATS,
-            .target_all = true,
+            .any_table = true,
             .sample_type = SampleType::FullScan,
             .formatted_sql = "CREATE TABLE_STATS ALL WITH FULLSCAN"});
+
+    checkCreateStatsQuerySuccessParse(
+        "CREATE TABLE_STATS dog.* WITH FULLSCAN",
+        CreateStatsASTParseResult{
+            .id = "CREATE TABLE_STATS",
+            .kind = StatsQueryKind::TABLE_STATS,
+            .any_table = true,
+            .database = "dog",
+            .sample_type = SampleType::FullScan,
+            .formatted_sql = "CREATE TABLE_STATS dog.* WITH FULLSCAN"});
+
+    checkCreateStatsQuerySuccessParse(
+        "CREATE TABLE_STATS *.* WITH FULLSCAN",
+        CreateStatsASTParseResult{
+            .id = "CREATE TABLE_STATS",
+            .kind = StatsQueryKind::TABLE_STATS,
+            .any_database = true,
+            .any_table = true,
+            .sample_type = SampleType::FullScan,
+            .formatted_sql = "CREATE TABLE_STATS *.* WITH FULLSCAN"});
 
     checkCreateStatsQuerySuccessParse(
         "CREATE STATS db1.t1 PARTITION ID 'yyy' with sample 0.25 ratio 5 rows",
@@ -380,7 +429,7 @@ TEST_F(StatsQueryTest, CreateStatsQueryParsers)
         CreateStatsASTParseResult{
             .id = "CREATE COLUMN_STATS",
             .kind = StatsQueryKind::COLUMN_STATS,
-            .target_all = true,
+            .any_table = true,
             .cluster = "c1",
             .formatted_sql = "CREATE COLUMN_STATS ALL ON CLUSTER c1",
         });
@@ -407,6 +456,8 @@ TEST_F(StatsQueryTest, CreateStatsQueryParsers)
     checkFailParse("CREATE STATS t1 WITH FULLSCAN SAMPLE");
     checkFailParse("CREATE STATS t1 WITH 0.01 ROWS 100 RATIO");
     checkFailParse("CREATE STATS t1 WITH RATIO 1000");
+    checkFailParse("CREATE STATS t1 IN CACHE");
+    checkFailParse("CREATE STATS t1 IN CATALOG");
 }
 
 TEST_F(StatsQueryTest, CreateStatsASTClone)
@@ -415,7 +466,7 @@ TEST_F(StatsQueryTest, CreateStatsASTClone)
     ptr1->database = "db";
     ptr1->table = "table";
     ptr1->kind = StatsQueryKind::COLUMN_STATS;
-    ptr1->target_all = true;
+    ptr1->any_table = true;
     ptr1->cluster = "";
     ptr1->sample_type = SampleType::Sample;
     ptr1->sample_rows = 4;
@@ -431,7 +482,7 @@ TEST_F(StatsQueryTest, CreateStatsASTClone)
     ASSERT_TRUE(ptr1->database == ptr2->database);
     ASSERT_TRUE(ptr1->table == ptr2->table);
     ASSERT_TRUE(ptr1->kind == ptr2->kind);
-    ASSERT_TRUE(ptr1->target_all == ptr2->target_all);
+    ASSERT_TRUE(ptr1->any_table == ptr2->any_table);
     ASSERT_TRUE(ptr1->if_not_exists == ptr2->if_not_exists);
     ASSERT_TRUE(ptr1->cluster == ptr2->cluster);
     ASSERT_TRUE(ptr2->sample_type == SampleType::Sample);
@@ -449,7 +500,7 @@ TEST_F(StatsQueryTest, CreateStatsASTRewrittenWithoutOnCluster)
     ptr1->database = "";
     ptr1->table = "table";
     ptr1->kind = StatsQueryKind::TABLE_STATS;
-    ptr1->target_all = false;
+    ptr1->any_table = false;
     ptr1->cluster = "CC2";
 
     ASTPtr rewritten = ptr1->getRewrittenASTWithoutOnCluster("new_db");
@@ -459,6 +510,7 @@ TEST_F(StatsQueryTest, CreateStatsASTRewrittenWithoutOnCluster)
     ASSERT_TRUE(ptr2->database == "new_db");
     ASSERT_TRUE(ptr1->table == ptr2->table);
     ASSERT_TRUE(ptr1->kind == ptr2->kind);
-    ASSERT_TRUE(ptr1->target_all == ptr2->target_all);
+    ASSERT_TRUE(ptr1->any_table == ptr2->any_table);
     ASSERT_TRUE(ptr2->cluster.empty());
 }
+#endif

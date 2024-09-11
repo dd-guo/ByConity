@@ -22,6 +22,7 @@
 #pragma once
 
 #include <list>
+#include <functional>
 
 #include <Parsers/IParserBase.h>
 #include <Parsers/CommonParsers.h>
@@ -291,12 +292,32 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+class ParserBitwiseXorExpression : public IParserDialectBase
+{
+    static const char * operators[];
+    ParserUnaryExpression & nested_parser = *new ParserUnaryExpression(dt);
+    ParserLeftAssociativeBinaryOperatorList operator_parser {operators, std::unique_ptr<ParserUnaryExpression>(&nested_parser)};
+
+protected:
+    const char * getName() const override { return "bitwise xor expression"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override
+    {
+        if (dt.parse_bitwise_operators)
+            return operator_parser.parse(pos, node, expected);
+        else
+            return nested_parser.parse(pos, node, expected);
+    }
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
 
 class ParserMultiplicativeExpression : public IParserDialectBase
 {
 private:
     static const char * operators[];
-    ParserLeftAssociativeBinaryOperatorList operator_parser {operators, std::make_unique<ParserUnaryExpression>(dt)};
+    ParserLeftAssociativeBinaryOperatorList operator_parser {operators, std::make_unique<ParserBitwiseXorExpression>(dt)};
 
 protected:
     const char * getName() const  override { return "multiplicative expression"; }
@@ -309,11 +330,23 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+/// DATE32 operator. "DATE32 '2001-01-01'" would be parsed as "toDate32('2001-01-01')".
+class ParserDate32OperatorExpression : public IParserDialectBase
+{
+protected:
+    ParserMultiplicativeExpression next_parser{dt};
+
+    const char * getName() const  override { return "DATE32 operator expression"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
 /// DATE operator. "DATE '2001-01-01'" would be parsed as "toDate('2001-01-01')".
 class ParserDateOperatorExpression : public IParserDialectBase
 {
 protected:
-    ParserMultiplicativeExpression next_parser{dt};
+    ParserDate32OperatorExpression next_parser{dt};
 
     const char * getName() const  override { return "DATE operator expression"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
@@ -321,13 +354,41 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
-/// TIMESTAMP operator. "TIMESTAMP '2001-01-01 12:34:56'" would be parsed as "toDateTime('2001-01-01 12:34:56')".
-class ParserTimestampOperatorExpression : public IParserDialectBase
+/// TIMESTAMP64/DATETIME64 operator. "TIMESTAMP64/DATETIME64 '2001-01-01 12:34:56'" would be parsed as "toDateTime64('2001-01-01 12:34:56')".
+class ParserTimestampDatetime64OperatorExpression : public IParserDialectBase
 {
 protected:
     ParserDateOperatorExpression next_parser{dt};
 
-    const char * getName() const  override { return "TIMESTAMP operator expression"; }
+    const char * getName() const override { return "TIMESTAMP64/DATETIME64 operator expression"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+/// TIMESTAMP/DATETIME operator. "TIMESTAMP/DATETIME '2001-01-01 12:34:56'" would be parsed as "toDateTime('2001-01-01 12:34:56')".
+class ParserTimestampDatetimeOperatorExpression : public IParserDialectBase
+{
+protected:
+    ParserTimestampDatetime64OperatorExpression next_parser{dt};
+
+    const char * getName() const override { return "TIMESTAMP/DATETIME operator expression"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+/// TIME operator. "TIME '12:34:56'" would be parsed as "toTimeType('12:34:56', 3)".
+class ParserTimeOperatorExpression : public IParserDialectBase
+{
+protected:
+    ParserTimestampDatetimeOperatorExpression next_parser{dt};
+
+    const char * getName() const override { return "TIME operator expression"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 public:
     using IParserDialectBase::IParserDialectBase;
@@ -337,7 +398,7 @@ public:
 class ParserIntervalOperatorExpression : public IParserDialectBase
 {
 protected:
-    ParserTimestampOperatorExpression next_parser{dt};
+    ParserTimeOperatorExpression next_parser{dt};
 
     const char * getName() const  override { return "INTERVAL operator expression"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
@@ -366,10 +427,67 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+class ParserShiftExpression : public IParserDialectBase
+{
+    static const char * operators[];
+    ParserAdditiveExpression & nested_parser = *new ParserAdditiveExpression(dt);
+    ParserLeftAssociativeBinaryOperatorList operator_parser{operators, std::unique_ptr<ParserAdditiveExpression>(&nested_parser)};
+protected:
+    const char * getName() const override { return "shift expression"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override
+    {
+        if (dt.parse_bitwise_operators)
+            return operator_parser.parse(pos, node, expected);
+        else
+            return nested_parser.parse(pos, node, expected);
+    }
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserBitwiseAndExpression : public IParserDialectBase
+{
+    static const char * operators[];
+    ParserShiftExpression & nested_parser = *new ParserShiftExpression(dt);
+    ParserLeftAssociativeBinaryOperatorList operator_parser{operators, std::unique_ptr<ParserShiftExpression>(&nested_parser)};
+protected:
+    const char * getName() const override { return "bitAnd expression"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override
+    {
+        if (dt.parse_bitwise_operators)
+            return operator_parser.parse(pos, node, expected);
+        else
+            return nested_parser.parse(pos, node, expected);
+    }
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserBitwiseOrExpression : public IParserDialectBase
+{
+    static const char * operators[];
+    ParserBitwiseAndExpression & nested_parser = *new ParserBitwiseAndExpression(dt);
+    ParserLeftAssociativeBinaryOperatorList operator_parser{operators, std::unique_ptr<ParserBitwiseAndExpression>(&nested_parser)};
+protected:
+    const char * getName() const  override { return "bitOr expression"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override
+    {
+        if (dt.parse_bitwise_operators)
+            return operator_parser.parse(pos, node, expected);
+        else
+            return nested_parser.parse(pos, node, expected);
+    }
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
 
 class ParserConcatExpression : public IParserDialectBase
 {
-    ParserVariableArityOperatorList operator_parser {"||", "concat", std::make_unique<ParserAdditiveExpression>(dt), dt};
+    ParserVariableArityOperatorList operator_parser {"||", "concat", std::make_unique<ParserBitwiseOrExpression>(dt), dt};
 
 protected:
     const char * getName() const override { return "string concatenation expression"; }

@@ -15,19 +15,63 @@
 
 #include <Optimizer/MaterializedView/MaterializedViewMemoryCache.h>
 
-#include <Analyzers/QueryAnalyzer.h>
-#include <Analyzers/QueryRewriter.h>
 #include <Interpreters/InterpreterSelectQueryUseOptimizer.h>
 #include <Interpreters/SegmentScheduler.h>
-#include <Optimizer/Iterative/IterativeRewriter.h>
-#include <Optimizer/PlanOptimizer.h>
-#include <Optimizer/Rewriter/PredicatePushdown.h>
-#include <Optimizer/Rule/Rules.h>
 #include <QueryPlan/QueryPlanner.h>
+#include <Storages/StorageDistributed.h>
+#include <Common/Exception.h>
+#include <common/logger_useful.h>
 #include <Storages/StorageMaterializedView.h>
 
 namespace DB
 {
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int QUERY_IS_NOT_SUPPORTED_IN_MATERIALIZED_VIEW;
+}
+class MaterializedViewMemoryCache::LocalTableRewriter
+{
+public:
+    using Visitor = InDepthNodeVisitor<LocalTableRewriter, true>;
+
+    struct Data
+    {
+        const std::map<String, StorageID> & table_to_distributed_table;
+
+        explicit Data(const std::map<String, StorageID> & table_to_distributed_table_)
+            : table_to_distributed_table(table_to_distributed_table_) {}
+        bool success = true;
+    };
+
+
+    static void visit(ASTPtr & ast, Data & data)
+    {
+        if (auto * node = ast->as<ASTTableExpression>())
+            visit(*node, data);
+    }
+
+    static bool needChildVisit(ASTPtr &, const ASTPtr &)
+    {
+        return true;
+    }
+
+private:
+    static void visit(ASTTableExpression & table, Data & data) {
+        if (auto * database_and_table = table.database_and_table_name->as<ASTTableIdentifier>()) {
+            auto table_id = database_and_table->getTableId();
+            if (data.table_to_distributed_table.contains(table_id.getFullTableName())) {
+                table.children.clear();
+                table.database_and_table_name =
+                    std::make_shared<ASTTableIdentifier>(data.table_to_distributed_table.at(table_id.getFullTableName()));
+                table.children.emplace_back(table.database_and_table_name);
+            } else {
+                data.success = false;
+            }
+        }
+    }
+};
+
 MaterializedViewMemoryCache & MaterializedViewMemoryCache::instance()
 {
     static MaterializedViewMemoryCache cache;
@@ -35,7 +79,11 @@ MaterializedViewMemoryCache & MaterializedViewMemoryCache::instance()
 }
 
 std::optional<MaterializedViewStructurePtr>
-MaterializedViewMemoryCache::getMaterializedViewStructure(const StorageID & database_and_table_name, ContextMutablePtr context)
+MaterializedViewMemoryCache::getMaterializedViewStructure(
+    const StorageID & database_and_table_name,
+    ContextMutablePtr context,
+    bool local_materialized_view,
+    const std::map<String, StorageID> & local_table_to_distributed_table)
 {
     auto dependent_table = DatabaseCatalog::instance().tryGetTable(database_and_table_name, context);
     if (!dependent_table)
@@ -45,25 +93,63 @@ MaterializedViewMemoryCache::getMaterializedViewStructure(const StorageID & data
     if (!materialized_view)
         return {};
 
-    auto query_ptr = QueryRewriter::rewrite(materialized_view->getInnerQuery(), context, false);
-    AnalysisPtr analysis = QueryAnalyzer::analyze(query_ptr, context);
-
-    if (!analysis->non_deterministic_functions.empty())
+    if (materialized_view->sync() && !context->getSettings().enable_sync_materialized_view_rewrite)
         return {};
 
-    QueryPlanPtr query_plan = QueryPlanner::plan(query_ptr, *analysis, context);
+    ASTPtr query = materialized_view->getInnerQuery();
+    StorageID materialized_view_id = materialized_view->getStorageID();
+    std::optional<StorageID> target_table_id = findTargetTable(
+        local_materialized_view, *materialized_view, materialized_view_id, context);
+    if (!target_table_id) {
+        return {};
+    }
 
-    static Rewriters rewriters
-        = {std::make_shared<PredicatePushdown>(),
-           std::make_shared<IterativeRewriter>(Rules::simplifyExpressionRules(), "SimplifyExpression"),
-           std::make_shared<IterativeRewriter>(Rules::removeRedundantRules(), "RemoveRedundant"),
-           std::make_shared<IterativeRewriter>(Rules::inlineProjectionRules(), "InlineProjection"),
-           std::make_shared<IterativeRewriter>(Rules::normalizeExpressionRules(), "NormalizeExpression")};
+    if (local_materialized_view) {
+        LocalTableRewriter::Data data{local_table_to_distributed_table};
+        LocalTableRewriter::Visitor(data).visit(query);
+    }
 
-    for (auto & rewriter : rewriters)
-        rewriter->rewrite(*query_plan, context);
+    try
+    {
+        return MaterializedViewStructure::buildFrom(materialized_view_id, target_table_id.value(), query, materialized_view->async(), context);
+    }
+    catch (Exception & exception)
+    {
+        static auto * log = &Poco::Logger::get("MaterializedViewRewriter");
+        if (exception.code() == ErrorCodes::QUERY_IS_NOT_SUPPORTED_IN_MATERIALIZED_VIEW)
+            LOG_DEBUG(log, "skip {}, reason: {}", materialized_view_id.getFullTableName(), exception.message());
+        else
+            LOG_ERROR(log, "skip {}, reason: {}", materialized_view_id.getFullTableName(), exception.message());
+        return {};
+    }
+}
 
-    GraphvizPrinter::printLogicalPlan(*query_plan, context, "MaterializedViewMemoryCache");
-    return MaterializedViewStructure::buildFrom(*materialized_view, query_plan->getPlanNode(), context);
+std::optional<StorageID> MaterializedViewMemoryCache::findTargetTable(
+    bool local_materialized_view, const StorageMaterializedView & view, const StorageID & view_id, ContextMutablePtr context)
+{
+    if (!local_materialized_view) {
+        return std::make_optional(view.getTargetTableId());
+    }
+
+    if (view_id.getTableName().ends_with("_local")) {
+        StorageID distributed_materialized_view_id{
+            view_id.getDatabaseName(),
+            view_id.getTableName().substr(0, view_id.getTableName().size() - 6)};
+        auto distributed = DatabaseCatalog::instance().tryGetTable(
+            distributed_materialized_view_id, context);
+        if (auto * storage_distributed = distributed->as<StorageDistributed>()) {
+            return std::make_optional(distributed_materialized_view_id);
+        }
+    } else {
+        StorageID distributed_materialized_view_id{
+            view_id.getDatabaseName(),
+            view_id.getTableName() + "_distributed"};
+        auto distributed = DatabaseCatalog::instance().tryGetTable(
+            distributed_materialized_view_id, context);
+        if (auto * storage_distributed = distributed->as<StorageDistributed>()) {
+            return std::make_optional(distributed_materialized_view_id);
+        }
+    }
+    return {};
 }
 }

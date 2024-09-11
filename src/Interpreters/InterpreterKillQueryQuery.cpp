@@ -19,30 +19,33 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Interpreters/InterpreterKillQueryQuery.h>
-#include <Parsers/ASTKillQueryQuery.h>
-#include <Parsers/queryToString.h>
-#include <Interpreters/Context.h>
-#include <Interpreters/executeDDLQueryOnCluster.h>
-#include <Interpreters/ProcessList.h>
-#include <Interpreters/executeQuery.h>
-#include <Interpreters/CancellationCode.h>
-#include <Interpreters/InterpreterAlterQuery.h>
-#include <Parsers/ASTAlterQuery.h>
-#include <Parsers/ParserAlterQuery.h>
-#include <Parsers/parseQuery.h>
+#include <cstddef>
+#include <iostream>
+#include <thread>
 #include <Access/ContextAccess.h>
 #include <Columns/ColumnString.h>
-#include <Common/typeid_cast.h>
-#include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnsNumber.h>
-#include <DataTypes/DataTypesNumber.h>
 #include <DataStreams/OneBlockInputStream.h>
+#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Interpreters/CancellationCode.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/InterpreterAlterQuery.h>
+#include <Interpreters/InterpreterKillQueryQuery.h>
+#include <Interpreters/ProcessList.h>
+#include <Interpreters/QueueManager.h>
+#include <Interpreters/executeDDLQueryOnCluster.h>
+#include <Interpreters/executeQuery.h>
+#include <Parsers/ASTAlterQuery.h>
+#include <Parsers/ASTKillQueryQuery.h>
+#include <Parsers/ParserAlterQuery.h>
+#include <Parsers/parseQuery.h>
+#include <Parsers/queryToString.h>
 #include <Storages/IStorage.h>
+#include <Storages/System/CollectWhereClausePredicate.h>
 #include <Common/quoteString.h>
-#include <thread>
-#include <iostream>
-#include <cstddef>
+#include <Common/typeid_cast.h>
+#include <Parsers/formatTenantDatabaseName.h>
 
 
 namespace DB
@@ -119,24 +122,26 @@ static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & proce
     };
 
     String query_user;
+    const auto & tenant_id = getCurrentTenantId();
+    const auto & nontenant_client_user = getOriginalEntityName(my_client.current_user, tenant_id);
 
     for (size_t i = 0; i < num_processes; ++i)
     {
         if ((my_client.current_query_id == query_id_col.getDataAt(i).toString())
-            && (my_client.current_user == user_col.getDataAt(i).toString()))
+            && (nontenant_client_user == user_col.getDataAt(i).toString()))
             continue;
 
         auto query_id = query_id_col.getDataAt(i).toString();
         query_user = user_col.getDataAt(i).toString();
 
-        if ((my_client.current_user != query_user) && !is_kill_query_granted())
+        if ((nontenant_client_user != query_user) && !is_kill_query_granted())
             continue;
 
         res.emplace_back(std::move(query_id), query_user, i, false);
     }
 
     if (res.empty() && access_denied)
-        throw Exception("User " + my_client.current_user + " attempts to kill query created by " + query_user, ErrorCodes::ACCESS_DENIED);
+        throw Exception("User " + nontenant_client_user + " attempts to kill query created by " + query_user, ErrorCodes::ACCESS_DENIED);
 
     return res;
 }
@@ -223,26 +228,37 @@ BlockIO InterpreterKillQueryQuery::execute()
     {
     case ASTKillQueryQuery::Type::Query:
     {
-        Block processes_block = getSelectResult("query_id, user, query", "system.processes");
-        if (!processes_block)
-            return res_io;
+            auto context = getContext();
+            auto where_clause = DB::collectWhereORClausePredicate(query.where_expression, getContext());
+            String query_id;
+            std::for_each(where_clause.begin(), where_clause.end(), [&query_id](const std::map<String, Field> & wheres) {
+                auto iter = wheres.find("query_id");
+                if (iter != wheres.end())
+                    query_id = iter->second.get<String>();
+            });
+            if (!query_id.empty())
+                context->getQueueManager()->cancel(query_id);
+            Block processes_block = getSelectResult("query_id, user, query", "system.processes");
+            if (!processes_block)
+                return res_io;
 
-        ProcessList & process_list = getContext()->getProcessList();
-        QueryDescriptors queries_to_stop = extractQueriesExceptMeAndCheckAccess(processes_block, getContext());
+            ProcessList & process_list = context->getProcessList();
+            QueryDescriptors queries_to_stop = extractQueriesExceptMeAndCheckAccess(processes_block, context);
 
-        auto header = processes_block.cloneEmpty();
-        header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
+            auto header = processes_block.cloneEmpty();
+            header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
 
-        if (!query.sync || query.test)
-        {
-            MutableColumns res_columns = header.cloneEmptyColumns();
-            for (const auto & query_desc : queries_to_stop)
+            if (!query.sync || query.test)
             {
-                auto code = (query.test) ? CancellationCode::Unknown : process_list.sendCancelToQuery(query_desc.query_id, query_desc.user, true);
-                insertResultRow(query_desc.source_num, code, processes_block, header, res_columns);
-            }
+                MutableColumns res_columns = header.cloneEmptyColumns();
+                for (const auto & query_desc : queries_to_stop)
+                {
+                    auto code = (query.test) ? CancellationCode::Unknown
+                                             : process_list.sendCancelToQuery(query_desc.query_id, (context->is_tenant_user() ? formatTenantName(query_desc.user) : query_desc.user), true);
+                    insertResultRow(query_desc.source_num, code, processes_block, header, res_columns);
+                }
 
-            res_io.in = std::make_shared<OneBlockInputStream>(header.cloneWithColumns(std::move(res_columns)));
+                res_io.in = std::make_shared<OneBlockInputStream>(header.cloneWithColumns(std::move(res_columns)));
         }
         else
         {
@@ -285,7 +301,7 @@ BlockIO InterpreterKillQueryQuery::execute()
                     code = CancellationCode::NotFound;
                 else
                 {
-                    ParserAlterCommand parser(ParserSettings::valueOf(getContext()->getSettingsRef().dialect_type));
+                    ParserAlterCommand parser(ParserSettings::valueOf(getContext()->getSettingsRef()));
                     auto command_ast
                         = parseQuery(parser, command_col.getDataAt(i).toString(), 0, getContext()->getSettingsRef().max_parser_depth);
                     required_access_rights = InterpreterAlterQuery::getRequiredAccessForCommand(
@@ -323,7 +339,8 @@ Block InterpreterKillQueryQuery::getSelectResult(const String & columns, const S
     if (where_expression)
         select_query += " WHERE " + queryToString(where_expression);
 
-    auto stream = executeQuery(select_query, getContext(), true).getInputStream();
+    auto block_io = executeQuery(select_query, getContext(), true);
+    auto stream = block_io.getInputStream();
     Block res = stream->read();
 
     if (res && stream->read())

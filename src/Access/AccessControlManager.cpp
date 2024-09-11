@@ -4,6 +4,7 @@
 #include <Access/UsersConfigAccessStorage.h>
 #include <Access/DiskAccessStorage.h>
 #include <Access/LDAPAccessStorage.h>
+#include <Access/KVAccessStorage.h>
 #include <Access/ContextAccess.h>
 #include <Access/RoleCache.h>
 #include <Access/RowPolicyCache.h>
@@ -30,28 +31,6 @@ namespace ErrorCodes
 }
 
 
-namespace
-{
-    void checkForUsersNotInMainConfig(
-        const Poco::Util::AbstractConfiguration & config,
-        const std::string & config_path,
-        const std::string & users_config_path,
-        Poco::Logger * log)
-    {
-        if (config.getBool("skip_check_for_incorrect_settings", false))
-            return;
-
-        if (config.has("users") || config.has("profiles") || config.has("quotas"))
-        {
-            /// We cannot throw exception here, because we have support for obsolete 'conf.d' directory
-            /// (that does not correspond to config.d or users.d) but substitute configuration to both of them.
-
-            LOG_ERROR(log, "The <users>, <profiles> and <quotas> elements should be located in users config file: {} not in main config {}."
-                " Also note that you should place configuration changes to the appropriate *.d directory like 'users.d'.",
-                users_config_path, config_path);
-        }
-    }
-}
 
 
 class AccessControlManager::ContextAccessCache
@@ -65,12 +44,18 @@ public:
         auto x = cache.get(params);
         if (x)
         {
-            if ((*x)->getUser())
+            auto user_ptr = (*x)->getUser();
+            if (user_ptr)
+            {
+                if (params.load_roles && params.use_default_roles)
+                    (*x)->loadRoles(user_ptr);
                 return *x;
+            }
             /// No user, probably the user has been dropped while it was in the cache.
             cache.remove(params);
         }
         auto res = std::shared_ptr<ContextAccess>(new ContextAccess(manager, params));
+        res->initialize(params.load_roles);
         cache.add(params, res);
         return res;
     }
@@ -128,19 +113,55 @@ private:
     mutable std::mutex mutex;
 };
 
+class AccessControlManager::SensitivePermissionTenants
+{
+public:
+    void registerTenants(const Strings & tenants_)
+    {
+        std::lock_guard lock{mutex};
+        tenants.clear();
+        tenants.reserve(tenants_.size());
+        tenants.insert(tenants_.begin(), tenants_.end());
+    }
+
+    bool isSensitivePermissionEnabled(const String & tenant) const
+    {
+        std::lock_guard lock{mutex};
+        return tenants.contains(tenant);
+    }
+
+private:
+    std::unordered_set<String> tenants;
+    mutable std::mutex mutex;
+};
 
 AccessControlManager::AccessControlManager()
-    : MultipleAccessStorage("user directories"),
+    : MultipleAccessStorage("KV Storage"),
       context_access_cache(std::make_unique<ContextAccessCache>(*this)),
-      role_cache(std::make_unique<RoleCache>(*this)),
+      role_cache(std::make_unique<RoleCache>(*this, 600)),
       row_policy_cache(std::make_unique<RowPolicyCache>(*this)),
       quota_cache(std::make_unique<QuotaCache>(*this)),
       settings_profiles_cache(std::make_unique<SettingsProfilesCache>(*this)),
       external_authenticators(std::make_unique<ExternalAuthenticators>()),
-      custom_settings_prefixes(std::make_unique<CustomSettingsPrefixes>())
+      custom_settings_prefixes(std::make_unique<CustomSettingsPrefixes>()),
+      sensitive_permission_tenants(std::make_unique<SensitivePermissionTenants>())
 {
 }
 
+bool AccessControlManager::isSensitiveGrantee(const String & grantee) const
+{
+    auto pos = grantee.find('.');
+
+    if (pos == String::npos || pos == 0)
+        return false;
+
+    return isSensitiveTenant(grantee.substr(0, pos));
+}
+
+bool AccessControlManager::isSensitiveTenant(const String & tenant) const
+{
+    return sensitive_permission_tenants->isSensitivePermissionEnabled(tenant);
+}
 
 AccessControlManager::~AccessControlManager() = default;
 
@@ -225,6 +246,19 @@ void AccessControlManager::startPeriodicReloadingUsersConfigs()
     }
 }
 
+void AccessControlManager::addKVStorage(const ContextPtr & context)
+{
+    auto storages = getStoragesPtr();
+    for (const auto & storage : *storages)
+    {
+        if (auto kv_storage = typeid_cast<std::shared_ptr<KVAccessStorage>>(storage))
+            return;
+    }
+    auto new_storage = std::make_shared<KVAccessStorage>(context);
+    addStorage(new_storage);
+    sensitive_resource_getter = [catalog = context->getCnchCatalog()] (String db) { return catalog->getSensitiveResource(db); };
+    LOG_DEBUG(getLogger(), "Added {} access storage '{}'", String(new_storage->getStorageType()), new_storage->getStorageName());
+}
 
 void AccessControlManager::addDiskStorage(const String & directory_, bool readonly_)
 {
@@ -327,6 +361,24 @@ void AccessControlManager::addStoragesFromUserDirectoriesConfig(
     }
 }
 
+void AccessControlManager::setUpFromMainConfig(const Poco::Util::AbstractConfiguration & config_, const String & config_path_,
+                                        const zkutil::GetZooKeeper & get_zookeeper_function_)
+{
+    if (config_.has("custom_settings_prefixes"))
+        setCustomSettingsPrefixes(config_.getString("custom_settings_prefixes"));
+
+    /// Optional improvements in access control system.
+    /// The default values are false because we need to be compatible with earlier access configurations
+    setSelectFromSystemDatabaseRequiresGrant(config_.getBool("access_control_improvements.select_from_system_db_requires_grant", false));
+    setSelectFromInformationSchemaRequiresGrant(config_.getBool("access_control_improvements.select_from_information_schema_requires_grant", false));
+    setSelectFromMySQLRequiresGrant(config_.getBool("access_control_improvements.select_from_mysql_requires_grant", false));
+
+    addStoragesFromMainConfig(config_, config_path_, get_zookeeper_function_);
+
+    if (config_.has("sensitive_permission_tenants"))
+        setSensitivePermissionTenants(config_.getString("sensitive_permission_tenants"));
+}
+
 
 void AccessControlManager::addStoragesFromMainConfig(
     const Poco::Util::AbstractConfiguration & config,
@@ -338,28 +390,10 @@ void AccessControlManager::addStoragesFromMainConfig(
     String include_from_path = config.getString("include_from", "/etc/metrika.xml");
     bool has_user_directories = config.has("user_directories");
 
-    /// If path to users' config isn't absolute, try guess its root (current) dir.
-    /// At first, try to find it in dir of main config, after will use current dir.
-    String users_config_path = config.getString("users_config", "");
-    if (users_config_path.empty())
-    {
-        if (!has_user_directories)
-            users_config_path = config_path;
-    }
-    else if (std::filesystem::path{users_config_path}.is_relative() && std::filesystem::exists(config_dir + users_config_path))
-        users_config_path = config_dir + users_config_path;
 
-    if (!users_config_path.empty())
-    {
-        if (users_config_path != config_path)
-            checkForUsersNotInMainConfig(config, config_path, users_config_path, getLogger());
-
-        addUsersConfigStorage(users_config_path, include_from_path, dbms_dir, get_zookeeper_function);
-    }
-
-    String disk_storage_dir = config.getString("access_control_path", "");
-    if (!disk_storage_dir.empty())
-        addDiskStorage(disk_storage_dir);
+    // String disk_storage_dir = config.getString("access_control_path", "");
+    // if (!disk_storage_dir.empty())
+    //     addDiskStorage(disk_storage_dir);
 
     if (has_user_directories)
         addStoragesFromUserDirectoriesConfig(config, "user_directories", config_dir, dbms_dir, include_from_path, get_zookeeper_function);
@@ -395,6 +429,13 @@ void AccessControlManager::setCustomSettingsPrefixes(const String & comma_separa
     setCustomSettingsPrefixes(prefixes);
 }
 
+void AccessControlManager::setSensitivePermissionTenants(const String & comma_separated_tenants)
+{
+    Strings tenants;
+    splitInto<','>(tenants, comma_separated_tenants);
+    sensitive_permission_tenants->registerTenants(tenants);
+}
+
 bool AccessControlManager::isSettingNameAllowed(const std::string_view & setting_name) const
 {
     return custom_settings_prefixes->isSettingNameAllowed(setting_name);
@@ -405,14 +446,16 @@ void AccessControlManager::checkSettingNameIsAllowed(const std::string_view & se
     custom_settings_prefixes->checkSettingNameIsAllowed(setting_name);
 }
 
-
-std::shared_ptr<const ContextAccess> AccessControlManager::getContextAccess(
+ContextAccessParams AccessControlManager::getContextAccessParams(
     const UUID & user_id,
     const std::vector<UUID> & current_roles,
     bool use_default_roles,
     const Settings & settings,
     const String & current_database,
-    const ClientInfo & client_info) const
+    const ClientInfo & client_info,
+    const String & tenant,
+    bool has_tenant_id_in_username,
+    bool load_roles) const
 {
     ContextAccessParams params;
     params.user_id = user_id;
@@ -426,6 +469,10 @@ std::shared_ptr<const ContextAccess> AccessControlManager::getContextAccess(
     params.http_method = client_info.http_method;
     params.address = client_info.current_address.host();
     params.quota_key = client_info.quota_key;
+    params.has_tenant_id_in_username = has_tenant_id_in_username;
+    params.enable_sensitive_permission =
+        has_tenant_id_in_username ? isSensitiveTenant(tenant) : false;
+    params.load_roles = load_roles;
 
     /// Extract the last entry from comma separated list of X-Forwarded-For addresses.
     /// Only the last proxy can be trusted (if any).
@@ -437,8 +484,7 @@ std::shared_ptr<const ContextAccess> AccessControlManager::getContextAccess(
         boost::trim(last_forwarded_address);
         params.forwarded_address = last_forwarded_address;
     }
-
-    return getContextAccess(params);
+    return params;
 }
 
 
@@ -489,9 +535,10 @@ std::shared_ptr<const EnabledSettings> AccessControlManager::getEnabledSettings(
     return settings_profiles_cache->getEnabledSettings(user_id, settings_from_user, enabled_roles, settings_from_enabled_roles);
 }
 
-std::shared_ptr<const SettingsChanges> AccessControlManager::getProfileSettings(const String & profile_name) const
+
+std::shared_ptr<const SettingsProfilesInfo> AccessControlManager::getSettingsProfileInfo(const UUID & profile_id)
 {
-    return settings_profiles_cache->getProfileSettings(profile_name);
+    return settings_profiles_cache->getSettingsProfileInfo(profile_id);
 }
 
 const ExternalAuthenticators & AccessControlManager::getExternalAuthenticators() const

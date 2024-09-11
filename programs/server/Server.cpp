@@ -29,40 +29,68 @@
 #include <unistd.h>
 #include <Access/AccessControlManager.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Common/Config/MetastoreConfig.h>
+#include <Catalog/Catalog.h>
+#include "BrpcServerHolder.h"
+#include "MetricsTransmitter.h"
+#include <Transaction/LockManager.h>
+// #include <Catalog/MetastoreConfig.h>
+#include <CloudServices/CnchServerServiceImpl.h>
+#include <CloudServices/CnchWorkerClientPools.h>
+#include <CloudServices/CnchWorkerServiceImpl.h>
+#include <DataTypes/MapHelpers.h>
+#include <Core/ServerUUID.h>
 #include <Dictionaries/registerDictionaries.h>
 #include <Disks/registerDisks.h>
+#include <ExternalCatalog/IExternalCatalogMgr.h>
 #include <Formats/registerFormats.h>
 #include <Functions/registerFunctions.h>
 #include <IO/HTTPCommon.h>
+#include <IO/Scheduler/IOScheduler.h>
 #include <IO/UseSSL.h>
 #include <Interpreters/AsynchronousMetrics.h>
 #include <Interpreters/DDLWorker.h>
 #include <Interpreters/DNSCacheUpdater.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/DistributedStages/PlanSegmentManagerRpcService.h>
-#include <Interpreters/RuntimeFilter/RuntimeFilterService.h>
 #include <Interpreters/ExternalDictionariesLoader.h>
 #include <Interpreters/ExternalLoaderXMLConfigRepository.h>
-#include <Interpreters/ExternalModelsLoader.h>
 #include <Interpreters/InterserverCredentials.h>
 #include <Interpreters/JIT/CompiledExpressionCache.h>
+#include <Interpreters/PreparedStatement/PreparedStatementManager.h>
 #include <Interpreters/ProcessList.h>
+#include <Interpreters/RuntimeFilter/RuntimeFilterService.h>
+#include <Interpreters/SQLBinding/SQLBindingCache.h>
+#include <Interpreters/ServerPartLog.h>
 #include <Interpreters/loadMetadata.h>
-#include <Processors/Exchange/DataTrans/Brpc/BrpcExchangeReceiverRegistryService.h>
+#include <QueryPlan/Hints/registerHints.h>
+#include <QueryPlan/PlanCache.h>
 #include <Server/HTTP/HTTPServer.h>
 #include <Server/HTTPHandlerFactory.h>
 #include <Server/MySQLHandlerFactory.h>
 #include <Server/PostgreSQLHandlerFactory.h>
 #include <Server/ProtocolServerAdapter.h>
+#include <Server/ServerHelper.h>
 #include <Server/TCPHandlerFactory.h>
+#include <Server/TCPServer.h>
+#include <ServiceDiscovery/registerServiceDiscovery.h>
+#include <Statistics/CacheManager.h>
 #include <Storages/DiskCache/DiskCacheFactory.h>
+#include <Storages/DiskCache/NvmCache.h>
 #include <Storages/HDFS/HDFSCommon.h>
 #include <Storages/HDFS/HDFSFileSystem.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/System/attachSystemTables.h>
-#include <Storages/registerStorages.h>
+#include <Storages/System/attachInformationSchemaTables.h>
+#include <Storages/System/attachMySQLTables.h>
+#include <AggregateFunctions/registerAggregateFunctions.h>
+#include <Functions/registerFunctions.h>
 #include <TableFunctions/registerTableFunctions.h>
-#include <ServiceDiscovery/registerServiceDiscovery.h>
+#include <Formats/registerFormats.h>
+#include <Storages/registerStorages.h>
+#include <Storages/MergeTree/ChecksumsCache.h>
+#include <Storages/MergeTree/GinIndexStore.h>
+#include <TableFunctions/registerTableFunctions.h>
 #include <brpc/server.h>
 #include <google/protobuf/service.h>
 #include <sys/resource.h>
@@ -75,10 +103,12 @@
 #include <Poco/Net/NetException.h>
 #include <Poco/Util/HelpFormatter.h>
 #include <Poco/Version.h>
-#include <Common/CGroup/CGroupManagerFactory.h>
+#include <Common/CurrentMemoryTracker.h>
 #include <Common/Brpc/BrpcApplication.h>
+#include <Common/CGroup/CGroupManagerFactory.h>
 #include <Common/ClickHouseRevision.h>
 #include <Common/Config/ConfigReloader.h>
+#include <Common/Config/VWCustomizedSettings.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/DNSResolver.h>
 #include <Common/Elf.h>
@@ -97,6 +127,7 @@
 #include <Common/getMappedArea.h>
 #include <Common/getMultipleKeysFromConfig.h>
 #include <Common/getNumberOfPhysicalCPUCores.h>
+#include <Common/JeprofControl.h>
 #include <Common/remapExecutable.h>
 #include <Common/Configurations.h>
 #include <common/ErrorHandlers.h>
@@ -108,23 +139,14 @@
 #include <common/logger_useful.h>
 #include <common/phdr_cache.h>
 #include <common/scope_guard.h>
-#include "MetricsTransmitter.h"
-#include <DataTypes/MapHelpers.h>
-#include <Statistics/CacheManager.h>
-#include <CloudServices/CnchServerServiceImpl.h>
-#include <CloudServices/CnchWorkerServiceImpl.h>
-#include <CloudServices/CnchWorkerClientPools.h>
-#include <Catalog/CatalogConfig.h>
-#include <Catalog/Catalog.h>
-
+#include <Common/ChineseTokenExtractor.h>
+#include <Common/HuAllocator.h>
 
 #include <CloudServices/CnchServerClientPool.h>
-#include <CloudServices/CnchWorkerClientPools.h>
-#include <CloudServices/CnchServerServiceImpl.h>
-#include <CloudServices/CnchWorkerServiceImpl.h>
 
 #include <ServiceDiscovery/registerServiceDiscovery.h>
 #include <ServiceDiscovery/ServiceDiscoveryLocal.h>
+#include <Statistics/AutoStatisticsManager.h>
 
 #if !defined(ARCADIA_BUILD)
 #   include "config_core.h"
@@ -160,11 +182,15 @@
 #    include <jemalloc/jemalloc.h>
 #endif
 
+#include <IO/VETosCommon.h>
+#include <IO/OSSCommon.h>
+
 namespace CurrentMetrics
 {
     extern const Metric Revision;
     extern const Metric VersionInteger;
     extern const Metric MemoryTracking;
+    extern const Metric MergesMutationsMemoryTracking;
     extern const Metric MaxDDLEntryID;
 }
 
@@ -185,11 +211,25 @@ static bool jemallocOptionEnabled(const char *name)
 static bool jemallocOptionEnabled(const char *) { return 0; }
 #endif
 
+namespace DB::ErrorCodes
+{
+    extern const int NO_ELEMENTS_IN_CONFIG;
+    extern const int SUPPORT_IS_DISABLED;
+    extern const int ARGUMENT_OUT_OF_BOUND;
+    extern const int EXCESSIVE_ELEMENT_IN_CONFIG;
+    extern const int INVALID_CONFIG_PARAMETER;
+    extern const int SYSTEM_ERROR;
+    extern const int FAILED_TO_GETPWUID;
+    extern const int MISMATCHING_USERS_FOR_PROCESS_AND_DATA;
+    extern const int NETWORK_ERROR;
+    extern const int CORRUPTED_DATA;
+    extern const int UNKNOWN_POLICY;
+    extern const int PATH_ACCESS_DENIED;
+}
 
 int mainEntryClickHouseServer(int argc, char ** argv)
 {
     DB::Server app;
-
     if (jemallocOptionEnabled("opt.background_thread"))
     {
         LOG_ERROR(&app.logger(),
@@ -199,8 +239,8 @@ int mainEntryClickHouseServer(int argc, char ** argv)
             "(that can be disabled with CLICKHOUSE_WATCHDOG_ENABLE=0)");
     }
 
-    /// Do not fork separate process from watchdog if we attached to terminal.
-    /// Otherwise it breaks gdb usage.
+    /// Do not fork separate process from watchdog by default
+    /// Otherwise it breaks minidump and jeprof usage
     /// Can be overridden by environment variable (cannot use server config at this moment).
     if (argc > 0)
     {
@@ -212,8 +252,6 @@ int mainEntryClickHouseServer(int argc, char ** argv)
 
             /// Other values disable watchdog explicitly.
         }
-        else if (!isatty(STDIN_FILENO) && !isatty(STDOUT_FILENO) && !isatty(STDERR_FILENO))
-            app.shouldSetupWatchdog(argv[0]);
     }
 
     try
@@ -232,25 +270,6 @@ int mainEntryClickHouseServer(int argc, char ** argv)
 namespace
 {
 
-void setupTmpPath(Poco::Logger * log, const std::string & path)
-{
-    LOG_DEBUG(log, "Setting up {} to store temporary data in it", path);
-
-    fs::create_directories(path);
-
-    /// Clearing old temporary files.
-    fs::directory_iterator dir_end;
-    for (fs::directory_iterator it(path); it != dir_end; ++it)
-    {
-        if (it->is_regular_file() && startsWith(it->path().filename(), "tmp"))
-        {
-            LOG_DEBUG(log, "Removing old temporary file {}", it->path().string());
-            fs::remove(it->path());
-        }
-        else
-            LOG_DEBUG(log, "Skipped file in temporary path {}", it->path().string());
-    }
-}
 
 int waitServersToFinish(std::vector<DB::ProtocolServerAdapter> & servers, size_t seconds_to_wait)
 {
@@ -284,33 +303,6 @@ int waitServersToFinish(std::vector<DB::ProtocolServerAdapter> & servers, size_t
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-    extern const int NO_ELEMENTS_IN_CONFIG;
-    extern const int SUPPORT_IS_DISABLED;
-    extern const int ARGUMENT_OUT_OF_BOUND;
-    extern const int EXCESSIVE_ELEMENT_IN_CONFIG;
-    extern const int INVALID_CONFIG_PARAMETER;
-    extern const int SYSTEM_ERROR;
-    extern const int FAILED_TO_GETPWUID;
-    extern const int MISMATCHING_USERS_FOR_PROCESS_AND_DATA;
-    extern const int NETWORK_ERROR;
-    extern const int CORRUPTED_DATA;
-    extern const int UNKNOWN_POLICY;
-    extern const int PATH_ACCESS_DENIED;
-}
-
-
-static std::string getCanonicalPath(std::string && path)
-{
-    Poco::trimInPlace(path);
-    if (path.empty())
-        throw Exception("path configuration parameter is empty", ErrorCodes::INVALID_CONFIG_PARAMETER);
-    if (path.back() != '/')
-        path += '/';
-    return std::move(path);
-}
 
 static std::string getUserName(uid_t user_id)
 {
@@ -432,6 +424,7 @@ void Server::createServer(const std::string & listen_host, const char * port_nam
     try
     {
         func(port);
+        global_context->registerServerPort(port_name, port);
     }
     catch (const Poco::Exception &)
     {
@@ -472,7 +465,7 @@ int Server::run()
     }
     if (config().hasOption("version"))
     {
-        std::cout << DBMS_NAME << " server version " << VERSION_STRING << VERSION_OFFICIAL << "." << std::endl;
+        std::cout << VERSION_NAME << " server version " << VERSION_STRING << VERSION_OFFICIAL << "." << std::endl;
         return 0;
     }
     return Application::run(); // NOLINT
@@ -543,6 +536,12 @@ void checkForUsersNotInMainConfig(
 #endif
 }
 
+void huallocLogPrint(std::string s)
+{
+    static Poco::Logger * logger = &Poco::Logger::get("HuallocDebug");
+    LOG_INFO(logger, s);
+}
+
 int Server::main(const std::vector<std::string> & /*args*/)
 {
     Poco::Logger * log = &logger();
@@ -552,6 +551,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
     MainThreadStatus::getInstance();
 
     registerFunctions();
+    registerHints();
     registerAggregateFunctions();
     registerTableFunctions();
     /// Init cgroup
@@ -561,6 +561,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
     registerDisks();
     registerFormats();
     registerServiceDiscovery();
+    initMetrics2();
 
     CurrentMetrics::set(CurrentMetrics::Revision, ClickHouseRevision::getVersionRevision());
     CurrentMetrics::set(CurrentMetrics::VersionInteger, ClickHouseRevision::getVersionInteger());
@@ -584,27 +585,67 @@ int Server::main(const std::vector<std::string> & /*args*/)
     global_context->setServerType(config().getString("cnch_type", "standalone"));
     global_context->makeGlobalContext();
     global_context->setApplicationType(Context::ApplicationType::SERVER);
+    global_context->setIsRestrictSettingsToWhitelist(config().getBool("restrict_tenanted_users_to_whitelist_settings", false));
+    if (global_context->getIsRestrictSettingsToWhitelist())
+    {
+        auto setting_names = getMultipleValuesFromConfig(config(), "tenant_whitelist_settings", "name");
+        global_context->addRestrictSettingsToWhitelist(setting_names);
+    }
 
     global_context->initCnchConfig(config());
+    global_context->setBlockPrivilegedOp(config().getBool("restrict_tenanted_users_to_privileged_operations", false));
     global_context->initRootConfig(config());
     const auto & root_config = global_context->getRootConfig();
-
 
     // Initialize global thread pool. Do it before we fetch configs from zookeeper
     // nodes (`from_zk`), because ZooKeeper interface uses the pool. We will
     // ignore `max_thread_pool_size` in configs we fetch from ZK, but oh well.
-    GlobalThreadPool::initialize(config().getUInt("max_thread_pool_size", 10000));
+    GlobalThreadPool::initialize(config().getUInt("max_thread_pool_size", 50000));
+
+    do
+    {
+        unsigned cores = getNumberOfPhysicalCPUCores() * 2;
+
+        if (cores < 4)
+            break;
+
+        int res = bthread_setconcurrency(cores);
+        if (res)
+            LOG_ERROR(log, "Error when calling bthread_setconcurrency. Error number {}.", res);
+    } while (false);
 
     // Init bRPC
     BrpcApplication::getInstance().initialize(config());
 
-    if (config().has("exchange_port") && config().has("exchange_status_port")
-        && (global_context->getServerType() == ServerType::cnch_server || global_context->getServerType() == ServerType::cnch_worker))
-    {
-        global_context->setComplexQueryActive(true);
+    // Init io scheduler
+    IO::Scheduler::IOSchedulerSet::instance().initialize(config(),
+        "io_scheduler");
+    auto worker_pool = IO::Scheduler::IOSchedulerSet::instance().workerPool();
+    if (worker_pool != nullptr) {
+        worker_pool->startup();
     }
+    SCOPE_EXIT({
+        if (worker_pool != nullptr) {
+            try {
+                worker_pool->shutdown();
+            } catch(...) {
+                tryLogCurrentException(log);
+            }
+        }
 
-    Catalog::CatalogConfig catalog_conf(global_context->getCnchConfigRef());
+        IO::Scheduler::IOSchedulerSet::instance().uninitialize();
+    });
+
+    if (global_context->getServerType() == ServerType::cnch_server || global_context->getServerType() == ServerType::cnch_worker)
+        global_context->setComplexQueryActive(true);
+
+    MetastoreConfig catalog_conf(global_context->getCnchConfigRef(), CATALOG_SERVICE_CONFIGURE);
+
+    std::string current_raw_sd_config;
+    if (config().has("service_discovery")) // only important for local mode (for observing if the sd section is changed)
+    {
+        current_raw_sd_config = config().getRawString("service_discovery");
+    }
 
     /// Initialize components in server or worker.
     if (global_context->getServerType() == ServerType::cnch_server || global_context->getServerType() == ServerType::cnch_worker)
@@ -634,6 +675,11 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
         // global_context->initTestLog();
     }
+
+    if (global_context->getServerType() == ServerType::cnch_worker)
+        global_context->initGlobalDataManager();
+
+    global_context->initTSOElectionReader();
 
     bool has_zookeeper = config().has("zookeeper");
 
@@ -777,6 +823,8 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     StatusFile status{path + "status", StatusFile::write_full_info};
 
+    ServerUUID::load(path + "/uuid", log);
+
     /// Try to increase limit on number of open files.
     {
         rlimit rlim;
@@ -812,8 +860,12 @@ int Server::main(const std::vector<std::string> & /*args*/)
         std::string tmp_path = config().getString("tmp_path", path + "tmp/");
         std::string tmp_policy = config().getString("tmp_policy", "");
         const VolumePtr & volume = global_context->setTemporaryStorage(tmp_path, tmp_policy);
+        // todo aron max_temporary_data_on_disk_size
+        // global_context->setTemporaryStoragePath(tmp_path, 0);
+
         for (const DiskPtr & disk : volume->getDisks())
             setupTmpPath(log, disk->getPath());
+        global_context->setTemporaryStoragePath();
     }
 
     /** Directory with 'flags': files indicating temporary settings for the server set by system administrator.
@@ -914,6 +966,11 @@ int Server::main(const std::vector<std::string> & /*args*/)
     if (config().has("pipeline_log_path"))
         global_context->setPipelineLogPath(config().getString("pipeline_log_path", "/tmp/"));
 
+    if (config().has(CHINESE_TOKENIZER_CONFIG_PREFIX))
+    {
+        ChineseTokenizerFactory::registeChineseTokneizer(config());
+    }
+
     auto main_config_reloader = std::make_unique<ConfigReloader>(
         config_path,
         include_from_path,
@@ -922,8 +979,17 @@ int Server::main(const std::vector<std::string> & /*args*/)
         main_config_zk_changed_event,
         [&](ConfigurationPtr config, bool initial_loading)
         {
+            global_context->reloadRootConfig(*config);
             Settings::checkNoSettingNamesAtTopLevel(*config, config_path);
 
+            /// Settings for total memory
+            UInt64 total_untracked_memory_limit_encoded
+                = config->getUInt64("total_untracked_memory_limit_encoded", CurrentMemoryTracker::DEFAULT_TOTAL_UNTRACKED_LIMIT_ENCODED);
+            if (total_untracked_memory_limit_encoded <= std::numeric_limits<UInt8>::max())
+            {
+                LOG_INFO(log, "Setting total_untracked_memory_limit_encoded: {}", total_untracked_memory_limit_encoded);
+                CurrentMemoryTracker::g_total_untracked_memory_limit_encoded = total_untracked_memory_limit_encoded;
+            }
             /// Limit on total memory usage
             size_t max_server_memory_usage = config->getUInt64("max_server_memory_usage", 0);
 
@@ -952,18 +1018,69 @@ int Server::main(const std::vector<std::string> & /*args*/)
             }
             BrpcApplication::getInstance().reloadConfig(*config);
 
+            #if USE_HUALLOC
+            if (config->getBool("hualloc_numa_aware", false))
+            {
+                size_t max_numa_node = SystemUtils::getMaxNumaNode();
+                std::vector<cpu_set_t> numa_nodes_cpu_mask = SystemUtils::getNumaNodesCpuMask();
+                bool hualloc_enable_mbind = config->getBool("hualloc_enable_mbind", false);
+                int mbind_mode = config->getInt("hualloc_mbind_mode", 1);
+
+                /*
+                *mbind mode
+                    #define MPOL_DEFAULT     0
+                    #define MPOL_PREFERRED   1
+                    #define MPOL_BIND        2
+                    #define MPOL_INTERLEAVE  3
+                    #define MPOL_LOCAL       4
+                    #define MPOL_MAX         5
+                */
+                huallocSetNumaInfo(
+                    max_numa_node,
+                    numa_nodes_cpu_mask,
+                    hualloc_enable_mbind,
+                    mbind_mode,
+                    huallocLogPrint
+                );
+            }
+
+            double default_hualloc_cache_ratio = config->getDouble("hualloc_cache_ratio", 0.25);
+            LOG_INFO(log, "HuAlloc cache memory size:{}",
+                    formatReadableSizeWithBinarySuffix(max_server_memory_usage * default_hualloc_cache_ratio));
+            HuAllocator<false>::InitHuAlloc(max_server_memory_usage * default_hualloc_cache_ratio);
+            #endif
             total_memory_tracker.setHardLimit(max_server_memory_usage);
             total_memory_tracker.setDescription("(total)");
             total_memory_tracker.setMetric(CurrentMetrics::MemoryTracking);
 
+            size_t merges_mutations_memory_usage_soft_limit = config->getUInt64("merges_mutations_memory_usage_soft_limit", 0);
+            double merges_mutations_memory_usage_to_ram_ratio = config->getDouble("merges_mutations_memory_usage_to_ram_ratio", 0.9);
+            size_t default_merges_mutations_server_memory_usage = static_cast<size_t>(memory_amount * merges_mutations_memory_usage_to_ram_ratio);
+            if (merges_mutations_memory_usage_soft_limit == 0 || merges_mutations_memory_usage_soft_limit > default_merges_mutations_server_memory_usage)
+            {
+                merges_mutations_memory_usage_soft_limit = default_merges_mutations_server_memory_usage;
+                LOG_WARNING(log, "Setting merges_mutations_memory_usage_soft_limit was set to {}"
+                    " ({} available * {:.2f} merges_mutations_memory_usage_to_ram_ratio)",
+                    formatReadableSizeWithBinarySuffix(merges_mutations_memory_usage_soft_limit),
+                    formatReadableSizeWithBinarySuffix(memory_amount),
+                    merges_mutations_memory_usage_to_ram_ratio);
+            }
+
+            LOG_INFO(log, "Merges and mutations memory limit is set to {}",
+                formatReadableSizeWithBinarySuffix(merges_mutations_memory_usage_soft_limit));
+            background_memory_tracker.setSoftLimit(merges_mutations_memory_usage_soft_limit);
+            background_memory_tracker.setDescription("(background)");
+            background_memory_tracker.setMetric(CurrentMetrics::MergesMutationsMemoryTracking);
+
             // FIXME logging-related things need synchronization -- see the 'Logger * log' saved
             // in a lot of places. For now, disable updating log configuration without server restart.
             //setTextLog(global_context->getTextLog());
-            //buildLoggers(*config, logger());
+            updateLevels(*config, logger());
             global_context->setClustersConfig(config);
             global_context->setMacros(std::make_unique<Macros>(*config, "macros", log));
             global_context->setExternalAuthenticatorsConfig(*config);
-            global_context->setExternalModelsConfig(config);
+
+            global_context->updateServerVirtualWarehouses(config);
 
             /// Setup protection to avoid accidental DROP for big tables (that are greater than 50 GB by default)
             if (config->has("max_table_size_to_drop"))
@@ -987,43 +1104,63 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
             global_context->updateStorageConfiguration(*config);
             global_context->updateInterserverCredentials(*config);
-
             global_context->setMergeSchedulerSettings(*config);
             CGroupManagerFactory::loadFromConfig(*config);
-            global_context->setCpuSetScaleManager(*config);
+#if USE_JEMALLOC
+            JeprofControl::instance().loadFromConfig(*config);
+#endif
+            global_context->updateAdditionalServices(*config);
+            if (global_context->getServerType() == ServerType::cnch_server)
+            {
+                global_context->updateQueueManagerConfig();
+                global_context->updateAdaptiveSchdulerConfig();
+                if (auto * auto_stats_manager = global_context->getAutoStatisticsManager())
+                {
+                    auto_stats_manager->prepareNewConfig(*config);
+                }
+
+                global_context->setVWCustomizedSettings(std::make_shared<VWCustomizedSettings>(config));
+            }
+
+            if (auto catalog = global_context->tryGetCnchCatalog())
+                catalog->loadFromConfig("catalog_service", *config);
         },
         /* already_loaded = */ false);  /// Reload it right now (initial loading)
 
     auto & access_control = global_context->getAccessControlManager();
-    if (config().has("custom_settings_prefixes"))
-        access_control.setCustomSettingsPrefixes(config().getString("custom_settings_prefixes"));
 
     /// Initialize map separator, once change the default value, it's necessary to adapt the corresponding tests.
     checkAndSetMapSeparator(config().getString("map_separator", "__"));
 
+    /// Determine whether use map type as default.
+    setDefaultUseMapType(config().getBool("default_use_kv_map_type", false));
+
     /// Still need `users_config` for server-worker communication
-    ConfigurationPtr users_config;
+    String users_config_path;
     if (config().has("users_config") || config().has("config-file") || fs::exists("config.xml"))
     {
         // String config_dir = std::filesystem::path{config_path}.remove_filename().string()
-        const auto users_config_path = config().getString("users_config", config().getString("config-file", "config.xml"));
-        ConfigProcessor config_processor(users_config_path);
-        const auto loaded_config = config_processor.loadConfig();
-        users_config = loaded_config.configuration;
+        users_config_path = config().getString("users_config", config().getString("config-file", "config.xml"));
     }
 
-    if (users_config)
-        global_context->setUsersConfig(users_config);
-    else
-        LOG_ERROR(log, "Can't load config for users");
+    auto users_config_reloader = std::make_unique<ConfigReloader>(
+        users_config_path,
+        include_from_path,
+        config().getString("path", ""),
+        zkutil::ZooKeeperNodeCache([&] { return global_context->getZooKeeper(); }),
+        std::make_shared<Poco::Event>(),
+        [&](ConfigurationPtr config, bool) { global_context->setUsersConfig(config); },
+        /* already_loaded = */ false);
 
     /// Initialize access storages.
-    access_control.addStoragesFromMainConfig(config(), config_path, [&] { return global_context->getZooKeeper(); });
+    access_control.setUpFromMainConfig(config(), config_path, [&] { return global_context->getZooKeeper(); });
+    access_control.addKVStorage(global_context);
 
     /// Reload config in SYSTEM RELOAD CONFIG query.
     global_context->setConfigReloadCallback([&]()
     {
         main_config_reloader->reload();
+        users_config_reloader->reload();
         access_control.reloadUsersConfigs();
     });
 
@@ -1033,11 +1170,10 @@ int Server::main(const std::vector<std::string> & /*args*/)
     /// Set up caches.
 
     /// Lower cache size on low-memory systems.
-    double cache_size_to_ram_max_ratio = config().getDouble("cache_size_to_ram_max_ratio", 0.5);
-    size_t max_cache_size = memory_amount * cache_size_to_ram_max_ratio;
+    size_t max_cache_size = memory_amount * root_config.cache_size_to_ram_max_ratio;
 
     /// Size of cache for uncompressed blocks. Zero means disabled.
-    size_t uncompressed_cache_size = config().getUInt64("uncompressed_cache_size", 0);
+    size_t uncompressed_cache_size = root_config.uncompressed_cache_size;
     if (uncompressed_cache_size > max_cache_size)
     {
         uncompressed_cache_size = max_cache_size;
@@ -1046,14 +1182,26 @@ int Server::main(const std::vector<std::string> & /*args*/)
     }
     global_context->setUncompressedCache(uncompressed_cache_size);
 
+    size_t footer_cache_size = config().getUInt64("footer_cache_size", 3221225472);
+    global_context->setFooterCache(footer_cache_size);
+
     /// Load global settings from default_profile and system_profile.
+    if (global_context->getServerType() == ServerType::cnch_server)
+    {
+        auto vw_customized_settings_ptr = std::make_shared<VWCustomizedSettings>(config());
+        if (!vw_customized_settings_ptr->isEmpty())
+        {
+            global_context->setVWCustomizedSettings(vw_customized_settings_ptr);
+        }
+    }
+
     global_context->setDefaultProfiles(config());
     const Settings & settings = global_context->getSettingsRef();
 
     /// Size of cache for marks (index of MergeTree family of tables). It is mandatory.
-    size_t mark_cache_size = config().getUInt64("mark_cache_size");
+    size_t mark_cache_size = root_config.mark_cache_size;
     if (!mark_cache_size)
-        LOG_ERROR(log, "Too low mark cache size will lead to severe performance degradation.");
+        LOG_ERROR(log, "Too low mark cache size will lead to server performance degradation.");
     if (mark_cache_size > max_cache_size)
     {
         mark_cache_size = max_cache_size;
@@ -1061,18 +1209,52 @@ int Server::main(const std::vector<std::string> & /*args*/)
             formatReadableSizeWithBinarySuffix(mark_cache_size));
     }
     global_context->setMarkCache(mark_cache_size);
-    global_context->setPrimaryIndexCache(mark_cache_size);
-    global_context->setChecksumsCache(config().getUInt64("checksum_cache_size", 10737418240)); // 10GB
 
-    /// Size of cache for query. It is not necessary.
-    size_t query_cache_size = config().getUInt64("query_cache_size", 0);
-    if (query_cache_size)
-        global_context->setQueryCache(query_cache_size);
+    /// A cache for part checksums
+    ChecksumsCacheSettings checksum_cache_settings;
+    checksum_cache_settings.lru_max_size = config().getUInt64("checksum_cache_size", 5368709120); //5GB
+    checksum_cache_settings.mapping_bucket_size = config().getUInt64("checksum_cache_bucket", 5000); //5000
+    checksum_cache_settings.cache_shard_num = config().getUInt64("checksum_cache_shard", 8); //8
+    checksum_cache_settings.lru_update_interval = config().getUInt64("checksum_cache_lru_update_interval", 60); //60 seconds
+    global_context->setChecksumsCache(checksum_cache_settings);
+
+    global_context->setCompressedDataIndexCache(config().getUInt64("compressed_data_index_cache", 5368709120));
+
+    global_context->setGinIndexFilterResultCache(config().getUInt64("gin_index_filter_result_cache", 5368709120)); // 5GB
+
+    /// A cache for gin index store
+    GinIndexStoreCacheSettings ginindex_store_cache_settings;
+    ginindex_store_cache_settings.lru_max_size = config().getUInt64("ginindex_store_cache_size", 5368709120); //5GB
+    ginindex_store_cache_settings.mapping_bucket_size = config().getUInt64("ginindex_store_cache_bucket", 1000); //1000
+    ginindex_store_cache_settings.cache_shard_num = config().getUInt64("ginindex_store_cache_shard", 2); //2
+    ginindex_store_cache_settings.lru_update_interval = config().getUInt64("ginindex_store_cache_lru_update_interval", 60); //60 seconds
+    global_context->setGinIndexStoreFactory(ginindex_store_cache_settings);
+
+    /// A cache for part's primary index
+    size_t primary_index_cache_size = root_config.cnch_primary_index_cache_size;
+    if (primary_index_cache_size > max_cache_size)
+    {
+        primary_index_cache_size = max_cache_size;
+        LOG_INFO(log, "Primary index cache size was lowered to {} because the system has low amount of memory",
+            formatReadableSizeWithBinarySuffix(primary_index_cache_size));
+    }
+    if (primary_index_cache_size)
+        global_context->setPrimaryIndexCache(primary_index_cache_size);
+
 
     /// A cache for mmapped files.
     size_t mmap_cache_size = config().getUInt64("mmap_cache_size", 1000);   /// The choice of default is arbitrary.
     if (mmap_cache_size)
         global_context->setMMappedFileCache(mmap_cache_size);
+
+    /// A cache for query results.
+    if (global_context->getServerType() == ServerType::cnch_server)
+        global_context->setQueryCache(config());
+
+    /// Size of cache for intermediate_result. It is not necessary.
+    size_t intermediate_result_cache_size = config().getUInt64("intermediate_result_cache_size", 1000000000);
+    if (intermediate_result_cache_size)
+        global_context->setIntermediateResultCache(intermediate_result_cache_size);
 
     /// Size of delete bitmap for HaMergeTree engine to be cached in memory; default is 1GB
     size_t delete_bitmap_cache_size = config().getUInt64("delete_bitmap_cache_size", 1073741824);
@@ -1084,10 +1266,6 @@ int Server::main(const std::vector<std::string> & /*args*/)
     size_t uki_data_cache_size = config().getUInt64("unique_key_index_data_cache_size", 1073741824); /// 1GB
     global_context->setUniqueKeyIndexCache(uki_meta_cache_size);
     global_context->setUniqueKeyIndexBlockCache(uki_data_cache_size);
-
-    /// Disk cache for unique key index
-    size_t unique_key_index_file_cache_size = config().getUInt64("unique_key_index_disk_cache_max_bytes", 53687091200); /// 50GB
-    global_context->setUniqueKeyIndexFileCache(unique_key_index_file_cache_size);
 
 #if USE_HDFS
     /// Init hdfs user
@@ -1106,6 +1284,10 @@ int Server::main(const std::vector<std::string> & /*args*/)
     HDFSConnectionParams hdfs_params = HDFSConnectionParams::parseHdfsFromConfig(global_context->getCnchConfigRef());
     global_context->setHdfsConnectionParams(hdfs_params);
 #endif
+    auto vetos_params = VETosConnectionParams::parseVeTosFromConfig(config());
+    global_context->setVETosConnectParams(vetos_params);
+    auto oss_connection_params = OSSConnectionParams::parseOSSFromConfig(config());
+    global_context->setOSSConnectParams(oss_connection_params);
 
     // Clear old store data in the background
     ThreadFromGlobalPool clear_old_data;
@@ -1181,6 +1363,24 @@ int Server::main(const std::vector<std::string> & /*args*/)
         throw;
     }
 
+    /// Disk cache for unique key index
+    size_t uki_disk_cache_max_bytes = 50 * 1024 * 1024 * 1024UL; // 50GB
+    for (const auto & [name, disk] : global_context->getDisksMap())
+    {
+        if (disk->getType() == DiskType::Type::Local && disk->getPath() == global_context->getPath())
+        {
+            Poco::File disk_path(disk->getPath());
+            if (!disk_path.canRead() || !disk_path.canWrite())
+                throw Exception("There is no RW access to disk " + name + " (" + disk->getPath() + ")", ErrorCodes::PATH_ACCESS_DENIED);
+            uki_disk_cache_max_bytes = std::min<size_t>(0.25 * disk->getAvailableSpace().bytes, uki_disk_cache_max_bytes);
+            break;
+        }
+    }
+    size_t unique_key_index_file_cache_size = config().getUInt64("unique_key_index_disk_cache_max_bytes", uki_disk_cache_max_bytes);
+    global_context->setUniqueKeyIndexFileCache(unique_key_index_file_cache_size);
+
+    global_context->setNvmCache(config());
+
 #if USE_EMBEDDED_COMPILER
     constexpr size_t compiled_expression_cache_size_default = 1024 * 1024 * 128;
     size_t compiled_expression_cache_size = config().getUInt64("compiled_expression_cache_size", compiled_expression_cache_size_default);
@@ -1196,7 +1396,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
     global_context->setFormatSchemaPath(remote_format_schema_path, true);
     try
     {
-        reloadFormatSchema(remote_format_schema_path, format_schema_path.string(), log);
+        reloadFormatSchema(global_context, remote_format_schema_path, format_schema_path.string(), log);
     }
     catch(const Exception &)
     {
@@ -1207,6 +1407,15 @@ int Server::main(const std::vector<std::string> & /*args*/)
         throw;
     }
 
+    // Note:: just for test.
+    {
+        // WARNING: There is a undesired restriction on FDB. Each process could only init one fdb client otherwise it will panic.
+        // so if we use fdb as the kv storage, the config for external and internal catalog must be the same.
+        if (global_context->getCnchConfigRef().has(ExternalCatalog::Mgr::configPrefix()))
+        {
+            ExternalCatalog::Mgr::init(*global_context, global_context->getCnchConfigRef());
+        }
+    }
     /// Check sanity of MergeTreeSettings on server startup
     global_context->getMergeTreeSettings().sanityCheck(settings);
     global_context->getReplicatedMergeTreeSettings().sanityCheck(settings);
@@ -1219,15 +1428,18 @@ int Server::main(const std::vector<std::string> & /*args*/)
         global_context->initCnchTransactionCoordinator();
 
         /// Initialize table and part cache, only server need part cache manager and storage cache.
-        global_context->setPartCacheManager();
-        if (config().getBool("enable_cnch_storage_cache", true))
+        if (config().getBool("enable_cnch_part_cache", true))
         {
-            LOG_INFO(log, "Init cnch storage cache.");
-            global_context->setCnchStorageCache(settings.cnch_max_cached_storage);
+            LOG_INFO(log, "Init cnch part cache.");
+            global_context->setPartCacheManager();
+        }
+        else
+        {
+            LOG_WARNING(log, "Disable cnch part cache, which is strongly suggested for product use, since disable it may bring significant performace issue.");
         }
 
         /// only server need start up server manager
-        global_context->setCnchServerManager();
+        global_context->setCnchServerManager(config());
 
         // size_t masking_policy_cache_size = config().getUInt64("mark_cache_size", 128);
         // size_t masking_policy_cache_lifetime = config().getUInt64("mark_cache_size_lifetime", 10000);
@@ -1240,6 +1452,9 @@ int Server::main(const std::vector<std::string> & /*args*/)
           * It is important to do early, not in destructor of Context, because
           *  table engines could use Context on destroy.
           */
+
+        DiskCacheFactory::instance().shutdown();
+
         LOG_INFO(log, "Shutting down storages.");
 
         global_context->shutdown();
@@ -1248,6 +1463,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
         // Uses a raw pointer to global context for getting ZooKeeper.
         main_config_reloader.reset();
+        users_config_reloader.reset();
 
         /** Explicitly destroy Context. It is more convenient than in destructor of Server, because logger is still available.
           * At this moment, no one could own shared part of Context.
@@ -1273,13 +1489,25 @@ int Server::main(const std::vector<std::string> & /*args*/)
         auto & database_catalog = DatabaseCatalog::instance();
         /// After the system database is created, attach virtual system tables (in addition to query_log and part_log)
         attachSystemTablesServer(*database_catalog.getSystemDatabase(), has_zookeeper);
+        attachInformationSchema(global_context, *database_catalog.getDatabase(DatabaseCatalog::INFORMATION_SCHEMA, global_context));
+        attachInformationSchema(global_context, *database_catalog.getDatabase(DatabaseCatalog::INFORMATION_SCHEMA_UPPERCASE, global_context));
+        attachMySQL(global_context, *database_catalog.getDatabase(DatabaseCatalog::MYSQL, global_context));
+        attachMySQL(global_context, *database_catalog.getDatabase(DatabaseCatalog::MYSQL_UPPERCASE, global_context));
         /// We load temporary database first, because projections need it.
         database_catalog.initializeAndLoadTemporaryDatabase();
         /// Then, load remaining databases
         loadMetadata(global_context, default_database);
         database_catalog.loadDatabases();
         /// After loading validate that default database exists
-        database_catalog.assertDatabaseExists(default_database);
+        database_catalog.assertDatabaseExists(default_database, global_context);
+
+        if (global_context->getServerType() == ServerType::cnch_server)
+        {
+            /// Load digest information from system.server_part_log for partition selector.
+            if (auto server_part_log = global_context->getServerPartLog())
+                server_part_log->prepareTable();
+            global_context->initBGPartitionSelector();
+        }
     }
     catch (...)
     {
@@ -1290,6 +1518,8 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     /// start background task to sync metadata automatically. consider to remove it later.
     global_context->setMetaChecker();
+
+
 
     /// Init trace collector only after trace_log system table was created
     /// Disable it if we collect test coverage information, because it will work extremely slow.
@@ -1394,8 +1624,6 @@ int Server::main(const std::vector<std::string> & /*args*/)
     http_params->setTimeout(settings.http_receive_timeout);
     http_params->setKeepAliveTimeout(keep_alive_timeout);
 
-    std::vector<std::unique_ptr<brpc::Server>> rpc_servers;
-    std::vector<std::unique_ptr<::google::protobuf::Service>> rpc_services;
     auto servers = std::make_shared<std::vector<ProtocolServerAdapter>>();
 
     std::vector<std::string> listen_hosts = DB::getMultipleValuesFromConfig(config(), "", "listen_host");
@@ -1411,7 +1639,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
     {
         /// This object will periodically calculate some metrics.
         AsynchronousMetrics async_metrics(
-            global_context, config().getUInt("asynchronous_metrics_update_period_s", 1), {}, servers);
+            global_context, config().getUInt("asynchronous_metrics_update_period_s", 1), {}, servers, log);
         attachSystemTablesAsync(*DatabaseCatalog::instance().getSystemDatabase(), async_metrics);
 
         for (const auto & listen_host : listen_hosts)
@@ -1429,7 +1657,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
                     port_name,
                     "http://" + address.toString(),
                     std::make_unique<HTTPServer>(
-                        context(), createHandlerFactory(*this, async_metrics, "HTTPHandler-factory"), server_pool, socket, http_params));
+                        context(), createHandlerFactory(*this, async_metrics, "HTTPHandler-factory", context()), server_pool, socket, http_params));
             });
 
             /// HTTPS
@@ -1445,7 +1673,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
                     port_name,
                     "https://" + address.toString(),
                     std::make_unique<HTTPServer>(
-                        context(), createHandlerFactory(*this, async_metrics, "HTTPSHandler-factory"), server_pool, socket, http_params));
+                        context(), createHandlerFactory(*this, async_metrics, "HTTPSHandler-factory", context()), server_pool, socket, http_params));
 #else
                 UNUSED(port);
                 throw Exception{"HTTPS protocol is disabled because Poco library was built without NetSSL support.",
@@ -1526,7 +1754,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
                     "replica communication (interserver): http://" + address.toString(),
                     std::make_unique<HTTPServer>(
                         context(),
-                        createHandlerFactory(*this, async_metrics, "InterserverIOHTTPHandler-factory"),
+                        createHandlerFactory(*this, async_metrics, "InterserverIOHTTPHandler-factory", context()),
                         server_pool,
                         socket,
                         http_params));
@@ -1545,7 +1773,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
                     "secure replica communication (interserver): https://" + address.toString(),
                     std::make_unique<HTTPServer>(
                         context(),
-                        createHandlerFactory(*this, async_metrics, "InterserverIOHTTPSHandler-factory"),
+                        createHandlerFactory(*this, async_metrics, "InterserverIOHTTPSHandler-factory", context()),
                         server_pool,
                         socket,
                         http_params));
@@ -1566,7 +1794,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
                 servers->emplace_back(
                     port_name,
                     "MySQL compatibility protocol: " + address.toString(),
-                    std::make_unique<Poco::Net::TCPServer>(
+                    std::make_unique<TCPServer>(
                         new MySQLHandlerFactory(*this),
                         server_pool,
                         socket,
@@ -1615,7 +1843,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
                     "Prometheus: http://" + address.toString(),
                     std::make_unique<HTTPServer>(
                         context(),
-                        createHandlerFactory(*this, async_metrics, "PrometheusHandler-factory"),
+                        createHandlerFactory(*this, async_metrics, "PrometheusHandler-factory", context()),
                         server_pool,
                         socket,
                         http_params));
@@ -1652,6 +1880,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
         buildLoggers(config(), logger());
 
         main_config_reloader->start();
+        users_config_reloader->start();
         access_control.startPeriodicReloadingUsersConfigs();
         if (dns_cache_updater)
             dns_cache_updater->start();
@@ -1685,85 +1914,13 @@ int Server::main(const std::vector<std::string> & /*args*/)
                                                                      "distributed_ddl", "DDLWorker", &CurrentMetrics::MaxDDLEntryID));
         }
 
-        bool enable_brpc_builtin_services = global_context->getSettingsRef().enable_brpc_builtin_services;
-
-        if (global_context->getComplexQueryActive())
+        if (global_context->getServerType() == ServerType::cnch_server && global_context->getComplexQueryActive())
         {
-            global_context->setExchangePort(config().getInt("exchange_port"));
-            global_context->setExchangeStatusPort(config().getInt("exchange_status_port"));
-
             Statistics::CacheManager::initialize(global_context);
-
-            for (size_t i = 0; i < listen_hosts.size(); i++)
-            {
-                auto& listen_host = listen_hosts[i];
-                /// Brpc data trans registry service
-                auto exchange_server = std::make_unique<brpc::Server>();
-                auto exchange_status_server = std::make_unique<brpc::Server>();
-
-                auto exchange_service = std::make_unique<BrpcExchangeReceiverRegistryService>(global_context->getSettingsRef().exchange_stream_max_buf_size);
-                auto plan_segment_service = std::make_unique<PlanSegmentManagerRpcService>(global_context);
-                auto runtime_filter_service = std::make_unique<RuntimeFilterService>(global_context);
-
-                if (exchange_server->AddService(exchange_service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) != 0)
-                    throw Exception("Fail to add BrpcExchangeReceiverRegistryService", ErrorCodes::LOGICAL_ERROR);
-
-                if (exchange_status_server->AddService(plan_segment_service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) != 0)
-                    throw Exception("Fail to add PlanSegmentManagerRpcService", ErrorCodes::LOGICAL_ERROR);
-
-                // RuntimeFilterService reuse PlanSegmentManagerRpcService port
-                if (exchange_status_server->AddService(runtime_filter_service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) != 0)
-                    throw Exception("Fail to add RuntimeFilterService", ErrorCodes::LOGICAL_ERROR);
-
-                std::string host_exchange_port = createHostPortString(listen_host, global_context->getExchangePort());
-                brpc::ServerOptions stream_options;
-                stream_options.idle_timeout_sec = -1;
-                if (i > 0)
-                    stream_options.server_info_name = fmt::format("stm{}", i);
-                else
-                    stream_options.server_info_name = fmt::format("stm");
-                stream_options.has_builtin_services = enable_brpc_builtin_services;
-                if (exchange_server->Start(host_exchange_port.c_str(), &stream_options) != 0)
-                {
-                    if (listen_try)
-                    {
-                        LOG_ERROR(log, "Fail to start BrpcExchangeReceiverRegistryService {}\n", host_exchange_port);
-                    }
-                    else
-                    {
-                        throw Exception("Fail to start BrpcExchangeReceiverRegistryService", ErrorCodes::LOGICAL_ERROR) ;
-                    }
-                }
-
-                std::string host_exchange_status_port = createHostPortString(listen_host, global_context->getExchangeStatusPort());
-                brpc::ServerOptions cmd_options;
-                if (i > 0)
-                    cmd_options.server_info_name = fmt::format("cmd{}", i);
-                else
-                    cmd_options.server_info_name = fmt::format("cmd");
-                cmd_options.has_builtin_services = enable_brpc_builtin_services;
-                if (exchange_status_server->Start(host_exchange_status_port.c_str(), &cmd_options) != 0)
-                {
-                    if (listen_try)
-                    {
-                        LOG_ERROR(log, "Fail to start PlanSegmentManagerRpcService {}\n", host_exchange_status_port);
-                    }
-                    else
-                    {
-                        throw Exception("Fail to start PlanSegmentManagerRpcService", ErrorCodes::LOGICAL_ERROR) ;
-                    }
-                }
-
-                rpc_servers.emplace_back(std::move(exchange_server));
-                rpc_servers.emplace_back(std::move(exchange_status_server));
-
-                rpc_services.emplace_back(std::move(exchange_service));
-                rpc_services.emplace_back(std::move(plan_segment_service));
-                rpc_services.emplace_back(std::move(runtime_filter_service));
-
-                LOG_INFO(log, "start BrpcExchangeReceiverRegistryService listening :: {}", host_exchange_port);
-                LOG_INFO(log, "start PlanSegmentManagerRpcService listening :: {}", host_exchange_status_port);
-            }
+            BindingCacheManager::initializeGlobalBinding(global_context);
+            PlanCacheManager::initialize(global_context);
+            PreparedStatementManager::initialize(global_context);
+            Statistics::AutoStats::AutoStatisticsManager::initialize(global_context, global_context->getConfigRef());
         }
 
         if (global_context->getServerType() == ServerType::cnch_server || global_context->getServerType() == ServerType::cnch_worker)
@@ -1779,49 +1936,26 @@ int Server::main(const std::vector<std::string> & /*args*/)
             LOG_INFO(log, "Listening for {}", server.getDescription());
         }
 
-        /// Server and worker rpc services
-        std::unique_ptr<CnchServerServiceImpl> cnch_server_endpoint;
-        std::unique_ptr<CnchWorkerServiceImpl> cnch_worker_endpoint;
-
-        if (global_context->getServerType() == ServerType::cnch_server)
-            cnch_server_endpoint = std::make_unique<CnchServerServiceImpl>(global_context);
-        if (global_context->getServerType() == ServerType::cnch_worker)
-            cnch_worker_endpoint = std::make_unique<CnchWorkerServiceImpl>(global_context);
-
-        if (cnch_server_endpoint || cnch_worker_endpoint)
+        std::vector<std::unique_ptr<BrpcServerHolder>> rpc_server_holders;
+        for (auto & host : listen_hosts)
         {
-            UInt64 rpc_port = config().getInt("rpc_port");
-
-            for (const auto & listen : listen_hosts)
-            {
-                rpc_servers.push_back(std::make_unique<brpc::Server>());
-                auto & rpc_server = rpc_servers.back();
-
-                if (cnch_server_endpoint && 0 != rpc_server->AddService(cnch_server_endpoint.get(), brpc::SERVER_DOESNT_OWN_SERVICE))
-                    throw Exception("Failed to add cnch server rpc service.", ErrorCodes::BRPC_EXCEPTION);
-                if (cnch_worker_endpoint && 0 != rpc_server->AddService(cnch_worker_endpoint.get(), brpc::SERVER_DOESNT_OWN_SERVICE))
-                    throw Exception("Failed to add cnch worker rpc service.", ErrorCodes::BRPC_EXCEPTION);
-
-                std::string host_port = createHostPortString(listen, rpc_port);
-                brpc::ServerOptions options;
-                options.server_info_name = "def";
-                options.has_builtin_services = enable_brpc_builtin_services;
-                if (0 != rpc_server->Start(host_port.c_str(), &options))
-                {
-                    if (listen_try)
-                    {
-                        LOG_ERROR(log, "Failed to start rpc server on {}\n", host_port);
-                    }
-                    else
-                    {
-                        throw Exception("Failed to start rpc server on " + host_port, ErrorCodes::BRPC_EXCEPTION);
-                    }
-                }
-
-                LOG_INFO(log, "Listening rpc: " + host_port);
-            }
+            std::string brpc_host_port = createHostPortString(host, root_config.rpc_port);
+            rpc_server_holders.emplace_back(std::make_unique<BrpcServerHolder>(brpc_host_port, global_context, listen_try));
         }
 
+        bool service_available = false;
+        for (auto& holder : rpc_server_holders)
+        {
+            service_available |= holder->available();
+        }
+
+        if (!service_available)
+        {
+            throw Exception("Failed to start rpc server in all listen_hosts.", ErrorCodes::BRPC_EXCEPTION);
+        }
+
+        if (global_context->getServerType() == ServerType::cnch_worker)
+            global_context->initDiskExchangeDataManager();
 
         LOG_INFO(log, "Ready for connections.");
 
@@ -1838,8 +1972,8 @@ int Server::main(const std::vector<std::string> & /*args*/)
                 current_connections += server.currentConnections();
             }
 
-            for (auto & rpc_server : rpc_servers)
-                rpc_server->Stop(0);
+            for (auto & holder : rpc_server_holders)
+                holder->stop();
 
             if (current_connections)
                 LOG_INFO(log, "Closed all listening sockets. Waiting for {} outstanding connections.", current_connections);
@@ -1848,6 +1982,9 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
             /// Killing remaining queries.
             global_context->getProcessList().killAllQueries();
+            auto nvm_cache = global_context->getNvmCache();
+            if (nvm_cache)
+                nvm_cache->shutDown();
 
             if (current_connections)
                 current_connections = waitServersToFinish(*servers, config().getInt("shutdown_wait_unfinished", 5));
@@ -1858,6 +1995,9 @@ int Server::main(const std::vector<std::string> & /*args*/)
                     " Tip: To increase wait time add to config: <shutdown_wait_unfinished>60</shutdown_wait_unfinished>", current_connections);
             else
                 LOG_INFO(log, "Closed connections.");
+
+            for (auto & holder : rpc_server_holders)
+                holder->join();
 
             /// Wait server pool to avoid use-after-free of destroyed context in the handlers
             server_pool.joinAll();
@@ -1876,6 +2016,9 @@ int Server::main(const std::vector<std::string> & /*args*/)
                 LOG_INFO(log, "Will shutdown forcefully.");
                 forceShutdown();
             }
+
+            /// Need to shutdown LockManager before shared->schedule_pool in context shutdown, otherwise it may core.
+            LockManager::instance().shutdown();
         });
 
         std::vector<std::unique_ptr<MetricsTransmitter>> metrics_transmitters;
@@ -1885,10 +2028,35 @@ int Server::main(const std::vector<std::string> & /*args*/)
                 global_context->getConfigRef(), graphite_key, async_metrics));
         }
 
+        /// Start worker's heartbeat task when it's fully ready.
+        if (global_context->getServerType() == ServerType::cnch_worker && global_context->getResourceManagerClient())
+            global_context->startResourceReport();
+
         waitForTerminationRequest();
     }
 
     return Application::EXIT_OK;
+}
+
+void Server::initMetrics2()
+{
+    auto & load_config = config();
+    bool enable_metrics2 = load_config.getBool("metrics2.enable_metrics", true);
+    if (!enable_metrics2)
+        return;
+
+    metrics2::MetricCollectorConf conf;
+    conf.auto_batch = load_config.getInt("metrics2.auto_batch", 1);
+    conf.enable_debug_metric = load_config.getBool("metrics2.enable_debug_metric", false);
+    conf.namespace_prefix = load_config.getString("metrics2.metric_name_prefix", "cnch");
+    conf.send_batch_size = load_config.getInt("metrics2.send_batch_size", 1);
+    conf.sock_path = load_config.getString("metrics2.sock_path", "/tmp/metric.sock");
+    conf.udp_server_ip = load_config.getString("metrics2.udp_server_ip", "127.0.0.1");
+    conf.udp_server_port = load_config.getInt("metrics2.udp_server_port", 9123);
+    conf.use_remote_server = load_config.getInt("metrics2.use_remote_server", false);
+
+    String custom_tags = load_config.getString("metrics2.tags", "");
+    Metrics::InitMetrics(conf, custom_tags);
 }
 
 }

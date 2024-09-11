@@ -31,11 +31,14 @@ enum class CompressionMethod
     /// Zstd compressor
     ///  This option corresponds to HTTP Content-Encoding: zstd
     Zstd,
-    Brotli
+    Brotli,
+    Snappy
 };
 
 /// How the compression method is named in HTTP.
 std::string toContentEncodingName(CompressionMethod method);
+
+std::string getFileSuffix(CompressionMethod method);
 
 /** Choose compression method from path and hint.
   * if hint is "auto" or empty string, then path is analyzed,
@@ -47,6 +50,7 @@ CompressionMethod chooseCompressionMethod(const std::string & path, const std::s
 std::unique_ptr<ReadBuffer> wrapReadBufferWithCompressionMethod(
     std::unique_ptr<ReadBuffer> nested,
     CompressionMethod method,
+    bool snappy_format_blocked = false,
     size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
     char * existing_memory = nullptr,
     size_t alignment = 0);

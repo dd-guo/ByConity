@@ -23,15 +23,15 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/InterpreterSelectWithUnionQuery.h>
+#include <Interpreters/InterpreterSelectIntersectExceptQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTSelectIntersectExceptQuery.h>
 #include <Parsers/queryToString.h>
 #include <Parsers/ASTTEALimit.h>
 #include <Parsers/ASTOrderByElement.h>
 #include <Parsers/ASTSubquery.h>
 #include <Processors/Executors/PullingAsyncPipelineExecutor.h>
-
-#include <Storages/StorageMemory.h>
 
 #include <QueryPlan/DistinctStep.h>
 #include <QueryPlan/ExpressionStep.h>
@@ -58,9 +58,8 @@ namespace ErrorCodes
 }
 
 InterpreterSelectWithUnionQuery::InterpreterSelectWithUnionQuery(
-        const ASTPtr & query_ptr_, ContextPtr context_,
-        const SelectQueryOptions & options_, const Names & required_result_column_names)
-    : IInterpreterUnionOrSelectQuery(query_ptr_, context_, options_)
+    const ASTPtr & query_ptr_, ContextPtr context_, const SelectQueryOptions & options_, const Names & required_result_column_names)
+    : IInterpreterUnionOrSelectQuery(query_ptr_, context_, options_), log(&Poco::Logger::get("InterpreterSelectWithUnionQuery"))
 {
     ASTSelectWithUnionQuery * ast = query_ptr->as<ASTSelectWithUnionQuery>();
     bool require_full_header = ast->hasNonDefaultUnionMode();
@@ -113,7 +112,9 @@ InterpreterSelectWithUnionQuery::InterpreterSelectWithUnionQuery(
     if (num_children == 1 && settings_limit_offset_needed)
     {
         const ASTPtr first_select_ast = ast->list_of_selects->children.at(0);
-        ASTSelectQuery * select_query = first_select_ast->as<ASTSelectQuery>();
+        ASTSelectQuery * select_query = dynamic_cast<ASTSelectQuery *>(first_select_ast.get());
+        if (!select_query)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid type in list_of_selects: {}", first_select_ast->getID());
 
         if (!select_query->withFill() && !select_query->limit_with_ties)
         {
@@ -161,6 +162,7 @@ InterpreterSelectWithUnionQuery::InterpreterSelectWithUnionQuery(
         const Names & current_required_result_column_names
             = query_num == 0 ? required_result_column_names : required_result_column_names_for_other_selects[query_num];
 
+        // only select related ast is added here
         nested_interpreters.emplace_back(
             buildCurrentChildInterpreter(ast->list_of_selects->children.at(query_num), require_full_header ? Names() : current_required_result_column_names));
     }
@@ -175,7 +177,28 @@ InterpreterSelectWithUnionQuery::InterpreterSelectWithUnionQuery(
     {
         Blocks headers(num_children);
         for (size_t query_num = 0; query_num < num_children; ++query_num)
+        {
             headers[query_num] = nested_interpreters[query_num]->getSampleBlock();
+            /// Here we check that, in case if required_result_column_names were specified,
+            /// nested interpreter returns exactly it. Except if query requires full header.
+            /// The code aboew is written in a way that for 0th query required_result_column_names_for_other_selects[0]
+            /// is an empty list, and we should use required_result_column_names instead.
+            const auto & current_required_result_column_names = (query_num == 0 && !require_full_header)
+                ? required_result_column_names
+                : required_result_column_names_for_other_selects[query_num];
+            if (!current_required_result_column_names.empty())
+            {
+                const auto & header_columns = headers[query_num].getNames();
+                if (current_required_result_column_names != header_columns)
+                {
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Different order of columns in UNION subquery: {} and {}",
+                        fmt::join(current_required_result_column_names, ", "),
+                        fmt::join(header_columns, ", "));
+                }
+
+            }
+        }
 
         result_header = getCommonHeaderForUnion(headers, context->getSettingsRef().allow_extended_type_conversion);
     }
@@ -219,7 +242,7 @@ Block InterpreterSelectWithUnionQuery::getCommonHeaderForUnion(const Blocks & he
             columns[i] = &headers[i].getByPosition(column_num);
 
         ColumnWithTypeAndName & result_elem = common_header.getByPosition(column_num);
-        result_elem = getLeastSuperColumn(columns, allow_extended_conversion);
+        result_elem = getLeastSuperColumn(columns, context->getSettingsRef().enable_implicit_arg_type_convert, allow_extended_conversion);
     }
 
     return common_header;
@@ -241,6 +264,8 @@ InterpreterSelectWithUnionQuery::buildCurrentChildInterpreter(const ASTPtr & ast
         return std::make_unique<InterpreterSelectWithUnionQuery>(ast_ptr_, context, options, current_required_result_column_names);
     else if (ast_ptr_->as<ASTSelectQuery>())
         return std::make_unique<InterpreterSelectQuery>(ast_ptr_, context, options, current_required_result_column_names);
+    else if (ast_ptr_->as<ASTSelectIntersectExceptQuery>())
+        return std::make_unique<InterpreterSelectIntersectExceptQuery>(ast_ptr_, context, options);
     else
         throw Exception("Unrecognized Query kind", ErrorCodes::NOT_IMPLEMENTED);
 }
@@ -300,13 +325,13 @@ void InterpreterSelectWithUnionQuery::buildQueryPlan(QueryPlan & query_plan)
             data_streams[i] = plans[i]->getCurrentDataStream();
         }
 
-        auto max_threads = context->getSettingsRef().max_threads;
-        auto union_step = std::make_unique<UnionStep>(std::move(data_streams), max_threads);
+        auto max_threads = settings.max_threads;
+        auto union_step = std::make_unique<UnionStep>(std::move(data_streams), DataStream{}, OutputToInputs{}, max_threads, false);
 
         query_plan.unitePlans(std::move(union_step), std::move(plans));
 
         const auto & query = query_ptr->as<ASTSelectWithUnionQuery &>();
-        if (query.union_mode == ASTSelectWithUnionQuery::Mode::DISTINCT)
+        if (query.union_mode == SelectUnionMode::UNION_DISTINCT)
         {
             /// Add distinct transform
             SizeLimits limits(settings.max_rows_in_distinct, settings.max_bytes_in_distinct, settings.distinct_overflow_mode);
@@ -334,25 +359,14 @@ void InterpreterSelectWithUnionQuery::buildQueryPlan(QueryPlan & query_plan)
         }
     }
 
-}
-
-void InterpreterSelectWithUnionQuery::checkQueryCache(QueryPlan & query_plan)
-{
-    if (!context->getSettings().enable_query_cache)
-        return;
-
-    auto query_cache_step = std::make_unique<QueryCacheStep>(query_plan.getCurrentDataStream(), query_ptr, context, options.to_stage);
-    query_cache_step->setStepDescription("QUERY CACHE");
-
-    if (!query_cache_step->isValidQuery())
-        return;
-
-    if (query_cache_step->hitCache())
-    {
-        QueryPlan empty_query_plan;
-        query_plan = std::move(empty_query_plan);
-    }
-    query_plan.addStep(std::move(query_cache_step));
+    std::for_each(nested_interpreters.begin(), nested_interpreters.end(),
+        [this] (const auto & nested_interpreter)
+        {
+            addUsedStorageIDs(nested_interpreter->getUsedStorageIDs());
+            if (!nested_interpreter->hasAllUsedStorageIDs())
+                setHasAllUsedStorageIDs(false);
+        }
+    );
 }
 
 BlockIO InterpreterSelectWithUnionQuery::execute()
@@ -361,8 +375,6 @@ BlockIO InterpreterSelectWithUnionQuery::execute()
 
     QueryPlan query_plan;
     buildQueryPlan(query_plan);
-
-    checkQueryCache(query_plan);
 
     auto pipeline = query_plan.buildQueryPipeline(
         QueryPlanOptimizationSettings::fromContext(context),
@@ -374,10 +386,12 @@ BlockIO InterpreterSelectWithUnionQuery::execute()
     else
         res.pipeline = std::move(*pipeline);
     res.pipeline.addInterpreterContext(context);
+    res.pipeline.addUsedStorageIDs(used_storage_ids);
+    if (!hasAllUsedStorageIDs())
+        res.pipeline.setHasAllUsedStorageIDs(false);
 
     return res;
 }
-
 
 void InterpreterSelectWithUnionQuery::ignoreWithTotals()
 {
@@ -391,7 +405,7 @@ QueryPipeline InterpreterSelectWithUnionQuery::executeTEALimit(QueryPipelinePtr 
 
     // Create implicit storage to buffer pre tealimit results
     NamesAndTypesList columns = result_header.getNamesAndTypesList();
-    auto temporary_table = TemporaryTableHolder(context->getQueryContext(), ColumnsDescription{columns}, {});
+    auto temporary_table = TemporaryTableHolder(context->getQueryContext(), ColumnsDescription{columns}, {}, {}, {});
 
     String implicit_name  = "_TEALIMITDATA";
 
@@ -434,6 +448,8 @@ QueryPipeline InterpreterSelectWithUnionQuery::executeTEALimit(QueryPipelinePtr 
     bool tealimit_order_keep = context->getSettingsRef().tealimit_order_keep;
 
     auto tea_limit =  dynamic_cast<ASTTEALimit*>(ast.tealimit.get());
+    chassert(tea_limit != nullptr);
+    // coverity[var_deref_model]
     String g_list_str = queryToString(*tea_limit->group_expr_list);
     postQuery << "(" << g_list_str << ") IN (";
     // SUBQUERY
@@ -535,6 +551,26 @@ QueryPipeline InterpreterSelectWithUnionQuery::executeTEALimit(QueryPipelinePtr 
     {
         comma = false;
         postQuery << " ORDER BY ";
+
+        if (ast.list_of_selects->children.size() == 1)
+        {
+            auto & select_ast = ast.list_of_selects->children[0];
+
+            if (auto * select = select_ast->as<ASTSelectQuery>())
+            {
+                if (select->orderBy())
+                {
+                    for (auto & elem : select->orderBy()->children)
+                    {
+                        if (comma)
+                            postQuery << ", ";
+                        comma = true;
+                        postQuery << serializeAST(*elem, true);
+                    }
+                }
+            }
+        }
+
         for (auto &elem : tea_limit->order_expr_list->children)
         {
             if (comma) postQuery << ", ";
@@ -542,6 +578,8 @@ QueryPipeline InterpreterSelectWithUnionQuery::executeTEALimit(QueryPipelinePtr 
             postQuery<< serializeAST(*elem, true);
         }
     }
+
+    LOG_TRACE(log, "tealimit rewrited query: {}", postQuery.str());
 
     // evaluate the internal SQL and get the result
     return executeQuery(postQuery.str(), context->getQueryContext(), true).pipeline;

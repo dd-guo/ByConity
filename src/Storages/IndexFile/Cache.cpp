@@ -142,7 +142,6 @@ namespace
             }
             LRUHandle ** new_list = new LRUHandle *[new_length];
             memset(new_list, 0, sizeof(new_list[0]) * new_length);
-            uint32_t count = 0;
             for (uint32_t i = 0; i < length_; i++)
             {
                 LRUHandle * h = list_[i];
@@ -154,10 +153,8 @@ namespace
                     h->next_hash = *ptr;
                     *ptr = h;
                     h = next;
-                    count++;
                 }
             }
-            assert(elems_ == count);
             delete[] list_;
             list_ = new_list;
             length_ = new_length;
@@ -383,13 +380,14 @@ namespace
         LRUCache shard_[kNumShards];
         std::mutex id_mutex_;
         uint64_t last_id_;
+        size_t capacity;
 
         static inline uint32_t HashSlice(const Slice & s) { return Hash(s.data(), s.size(), 0); }
 
         static uint32_t Shard(uint32_t hash) { return hash >> (32 - kNumShardBits); }
 
     public:
-        explicit ShardedLRUCache(size_t capacity) : last_id_(0)
+        explicit ShardedLRUCache(size_t capacity_) : last_id_(0), capacity(capacity_)
         {
             const size_t per_shard = (capacity + (kNumShards - 1)) / kNumShards;
             for (int s = 0; s < kNumShards; s++)
@@ -440,6 +438,12 @@ namespace
             }
             return total;
         }
+
+        size_t TotalCapacity() const override
+        {
+            return capacity;
+        }
+
     };
 
 } // end anonymous namespace

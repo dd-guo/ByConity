@@ -28,7 +28,7 @@
 namespace DB
 {
 
-template <typename T>
+template <typename T, bool has_buf>
 class ColumnVector;
 
 /** Implements part of the IDataType interface, common to all numbers and for Date and DateTime.
@@ -71,13 +71,13 @@ public:
     size_t getSizeOfValueInMemory() const override { return sizeof(T); }
     bool isCategorial() const override { return isValueRepresentedByInteger(); }
     bool canBeInsideLowCardinality() const override { return true; }
+
+    SerializationPtr doGetDefaultSerialization() const override { return std::make_shared<SerializationNumber<T>>(); }
     Field stringToVisitorField(const String & ins) const override;
     String stringToVisitorString(const String & ins) const override;
 
-    SerializationPtr doGetDefaultSerialization() const override { return std::make_shared<SerializationNumber<T>>(); }
-
     bool canBeMapKeyType() const override { return true; }
-    bool canBeMapValueType() const override { return true; }
+    bool canBeByteMapValueType() const override { return true; }
 };
 
 /// Prevent implicit template instantiation of DataTypeNumberBase for common numeric types

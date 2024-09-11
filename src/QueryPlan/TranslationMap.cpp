@@ -12,42 +12,45 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <QueryPlan/TranslationMap.h>
 
 #include <Analyzers/function_utils.h>
-#include <QueryPlan/TranslationMap.h>
-#include <QueryPlan/planning_common.h>
-#include <QueryPlan/Void.h>
-#include <Parsers/ASTVisitor.h>
-#include <Parsers/ASTIdentifier.h>
+#include <Interpreters/misc.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTVisitor.h>
+#include <QueryPlan/Void.h>
+#include <QueryPlan/planning_common.h>
 
 namespace DB
 {
 
-TranslationMap::TranslationMap(TranslationMapPtr outer_context_,
-                               ScopePtr scope_,
-                               FieldSymbolInfos field_symbol_infos_,
-                               Analysis & analysis_,
-                               ContextPtr context_) :
-    analysis(analysis_),
-    context(std::move(context_)),
-    outer_context(std::move(outer_context_)),
-    scope(scope_),
-    field_symbol_infos(std::move(field_symbol_infos_)),
-    expression_symbols(createScopeAwaredASTMap<String>(analysis))
+TranslationMap::TranslationMap(
+    TranslationMapPtr outer_context_, ScopePtr scope_, FieldSymbolInfos field_symbol_infos_, Analysis & analysis_, ContextPtr context_)
+    : analysis(analysis_)
+    , context(std::move(context_))
+    , outer_context(std::move(outer_context_))
+    , scope(scope_)
+    , field_symbol_infos(std::move(field_symbol_infos_))
+    , expression_symbols(createScopeAwaredASTMap<String>(analysis, scope))
 {
     checkSymbols();
 }
 
-TranslationMap & TranslationMap::withScope(ScopePtr scope_, const FieldSymbolInfos & field_symbol_infos_, bool remove_mappings)
+TranslationMap & TranslationMap::withScope(ScopePtr scope_, FieldSymbolInfos field_symbol_infos_, bool remove_mappings)
 {
     scope = scope_;
-    field_symbol_infos = field_symbol_infos_;
+    field_symbol_infos = std::move(field_symbol_infos_);
 
     checkSymbols();
 
     if (remove_mappings)
         expression_symbols.clear();
+
+    auto new_expression_symbols = createScopeAwaredASTMapVariadic<String>(
+        analysis, scope, expression_symbols.begin(), expression_symbols.end(), expression_symbols.bucket_count());
+    new_expression_symbols.swap(expression_symbols);
 
     return *this;
 }
@@ -106,6 +109,7 @@ public:
     ASTPtr visitASTFunction(ASTPtr & node, const Void &) override;
     ASTPtr visitASTSubquery(ASTPtr & node, const Void &) override;
     ASTPtr visitASTQuantifiedComparison(ASTPtr & node, const Void &) override;
+    ASTPtr visitASTPreparedParameter(ASTPtr & node, const Void &) override;
 
     TranslationMapVisitor(Analysis & analysis_, const TranslationMap & translation_map_)
         : analysis(analysis_),
@@ -131,13 +135,15 @@ private:
     Analysis & analysis;
     const TranslationMap & translation_map;
     const bool use_legacy_column_name_of_tuple;
+    int is_in_value_list = 0;
 
     template<typename F>
     ASTPtr preferToUseMapped(ASTPtr & node, F && translate_func)
     {
         const auto & expression_symbols = translation_map.expression_symbols;
 
-        if (expression_symbols.find(node) != expression_symbols.end())
+        // don't translate expressions in IN value list, as it does not support variables yet.
+        if (expression_symbols.find(node) != expression_symbols.end() && !is_in_value_list)
             return toSymbolRef(expression_symbols.at(node));
 
         return translate_func(node);
@@ -161,6 +167,10 @@ String TranslationMap::translateToSymbol(const ASTPtr & expression) const
 
         if (auto * iden = translated->as<ASTIdentifier>())
             return iden->name();
+
+        // since literals won't be translated
+        if (auto it = expression_symbols.find(expression); it != expression_symbols.end())
+            return it->second;
     }
 
     throw Exception("Expression " + expression->getColumnName() + " can not be translated to symbol" , ErrorCodes::LOGICAL_ERROR);
@@ -193,15 +203,15 @@ bool TranslationMap::canTranslateToSymbol(const ASTPtr & expression) const
 
 ASTPtr TranslationMapVisitor::visitASTLiteral(ASTPtr & node, const Void &)
 {
-    return preferToUseMapped(node, [&](ASTPtr & lit) -> ASTPtr {
-        auto & field = lit->as<ASTLiteral &>().value;
-        auto rewritten_lit = std::make_shared<ASTLiteral>(field);
+    // don't translate literals into calculated expressions, a counter example is: SELECT round(100, 0) GROUP BY 0
+    // translating round(100, 0) to round(100, expr#0) will cause exception: Argument at index 1 for function round must be constant
+    auto & field = node->as<ASTLiteral &>().value;
+    auto rewritten_lit = std::make_shared<ASTLiteral>(field);
 
-        if (use_legacy_column_name_of_tuple && field.getType() == Field::Types::Tuple)
-            rewritten_lit->use_legacy_column_name_of_tuple = true;
+    if (use_legacy_column_name_of_tuple && field.getType() == Field::Types::Tuple)
+        rewritten_lit->use_legacy_column_name_of_tuple = true;
 
-        return rewritten_lit;
-    });
+    return rewritten_lit;
 }
 
 ASTPtr TranslationMapVisitor::visitASTIdentifier(ASTPtr & node, const Void &)
@@ -252,7 +262,23 @@ ASTPtr TranslationMapVisitor::visitASTFunction(ASTPtr & node, const Void &)
 
         if (function_type == FunctionType::FUNCTION)
         {
-            return makeASTFunction(function.name, process(function_args));
+            ASTs translated_args;
+            size_t num_arguments = function_args.size();
+
+            for (size_t arg_idx = 0; arg_idx < num_arguments; ++arg_idx)
+            {
+                auto & arg = function_args.at(arg_idx);
+
+                if (functionIsInOperator(function.name) && arg_idx == 1)
+                {
+                    ++is_in_value_list;
+                    translated_args.push_back(process(arg));
+                    --is_in_value_list;
+                }
+                else
+                    translated_args.push_back(process(arg));
+            }
+            return makeASTFunction(function.name, std::move(translated_args));
         }
         else if (function_type == FunctionType::LAMBDA_EXPRESSION)
         {
@@ -270,10 +296,19 @@ ASTPtr TranslationMapVisitor::visitASTQuantifiedComparison(ASTPtr & node, const 
     });
 }
 
+ASTPtr TranslationMapVisitor::visitASTPreparedParameter(ASTPtr & pre_node, const Void &)
+{
+    return preferToUseMapped(pre_node, [&](ASTPtr & node) -> ASTPtr { return node; });
+}
+
 ASTPtr TranslationMapVisitor::handleColumnReference(const ResolvedField & column_reference, const ASTPtr & node)
 {
     if (translation_map.scope->isLocalScope(column_reference.scope))
-        return toSymbolRef(translation_map.getFieldSymbol(column_reference.hierarchy_index));
+    {
+        auto field_symbol = translation_map.getFieldSymbol(column_reference.hierarchy_index);
+        assert(!field_symbol.empty());
+        return toSymbolRef(field_symbol);
+    }
     else if (translation_map.outer_context)
         return translation_map.outer_context->translate(node);
     else

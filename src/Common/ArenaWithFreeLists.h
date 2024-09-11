@@ -21,7 +21,11 @@ namespace DB
   * When allocating, we take the head of the list of free blocks,
   *  or, if the list is empty - allocate a new block using Arena.
   */
+#if USE_HUALLOC
+class ArenaWithFreeLists : private HuAllocator<false>, private boost::noncopyable
+#else
 class ArenaWithFreeLists : private Allocator<false>, private boost::noncopyable
+#endif
 {
 private:
     /// If the block is free, then the pointer to the next free block is stored at its beginning, or nullptr, if there are no more free blocks.
@@ -58,13 +62,23 @@ public:
 
     char * alloc(const size_t size)
     {
+        #if USE_HUALLOC
+        if (size > max_fixed_block_size)
+            return static_cast<char *>(HuAllocator<false>::alloc(size));
+        #else
         if (size > max_fixed_block_size)
             return static_cast<char *>(Allocator<false>::alloc(size));
+        #endif
 
         /// find list of required size
         const auto list_idx = findFreeListIndex(size);
 
         /// If there is a free block.
+        /*
+            findFreeListIndex accounts for leading 0 in the bits, hence it will not go as high as 63 as
+            indicated by coverity
+        */ 
+        // coverity[overrun-local]
         if (auto & free_block_ptr = free_lists[list_idx])
         {
             /// Let's take it. And change the head of the list to the next
@@ -85,14 +99,21 @@ public:
 
     void free(char * ptr, const size_t size)
     {
+        #if USE_HUALLOC
+        if (size > max_fixed_block_size)
+            return HuAllocator<false>::free(ptr, size);
+        #else
         if (size > max_fixed_block_size)
             return Allocator<false>::free(ptr, size);
+        #endif
 
         /// find list of required size
         const auto list_idx = findFreeListIndex(size);
 
         /// Insert the released block into the head of the list.
         auto & free_block_ptr = free_lists[list_idx];
+        // maximuum value of list_ixd is 15 when size is 65536
+        // coverity[overrun-local]
         const auto old_head = free_block_ptr;
         free_block_ptr = reinterpret_cast<Block *>(ptr);
         free_block_ptr->next = old_head;

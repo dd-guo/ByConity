@@ -21,6 +21,7 @@
 #include <Interpreters/VirtualWarehousePool.h>
 #include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
 #include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
+#include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Transaction/ICnchTransaction.h>
 #include <WorkerTasks/ManipulationList.h>
 
@@ -34,6 +35,8 @@ using CnchWorkerClientPtr = std::shared_ptr<CnchWorkerClient>;
 
 class CnchMergeMutateThread;
 struct PartMergeLogElement;
+class CnchBGThreadPartitionSelector;
+using PartitionSelectorPtr = std::shared_ptr<CnchBGThreadPartitionSelector>;
 
 struct ManipulationTaskRecord
 {
@@ -51,6 +54,20 @@ struct ManipulationTaskRecord
     String task_id;
     TransactionCnchPtr transaction;
 
+    UInt64 submit_time_ns{0};
+
+    /// Set task_record's commit_start_time once it go into txn commit stage.
+    /// There are some other operations may be conflict with merge.
+    /// 1. DROP PARTITION - get the current max block id and generate a DropRange part. 
+    ///    Need to cancel merge tasks before getting data parts.
+    /// 2. INGEST PARTITION - generate new content based on current source parts.
+    ///    Need to cancel merge tasks and suspend the merge process before INGEST PARTITION finish.
+    /// 3. INSERT OVERWRITE - need to generate a DropRange part to invalid old parts.
+    /// So it's possible that other threads may cancel merge tasks.
+    /// As we can't control the txn state after it's committing (it's controlled by txn manager),
+    /// those committing tasks must be destroyed by txn, but not others(DROP PARTITION, INGEST PARTITION).
+    time_t commit_start_time{0};
+
     ServerDataPartsVector parts;
 
     /// for heartbeat
@@ -59,6 +76,8 @@ struct ManipulationTaskRecord
 
     /// for system.part_merge_log & system.server_part_log
     String result_part_name;
+
+    Strings getSourcePartNames() const;
 };
 
 struct FutureManipulationTask
@@ -103,6 +122,57 @@ struct MergeSelectionMetrics
     size_t elapsed_calc_visible_parts = 0;
     size_t elapsed_calc_merge_parts = 0;
     size_t elapsed_select_parts = 0;
+
+    /// #partition returned from partition selector
+    size_t num_partitions = 0;
+    /// #partition without locked partitions.
+    size_t num_unlock_partitions = 0;
+    /// total number of parts of above partitions.
+    size_t num_source_parts = 0;
+    /// #part after calcVisibleParts
+    size_t num_visible_parts = 0;
+    /// #part without illegal parts (merging part or big part)
+    size_t num_legal_visible_parts = 0;
+
+    size_t totalElapsed() const { return elapsed_get_data_parts + elapsed_calc_visible_parts + elapsed_calc_merge_parts + elapsed_select_parts; }
+
+    String toDebugString() const
+    {
+        WriteBufferFromOwnString wb;
+        wb << '{'
+            << "elapsed_get_data_parts(us):" << elapsed_get_data_parts
+            << ", elapsed_calc_visible_parts:" << elapsed_calc_visible_parts
+            << ", elapsed_select_parts:" << elapsed_select_parts
+            << "; num_partitions:" << num_partitions
+            << ", num_unlock_partitions:" << num_unlock_partitions
+            << ", num_source_parts:" << num_source_parts
+            << ", num_visible_parts:" << num_visible_parts
+            << ", num_legal_visible_parts:" << num_legal_visible_parts
+            << '}';
+        return wb.str();
+    }
+};
+
+struct ClusterTaskProgress
+{
+    UInt64 progress{100}; // default is completed because all parts of a table has same table_definition_hash intially
+    UInt64 start_time_seconds{0};
+
+    String toString() const
+    {
+        String result = std::to_string(progress) + "%";
+        if (start_time_seconds)
+        {
+            time_t sec_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::time_point(std::chrono::seconds(start_time_seconds)));
+            char buffer[80];
+            struct tm * timeinfo;
+            timeinfo = localtime(&sec_time);
+            strftime(buffer, 80, "%Y-%m-%d %H:%M:%S", timeinfo);
+            std::string str_time(buffer);
+            result += " start at " + str_time;
+        }
+        return result;
+    }
 };
 
 class CnchMergeMutateThread : public ICnchBGThread
@@ -117,19 +187,23 @@ public:
     CnchMergeMutateThread(ContextPtr context, const StorageID & id);
     ~CnchMergeMutateThread() override;
 
-    void shutdown();
 
     void tryRemoveTask(const String & task_id);
-    void finishTask(const String & task_id, const MergeTreeDataPartPtr & merged_part, std::function<void()> && commit_parts);
-    bool removeTasksOnPartition(const String & partition_id);
+    void finishTask(const String & task_id, std::function<void(const Strings &, UInt64)> && precommit_parts);
+    bool removeTasksOnPartitions(const std::unordered_set<String> & partitions);
 
-    String triggerPartMerge(StoragePtr & istorage, const String & partition_id, bool aggressive, bool try_select, bool try_execute);
+    String triggerPartMerge(StoragePtr & istorage, const String & partition_id, bool final, bool try_select, bool try_execute);
     void triggerPartMutate(StoragePtr storage);
 
     void waitTasksFinish(const std::vector<String> & task_ids, UInt64 timeout_ms);
+    void waitMutationFinish(UInt64 mutation_commit_time, UInt64 timeout_ms);
+    MergeTreeMutationStatusVector getAllMutationStatuses();
+    ClusterTaskProgress getReclusteringTaskProgress();
+    void setTableClusterStatus();
 
 private:
     void preStart() override;
+    void clearData() override;
 
     void runHeartbeatTask();
 
@@ -141,12 +215,12 @@ private:
 
     bool tryMergeParts(StoragePtr & istorage, StorageCnchMergeTree & storage);
     bool trySelectPartsToMerge(StoragePtr & istorage, StorageCnchMergeTree & storage, MergeSelectionMetrics & metrics);
-    String submitFutureManipulationTask(FutureManipulationTask & future_task, bool maybe_sync_task = false);
+    String submitFutureManipulationTask(const StorageCnchMergeTree & storage, FutureManipulationTask & future_task, bool maybe_sync_task = false);
 
     // Mutate
+    void removeMutationEntryFromKV(const CnchMergeTreeMutationEntry & entry, std::lock_guard<std::mutex> &);
+    void calcMutationPartitions(CnchMergeTreeMutationEntry & mutate_entry, StoragePtr & istorage, StorageCnchMergeTree & storage);
     bool tryMutateParts(StoragePtr & istorage, StorageCnchMergeTree & storage);
-    void parseMutationEntries(const Strings & all_mutations, std::lock_guard<std::mutex> &);
-    void removeMutationEntry(const TxnTimestamp & commit_ts, bool recluster_finish, std::lock_guard<std::mutex> &);
 
     void removeTaskImpl(const String & task_id, std::lock_guard<std::mutex> & lock, TaskRecordPtr * out_task_record = nullptr);
 
@@ -159,6 +233,10 @@ private:
         std::lock_guard lock(currently_merging_mutating_parts_mutex);
         return currently_merging_mutating_parts;
     }
+
+    Strings removeLockedPartition(const Strings & partitions);
+
+    PartitionSelectorPtr partition_selector;
 
     std::mutex currently_merging_mutating_parts_mutex;
     NameSet currently_merging_mutating_parts;
@@ -174,10 +252,11 @@ private:
     std::queue<std::unique_ptr<FutureManipulationTask>> merge_pending_queue;
 
     std::mutex try_mutate_parts_mutex; /// protect tryMutateParts(), getMutationStatus()
+    /// Partitions that all parts are mutated or under mutating.
     NameSet scheduled_mutation_partitions;
+    /// Partitions that all parts are mutated.
     NameSet finish_mutation_partitions;
     std::optional<CnchMergeTreeMutationEntry> current_mutate_entry;
-    std::map<TxnTimestamp, CnchMergeTreeMutationEntry> current_mutations_by_version;
 
     /// Separate quota for merge & mutation tasks
     std::atomic<int> running_merge_tasks{0};

@@ -25,6 +25,11 @@
 
 namespace DB
 {
+namespace ErrorCodes
+{
+    extern const int UNKNOWN_CNCH_BG_THREAD_TYPE;
+}
+
 using UUIDToBGThreads = std::unordered_map<UUID, CnchBGThreadPtr>;
 namespace ResourceManagement
 {
@@ -83,16 +88,19 @@ private:
 class CnchBGThreadsMapArray : protected WithContext, private boost::noncopyable
 {
 public:
-    CnchBGThreadsMapArray(ContextPtr global_context_);
+    explicit CnchBGThreadsMapArray(ContextPtr global_context_);
     ~CnchBGThreadsMapArray();
 
-    void destroy();
+    void shutdown();
 
     inline CnchBGThreadsMap * at(size_t type)
     {
-        auto res = threads_array[size_t(type)].get();
+        if (unlikely(!isServerBGThreadType(type)))
+            throw Exception(ErrorCodes::UNKNOWN_CNCH_BG_THREAD_TYPE, "Unknown server bg thread type: {}", type);
+
+        auto * res = threads_array.at(type).get();
         if (unlikely(!res))
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "CnchBGThread for type {} is not initialized", toString(CnchBGThreadType(type)));
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CnchBGThread for type {} is not initialized.", type);
         return res;
     }
 
@@ -100,9 +108,10 @@ public:
 
     void startResourceReport();
     void stopResourceReport();
+    bool isResourceReportRegistered();
 
 private:
-    std::array<std::unique_ptr<CnchBGThreadsMap>, CnchBGThread::NumType> threads_array;
+    std::array<std::unique_ptr<CnchBGThreadsMap>, CnchBGThread::NumServerType> threads_array;
 
     std::unique_ptr<ResourceReporterTask> resource_reporter_task;
 

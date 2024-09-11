@@ -37,7 +37,12 @@ public:
     ASTPtr out_file;
     ASTPtr format;
     ASTPtr settings_ast;
+    ASTPtr compression_method;
+    ASTPtr compression_level;
+    bool ignore_format = false;
 
+    void formatOutput(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const;
+    
     void formatImpl(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const final;
 
     ASTType getType() const override { return ASTType::ASTQueryWithOutput; }

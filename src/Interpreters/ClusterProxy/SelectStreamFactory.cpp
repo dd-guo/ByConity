@@ -30,6 +30,7 @@
 #include <TableFunctions/TableFunctionFactory.h>
 #include <IO/ConnectionTimeoutsContext.h>
 #include <Interpreters/RequiredSourceColumnsVisitor.h>
+#include <DataTypes/ObjectUtils.h>
 
 #include <common/logger_useful.h>
 #include <Processors/Pipe.h>
@@ -62,29 +63,39 @@ namespace ClusterProxy
 
 SelectStreamFactory::SelectStreamFactory(
     const Block & header_,
+    const ColumnsDescriptionByShardNum & objects_by_shard_,
+    const StorageSnapshotPtr & storage_snapshot_,
     QueryProcessingStage::Enum processed_stage_,
     StorageID main_table_,
     const Scalars & scalars_,
     bool has_virtual_shard_num_column_,
-    const Tables & external_tables_)
+    const Tables & external_tables_,
+    ExpressionActionsPtr actions_for_remote_)
     : header(header_),
+    objects_by_shard(objects_by_shard_),
+    storage_snapshot(storage_snapshot_),
     processed_stage{processed_stage_},
     main_table(std::move(main_table_)),
     table_func_ptr{nullptr},
     scalars{scalars_},
     has_virtual_shard_num_column(has_virtual_shard_num_column_),
-    external_tables{external_tables_}
+    external_tables{external_tables_},
+    actions_for_remote{actions_for_remote_}
 {
 }
 
 SelectStreamFactory::SelectStreamFactory(
     const Block & header_,
+    const ColumnsDescriptionByShardNum & objects_by_shard_,
+    const StorageSnapshotPtr & storage_snapshot_,
     QueryProcessingStage::Enum processed_stage_,
     ASTPtr table_func_ptr_,
     const Scalars & scalars_,
     bool has_virtual_shard_num_column_,
     const Tables & external_tables_)
     : header(header_),
+    objects_by_shard(objects_by_shard_),
+    storage_snapshot(storage_snapshot_),
     processed_stage{processed_stage_},
     table_func_ptr{table_func_ptr_},
     scalars{scalars_},
@@ -249,6 +260,10 @@ void SelectStreamFactory::createForShard(
         }
     }
 
+    auto it = objects_by_shard.find(shard_info.shard_num);
+    if (it != objects_by_shard.end())
+        replaceMissedSubcolumnsByConstants(storage_snapshot->object_columns, it->second, query_ast);
+
     auto emplace_local_stream = [&]()
     {
         plans.emplace_back(createLocalPlan(modified_query_ast, modified_header, context, processed_stage));
@@ -267,14 +282,18 @@ void SelectStreamFactory::createForShard(
         if (!table_func_ptr)
             remote_query_executor->setMainTable(main_table);
 
-        remote_pipes.emplace_back(createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read));
+        remote_pipes.emplace_back(createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read, context->getSettingsRef().resize_number_after_remote_source));
         remote_pipes.back().addInterpreterContext(context);
         addConvertingActions(remote_pipes.back(), header);
     };
 
     const auto & settings = context->getSettingsRef();
 
-    if (settings.prefer_localhost_replica && shard_info.isLocal())
+    /**
+        prefer_localhost_replica in cnch is useless and is buggy.
+        and in worker we query from remote to reuse send WorkerResource flow to send/load data part
+    */
+    if (main_table && settings.prefer_localhost_replica && shard_info.isLocal() && (context->getServerType() != ServerType::cnch_worker))
     {
         StoragePtr main_table_storage;
 
@@ -283,9 +302,9 @@ void SelectStreamFactory::createForShard(
             TableFunctionPtr table_function_ptr = TableFunctionFactory::instance().get(table_func_ptr, context);
             main_table_storage = table_function_ptr->execute(table_func_ptr, context, table_function_ptr->getName());
         }
-        else
+        else if(main_table)
         {
-            auto resolved_id = context->resolveStorageID(main_table);
+            auto resolved_id = context->tryResolveStorageID(main_table);
             main_table_storage = DatabaseCatalog::instance().tryGetTable(resolved_id, context);
         }
 
@@ -323,7 +342,7 @@ void SelectStreamFactory::createForShard(
             return;
         }
 
-        UInt32 local_delay = replicated_storage->getAbsoluteDelay();
+        UInt64 local_delay = replicated_storage->getAbsoluteDelay();
 
         if (local_delay < max_allowed_delay)
         {
@@ -412,7 +431,7 @@ void SelectStreamFactory::createForShard(
                 auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
                     std::move(connections), modified_query, header, context, throttler, scalars, external_tables, stage);
 
-                return createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read);
+                return createRemoteSourcePipe(remote_query_executor, add_agg_info, add_totals, add_extremes, async_read, context->getSettingsRef().resize_number_after_remote_source);
             }
         };
 

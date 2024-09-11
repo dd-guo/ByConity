@@ -22,12 +22,12 @@
 #pragma once
 
 #include <Processors/IProcessor.h>
-#include <Interpreters/RuntimeFilter/RuntimeFilterHolder.h>
 #include <QueryPlan/QueryIdHolder.h>
 #include <QueryPlan/QueryPlan.h>
 #include <Access/EnabledQuota.h>
 #include <DataStreams/SizeLimits.h>
 #include <Storages/TableLockHolder.h>
+#include <Interpreters/Cache/QueryCache.h> /// nested classes such as QC::Writer can't be fwd declared
 
 namespace DB
 {
@@ -43,6 +43,9 @@ class IStorage;
 using StoragePtr = std::shared_ptr<IStorage>;
 
 using OutputPortRawPtrs = std::vector<OutputPort *>;
+
+namespace IntermediateResult { struct CacheHolder; }
+using CacheHolderPtr = std::shared_ptr<IntermediateResult::CacheHolder>;
 
 /// Pipe is a set of processors which represents the part of pipeline.
 /// Pipe contains a list of output ports, with specified port for totals and specified port for extremes.
@@ -94,6 +97,13 @@ public:
     void addTransform(ProcessorPtr transform, OutputPort * totals, OutputPort * extremes);
     void addTransform(ProcessorPtr transform, InputPort * totals, InputPort * extremes);
 
+    void readFromQueryCache(
+        std::unique_ptr<SourceFromChunks> source,
+        std::unique_ptr<SourceFromChunks> source_totals,
+        std::unique_ptr<SourceFromChunks> source_extremes);
+    void addQueryCacheTransform(std::shared_ptr<QueryCache::Writer> query_cache_writer);
+    void finalizeWriteInQueryCache();
+
     enum class StreamType
     {
         Main = 0, /// Stream for query data. There may be several streams of this type.
@@ -107,6 +117,8 @@ public:
     /// Add transform with single input and single output for each port.
     void addSimpleTransform(const ProcessorGetter & getter);
     void addSimpleTransform(const ProcessorGetterWithStreamKind & getter);
+    /// Add a simple transform to port(could be totals or extremes, which will be set to null after connected)
+    void addSimpleTransformToPort(ProcessorPtr transform, OutputPort * port);
 
     /// Changes the number of output ports if needed. Adds ResizeTransform.
     void resize(size_t num_streams, bool force = false, bool strict = false);
@@ -133,9 +145,11 @@ public:
     void addTableLock(TableLockHolder lock) { holder.table_locks.emplace_back(std::move(lock)); }
     /// This methods are from QueryPipeline. Needed to make conversion from pipeline to pipe possible.
     void addInterpreterContext(std::shared_ptr<const Context> context) { holder.interpreter_context.emplace_back(std::move(context)); }
-    void addStorageHolder(StoragePtr storage) { holder.storage_holders.emplace_back(std::move(storage)); }
+    //void addStorageHolder(StoragePtr storage) { holder.storage_holders.emplace_back(std::move(storage)); }
+    void addStorageHolder(StoragePtr storage);
     void addQueryIdHolder(std::shared_ptr<QueryIdHolder> query_id_holder) { holder.query_id_holder = std::move(query_id_holder); }
-    void addRuntimeFilterHolder(RuntimeFilterHolder rf_holder) { holder.runtime_filters.emplace_back(std::move(rf_holder)); }
+    void addCacheHolder(CacheHolderPtr cache_holder) { holder.cache_holder = std::move(cache_holder); }
+    CacheHolderPtr getCacheHolder() { return holder.cache_holder; }
     /// For queries with nested interpreters (i.e. StorageDistributed)
     void addQueryPlan(std::unique_ptr<QueryPlan> plan) { holder.query_plans.emplace_back(std::move(plan)); }
 
@@ -157,7 +171,7 @@ private:
         std::vector<TableLockHolder> table_locks;
         std::vector<std::unique_ptr<QueryPlan>> query_plans;
         std::shared_ptr<QueryIdHolder> query_id_holder;
-        std::vector<RuntimeFilterHolder> runtime_filters;
+        CacheHolderPtr cache_holder;
     };
 
     Holder holder;

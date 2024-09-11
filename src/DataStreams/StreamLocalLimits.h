@@ -22,6 +22,7 @@
 #pragma once
 #include <DataStreams/SizeLimits.h>
 #include <DataStreams/ExecutionSpeedLimits.h>
+#include <list>
 
 namespace DB
 {
@@ -49,9 +50,14 @@ struct StreamLocalLimits
     ExecutionSpeedLimits speed_limits;
 
     OverflowMode timeout_overflow_mode = OverflowMode::THROW;
-
-    void serialize(WriteBuffer & buf) const;
-    void deserialize(ReadBuffer & buf);
 };
+
+struct StorageLimits
+{
+    StreamLocalLimits local_limits;
+    SizeLimits leaf_limits;
+};
+
+using StorageLimitsList = std::list<StorageLimits>;
 
 }

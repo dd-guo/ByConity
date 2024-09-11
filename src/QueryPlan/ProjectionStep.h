@@ -15,15 +15,17 @@
 
 #pragma once
 
+#include <Core/NameToType.h>
 #include <QueryPlan/Assignment.h>
 #include <QueryPlan/ITransformingStep.h>
-#include <Optimizer/DynamicFilters.h>
-#include <Core/NameToType.h>
 
 namespace DB
 {
 class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
+
+class RuntimeFilterBuilder;
+using RuntimeFilterBuilderPtr = std::shared_ptr<RuntimeFilterBuilder>;
 
 class ProjectionStep : public ITransformingStep
 {
@@ -33,34 +35,35 @@ public:
         Assignments assignments_,
         NameToType name_to_type_,
         bool final_project_ = false,
-        std::unordered_map<String, DynamicFilterBuildInfo> dynamic_filters_ = {});
+        bool index_project_ = false,
+        PlanHints hints_ = {});
 
     String getName() const override { return "Projection"; }
     Type getType() const override { return Type::Projection; }
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr context);
+    void toProto(Protos::ProjectionStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<ProjectionStep> fromProto(const Protos::ProjectionStep & proto, ContextPtr context);
 
     ActionsDAGPtr createActions(ContextPtr context) const;
     const Assignments & getAssignments() const { return assignments; }
     const NameToType & getNameToType() const { return name_to_type; }
 
-    const std::unordered_map<String, DynamicFilterBuildInfo> & getDynamicFilters() const { return dynamic_filters; }
-
     bool isFinalProject() const { return final_project; }
+    bool isIndexProject() const { return index_project; }
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
+
+    void prepare(const PreparedStatementContext & prepared_context) override;
+
+    static ActionsDAGPtr createActions(const Assignments & assignments, const NamesAndTypesList & source, ContextPtr context);
 
 private:
     Assignments assignments;
     NameToType name_to_type;
     // final output step
     bool final_project;
-
-    std::unordered_map<String, DynamicFilterBuildInfo> dynamic_filters;
-
-    void buildDynamicFilterPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings & build_context) const;
+    bool index_project;
 };
 
 }

@@ -16,21 +16,24 @@
 #pragma once
 
 #include <optional>
-#include <Transaction/IntentLock.h>
-#include <Transaction/TimestampCacheManager.h>
-#include <Transaction/ICnchTransaction.h>
-#include <Transaction/TransactionCleaner.h>
-#include <Transaction/TransactionCommon.h>
-#include <Transaction/TxnTimestamp.h>
+#include <Interpreters/Context_fwd.h>
+#include <Transaction/CnchExplicitTransaction.h>
 #include <Transaction/CnchProxyTransaction.h>
 #include <Transaction/CnchServerTransaction.h>
-#include <Transaction/CnchExplicitTransaction.h>
+#include <Transaction/ICnchTransaction.h>
+#include <Transaction/IntentLock.h>
+#include <Transaction/TimestampCacheManager.h>
+#include <Transaction/TransactionCleaner.h>
+#include <Transaction/TransactionCommon.h>
+#include <Transaction/TransactionRecordCache.h>
+#include <Transaction/TxnTimestamp.h>
 #include <Common/HostWithPorts.h>
-#include "Interpreters/Context_fwd.h"
 
 namespace DB
 {
 class Context;
+class CnchProxyTransaction;
+using ProxyTransactionPtr = std::shared_ptr<CnchProxyTransaction>;
 
 
 struct CreateTransactionOption
@@ -67,13 +70,14 @@ class TransactionCoordinatorRcCnch : WithContext
 public:
     explicit TransactionCoordinatorRcCnch(const ContextPtr & context_)
         : WithContext(context_)
-        , ts_cache_manager(std::make_unique<TimestampCacheManager>(getContext()->getConfigRef().getUInt("max_tscache_size", 1000)))
+        // , ts_cache_manager(std::make_unique<TimestampCacheManager>(getContext()->getConfigRef().getUInt("max_tscache_size", 1000)))
         , txn_cleaner(std::make_unique<TransactionCleaner>(
               getContext(),
               getContext()->getConfigRef().getUInt("cnch_transaction_cleaner_max_threads", 128),
               getContext()->getConfigRef().getUInt("cnch_transaction_cleaner_queue_size", 10000),
               getContext()->getConfigRef().getUInt("cnch_transaction_cleaner_dm_max_threads", 32),
               getContext()->getConfigRef().getUInt("cnch_transaction_cleaner_dm_queue_size", 10000)))
+        , finished_or_failed_txn_record_cache(std::make_unique<TransactionRecordCache>(getContext()->getConfigRef().getUInt("size_of_cached_txn_records", 20000)))
         , scan_interval(getContext()->getConfigRef().getInt("cnch_transaction_list_scan_interval", 10 * 60 * 1000)) // default 10 mins
         , log(&Poco::Logger::get("TransactionCoordinator"))
     {
@@ -131,10 +135,8 @@ public:
 
     // create proxy transaction
     // used when forward query to other server (or worker)
-    ProxyTransactionPtr createProxyTransaction(
-        const HostWithPorts & host_ports,
-        TxnTimestamp primary_txn_id = {0}
-    );
+    ProxyTransactionPtr createProxyTransaction(const HostWithPorts & host_ports, TxnTimestamp primary_txn_id,
+        bool read_only);
 
     TransactionCnchPtr getTransaction(const TxnTimestamp & txn_id) const;
     bool isActiveTransaction(const TxnTimestamp & txn_id) const;
@@ -150,8 +152,9 @@ public:
     // clear related api used by background scan task
     bool clearZombieParts(const std::vector<String> & parts);
 
-    TimestampCacheManager & getTsCacheManager() const { return *ts_cache_manager; }
+    // TimestampCacheManager & getTsCacheManager() const { return *ts_cache_manager; }
     TransactionCleaner & getTxnCleaner() const { return *txn_cleaner; }
+    TransactionRecordCache * getFinishedOrFailedTxnRecordCache() const { return finished_or_failed_txn_record_cache.get(); }
 
     CnchTransactionStatus getTransactionStatus(const TxnTimestamp & txnID) const;
 
@@ -165,11 +168,19 @@ public:
         return active_txn_list;
     }
 
+    auto getActiveXIDsPerTable() const
+    {
+        std::lock_guard lock(min_ts_mutex);
+        return table_to_timestamps;
+    }
+
     void shutdown()
     {
         scan_active_txns_task->deactivate();
         txn_cleaner->finalize();
     }
+
+    void addTransaction(const TransactionCnchPtr & txn);
 
 private:
     void eraseActiveTimestamp(const TransactionCnchPtr & txn);
@@ -183,10 +194,10 @@ private:
     mutable std::mutex min_ts_mutex;
     std::map<TxnTimestamp, std::map<UUID, StorageID>> timestamp_to_tables;
     std::map<UUID, std::set<TxnTimestamp>> table_to_timestamps;
-    uint64_t last_time_clean_timestamps;
 
-    TimestampCacheManagerPtr ts_cache_manager;
+    // TimestampCacheManagerPtr ts_cache_manager;
     TransactionCleanerPtr txn_cleaner;
+    TransactionRecordCachePtr finished_or_failed_txn_record_cache;
 
     // background tasks
     UInt64 scan_interval;

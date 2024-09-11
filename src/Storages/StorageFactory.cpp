@@ -20,13 +20,16 @@
  */
 
 #include <Storages/StorageFactory.h>
+#include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
-#include <Parsers/ASTFunction.h>
+#include <Interpreters/StorageID.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTFunction.h>
+#include <Storages/IStorage.h>
+#include <Storages/StorageFactory.h>
 #include <Common/Exception.h>
 #include <Common/StringUtils/StringUtils.h>
-#include <IO/WriteHelpers.h>
-#include <Interpreters/StorageID.h>
+#include <Storages/UniqueNotEnforcedDescription.h>
 
 namespace DB
 {
@@ -84,7 +87,11 @@ StoragePtr StorageFactory::get(
     ContextMutablePtr context,
     const ColumnsDescription & columns,
     const ConstraintsDescription & constraints,
-    bool has_force_restore_data_flag) const
+    const ForeignKeysDescription & foreign_keys,
+    const UniqueNotEnforcedDescription & unique,
+    bool has_force_restore_data_flag,
+    HiveParamsPtr hive_params,
+    bool skip_unknown_settings) const
 {
     String name, comment;
     ASTStorage * storage_def = query.storage;
@@ -138,8 +145,6 @@ StoragePtr StorageFactory::get(
 
             name = engine_def.name;
 
-            LOG_DEBUG(&Poco::Logger::get("StorageFactory"), " engine name {}", name);
-
             if (name == "View")
             {
                 throw Exception(
@@ -169,8 +174,8 @@ StoragePtr StorageFactory::get(
                     throw Exception("Unknown table engine " + name, ErrorCodes::UNKNOWN_STORAGE);
             }
 
-            if (storage_def->comment)
-                comment = storage_def->comment->as<ASTLiteral &>().value.get<String>();
+            if (query.comment)
+                comment = query.comment->as<ASTLiteral &>().value.get<String>();
 
             auto check_feature = [&](String feature_description, FeatureMatcherFn feature_matcher_fn)
             {
@@ -218,21 +223,27 @@ StoragePtr StorageFactory::get(
     }
 
     ASTs empty_engine_args;
+    //No issues with calling StorageID below with in braced initialization
+    // coverity[out_of_scope]
     Arguments arguments{
         .engine_name = name,
         .engine_args = has_engine_args ? storage_def->engine->arguments->children : empty_engine_args,
         .storage_def = storage_def,
         .query = query,
         .relative_data_path = relative_data_path,
-        .table_id = StorageID(query.database, query.table, query.uuid),
+        .table_id = query.getTableInfo(),
         .local_context = local_context,
         .context = context,
         .columns = columns,
         .constraints = constraints,
+        .foreign_keys = foreign_keys,
+        .unique = unique,
         .attach = query.attach,
         .create = query.create,
         .has_force_restore_data_flag = has_force_restore_data_flag,
-        .comment = comment};
+        .comment = comment,
+        .hive_client = hive_params !=nullptr ? hive_params->hive_client : nullptr,
+        .skip_unknown_settings = skip_unknown_settings };
 
     assert(arguments.getContext() == arguments.getContext()->getGlobalContext());
 

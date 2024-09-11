@@ -35,12 +35,15 @@ public:
     String name;
     ASTPtr type;
     std::optional<bool> null_modifier;
+    std::optional<bool> unsigned_modifier;
     String default_specifier;
     ASTPtr default_expression;
+    bool auto_increment;
+    bool mysql_primary_key;
     ASTPtr comment;
     ASTPtr codec;
     ASTPtr ttl;
-    UInt8 flags;
+    UInt16 flags;
 
     String getID(char delim) const override { return "ColumnDeclaration" + (delim + name); }
 
@@ -48,6 +51,8 @@ public:
 
     ASTPtr clone() const override;
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void toLowerCase() override { boost::to_lower(name); }
+    void toUpperCase() override { boost::to_upper(name); }
 };
 
 }

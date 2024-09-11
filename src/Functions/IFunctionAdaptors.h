@@ -26,7 +26,13 @@ protected:
         return function->executeImplDryRun(arguments, result_type, input_rows_count);
     }
 
+    bool isPreviledgedFunction() const final { return function->isPreviledgedFunction(); }
+
     bool useDefaultImplementationForNulls() const final { return function->useDefaultImplementationForNulls(); }
+    bool useDefaultImplementationForNothing() const final
+    {
+        return function->useDefaultImplementationForNothing();
+    }
     bool useDefaultImplementationForConstants() const final { return function->useDefaultImplementationForConstants(); }
     bool useDefaultImplementationForLowCardinalityColumns() const final { return function->useDefaultImplementationForLowCardinalityColumns(); }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const final { return function->getArgumentsThatAreAlwaysConstant(); }
@@ -53,9 +59,9 @@ public:
 
     bool isCompilable() const override { return function->isCompilable(getArgumentTypes()); }
 
-    llvm::Value * compile(llvm::IRBuilderBase & builder, Values values) const override
+    llvm::Value * compile(llvm::IRBuilderBase & builder, Values values, JITContext & jit_context) const override
     {
-        return function->compile(builder, getArgumentTypes(), std::move(values));
+        return function->compile(builder, getArgumentTypes(), std::move(values), jit_context);
     }
 
 #endif
@@ -79,6 +85,10 @@ public:
     bool isDeterministic() const override { return function->isDeterministic(); }
 
     bool isDeterministicInScopeOfQuery() const override { return function->isDeterministicInScopeOfQuery(); }
+
+    bool isShortCircuit(ShortCircuitSettings & settings, size_t number_of_arguments) const override { return function->isShortCircuit(settings, number_of_arguments); }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & args) const override { return function->isSuitableForShortCircuitArgumentsExecution(args); }
 
     bool hasInformationAboutMonotonicity() const override { return function->hasInformationAboutMonotonicity(); }
 
@@ -119,6 +129,10 @@ public:
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override { return function->getReturnTypeImpl(arguments); }
 
     bool useDefaultImplementationForNulls() const override { return function->useDefaultImplementationForNulls(); }
+    bool useDefaultImplementationForNothing() const override
+    {
+        return function->useDefaultImplementationForNothing();
+    }
     bool useDefaultImplementationForLowCardinalityColumns() const override { return function->useDefaultImplementationForLowCardinalityColumns(); }
     bool canBeExecutedOnLowCardinalityDictionary() const override { return function->canBeExecutedOnLowCardinalityDictionary(); }
 

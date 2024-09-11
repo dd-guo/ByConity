@@ -201,6 +201,8 @@ public:
         UInt64 size;
 
         bool operator== (const DictionaryKey & other) const { return hash == other.hash && size == other.size; }
+
+        bool operator<(const DictionaryKey & other) const {return hash < other.hash || (hash==other.hash && size < other.size);}
     };
 
     struct DictionaryKeyHash
@@ -279,6 +281,11 @@ struct HashMethodSingleLowCardinalityColumn : public SingleColumnMethod
         if (!low_cardinality_column)
             throw Exception("Invalid aggregation key type for HashMethodSingleLowCardinalityColumn method. "
                             "Excepted LowCardinality, got " + column->getName(), ErrorCodes::LOGICAL_ERROR);
+
+        if (low_cardinality_column->isFullState())
+            throw Exception("Invalid aggregation key type for HashMethodSingleLowCardinalityColumn method. "
+                            "Not Support fallback LowCardinality ", ErrorCodes::LOGICAL_ERROR);
+
         return *low_cardinality_column;
     }
 

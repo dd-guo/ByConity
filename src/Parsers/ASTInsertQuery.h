@@ -40,7 +40,13 @@ public:
     ASTPtr watch;
     ASTPtr table_function;
     ASTPtr in_file;
+    ASTPtr compression;
+    ASTPtr partition_by;
     ASTPtr settings_ast;
+    bool is_overwrite = false;
+    ASTPtr overwrite_partition;
+    // REPLACE INTO
+    bool is_replace = false;
 
     /// Data to insert
     const char * data = nullptr;
@@ -66,15 +72,46 @@ public:
         if (select) { res->select = select->clone(); res->children.push_back(res->select); }
         if (watch) { res->watch = watch->clone(); res->children.push_back(res->watch); }
         if (table_function) { res->table_function = table_function->clone(); res->children.push_back(res->table_function); }
+        if (partition_by) { res->partition_by = partition_by->clone(); res->children.push_back(res->partition_by); }
         if (settings_ast) { res->settings_ast = settings_ast->clone(); res->children.push_back(res->settings_ast); }
+        if (is_overwrite && overwrite_partition)
+        {
+            res->overwrite_partition = overwrite_partition->clone();
+            res->children.push_back(res->overwrite_partition);
+        }
 
         if (in_file)
         {
-            res->in_file = in_file->clone(); res->children.push_back(res->in_file);
+            res->in_file = in_file->clone();
+            res->children.push_back(res->in_file);
         }
+
+        res->is_overwrite = is_overwrite;
 
         return res;
     }
+
+    void toLowerCase() override
+    {
+        if (!table_id.empty())
+        {
+            boost::to_lower(table_id.database_name);
+            boost::to_lower(table_id.table_name);
+        }
+    }
+
+    void toUpperCase() override
+    {
+        if (!table_id.empty())
+        {
+            boost::to_upper(table_id.database_name);
+            boost::to_upper(table_id.table_name);
+        }
+    }
+
+    void serialize(WriteBuffer & buf) const override;
+    void deserializeImpl(ReadBuffer & buf) override;
+    static ASTPtr deserialize(ReadBuffer & buf);
 
 protected:
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;

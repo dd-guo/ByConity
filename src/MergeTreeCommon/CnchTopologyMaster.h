@@ -36,18 +36,23 @@ public:
 
     std::list<CnchServerTopology> getCurrentTopology();
 
+    std::pair<PairInt64, CnchServerTopology> getCurrentTopologyVersion();
+
     /// Get target server for table with current timestamp.
-    HostWithPorts getTargetServer(const String & table_uuid, bool allow_empty_result, bool allow_tso_unavailable = false);
+    HostWithPorts getTargetServer(const String & table_uuid, const String & server_vw_name, bool allow_empty_result, bool allow_tso_unavailable = false);
     /// Get target server with provided timestamp.
-    HostWithPorts getTargetServer(const String & table_uuid, UInt64 ts,  bool allow_empty_result, bool allow_tso_unavailable = false);
+    HostWithPorts getTargetServer(const String & table_uuid, const String & server_vw_name, const UInt64 ts,  bool allow_empty_result, bool allow_tso_unavailable = false);
 
     void shutDown();
+
+    void dumpStatus() const;
 private:
 
-    void fetchTopologies();
+    bool fetchTopologies();
 
     HostWithPorts getTargetServerImpl(
         const String & table_uuid,
+        const String server_vw_name,
         std::list<CnchServerTopology> & current_topology,
         UInt64 current_ts,
         bool allow_empty_result,
@@ -57,7 +62,9 @@ private:
     BackgroundSchedulePool::TaskHolder topology_fetcher;
     std::list<CnchServerTopology> topologies;
     const Settings settings;
-    mutable std::mutex mutex;
+    mutable std::timed_mutex mutex;
+
+    std::atomic<UInt64> fetch_time{0};
 };
 
 using CnchTopologyMasterPtr = std::shared_ptr<CnchTopologyMaster>;

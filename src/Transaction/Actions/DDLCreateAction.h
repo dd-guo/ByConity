@@ -15,21 +15,48 @@
 
 #pragma once
 
+#include <variant>
+#include <Core/SettingsEnums.h>
 #include <Core/UUID.h>
+#include <Interpreters/StorageID.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Transaction/Actions/IAction.h>
 
 namespace DB
 {
-struct CreateActionParams
+struct CreateDatabaseParams
 {
-    String database;
-    String table;
+    String name;
     UUID uuid;
+    String statement; // used by CnchMaterializedMySQL
+    String engine_name;
+    enum TextCaseOption text_case_option = TextCaseOption::MIXED;
+};
+
+struct CreateSnapshotParams
+{
+    UUID db_uuid;
+    String name;
+    int ttl_in_days;
+    UUID bind_table;
+};
+
+struct CreateDictionaryParams
+{
+    StorageID storage_id;
     String statement;
     bool attach = false;
-    bool is_dictionary = false;
 };
+
+struct CreateTableParams
+{
+    UUID db_uuid = UUIDHelpers::Nil;
+    StorageID storage_id;
+    String statement;
+    bool attach = false;
+};
+
+using CreateActionParams = std::variant<CreateDatabaseParams, CreateSnapshotParams, CreateDictionaryParams, CreateTableParams>;
 
 class DDLCreateAction : public IAction
 {
@@ -43,9 +70,6 @@ public:
 
     void executeV1(TxnTimestamp commit_time) override;
     void abort() override;
-
-private:
-    void updateTsCache(const UUID & uuid, const TxnTimestamp & commit_time) override;
 
 private:
     CreateActionParams params;

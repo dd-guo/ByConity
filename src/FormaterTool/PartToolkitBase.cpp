@@ -15,12 +15,13 @@
 
 #include <FormaterTool/PartToolkitBase.h>
 #include <FormaterTool/ZipHelper.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/InterpreterCreateQuery.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTPartToolKit.h>
-#include <Interpreters/InterpreterCreateQuery.h>
-#include <Interpreters/Context.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMergeTree.h>
+#include <Poco/JSON/Template.h>
 
 namespace DB
 {
@@ -30,10 +31,30 @@ namespace ErrorCodes
     extern const int INCORRECT_QUERY;
 }
 
+const std::string default_config = "<yandex>\n"
+                                   "<storage_configuration>\n"
+                                   "<disks>\n"
+                                   "    <hdfs>\n"
+                                   "        <path><?= source-path ?></path>\n"
+                                   "        <type>hdfs</type>\n"
+                                   "    </hdfs>\n"
+                                   "</disks>\n"
+                                   "<policies>\n"
+                                   "    <cnch_default_hdfs>\n"
+                                   "        <volumes>\n"
+                                   "            <hdfs>\n"
+                                   "                <default>hdfs</default>\n"
+                                   "                <disk>hdfs</disk>\n"
+                                   "            </hdfs>\n"
+                                   "        </volumes>\n"
+                                   "    </cnch_default_hdfs>\n"
+                                   "</policies>\n"
+                                   "</storage_configuration>\n"
+                                   "</yandex>";
+
 PartToolkitBase::PartToolkitBase(const ASTPtr & query_ptr_, ContextMutablePtr context_)
     : WithMutableContext(context_), query_ptr(query_ptr_)
 {
-
 }
 
 PartToolkitBase::~PartToolkitBase()
@@ -60,7 +81,7 @@ void PartToolkitBase::applySettings()
     if (pw_query.settings)
     {
         const ASTSetQuery & set_ast = pw_query.settings->as<ASTSetQuery &>();
-        for (auto & change : set_ast.changes)
+        for (const auto & change : set_ast.changes)
         {
             if (settings.has(change.name))
                 settings.set(change.name, change.value);
@@ -70,9 +91,58 @@ void PartToolkitBase::applySettings()
                 getContext()->setHdfsUser(change.value.safeGet<String>());
             else if (change.name == "hdfs_nnproxy")
                 getContext()->setHdfsNNProxy(change.value.safeGet<String>());
+            else if (change.name == "s3_input_config") {
+                s3_input_config = std::make_unique<S3::S3Config>(change.value.safeGet<String>());
+            } else if (change.name == "s3_output_config") {
+                s3_output_config = std::make_unique<S3::S3Config>(change.value.safeGet<String>());
+            }
             else
                 user_settings.emplace(change.name, change.value);
         }
+    }
+    if (pw_query.s3_clean_task_info) {
+        /// There is no need to initialize further in `S3 CLEAN` mode.
+        return;
+    }
+
+    /// Init HDFS params.
+    ///
+    /// User can bypass nnproxy by passing a string to `hdfs_nnproxy` with prefixs like `hdfs://` or `cfs://`.
+    HDFSConnectionParams hdfs_params
+        = HDFSConnectionParams::parseFromMisusedNNProxyStr(getContext()->getHdfsNNProxy(), getContext()->getHdfsUser());
+    getContext()->setHdfsConnectionParams(hdfs_params);
+
+    /// Register default HDFS file system as well in case of
+    /// lower level logic call `getDefaultHdfsFileSystem`.
+    /// Default values are the same as those on the ClickHouse server.
+    {
+        const int hdfs_max_fd_num = user_settings.count("hdfs_max_fd_num") ? user_settings["hdfs_max_fd_num"].safeGet<int>() : 100000;
+        const int hdfs_skip_fd_num = user_settings.count("hdfs_skip_fd_num") ? user_settings["hdfs_skip_fd_num"].safeGet<int>() : 100;
+        const int hdfs_io_error_num_to_reconnect
+            = user_settings.count("hdfs_io_error_num_to_reconnect") ? user_settings["hdfs_io_error_num_to_reconnect"].safeGet<int>() : 10;
+        registerDefaultHdfsFileSystem(hdfs_params, hdfs_max_fd_num, hdfs_skip_fd_num, hdfs_io_error_num_to_reconnect);
+    }
+
+    /// Renders default config to initialize storage configurations.
+    Poco::JSON::Object::Ptr params = new Poco::JSON::Object();
+    params->set("source-path", pw_query.source_path->as<ASTLiteral &>().value.safeGet<String>());
+    Poco::JSON::Template tpl;
+    tpl.parse(default_config);
+    std::stringstream out;
+    tpl.render(params, out);
+    std::string default_xml_config = "<?xml version=\"1.0\"?>";
+    default_xml_config = default_xml_config + out.str();
+
+    DB::ConfigProcessor config_processor("", false, false);
+    auto config = config_processor.loadConfig(default_xml_config).configuration;
+    getContext()->setConfig(config);
+
+    /// Overwrite settings if `s3_input_config` is provided.
+    if (s3_input_config) {
+        settings.set("s3_endpoint", s3_input_config->endpoint);
+        settings.set("s3_ak_id", s3_input_config->ak_id);
+        settings.set("s3_ak_secret", s3_input_config->ak_secret);
+        settings.set("s3_region", s3_input_config->region);
     }
 }
 
@@ -89,15 +159,23 @@ StoragePtr PartToolkitBase::getTable()
         if (!create.storage || !create.columns_list)
             throw Exception("Wrong create query.", ErrorCodes::INCORRECT_QUERY);
 
-        ColumnsDescription columns = InterpreterCreateQuery::getColumnsDescription(*create.columns_list->columns, getContext(), create.attach);
-        ConstraintsDescription constraints = InterpreterCreateQuery::getConstraintsDescription(create.columns_list->constraints);
+        if (create.storage->engine != nullptr && create.storage->engine->name != "CloudMergeTree")
+            throw Exception("Only support CloudMergeTree in Part Tool.", ErrorCodes::INCORRECT_QUERY);
 
-        StoragePtr res = StorageFactory::instance().get(create,
+        ColumnsDescription columns = InterpreterCreateQuery::getColumnsDescription(*create.columns_list->columns, getContext(), create.attach, create.database == "system");
+        ConstraintsDescription constraints = InterpreterCreateQuery::getConstraintsDescription(create.columns_list->constraints);
+        ForeignKeysDescription foreign_keys = InterpreterCreateQuery::getForeignKeysDescription(create.columns_list->foreign_keys);
+        UniqueNotEnforcedDescription unique = InterpreterCreateQuery::getUniqueNotEnforcedDescription(create.columns_list->unique);
+
+        StoragePtr res = StorageFactory::instance().get(
+            create,
             PT_RELATIVE_LOCAL_PATH,
             getContext(),
             getContext()->getGlobalContext(),
             columns,
             constraints,
+            foreign_keys,
+            unique,
             false);
 
         storage = res;

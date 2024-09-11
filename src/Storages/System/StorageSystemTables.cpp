@@ -28,10 +28,11 @@
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Databases/IDatabase.h>
+#include <Databases/DatabaseCnch.h>
 #include <Access/ContextAccess.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTCreateQuery.h>
-#include <Parsers/queryToString.h>
+#include <Parsers/formatTenantDatabaseName.h>
 #include <Common/typeid_cast.h>
 #include <Common/StringUtils/StringUtils.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -40,6 +41,7 @@
 #include <Processors/Sources/SourceWithProgress.h>
 #include <Processors/Pipe.h>
 #include <DataTypes/DataTypeUUID.h>
+#include <Catalog/Catalog.h>
 
 
 namespace DB
@@ -68,6 +70,7 @@ StorageSystemTables::StorageSystemTables(const StorageID & table_id_)
         {"dependencies_table", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
         {"create_table_query", std::make_shared<DataTypeString>()},
         {"engine_full", std::make_shared<DataTypeString>()},
+        {"as_select", std::make_shared<DataTypeString>()},
         {"partition_key", std::make_shared<DataTypeString>()},
         {"sorting_key", std::make_shared<DataTypeString>()},
         {"primary_key", std::make_shared<DataTypeString>()},
@@ -78,6 +81,7 @@ StorageSystemTables::StorageSystemTables(const StorageID & table_id_)
         {"lifetime_rows", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>())},
         {"lifetime_bytes", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>())},
         {"comment", std::make_shared<DataTypeString>()},
+        {"has_own_data", std::make_shared<DataTypeUInt8>()},
     }));
     setInMemoryMetadata(storage_metadata);
 }
@@ -86,14 +90,24 @@ StorageSystemTables::StorageSystemTables(const StorageID & table_id_)
 static ColumnPtr getFilteredDatabases(const SelectQueryInfo & query_info, ContextPtr context)
 {
     MutableColumnPtr column = ColumnString::create();
+    String tenant_id = context->getTenantId();
 
-    const auto databases = DatabaseCatalog::instance().getDatabases();
+    const auto databases = DatabaseCatalog::instance().getDatabases(context);
     for (const auto & database_name : databases | boost::adaptors::map_keys)
     {
+        String database_strip_tenantid = database_name;
         if (database_name == DatabaseCatalog::TEMPORARY_DATABASE)
             continue; /// We don't want to show the internal database for temporary tables in system.tables
 
-        column->insert(database_name);
+        if (!tenant_id.empty())
+        {
+            if (startsWith(database_name, tenant_id + "."))
+                database_strip_tenantid = getOriginalDatabaseName(database_name, tenant_id);
+            // Will skip database of other tenants.
+            else if (database_name.find(".") != std::string::npos || !DatabaseCatalog::isDefaultVisibleSystemDatabase(database_name))
+                continue;
+        }
+        column->insert(database_strip_tenantid);
     }
 
     Block block { ColumnWithTypeAndName(std::move(column), std::make_shared<DataTypeString>(), "database") };
@@ -105,7 +119,7 @@ static ColumnPtr getFilteredDatabases(const SelectQueryInfo & query_info, Contex
 /// Otherwise it will require table initialization for Lazy database.
 static bool needLockStructure(const DatabasePtr & database, const Block & header)
 {
-    if (database->getEngineName() != "Lazy")
+    if (database->getEngineName() != "Lazy" && database->getEngineName() != "Cnch")
         return true;
 
     static const std::set<std::string> columns_without_lock = { "database", "name", "uuid", "metadata_modification_time" };
@@ -154,7 +168,7 @@ protected:
             while (database_idx < databases->size() && (!tables_it || !tables_it->isValid()))
             {
                 database_name = databases->getDataAt(database_idx).toString();
-                database = DatabaseCatalog::instance().tryGetDatabase(database_name);
+                database = DatabaseCatalog::instance().tryGetDatabase(database_name, context);
 
                 if (!database)
                 {
@@ -223,12 +237,16 @@ protected:
                         {
                             auto temp_db = DatabaseCatalog::instance().getDatabaseForTemporaryTables();
                             ASTPtr ast = temp_db ? temp_db->tryGetCreateTableQuery(table.second->getStorageID().getTableName(), context) : nullptr;
-                            res_columns[res_index++]->insert(ast ? queryToString(ast) : "");
+                            res_columns[res_index++]->insert(ast ? ast->formatWithHiddenSecrets() : "");
                         }
 
                         // engine_full
                         if (columns_mask[src_index++])
                             res_columns[res_index++]->insert(table.second->getName());
+
+                        // as_select
+                        if (columns_mask[src_index++])
+                            res_columns[res_index++]->insertDefault();
 
                         // partition_key
                         if (columns_mask[src_index++])
@@ -269,6 +287,10 @@ protected:
                         // comment
                         if (columns_mask[src_index++])
                             res_columns[res_index++]->insertDefault();
+
+                        // has_own_data
+                        if (columns_mask[src_index++])
+                            res_columns[res_index++]->insertDefault();
                     }
                 }
 
@@ -277,17 +299,32 @@ protected:
                 return Chunk(std::move(res_columns), num_rows);
             }
 
-            const bool check_access_for_tables = check_access_for_databases && !access->isGranted(AccessType::SHOW_TABLES, database_name);
-
-            if (!tables_it || !tables_it->isValid())
-                tables_it = database->getTablesIterator(context);
+            const bool check_access_for_tables = check_access_for_databases && !access->isGranted(AccessType::SHOW_TABLES, formatTenantDatabaseName(database_name));
 
             const bool need_lock_structure = needLockStructure(database, getPort().getHeader());
+
+            if (!tables_it || !tables_it->isValid())
+            {
+                DatabaseCnch * cnch_db = dynamic_cast<DatabaseCnch *>(database.get());
+                if (cnch_db)
+                {
+                    if (!need_lock_structure)
+                        tables_it = cnch_db->getTablesIteratorLightweight(context);
+                    else
+                    {
+                        if (!cnch_tables_snapshot)
+                            loadCnchTableSnapshot();
+                        tables_it = cnch_db->getTablesIteratorWithCommonSnapshot(context, *cnch_tables_snapshot);
+                    }
+                }
+                else
+                    tables_it = database->getTablesIterator(context);
+            }
 
             for (; rows_count < max_block_size && tables_it->isValid(); tables_it->next())
             {
                 auto table_name = tables_it->name();
-                if (check_access_for_tables && !access->isGranted(AccessType::SHOW_TABLES, database_name, table_name))
+                if (check_access_for_tables && !access->isGranted(AccessType::SHOW_TABLES, formatTenantDatabaseName(database_name), table_name))
                     continue;
 
                 StoragePtr table = nullptr;
@@ -376,42 +413,46 @@ protected:
                         res_columns[res_index++]->insert(dependencies_table_name_array);
                 }
 
-                if (columns_mask[src_index] || columns_mask[src_index + 1])
+                if (columns_mask[src_index] || columns_mask[src_index + 1] || columns_mask[src_index + 2])
                 {
                     ASTPtr ast = database->tryGetCreateTableQuery(table_name, context);
+                    auto * ast_create = ast ? ast->as<ASTCreateQuery>() : nullptr;
 
-                    if (ast && !context->getSettingsRef().show_table_uuid_in_table_create_query_if_not_nil)
+                    if (ast_create && !context->getSettingsRef().show_table_uuid_in_table_create_query_if_not_nil)
                     {
-                        auto & create = ast->as<ASTCreateQuery &>();
-                        create.uuid = UUIDHelpers::Nil;
-                        create.to_inner_uuid = UUIDHelpers::Nil;
+                        ast_create->uuid = UUIDHelpers::Nil;
+                        ast_create->to_inner_uuid = UUIDHelpers::Nil;
                     }
 
                     if (columns_mask[src_index++])
-                        res_columns[res_index++]->insert(ast ? queryToString(ast) : "");
+                        res_columns[res_index++]->insert(ast ? ast->formatWithHiddenSecrets() : "");
 
                     if (columns_mask[src_index++])
                     {
                         String engine_full;
 
-                        if (ast)
+                        if (ast_create && ast_create->storage)
                         {
-                            const auto & ast_create = ast->as<ASTCreateQuery &>();
-                            if (ast_create.storage)
-                            {
-                                engine_full = queryToString(*ast_create.storage);
+                            engine_full = ast_create->storage->formatWithHiddenSecrets();
 
-                                static const char * const extra_head = " ENGINE = ";
-                                if (startsWith(engine_full, extra_head))
-                                    engine_full = engine_full.substr(strlen(extra_head));
-                            }
+                            static const char * const extra_head = " ENGINE = ";
+                            if (startsWith(engine_full, extra_head))
+                                engine_full = engine_full.substr(strlen(extra_head));
                         }
 
                         res_columns[res_index++]->insert(engine_full);
                     }
+
+                    if (columns_mask[src_index++])
+                    {
+                        String as_select;
+                        if (ast_create && ast_create->select)
+                            as_select = ast_create->select->formatWithHiddenSecrets();
+                        res_columns[res_index++]->insert(as_select);
+                    }
                 }
                 else
-                    src_index += 2;
+                    src_index += 3;
 
                 StorageMetadataPtr metadata_snapshot;
                 if (table)
@@ -421,7 +462,7 @@ protected:
                 if (columns_mask[src_index++])
                 {
                     if (metadata_snapshot && (expression_ptr = metadata_snapshot->getPartitionKeyAST()))
-                        res_columns[res_index++]->insert(queryToString(expression_ptr));
+                        res_columns[res_index++]->insert(expression_ptr->formatWithHiddenSecrets());
                     else
                         res_columns[res_index++]->insertDefault();
                 }
@@ -429,7 +470,7 @@ protected:
                 if (columns_mask[src_index++])
                 {
                     if (metadata_snapshot && (expression_ptr = metadata_snapshot->getSortingKey().expression_list_ast))
-                        res_columns[res_index++]->insert(queryToString(expression_ptr));
+                        res_columns[res_index++]->insert(expression_ptr->formatWithHiddenSecrets());
                     else
                         res_columns[res_index++]->insertDefault();
                 }
@@ -437,7 +478,7 @@ protected:
                 if (columns_mask[src_index++])
                 {
                     if (metadata_snapshot && (expression_ptr = metadata_snapshot->getPrimaryKey().expression_list_ast))
-                        res_columns[res_index++]->insert(queryToString(expression_ptr));
+                        res_columns[res_index++]->insert(expression_ptr->formatWithHiddenSecrets());
                     else
                         res_columns[res_index++]->insertDefault();
                 }
@@ -445,7 +486,7 @@ protected:
                 if (columns_mask[src_index++])
                 {
                     if (metadata_snapshot && (expression_ptr = metadata_snapshot->getSamplingKeyAST()))
-                        res_columns[res_index++]->insert(queryToString(expression_ptr));
+                        res_columns[res_index++]->insert(expression_ptr->formatWithHiddenSecrets());
                     else
                         res_columns[res_index++]->insertDefault();
                 }
@@ -504,12 +545,37 @@ protected:
                     else
                         res_columns[res_index++]->insertDefault();
                 }
+
+                if (columns_mask[src_index++])
+                {
+                    if (table)
+                        res_columns[res_index++]->insert(table->storesDataOnDisk());
+                    else
+                        res_columns[res_index++]->insertDefault();
+                }
             }
         }
 
         UInt64 num_rows = res_columns.at(0)->size();
         return Chunk(std::move(res_columns), num_rows);
     }
+
+    void loadCnchTableSnapshot()
+    {
+        String tenant_id = context->getTenantId();
+        // speed up table scan if the tenant only owns few tables.
+        if (!tenant_id.empty())
+        {
+            auto tableIDs = context->getCnchCatalog()->getTablesIDByTenant(tenant_id);
+            if (tableIDs.size() <= context->getSettingsRef().scan_all_table_threshold)
+            {
+                cnch_tables_snapshot = context->getCnchCatalog()->getTablesByIDs(tableIDs);
+                return;
+            }
+        }
+        cnch_tables_snapshot = context->getCnchCatalog()->getAllTables();
+    }
+
 private:
     std::vector<UInt8> columns_mask;
     UInt64 max_block_size;
@@ -520,25 +586,26 @@ private:
     bool done = false;
     DatabasePtr database;
     std::string database_name;
+    std::optional<std::vector<Protos::DataModelTable>> cnch_tables_snapshot;
 };
 
 
 Pipe StorageSystemTables::read(
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum /*processed_stage*/,
     const size_t max_block_size,
     const unsigned /*num_streams*/)
 {
-    metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
+    storage_snapshot->check(column_names);
 
     /// Create a mask of what columns are needed in the result.
 
     NameSet names_set(column_names.begin(), column_names.end());
 
-    Block sample_block = metadata_snapshot->getSampleBlock();
+    Block sample_block = storage_snapshot->metadata->getSampleBlock();
     Block res_block;
 
     std::vector<UInt8> columns_mask(sample_block.columns());

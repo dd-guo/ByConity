@@ -24,6 +24,8 @@ public:
 
     bool isDeterministic() const override { return false; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     size_t getNumberOfArguments() const override
     {
         return 0;
@@ -42,7 +44,7 @@ public:
 };
 
 
-void registerFunctionFQDN(FunctionFactory & factory)
+REGISTER_FUNCTION(FQDN)
 {
     factory.registerFunction<FunctionFQDN>(FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionFQDN>("fullHostName");

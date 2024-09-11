@@ -10,6 +10,8 @@ struct SignImpl
 {
     using ResultType = Int8;
     static const constexpr bool allow_fixed_string = false;
+    static const constexpr bool allow_string_integer = false;
+    static const constexpr ArgType default_arg_type = ArgType::NUMBERS;
 
     static inline NO_SANITIZE_UNDEFINED ResultType apply(A a)
     {
@@ -39,7 +41,7 @@ struct FunctionUnaryArithmeticMonotonicity<NameSign>
     static IFunction::Monotonicity get(const Field &, const Field &) { return {true, true, false}; }
 };
 
-void registerFunctionSign(FunctionFactory & factory)
+REGISTER_FUNCTION(Sign)
 {
     factory.registerFunction<FunctionSign>(FunctionFactory::CaseInsensitive);
 }

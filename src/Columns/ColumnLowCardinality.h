@@ -85,6 +85,18 @@ public:
     ColumnPtr convertToFullColumn() const;
     ColumnPtr convertToFullColumnIfLowCardinality() const override { return convertToFullColumn(); }
 
+    void tryToFlushZeroCopyBuffer() const override 
+    {
+        
+        if (idx.getPositions())
+            idx.getPositions()->tryToFlushZeroCopyBuffer();
+        if (nested_column)
+            nested_column->tryToFlushZeroCopyBuffer();
+        if (dictionary.getColumnUniquePtr()) {
+            dictionary.getColumnUniquePtr()->tryToFlushZeroCopyBuffer();
+        }
+    }
+
     MutableColumnPtr cloneResized(size_t size) const override;
     size_t size() const override
     {
@@ -116,6 +128,14 @@ public:
             return getNestedColumn().getDataAt(n);
         else
             return getDictionary().getDataAt(getIndexes().getUInt(n));
+    }
+
+    bool isDefaultAt(size_t n) const override
+    {
+        if (full_state)
+            return getNestedColumn().isDefaultAt(n);
+        else
+            return getDictionary().isDefaultAt(getIndexes().getUInt(n));
     }
 
     StringRef getDataAtWithTerminatingZero(size_t n) const override
@@ -208,7 +228,13 @@ public:
 
     void insertData(const char * pos, size_t length) override;
 
-    void popBack(size_t n) override { idx.popBack(n); }
+    void popBack(size_t n) override
+    {
+        if (isFullState())
+            getNestedColumn().popBack(n);
+        else
+            idx.popBack(n);
+    }
 
     StringRef serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const override;
 
@@ -235,6 +261,11 @@ public:
                                                  getIndexes().cloneEmpty(), getNestedColumn().filter(filt, result_size_hint));
         else
             return ColumnLowCardinality::create(dictionary.getColumnUniquePtr(), getIndexes().filter(filt, result_size_hint));
+    }
+
+    void expand(const Filter & mask, bool inverted) override
+    {
+        idx.getPositionsPtr()->expand(mask, inverted);
     }
 
     ColumnPtr permute(const Permutation & perm, size_t limit) const override
@@ -265,13 +296,17 @@ public:
 
     bool hasEqualValues() const override;
 
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res) const override;
 
-    void updatePermutation(bool reverse, size_t limit, int, IColumn::Permutation & res, EqualRanges & equal_range) const override;
+    void updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int, IColumn::Permutation & res, EqualRanges & equal_ranges) const override;
 
-    void getPermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void getPermutationWithCollation(const Collator & collator, IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res) const override;
 
-    void updatePermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_range) const override;
+    void updatePermutationWithCollation(const Collator & collator, IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_ranges) const override;
 
     ColumnPtr replicate(const Offsets & offsets) const override
     {
@@ -313,7 +348,7 @@ public:
             return idx.getPositions()->allocatedBytes() + getDictionary().allocatedBytes();
     }
 
-    void forEachSubcolumn(ColumnCallback callback) override
+    void forEachSubcolumn(MutableColumnCallback callback) override
     {
         if (full_state)
         {
@@ -328,6 +363,26 @@ public:
             callback(dictionary.getColumnUniquePtr());
     }
 
+    void forEachSubcolumnRecursively(RecursiveMutableColumnCallback callback) override
+    {
+
+        if (isFullState())
+        {
+            callback(*nested_column);
+            nested_column->forEachSubcolumnRecursively(callback);
+        }
+
+        callback(*idx.getPositionsPtr());
+        idx.getPositionsPtr()->forEachSubcolumnRecursively(callback);
+
+        /// Column doesn't own dictionary if it's shared.
+        if (!dictionary.isShared())
+        {
+            callback(*dictionary.getColumnUniquePtr());
+            dictionary.getColumnUniquePtr()->forEachSubcolumnRecursively(callback);
+        }
+    }
+
     bool structureEquals(const IColumn & rhs) const override
     {
         if (full_state)
@@ -339,6 +394,21 @@ public:
             return idx.getPositions()->structureEquals(*rhs_low_cardinality->idx.getPositions())
                 && dictionary.getColumnUnique().structureEquals(rhs_low_cardinality->dictionary.getColumnUnique());
         return false;
+    }
+
+    double getRatioOfDefaultRows(double sample_ratio) const override
+    {
+        return getIndexes().getRatioOfDefaultRows(sample_ratio);
+    }
+
+    UInt64 getNumberOfDefaultRows() const override
+    {
+        return getIndexes().getNumberOfDefaultRows();
+    }
+
+    void getIndicesOfNonDefaultRows(Offsets & indices, size_t from, size_t limit) const override
+    {
+        return getIndexes().getIndicesOfNonDefaultRows(indices, from, limit);
     }
 
     bool valuesHaveFixedSize() const override
@@ -361,7 +431,7 @@ public:
     bool nestedIsNullable() const { return isColumnNullable(*dictionary.getColumnUnique().getNestedColumn()); }
     void nestedToNullable() { dictionary.getColumnUnique().nestedToNullable(); }
     void nestedRemoveNullable() { dictionary.getColumnUnique().nestedRemoveNullable(); }
-    bool isNullable() const override { if (full_state) return getNestedColumn().isNullable(); else return isColumnNullable(*dictionary.getColumnUniquePtr()); }
+    MutableColumnPtr cloneNullable() const;
 
     const IColumnUnique & getDictionary() const { return dictionary.getColumnUnique(); }
     IColumnUnique & getDictionary() { return dictionary.getColumnUnique(); }
@@ -417,6 +487,8 @@ public:
 
     const ColumnPtr & getNestedColumnPtr() const { return nested_column; }
     ColumnPtr & getNestedColumnPtr() { return nested_column; }
+    bool nestedCanBeInsideNullable() const { return dictionary.getColumnUnique().getNestedColumn()->canBeInsideNullable(); }
+    ColumnPtr cloneWithDefaultOnNull() const;
 
     void switchToFull()
     {
@@ -450,6 +522,7 @@ public:
 
         const ColumnPtr & getPositions() const { return positions; }
         WrappedPtr & getPositionsPtr() { return positions; }
+        const WrappedPtr & getPositionsPtr() const { return positions; }
         size_t getPositionAt(size_t row) const;
         void insertPosition(UInt64 position);
         void insertPositionsRange(const IColumn & column, UInt64 offset, UInt64 limit);
@@ -529,11 +602,10 @@ private:
 
     int compareAtImpl(size_t n, size_t m, const IColumn & rhs, int nan_direction_hint, const Collator * collator=nullptr) const;
 
-    void getPermutationImpl(bool reverse, size_t limit, int nan_direction_hint, Permutation & res, const Collator * collator = nullptr) const;
-
-    template <typename Cmp>
-    void updatePermutationImpl(size_t limit, Permutation & res, EqualRanges & equal_ranges, Cmp comparator) const;
+    void getPermutationImpl(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability, size_t limit, int nan_direction_hint, Permutation & res, const Collator * collator = nullptr) const;
 };
+
+bool isColumnLowCardinalityNullable(const IColumn & column);
 
 
 }

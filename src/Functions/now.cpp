@@ -65,6 +65,7 @@ public:
 
     bool isDeterministic() const override { return false; }
     bool isDeterministicInScopeOfQuery() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
 private:
     time_t time_value;
@@ -123,9 +124,11 @@ public:
 
 }
 
-void registerFunctionNow(FunctionFactory & factory)
+REGISTER_FUNCTION(Now)
 {
     factory.registerFunction<NowOverloadResolver>(FunctionFactory::CaseInsensitive);
+    factory.registerAlias("LOCALTIMESTAMP", "now", FunctionFactory::CaseInsensitive);
+    factory.registerAlias("sysdate", "now", FunctionFactory::CaseInsensitive);
 }
 
 }

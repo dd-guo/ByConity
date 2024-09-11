@@ -14,24 +14,26 @@
  */
 
 #pragma once
-#include <QueryPlan/IQueryPlanStep.h>
-#include <QueryPlan/ITransformingStep.h>
-#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Interpreters/asof.h>
 #include <Optimizer/PredicateConst.h>
+#include <Optimizer/RuntimeFilterUtils.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
+#include <QueryPlan/IQueryPlanStep.h>
+#include <QueryPlan/ITransformingStep.h>
 
 namespace DB
 {
 
-enum class DistributionType : UInt8
-{
-    UNKNOWN = 0,
-    REPARTITION,
-    BROADCAST
-};
+ENUM_WITH_PROTO_CONVERTER(
+    DistributionType, // enum name
+    Protos::DistributionType, // proto enum message
+    (UNKNOWN, 0),
+    (REPARTITION),
+    (BROADCAST));
 
 class IJoin;
 using JoinPtr = std::shared_ptr<IJoin>;
+class RuntimeFilterConsumer;
 
 /// Join two data streams.
 class JoinStep : public IQueryPlanStep
@@ -41,13 +43,20 @@ public:
         const DataStream & left_stream_,
         const DataStream & right_stream_,
         JoinPtr join_,
-        size_t max_block_size_);
+        size_t max_block_size_,
+        size_t max_streams_,
+        bool keep_left_read_in_order_,
+        bool is_ordered_ = false,
+        bool simple_reordered_ = false,
+        PlanHints hints_ = {});
 
     JoinStep(
         DataStreams input_streams_,
         DataStream output_stream_,
-        ASTTableJoin::Kind kind,
+        ASTTableJoin::Kind kind_,
         ASTTableJoin::Strictness strictness_,
+        size_t max_streams_ = 1,
+        bool keep_left_read_in_order_ = false,
         Names left_keys_ = {},
         Names right_keys_ = {},
         ConstASTPtr filter_ = PredicateConst::TRUE_VALUE,
@@ -55,7 +64,12 @@ public:
         std::optional<std::vector<bool>> require_right_keys_ = std::nullopt,
         ASOF::Inequality asof_inequality_ = ASOF::Inequality::GreaterOrEquals,
         DistributionType distribution_type_ = DistributionType::UNKNOWN,
-        bool magic_set_ = false);
+        JoinAlgorithm join_algorithm = JoinAlgorithm::AUTO,
+        bool is_magic_ = false,
+        bool is_ordered_ = false,
+        bool simple_reordered_ = false,
+        LinkedHashMap<String, RuntimeFilterBuildInfos> runtime_filter_builders = {},
+        PlanHints hints_ = {});
 
 
     String getName() const override { return "Join"; }
@@ -70,21 +84,47 @@ public:
 
     ASTTableJoin::Kind getKind() const { return kind; }
     void setKind(ASTTableJoin::Kind kind_) { kind = kind_; }
-
     ASTTableJoin::Strictness getStrictness() const { return strictness; }
+
+    size_t getMaxStreams() const { return max_streams; }
+    bool getKeepLeftReadInOrder() const { return keep_left_read_in_order; }
+
     const Names & getLeftKeys() const { return left_keys; }
     const Names & getRightKeys() const { return right_keys; }
     const ConstASTPtr & getFilter() const { return filter; }
     bool isHasUsing() const { return has_using; }
-    std::optional<std::vector<bool>> getRequireRightKeys() const
-    {
-        return require_right_keys;
-    }
+    std::optional<std::vector<bool>> getRequireRightKeys() const { return require_right_keys; }
     ASOF::Inequality getAsofInequality() const { return asof_inequality; }
     DistributionType getDistributionType() const { return distribution_type; }
     void setDistributionType(DistributionType distribution_type_) { distribution_type = distribution_type_; }
 
     bool isCrossJoin() const { return kind == ASTTableJoin::Kind::Cross || (kind == ASTTableJoin::Kind::Inner && left_keys.empty()); }
+
+    bool isInnerJoin() const {return kind == ASTTableJoin::Kind::Inner; }
+
+    bool isOuterJoin() const
+    {
+        return (kind == ASTTableJoin::Kind::Left || kind == ASTTableJoin::Kind::Right || kind == ASTTableJoin::Kind::Full)
+            && (strictness == ASTTableJoin::Strictness::All || strictness == ASTTableJoin::Strictness::Any);
+    }
+
+    bool isLeftOrRightOuterJoin() const
+    {
+        return (kind == ASTTableJoin::Kind::Left || kind == ASTTableJoin::Kind::Right)
+            && (strictness == ASTTableJoin::Strictness::All || strictness == ASTTableJoin::Strictness::Any);
+    }
+
+    bool isLeftOuterJoin() const
+    {
+        return kind == ASTTableJoin::Kind::Left
+            && (strictness == ASTTableJoin::Strictness::All || strictness == ASTTableJoin::Strictness::Any);
+    }
+
+    bool isRightOuterJoin() const
+    {
+        return kind == ASTTableJoin::Kind::Right
+            && (strictness == ASTTableJoin::Strictness::All || strictness == ASTTableJoin::Strictness::Any);
+    }
 
     bool isPhysical() const override { return distribution_type != DistributionType::UNKNOWN; }
     bool isLogical() const override { return !isPhysical(); }
@@ -92,35 +132,66 @@ public:
     bool isMagic() const { return is_magic; }
     void setMagic(bool is_magic_) { is_magic = is_magic_; }
 
+    bool isOrdered() const { return is_ordered; }
+    void setOrdered(bool is_ordered_) { is_ordered = is_ordered_; }
+
+    bool isSimpleReordered() const { return simple_reordered; }
+    void setSimpleReordered(bool simple_reordered_) { simple_reordered = simple_reordered_; }
+
+    bool mustReplicate() const;
+    bool mustRepartition() const;
+
+
     bool supportReorder(bool support_filter, bool support_cross = false) const;
 
     bool supportSwap() const
     {
         if (getStrictness() != ASTTableJoin::Strictness::Unspecified && getStrictness() != ASTTableJoin::Strictness::All
-            && getStrictness() != ASTTableJoin::Strictness::Any)
+            && getStrictness() != ASTTableJoin::Strictness::Any && getStrictness() != ASTTableJoin::Strictness::Semi
+            && getStrictness() != ASTTableJoin::Strictness::Anti)
             return false;
 
         // todo can support swap
         if (require_right_keys || has_using)
             return false;
 
-        return !isMagic() && !getLeftKeys().empty();
+        return true;
     }
+
+    void setJoinAlgorithm(JoinAlgorithm join_algorithm_) { join_algorithm = join_algorithm_; }
+    JoinAlgorithm getJoinAlgorithm() const { return join_algorithm; }
 
     /**
      * Hash Join don't support non-equivalent filter yet, so we must use nest loop join.
      */
     bool enforceNestLoopJoin() const;
 
-    JoinPtr makeJoin(ContextPtr context);
+    bool needStreamWithNonJoinedRows() const
+    {
+        if (strictness == ASTTableJoin::Strictness::Asof || strictness == ASTTableJoin::Strictness::Semi)
+            return false;
+        return isRightOrFull(kind);
+    }
 
-    void serialize(WriteBuffer & buf) const override;
-    void serialize(WriteBuffer & buffer, bool with_output) const;
+    JoinPtr makeJoin(
+        ContextPtr context,
+        std::shared_ptr<RuntimeFilterConsumer> && consumer,
+        size_t num_streams,
+        ExpressionActionsPtr filter_action,
+        String filter_column_name);
 
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
+    bool enforceGraceHashJoin() const;
+
+    void toProto(Protos::JoinStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<JoinStep> fromProto(const Protos::JoinStep & proto, ContextPtr context);
+
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
-    String serializeToString() const override;
+    void setOutputStream(DataStream output_stream_);
+    // TODO(gouguilin): protobuf serde
+
+    const LinkedHashMap<String, RuntimeFilterBuildInfos> & getRuntimeFilterBuilders() const { return runtime_filter_builders; }
+    RuntimeFilterBuilderPtr createRuntimeFilterBuilder(ContextPtr context) const;
 
 private:
     JoinPtr join;
@@ -129,13 +200,16 @@ private:
     ASTTableJoin::Kind kind;
     ASTTableJoin::Strictness strictness;
 
+    size_t max_streams;
+    bool keep_left_read_in_order;
+
     Names left_keys;
     Names right_keys;
 
     /**
      * Non-equals predicate
      *
-     * For example：
+     * For example:
      *
      * LEFT JOIN orders ON (c_custkey = o_custkey) AND (o_comment NOT LIKE '%special%requests%')
      */
@@ -162,9 +236,13 @@ private:
     ASOF::Inequality asof_inequality;
 
     DistributionType distribution_type = DistributionType::UNKNOWN;
-
+    JoinAlgorithm join_algorithm = JoinAlgorithm::AUTO;
     bool is_magic;
+    bool is_ordered;
+    bool simple_reordered;
     Processors processors;
+
+    LinkedHashMap<String, RuntimeFilterBuildInfos> runtime_filter_builders;
 };
 
 /// Special step for the case when Join is already filled.
@@ -180,8 +258,6 @@ public:
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 

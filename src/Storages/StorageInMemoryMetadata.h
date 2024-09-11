@@ -32,6 +32,8 @@
 #include <Storages/SelectQueryDescription.h>
 #include <Storages/TTLDescription.h>
 
+#include <Storages/UniqueNotEnforcedDescription.h>
+#include <Storages/ForeignKeysDescription.h>
 #include <Common/MultiVersion.h>
 
 namespace DB
@@ -48,6 +50,10 @@ struct StorageInMemoryMetadata
     IndicesDescription secondary_indices;
     /// Table constraints. Currently supported for MergeTree only.
     ConstraintsDescription constraints;
+    /// Table foreign keys. Currently supported for MergeTree only.
+    ForeignKeysDescription foreign_keys;
+    /// Table unique not enforced. Currently supported for MergeTree only.
+    UniqueNotEnforcedDescription unique_not_enforced;
     /// Table projections. Currently supported for MergeTree only.
     ProjectionsDescription projections;
     mutable const ProjectionDescription * selected_projection{};
@@ -96,6 +102,12 @@ struct StorageInMemoryMetadata
     /// Sets constraints
     void setConstraints(ConstraintsDescription constraints_);
 
+    /// Sets foreign keys
+    void setForeignKeys(ForeignKeysDescription foreign_keys_);
+
+    /// Sets unique not enforced
+    void setUniqueNotEnforced(UniqueNotEnforcedDescription unique);
+
     /// Sets projections
     void setProjections(ProjectionsDescription projections_);
 
@@ -134,6 +146,12 @@ struct StorageInMemoryMetadata
 
     /// Return table constraints
     const ConstraintsDescription & getConstraints() const;
+
+    /// Return table foreign keys
+    const ForeignKeysDescription & getForeignKeys() const;
+
+    /// Return table foreign keys
+    const UniqueNotEnforcedDescription & getUniqueNotEnforced() const;
 
     const ProjectionsDescription & getProjections() const;
     /// Has at least one projection
@@ -182,6 +200,9 @@ struct StorageInMemoryMetadata
     /// Block with ordinary columns + functional columns(if include_func_columns is true).
     Block getSampleBlockNonMaterialized(bool include_func_columns = false) const;
 
+    /// Block with ordinary + materialized columns + delete_flag. If not contain delete_flag, throw Exception.
+    Block getSampleBlockWithDeleteFlag() const;
+
     /// Block with ordinary + materialized + virtuals. Virtuals have to be
     /// explicitly specified, because they are part of Storage type, not
     /// Storage metadata.
@@ -212,7 +233,11 @@ struct StorageInMemoryMetadata
     /// Storage metadata. StorageID required only for more clear exception
     /// message.
     Block getSampleBlockForColumns(
-        const Names & column_names, const NamesAndTypesList & virtuals = {}, const StorageID & storage_id = StorageID::createEmpty()) const;
+        const Names & column_names, const NamesAndTypesList & virtuals = {}, const StorageID & storage_id = StorageID::createEmpty(),
+        BitEngineReadType bitengine_read_type = BitEngineReadType::ONLY_SOURCE) const;
+
+    /// Returns whether there are any column that has dynamic subcolumns
+    bool hasDynamicSubcolumns() const;
 
     /// Returns structure with partition key.
     const KeyDescription & getPartitionKey() const;
@@ -233,11 +258,16 @@ struct StorageInMemoryMetadata
     bool isClusterByKeyDefined() const;
     /// Storage has cluster by key.
     bool hasClusterByKey() const;
-    /// Returns column names that need to be read to calculate cluster by key.
+    /// Returns columns names in cluster by specified by. For example: 'id', 'sipHash64(id)', etc.
     Names getColumnsForClusterByKey() const;
+    /// Returns column names that need to be read to calculate cluster by key.
+    Names getColumnsRequiredForClusterByKey() const;
     Int64 getBucketNumberFromClusterByKey() const;
     Int64 getSplitNumberFromClusterByKey() const;
     bool getWithRangeFromClusterByKey() const;
+    bool getIsUserDefinedExpressionFromClusterByKey() const;
+    /// Check if cluster by key is same with unique key, only valid for unique table
+    bool checkIfClusterByKeySameWithUniqueKey() const;
 
     /// Returns structure with sorting key.
     const KeyDescription & getSortingKey() const;
@@ -285,8 +315,8 @@ struct StorageInMemoryMetadata
     /// Returns structure with unique key.
     const KeyDescription & getUniqueKey() const;
     /// Returns ASTExpressionList of unique key expression for storage or nullptr if there is none.
-    ASTPtr getUniqueKeyAST() const { return primary_key.definition_ast; }
-    /// Storage has user-defined (in CREATE query) sorting key.
+    ASTPtr getUniqueKeyAST() const { return unique_key.definition_ast; }
+    /// Storage has user-defined (in CREATE query) unique key.
     bool isUniqueKeyDefined() const;
     /// Storage has unique key (maybe part of some other key). It means, that
     /// it contains at least one column.
@@ -321,12 +351,10 @@ struct StorageInMemoryMetadata
     /// contains only the columns of the table, and all the columns are different.
     /// If |need_all| is set, then checks that all the columns of the table are in the block.
     void check(const Block & block, bool need_all = false) const;
-
-    /// check if there exist map column
-    bool hasMapColumn() const;
 };
 
 using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 using MultiVersionStorageMetadataPtr = MultiVersion<StorageInMemoryMetadata>;
 
+String listOfColumns(const NamesAndTypesList & available_columns);
 }

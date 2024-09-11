@@ -10,6 +10,8 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+struct NameBitNot { static constexpr auto name = "bitNot"; };
+
 namespace
 {
 
@@ -18,6 +20,8 @@ struct BitNotImpl
 {
     using ResultType = typename NumberTraits::ResultOfBitNot<A>::Type;
     static const constexpr bool allow_fixed_string = true;
+    static const constexpr bool allow_string_integer = false;
+    static const constexpr ArgType default_arg_type = ArgType::UNDEFINED;
 
     static inline ResultType apply(A a)
     {
@@ -36,7 +40,6 @@ struct BitNotImpl
 #endif
 };
 
-struct NameBitNot { static constexpr auto name = "bitNot"; };
 using FunctionBitNot = FunctionUnaryArithmetic<BitNotImpl, NameBitNot, true>;
 
 }
@@ -50,7 +53,7 @@ template <> struct FunctionUnaryArithmeticMonotonicity<NameBitNot>
     }
 };
 
-void registerFunctionBitNot(FunctionFactory & factory)
+REGISTER_FUNCTION(BitNot)
 {
     factory.registerFunction<FunctionBitNot>();
 }

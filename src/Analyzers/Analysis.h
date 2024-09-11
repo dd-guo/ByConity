@@ -15,20 +15,23 @@
 
 #pragma once
 
+#include <AggregateFunctions/IAggregateFunction.h>
 #include <Analyzers/ASTEquals.h>
+#include <Analyzers/ResolvedWindow.h>
 #include <Analyzers/Scope.h>
 #include <Analyzers/SubColumnID.h>
-#include <Analyzers/ResolvedWindow.h>
-#include <AggregateFunctions/IAggregateFunction.h>
+#include <Interpreters/StorageID.h>
 #include <Interpreters/asof.h>
 #include <Optimizer/Utils.h>
-#include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTFunction.h>
-#include <Parsers/ASTWindowDefinition.h>
-#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTOrderByElement.h>
 #include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/ASTWindowDefinition.h>
 #include <Storages/IStorage_fwd.h>
+#include <Common/LinkedHashSet.h>
+#include <common/logger_useful.h>
 
 #include <utility>
 #include <vector>
@@ -41,6 +44,8 @@ struct Analysis;
 using AnalysisPtr = std::shared_ptr<Analysis>;
 
 using ASTFunctionPtr = std::shared_ptr<ASTFunction>;
+
+using ExpressionTypes = std::unordered_map<ASTPtr, DataTypePtr>;
 
 using CTEId = UInt32;
 
@@ -154,6 +159,11 @@ struct CTEAnalysis
     CTEId id;
     ASTSubquery * representative;
     UInt64 ref_count;
+
+    bool isSharable() const
+    {
+        return ref_count >= 2;
+    }
 };
 
 using SubColumnIDSet = std::unordered_set<SubColumnID, SubColumnID::Hash>;
@@ -179,12 +189,57 @@ struct SubColumnReference
     }
 };
 
+struct HintAnalysis
+{
+    size_t leading_hint_count = 0;
+};
+
+struct ArrayJoinDescription
+{
+    ASTPtr expr;
+    bool create_new_field = false;
+};
+using ArrayJoinDescriptions = std::vector<ArrayJoinDescription>;
+struct ArrayJoinAnalysis
+{
+    bool is_left_array_join;
+    ArrayJoinDescriptions descriptions;
+};
+
+struct InsertAnalysis
+{
+    StoragePtr storage;
+    StorageID storage_id;
+    NamesAndTypes columns;
+};
+
+struct OutfileAnalysis
+{
+    String out_file;
+    String format;
+    String compression_method;
+    size_t compression_level;
+};
+
+struct ColumnWithType
+{
+    DataTypePtr type;
+    ColumnPtr column;
+
+    ColumnWithType() { }
+    ColumnWithType(const DataTypePtr & type_, const ColumnPtr & column_)
+        : type(type_), column(column_)
+    {}
+    ColumnWithType(const DataTypePtr & type_) : type(type_){}
+};
+
 template<typename Key, typename Val>
 using ListMultimap = std::unordered_map<Key, std::vector<Val>>;
 
 struct Analysis
 {
     ScopeFactory scope_factory;
+    Poco::Logger * logger = &Poco::Logger::get("Analysis");
 
     /// Scopes
     // Regular scopes in an ASTSelectQuery, kept by below convention:
@@ -193,7 +248,6 @@ struct Analysis
     //     ASTTableExpression::table_function -> table function scope
     //     ASTTableJoin -> joined scope
     //     ASTTablesInSelectQuery -> source scope
-    //     ASTSelectQuery -> order-by scope
     //     ASTFunction for lambda expression -> lambda scope
     std::unordered_map<IAST *, ScopePtr> scopes;
     void setScope(IAST &, ScopePtr);
@@ -207,6 +261,7 @@ struct Analysis
     std::unordered_map<ASTIdentifier *, ScopePtr> table_storage_scopes;
     void setTableStorageScope(ASTIdentifier &, ScopePtr);
     ScopePtr getTableStorageScope(ASTIdentifier &);
+    std::unordered_map<ASTIdentifier *, ScopePtr> & getTableStorageScopeMap();
 
     std::unordered_map<ASTIdentifier *, ASTs> table_alias_columns;
     void setTableAliasColumns(ASTIdentifier &, ASTs);
@@ -219,15 +274,31 @@ struct Analysis
     */
 
     /// Expressions
-    std::unordered_map<ASTPtr, DataTypePtr> expression_types;
-    bool hasExpressionType(const ASTPtr & expression);
-    void setExpressionType(const ASTPtr & expression, const DataTypePtr & type);
+    std::unordered_map<ASTPtr, ColumnWithType> expression_column_with_types;
+    bool hasExpressionColumnWithType(const ASTPtr & expression);
+    void setExpressionColumnWithType(const ASTPtr & expression, const ColumnWithType & column_with_type);
+    std::optional<ColumnWithType> tryGetExpressionColumnWithType(const ASTPtr & expression);
+    ExpressionTypes getExpressionTypes();
+    std::unordered_map<ASTPtr, ColumnWithType> getExpressionColumnWithTypes()
+    {
+        return expression_column_with_types;
+    }
     DataTypePtr getExpressionType(const ASTPtr & expression);
 
     // ASTIdentifier, ASTFieldReference
     std::unordered_map<ASTPtr, ResolvedField> column_references;
     void setColumnReference(const ASTPtr & ast, const ResolvedField & resolved);
     std::optional<ResolvedField> tryGetColumnReference(const ASTPtr & ast);
+
+    // Which columns are needed to read, used for planning phase column pruning.
+    // Columns used in alias columns will be included regardless of whether their
+    // alias columns are used.
+    //
+    // ASTTableIdentifier -> index of table storage scope
+    std::unordered_map<const IAST *, std::set<size_t>> read_columns;
+    void addReadColumn(const IAST * table_ast, size_t field_index);
+    void addReadColumn(const ResolvedField & resolved_field, bool add_used);
+    const std::set<size_t> & getReadColumns(const IAST & table_ast);
 
     // ASTIdentifier
     std::unordered_map<ASTPtr, ResolvedField> lambda_argument_references;
@@ -253,6 +324,7 @@ struct Analysis
     std::vector<WindowAnalysisPtr> & getWindowAnalysisOfSelectQuery(ASTSelectQuery & select_query);
 
     /// Subqueries
+    std::unordered_map<ASTPtr, bool> subquery_support_semi_anti;
     ListMultimap<ASTSelectQuery * , ASTPtr> scalar_subqueries;
     std::vector<ASTPtr> & getScalarSubqueries(ASTSelectQuery & select_query);
 
@@ -268,8 +340,12 @@ struct Analysis
     // CTE(common table expressions)
     ASTMap<CTEAnalysis> common_table_expressions;
     void registerCTE(ASTSubquery & subquery);
-    bool isSharableCTE(ASTSubquery & subquery);
-    CTEAnalysis & getCTEAnalysis(ASTSubquery & subquery);
+    std::optional<CTEAnalysis> tryGetCTEAnalysis(ASTSubquery & subquery);
+
+    // Prewhere
+    std::unordered_map<ASTSelectQuery *, ASTPtr> prewheres;
+    void setPrewhere(ASTSelectQuery & select_query, const ASTPtr & prewhere);
+    ASTPtr tryGetPrewhere(ASTSelectQuery & select_query);
 
     /// Join
     std::unordered_map<ASTTableJoin *, JoinUsingAnalysis> join_using_results;
@@ -279,8 +355,9 @@ struct Analysis
     JoinOnAnalysis & getJoinOnAnalysis(ASTTableJoin &);
 
     // ASTTableExpression::database_and_table/ASTTableExpression::table_function
-    std::unordered_map<const IAST *, StorageAnalysis> storage_results;
+    LinkedHashMap<const IAST *, StorageAnalysis> storage_results;
     const StorageAnalysis & getStorageAnalysis(const IAST &);
+    const LinkedHashMap<const IAST *, StorageAnalysis> & getStorages() const;
 
     /// Select
     std::unordered_map<ASTSelectQuery *, ASTs> select_expressions;
@@ -297,6 +374,13 @@ struct Analysis
     /// Limit By
     std::unordered_map<ASTSelectQuery *, UInt64> limit_by_values;
     UInt64 getLimitByValue(ASTSelectQuery & select_query);
+
+    ListMultimap<ASTSelectQuery *, ASTPtr> limit_by_items;
+    std::vector<ASTPtr> & getLimitByItem(ASTSelectQuery & select_query);
+
+    /// Limit By Offset
+    std::unordered_map<ASTSelectQuery *, UInt64> limit_by_offset_values;
+    UInt64 getLimitByOffsetValue(ASTSelectQuery & select_query);
 
     /// Limit
     std::unordered_map<ASTSelectQuery *, UInt64> limit_lengths;
@@ -317,15 +401,16 @@ struct Analysis
     std::unordered_map<IAST *, FieldDescriptions> output_descriptions;
     void setOutputDescription(IAST & ast, const FieldDescriptions & field_descs);
     FieldDescriptions & getOutputDescription(IAST & ast);
+    bool hasOutputDescription(IAST & ast);
 
     /// Sub column optimization
     std::unordered_map<ASTPtr, SubColumnReference> sub_column_references;
     void setSubColumnReference(const ASTPtr & ast, const SubColumnReference & reference);
     std::optional<SubColumnReference> tryGetSubColumnReference(const ASTPtr & ast);
 
-    std::unordered_map<const IAST *, std::vector<SubColumnIDSet>> used_sub_columns;
-    void addUsedSubColumn(const IAST * table_ast, size_t field_index, const SubColumnID & sub_column_id);
-    const std::vector<SubColumnIDSet> & getUsedSubColumns(const IAST & table_ast);
+    std::unordered_map<const IAST *, std::vector<SubColumnIDSet>> read_sub_columns;
+    void addReadSubColumn(const IAST * table_ast, size_t field_index, const SubColumnID & sub_column_id);
+    const std::vector<SubColumnIDSet> & getReadSubColumns(const IAST & table_ast);
 
     /// Type coercion
     // expression-level coercion
@@ -342,6 +427,47 @@ struct Analysis
     /// Non-deterministic functions
     std::unordered_set<IAST *> non_deterministic_functions;
     void addNonDeterministicFunctions(IAST & ast);
+
+    /// record hints info
+    HintAnalysis hint_analysis;
+    HintAnalysis & getHintInfo() { return hint_analysis; }
+
+    /// outfile info
+    std::optional<OutfileAnalysis> outfile_analysis;
+    std::optional<OutfileAnalysis> & getOutfileInfo() { return outfile_analysis; }
+
+    std::unordered_map<ASTSelectQuery *, ArrayJoinAnalysis> array_join_analysis;
+    ArrayJoinAnalysis & getArrayJoinAnalysis(ASTSelectQuery & select_query);
+
+    /// Insert
+    std::optional<InsertAnalysis> insert_analysis;
+    std::optional<InsertAnalysis> & getInsert() { return insert_analysis; }
+
+    // Which columns are used in query, used for EXPLAIN ANALYSIS reporting.
+    // A difference with read_columns is, columns used in alias columns are not included.
+    std::unordered_map<StorageID, LinkedHashSet<String>> used_columns;
+    void addUsedColumn(const StorageID & storage_id, const String & column)
+    {
+        used_columns[storage_id].emplace(column);
+    }
+    const std::unordered_map<StorageID, LinkedHashSet<String>> & getUsedColumns() const
+    {
+        return used_columns;
+    }
+
+    // Which functions are used in query.
+    std::set<String> used_functions;
+    void addUsedFunction(const String & function)
+    {
+        used_functions.emplace(function);
+    }
+    const std::set<String> & getUsedFunctions() const
+    {
+        return used_functions;
+    }
+
+    std::unordered_map<String, std::vector<String>> function_arguments;
+    void addUsedFunctionArgument(const String & func_name, ColumnsWithTypeAndName & processed_arguments);
 };
 
 }

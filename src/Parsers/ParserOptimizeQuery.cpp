@@ -46,6 +46,7 @@ bool ParserOptimizeQueryColumnsSpecification::parseImpl(Pos & pos, ASTPtr & node
 
 bool ParserOptimizeQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
+    ParserKeyword s_try("TRY");
     ParserKeyword s_optimize_table("OPTIMIZE TABLE");
     ParserKeyword s_partition("PARTITION");
     ParserKeyword s_final("FINAL");
@@ -58,9 +59,13 @@ bool ParserOptimizeQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expecte
     ASTPtr database;
     ASTPtr table;
     ASTPtr partition;
+    bool enable_try = false;
     bool final = false;
     bool deduplicate = false;
     String cluster_str;
+
+    if (s_try.ignore(pos, expected))
+        enable_try = true;
 
     if (!s_optimize_table.ignore(pos, expected))
         return false;
@@ -71,6 +76,7 @@ bool ParserOptimizeQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expecte
     if (s_dot.ignore(pos, expected))
     {
         database = table;
+        tryRewriteCnchDatabaseName(database, pos.getContext());
         if (!name_p.parse(pos, table, expected))
             return false;
     }
@@ -104,6 +110,7 @@ bool ParserOptimizeQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expecte
     tryGetIdentifierNameInto(database, query->database);
     tryGetIdentifierNameInto(table, query->table);
 
+    query->enable_try = enable_try;
     query->cluster = cluster_str;
     if ((query->partition = partition))
         query->children.push_back(partition);

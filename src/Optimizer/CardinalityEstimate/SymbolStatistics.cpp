@@ -17,6 +17,7 @@
 
 #include <Statistics/TypeUtils.h>
 #include <Common/FieldVisitorConvertToNumber.h>
+#include <Common/FieldVisitorToString.h>
 
 namespace DB
 {
@@ -42,6 +43,7 @@ SymbolStatistics::SymbolStatistics(
     , db_table_column(std::move(db_table_column_))
     , unknown(unknown_)
 {
+    normalize();
 }
 
 size_t SymbolStatistics::getOutputSizeInBytes()
@@ -66,6 +68,22 @@ bool SymbolStatistics::isString() const
     return tmp_type->getTypeId() == TypeIndex::String || tmp_type->getTypeId() == TypeIndex::FixedString;
 }
 
+void SymbolStatistics::normalize()
+{
+    // correct ndv
+    if (type)
+    {
+        auto tmp_type = Statistics::decayDataType(type);
+        if (tmp_type->isValueRepresentedByInteger() && (!(min == 0 && max == 0)))
+        {
+            if (ndv > max - min + 1)
+            {
+                ndv = max - min + 1;
+            }
+        }
+    }
+}
+
 bool SymbolStatistics::isImplicitConvertableFromString()
 {
     auto tmp_type = Statistics::decayDataType(type);
@@ -80,7 +98,7 @@ double SymbolStatistics::toDouble(const Field & literal)
 
 String SymbolStatistics::toString(const Field & literal)
 {
-    return literal.safeGet<String>();
+    return applyVisitor(FieldVisitorToStringWithoutQuoted(), literal);
 }
 
 bool SymbolStatistics::contains(double value)
@@ -116,7 +134,23 @@ double SymbolStatistics::estimateLessThanOrLessThanEqualFilter(double upper_boun
     double selectivity;
     if (histogram.getBuckets().empty())
     {
-        selectivity = (upper_bound - lower_bound) / (max - min);
+        if (std::isnan(max) || std::isnan(min))
+        {
+            return -1;
+        }
+        if (max == 0 && min == 0)
+        {
+            return -1;
+        }
+        double range = upper_bound - lower_bound;
+        if (range == 0 && upper_bound_inclusive)
+        {
+            selectivity = (max - min <= 0) ? 1 : 1 / (max - min);
+        }
+        else
+        {
+            selectivity = (max - min <= 0) ? 1 : range / (max - min);
+        }
     }
     else
     {
@@ -131,7 +165,23 @@ SymbolStatistics::estimateGreaterThanOrGreaterThanEqualFilter(double upper_bound
     double selectivity;
     if (histogram.getBuckets().empty())
     {
-        selectivity = (max - min <= 0) ? 1 : (upper_bound - lower_bound) / (max - min);
+        if (std::isnan(max) || std::isnan(min))
+        {
+            return -1;
+        }
+        if (max == 0 && min == 0)
+        {
+            return -1;
+        }
+        double range = upper_bound - lower_bound;
+        if (range == 0 && lower_bound_inclusive)
+        {
+            selectivity = (max - min <= 0) ? 1 : 1 / (max - min);
+        }
+        else
+        {
+            selectivity = (max - min <= 0) ? 1 : range / (max - min);
+        }
     }
     else
     {
@@ -345,12 +395,12 @@ SymbolStatisticsPtr SymbolStatistics::createNot(SymbolStatisticsPtr & origin)
 }
 
 // TODO Poisson distribution
-SymbolStatisticsPtr SymbolStatistics::applySelectivity(double selectivity)
+SymbolStatisticsPtr SymbolStatistics::applySelectivity(double selectivity) const
 {
     return applySelectivity(selectivity, selectivity);
 }
 
-SymbolStatisticsPtr SymbolStatistics::applySelectivity(double rowcount_selectivity, double ndv_selectivity)
+SymbolStatisticsPtr SymbolStatistics::applySelectivity(double rowcount_selectivity, double ndv_selectivity) const
 {
     UInt64 new_ndv = static_cast<UInt64>(getNdv() * ndv_selectivity);
     return std::make_shared<SymbolStatistics>(

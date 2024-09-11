@@ -35,9 +35,9 @@ CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, CnchSe
     : ICnchTransaction(context_), server_client(std::move(client))
 {
     checkServerClient();
-    auto [start_ts, txn_id] = server_client->createTransaction();
+    auto [start_ts, txn_id] = server_client->createTransaction(0, false);
     TransactionRecord record;
-    record.setID(txn_id).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Worker)).setStatus(CnchTransactionStatus::Running);
+    record.setID(txn_id).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Worker)).setStatus(CnchTransactionStatus::Running).setType(CnchTransactionType::Implicit);
     setTransactionRecord(std::move(record));
     is_initiator = true;
 }
@@ -50,7 +50,7 @@ CnchWorkerTransaction::CnchWorkerTransaction(
     checkServerClient();
     auto [start_ts, txn_id] = server_client->createTransactionForKafka(kafka_table_id, kafka_consumer_index);
     TransactionRecord record;
-    record.setID(txn_id).setStatus(CnchTransactionStatus::Running).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Kafka));
+    record.setID(txn_id).setStatus(CnchTransactionStatus::Running).setInitiator(txnInitiatorToString(CnchTransactionInitiator::Kafka)).setType(CnchTransactionType::Implicit);
     setTransactionRecord(std::move(record));
     is_initiator = true;
 }
@@ -61,8 +61,19 @@ CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, const 
     String initiator = txnInitiatorToString(CnchTransactionInitiator::Server);
     TransactionRecord record;
     record.read_only = true;
-    record.setID(txn_id).setPrimaryID(primary_txn_id).setInitiator(initiator).setStatus(CnchTransactionStatus::Running);
+    record.setID(txn_id).setPrimaryID(primary_txn_id).setInitiator(initiator).setStatus(CnchTransactionStatus::Running).setType(CnchTransactionType::Implicit);
     setTransactionRecord(std::move(record));
+}
+
+CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, const TxnTimestamp & txn_id, CnchServerClientPtr client, const TxnTimestamp & primary_txn_id)
+    : ICnchTransaction(context_), server_client(std::move(client))
+{
+    checkServerClient();
+    String initiator = txnInitiatorToString(CnchTransactionInitiator::Server);
+    TransactionRecord record;
+    record.setID(txn_id).setPrimaryID(primary_txn_id).setInitiator(initiator).setStatus(CnchTransactionStatus::Running).setType(CnchTransactionType::Implicit);
+    setTransactionRecord(std::move(record));
+    is_initiator = true;
 }
 
 CnchWorkerTransaction::CnchWorkerTransaction(const ContextPtr & context_, StorageID kafka_table_id_)
@@ -107,10 +118,14 @@ void CnchWorkerTransaction::precommit()
     if (auto status = getStatus(); status != CnchTransactionStatus::Running)
         throw Exception("Cannot precommit a transaction that is " + String(txnStatusToString(status)), ErrorCodes::LOGICAL_ERROR);
     checkServerClient();
-    auto lock = getLock();
-    server_client->precommitTransaction(getTransactionID(), getMainTableUUID());
-    txn_record.prepared = true;
-    LOG_DEBUG(log, "Transaction {} successfully finished pre commit.");
+    {
+        auto lock = getLock();
+        server_client->precommitTransaction(getContext(), getTransactionID(), getMainTableUUID());
+        txn_record.prepared = true;
+    }
+
+    assertLockAcquired();
+    LOG_DEBUG(log, "Transaction {} successfully finished pre commit.", txn_record.txnID().toUInt64());
 }
 
 TxnTimestamp CnchWorkerTransaction::commit()
@@ -177,6 +192,8 @@ TxnTimestamp CnchWorkerTransaction::commitV2()
 
     try
     {
+        /// XXX: If a topo switch occurs during the commit phase, it may lead to parallel lock holding.
+        /// While this problem is difficult to solve because committed transactions are not supported to be rolled back. Temporarily use the time window of topo switching to avoid this problem
         return commit();
     }
     catch (Exception & e)
@@ -228,7 +245,8 @@ TxnTimestamp CnchWorkerTransaction::commitV2()
         {
             LOG_DEBUG(log, "Transaction {} commit failed\n", txn_record.txnID().toUInt64());
             tryLogCurrentException(log, __PRETTY_FUNCTION__);
-            rollback();
+            // depends on kv implementation, such as bytekv, some error codes are uncertain case like LOCK_TIMEOUT,
+            // instead of call the rollback explicitly, it is better to let server executes the clean logic to make sure the correct state transition.
             throw;
         }
     }

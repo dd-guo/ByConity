@@ -27,6 +27,8 @@ public:
 
     bool isDeterministic() const override { return false; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     bool isDeterministicInScopeOfQuery() const override
     {
         return false;
@@ -56,7 +58,7 @@ public:
 
 }
 
-void registerFunctionHostName(FunctionFactory & factory)
+REGISTER_FUNCTION(HostName)
 {
     factory.registerFunction<FunctionHostName>();
     factory.registerAlias("hostname", "hostName");

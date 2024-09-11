@@ -2,10 +2,13 @@
 #include <Columns/ColumnString.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/IFunctionMySql.h>
 #include <Functions/GatherUtils/Algorithms.h>
 #include <Functions/GatherUtils/Sinks.h>
 #include <Functions/GatherUtils/Sources.h>
 #include <common/bit_cast.h>
+#include <DataTypes/DataTypeFixedString.h>
+#include <DataTypes/DataTypeString.h>
 
 namespace DB
 {
@@ -17,12 +20,13 @@ namespace ErrorCodes
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int TOO_LARGE_STRING_SIZE;
+    extern const int INDEX_OF_POSITIONAL_ARGUMENT_IS_OUT_OF_RANGE;
 }
 
 namespace
 {
     /// The maximum new padded length.
-    constexpr size_t MAX_NEW_LENGTH = 1000000;
+    constexpr ssize_t MAX_NEW_LENGTH = 1000000;
 
     /// Appends padding characters to a sink based on a pad string.
     /// Depending on how many padding characters are required to add
@@ -131,23 +135,51 @@ namespace
 
     /// If `is_right_pad` - it's the rightPad() function instead of leftPad().
     /// If `is_utf8` - lengths are measured in code points instead of bytes.
-    template <bool is_right_pad, bool is_utf8>
+    template <bool is_right_pad, bool is_utf8, bool is_space_func = false>
     class FunctionPadString : public IFunction
     {
     public:
-        static constexpr auto name = is_right_pad ? (is_utf8 ? "rightPadUTF8" : "rightPad") : (is_utf8 ? "leftPadUTF8" : "leftPad");
-        static FunctionPtr create(const ContextPtr) { return std::make_shared<FunctionPadString>(); }
+        static constexpr auto name = is_space_func ? "space" : (is_right_pad ? (is_utf8 ? "rightPadUTF8" : "rightPad") : (is_utf8 ? "leftPadUTF8" : "leftPad"));
+        static FunctionPtr create(ContextPtr context)
+        {
+            if (context && context->getSettingsRef().enable_implicit_arg_type_convert)
+                return std::make_shared<IFunctionMySql>(std::make_unique<FunctionPadString>());
+            return std::make_shared<FunctionPadString>();
+        }
+
+        ArgType getArgumentsType() const override { return is_space_func ? ArgType::UINTS : ArgType::STR_UINT_STR; }
 
         String getName() const override { return name; }
 
-        bool isVariadic() const override { return true; }
-        size_t getNumberOfArguments() const override { return 0; }
+        bool isVariadic() const override { return !is_space_func; }
+        size_t getNumberOfArguments() const override { return !is_space_func ? 0 : 1; }
+        bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-        bool useDefaultImplementationForConstants() const override { return false; }
+        bool useDefaultImplementationForConstants() const override { return true; }
+        ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {2}; }
 
         DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
         {
             size_t number_of_arguments = arguments.size();
+
+            if constexpr (is_space_func)
+            {
+                if (number_of_arguments != 1)
+                    throw Exception(
+                        ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                        "Number of arguments for function {} doesn't match: passed {}, should be 1",
+                        getName(),
+                        std::to_string(number_of_arguments));
+
+                if (!isUnsignedInteger(arguments[0]))
+                    throw Exception(
+                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                        "Illegal type {} of the first argument of function {}, should be unsigned integer",
+                        arguments[0]->getName(),
+                        getName());
+
+                return std::make_shared<DataTypeString>();
+            }
 
             if (number_of_arguments != 2 && number_of_arguments != 3)
                 throw Exception(
@@ -163,7 +195,7 @@ namespace
                     arguments[0]->getName(),
                     getName());
 
-            if (!isUnsignedInteger(arguments[1]))
+            if (!isInteger(arguments[1]))
                 throw Exception(
                     ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                     "Illegal type {} of the second argument of function {}, should be unsigned integer",
@@ -182,8 +214,19 @@ namespace
 
         ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
         {
-            auto column_string = arguments[0].column;
-            auto column_length = arguments[1].column;
+            ColumnPtr column_string;
+            ColumnPtr column_length;
+
+            if constexpr (is_space_func)
+            {
+                column_string = DataTypeString().createColumn()->cloneResized(input_rows_count);
+                column_length = arguments[0].column;
+            }
+            else
+            {
+                column_string = arguments[0].column;
+                column_length = arguments[1].column;
+            }
 
             String pad_string;
             if (arguments.size() == 3)
@@ -249,10 +292,10 @@ namespace
             for (; !res_sink.isEnd(); res_sink.next(), strings.next(), lengths.next())
             {
                 auto str = strings.getWhole();
-                size_t current_length = getLengthOfSlice<is_utf8>(str);
+                ssize_t current_length = getLengthOfSlice<is_utf8>(str);
 
                 auto new_length_slice = lengths.getWhole();
-                size_t new_length = new_length_slice.elements->getUInt(new_length_slice.position);
+                ssize_t new_length = new_length_slice.elements->getInt(new_length_slice.position);
 
                 if (need_check_length)
                 {
@@ -261,6 +304,11 @@ namespace
                         throw Exception(
                             "New padded length (" + std::to_string(new_length) + ") is too big, maximum is: " + std::to_string(MAX_NEW_LENGTH),
                             ErrorCodes::TOO_LARGE_STRING_SIZE);
+                    }
+                    if (new_length < 0)
+                    {
+                        throw Exception(
+                            ErrorCodes::INDEX_OF_POSITIONAL_ARGUMENT_IS_OUT_OF_RANGE, "New padded length ({}) is negative", std::to_string(new_length));
                     }
                     if (is_const_length)
                     {
@@ -294,12 +342,13 @@ namespace
     };
 }
 
-void registerFunctionPadString(FunctionFactory & factory)
+REGISTER_FUNCTION(PadString)
 {
     factory.registerFunction<FunctionPadString<false, false>>(); /// leftPad
     factory.registerFunction<FunctionPadString<false, true>>();  /// leftPadUTF8
     factory.registerFunction<FunctionPadString<true, false>>();  /// rightPad
     factory.registerFunction<FunctionPadString<true, true>>();   /// rightPadUTF8
+    factory.registerFunction<FunctionPadString<false, false, true>>(FunctionFactory::CaseInsensitive);   /// space
 
     factory.registerAlias("lpad", "leftPad", FunctionFactory::CaseInsensitive);
     factory.registerAlias("rpad", "rightPad", FunctionFactory::CaseInsensitive);

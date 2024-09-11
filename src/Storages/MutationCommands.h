@@ -60,6 +60,7 @@ struct MutationCommand
         RENAME_COLUMN,
         CLEAR_MAP_KEY,
         RECLUSTER,
+        MODIFY_CLUSTER_BY,
     };
 
     Type type = EMPTY;
@@ -116,7 +117,10 @@ public:
     {
         for (const auto & command : *this)
         {
-            if (command.type != MutationCommand::EMPTY &&
+            if (command.type != MutationCommand::DELETE &&
+                command.type != MutationCommand::UPDATE &&
+                command.type != MutationCommand::FAST_DELETE &&
+                command.type != MutationCommand::EMPTY &&
                 /* command.type != MutationCommand::BUILD_BITMAP && */
                 command.type != MutationCommand::CLEAR_MAP_KEY &&
                 command.type != MutationCommand::MATERIALIZE_INDEX /* &&
@@ -127,5 +131,7 @@ public:
         return false;
     }
 };
+
+using MutationCommandsPtr = std::shared_ptr<MutationCommands>;
 
 }

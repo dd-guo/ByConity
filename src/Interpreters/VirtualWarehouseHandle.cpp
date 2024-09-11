@@ -13,17 +13,30 @@
  * limitations under the License.
  */
 
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <algorithm>
 #include <Catalog/Catalog.h>
-#include <Common/Exception.h>
-#include <Common/thread_local_rng.h>
 #include <Interpreters/VirtualWarehouseHandle.h>
 #include <Interpreters/WorkerGroupHandle.h>
+#include <Interpreters/WorkerStatusManager.h>
 #include <ResourceManagement/ResourceManagerClient.h>
 #include <ServiceDiscovery/IServiceDiscovery.h>
+#include <Common/Exception.h>
+#include <Common/thread_local_rng.h>
+#include <Core/SettingsEnums.h>
+#include <Interpreters/Context.h>
+#include <ResourceManagement/CommonData.h>
+#include <boost/lexical_cast.hpp>
+#include <boost/lexical_cast/bad_lexical_cast.hpp>
+#include <consistent-hashing/consistent_hashing.h>
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
@@ -33,7 +46,11 @@ namespace ErrorCodes
 }
 
 VirtualWarehouseHandleImpl::VirtualWarehouseHandleImpl(
-    VirtualWarehouseHandleSource source_, std::string name_, UUID uuid_, const ContextPtr global_context_, const VirtualWarehouseSettings & settings_)
+    VirtualWarehouseHandleSource source_,
+    std::string name_,
+    UUID uuid_,
+    const ContextPtr global_context_,
+    const VirtualWarehouseSettings & settings_)
     : WithContext(global_context_)
     , source(source_)
     , name(std::move(name_))
@@ -48,9 +65,11 @@ VirtualWarehouseHandleImpl::VirtualWarehouseHandleImpl(
     VirtualWarehouseHandleSource source_, const VirtualWarehouseData & vw_data, const ContextPtr global_context_)
     : VirtualWarehouseHandleImpl(source_, vw_data.name, vw_data.uuid, global_context_, vw_data.settings)
 {
+    LOG_DEBUG(log, "create virtual warehouse {}", name);
+    queue_manager.updateQueue(vw_data.settings.queue_datas);
 }
 
-size_t VirtualWarehouseHandleImpl::empty(UpdateMode update_mode)
+bool VirtualWarehouseHandleImpl::empty(UpdateMode update_mode)
 {
     tryUpdateWorkerGroups(update_mode);
 
@@ -66,6 +85,16 @@ VirtualWarehouseHandleImpl::Container VirtualWarehouseHandleImpl::getAll(UpdateM
     return worker_groups;
 }
 
+size_t VirtualWarehouseHandleImpl::getNumWorkers(UpdateMode update_mode)
+{
+    tryUpdateWorkerGroups(update_mode);
+
+    size_t res = 0;
+    std::lock_guard lock(state_mutex);
+    for (auto const & [_, worker_group] : worker_groups)
+        res += worker_group->size();
+    return res;
+}
 
 WorkerGroupHandle VirtualWarehouseHandleImpl::getWorkerGroup(const String & worker_group_id, UpdateMode update_mode)
 {
@@ -79,40 +108,53 @@ WorkerGroupHandle VirtualWarehouseHandleImpl::getWorkerGroup(const String & work
     return it->second;
 }
 
-WorkerGroupHandle VirtualWarehouseHandleImpl::pickWorkerGroup(VWScheduleAlgo algo, const Requirement & requirement, UpdateMode update_mode)
+void VirtualWarehouseHandleImpl::updateWorkerStatusFromRM(const std::vector<WorkerGroupData> & groups_data)
 {
-    tryUpdateWorkerGroups(update_mode);
-
-    if (!algo)
-        algo = settings.vw_schedule_algo;
-
-    // All LOCAL_* algorithms use local scheduler.
-    if (algo < VWScheduleAlgo::GlobalRoundRobin)
-        return pickLocally(algo, requirement);
-
-    // GLOBAL_* algorithms use RM service.
-    auto rm_client = getContext()->getResourceManagerClient();
-    if (!rm_client)
+    auto worker_status_manager = getContext()->getWorkerStatusManager();
+    auto cannot_update_workers = worker_status_manager->getWorkersCannotUpdateFromRM();
+    if (log->trace())
     {
-        LOG_WARNING(log, "RM client is invalid, pick a worker group randomly for {}.", name);
-        return randomWorkerGroup();
+        LOG_TRACE(log, "adaptive updateWorkerStatusFromRM");
+        for (const auto & [id, _] : cannot_update_workers)
+            LOG_TRACE(log, "adaptive cannot update worker : {}", id.ToString());
     }
-
-    try
+    for (const auto & group_data : groups_data)
     {
-        auto worker_group_data = rm_client->pickWorkerGroup(name, algo, {});
-
+        for (const auto & worker_resource_data : group_data.worker_node_resource_vec)
         {
-            std::lock_guard lock(state_mutex);
-            auto it = worker_groups.find(worker_group_data.id);
-            if (it != worker_groups.end())
-                return it->second;
+            auto worker_id = WorkerStatusManager::getWorkerId(group_data.vw_name, group_data.id, worker_resource_data.id);
+            if (!cannot_update_workers.count(worker_id))
+            {
+                LOG_TRACE(log, "update worker {} from rm", worker_id.ToString());
+                Protos::WorkerNodeResourceData resource_info;
+                worker_resource_data.fillProto(resource_info);
+                worker_status_manager->updateWorkerNode(resource_info, WorkerStatusManager::UpdateSource::ComeFromRM);
+            }
         }
-        LOG_WARNING(log, "Worker group returned from RM is not found locally, pick a worker group randomly.");
     }
-    catch (const Exception & e)
+}
+
+WorkerGroupHandle VirtualWarehouseHandleImpl::pickWorkerGroup(
+    [[maybe_unused]] VWScheduleAlgo algo,
+    bool use_router,
+    VWLoadBalancing load_balance,
+    [[maybe_unused]] const Requirement & requirement,
+    [[maybe_unused]] UpdateMode update_mode)
+{
+    LOG_DEBUG(log, "pick worker group, use router [{}], load_balance[{}]", use_router, load_balance);
+    if (use_router)
     {
-        LOG_WARNING(log, "Failed to connect to RM, pick a worker group randomly: {}", e.displayText());
+        tryUpdateWorkerGroups(update_mode);
+        std::unique_lock<std::mutex> lock(state_mutex);
+
+        if (!priority_groups.empty() && (load_balance == VWLoadBalancing::IN_ORDER || load_balance == VWLoadBalancing::REVERSE_ORDER))
+        {
+            static std::atomic<uint64_t> round_robin_count{0};
+
+            size_t target_index = load_balance == VWLoadBalancing::IN_ORDER ? 0 : priority_groups.size() - 1;
+            if (!priority_groups[target_index].second.empty())
+                return priority_groups[target_index].second[round_robin_count++ % priority_groups[target_index].second.size()];
+        }
     }
 
     return randomWorkerGroup();
@@ -124,15 +166,18 @@ void VirtualWarehouseHandleImpl::tryUpdateWorkerGroups(UpdateMode update_mode)
         return;
 
     UInt64 current_ns = clock_gettime_ns(CLOCK_MONOTONIC_COARSE);
-    if (update_mode == ForceUpdate)
+    UInt64 the_last_update_time_ns = last_update_time_ns.load();
+
+    if (current_ns >= the_last_update_time_ns + force_update_interval_ns)
     {
-        last_update_time_ns.store(current_ns);
+        LOG_TRACE(log, "The worker_groups is not updated for {} ms. Will use ForceUpdate mode.", force_update_interval_ns / 1000000);
+        update_mode = ForceUpdate;
     }
-    else
+
+    /// TryUpdate mode - one of the query thread will do updateWorkerGroups.
+    if (update_mode != ForceUpdate)
     {
-        constexpr UInt64 update_interval_ns = 500ULL * 1000 * 1000; // 500ms TODO: make it configurable
-        UInt64 the_last_update_time_ns = last_update_time_ns.load();
-        if (current_ns < the_last_update_time_ns + update_interval_ns)
+        if (current_ns < the_last_update_time_ns + try_update_interval_ns)
             return;
         if (!last_update_time_ns.compare_exchange_strong(the_last_update_time_ns, current_ns))
             return;
@@ -144,8 +189,10 @@ void VirtualWarehouseHandleImpl::tryUpdateWorkerGroups(UpdateMode update_mode)
     if (!success)
         success = updateWorkerGroupsFromPSM();
 
-    if (!success && worker_groups.empty())
-        LOG_WARNING(log, "Updating of worker groups failed");
+    if (!success || worker_groups.empty())
+        LOG_WARNING(log, "Failed to update worker groups for VW:{}", name);
+
+    last_update_time_ns.store(current_ns);
 }
 
 
@@ -175,20 +222,63 @@ bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromRM()
         }
 
         std::vector<WorkerGroupData> groups_data;
-        rm_client->getWorkerGroups(name, groups_data);
+        std::optional<VirtualWarehouseSettings> new_settings;
+        rm_client->getWorkerGroups(name, groups_data, new_settings, last_settings_timestamp);
         if (groups_data.empty())
         {
             LOG_DEBUG(log, "No worker group found in VW {} from RM", name);
             return false;
         }
 
+        if (new_settings)
+            updateSettings(*new_settings);
+        updateWorkerStatusFromRM(groups_data);
         std::lock_guard lock(state_mutex);
 
         Container old_groups;
         old_groups.swap(worker_groups);
 
+        std::optional<size_t> composite_index;
+
+        for (size_t i = 0; i < groups_data.size(); i++)
+        {
+            // Only use first Composite WG to complete
+            const auto & group_data = groups_data[i];
+            if (group_data.num_workers > 0 && group_data.type == WorkerGroupType::Composite && !composite_index)
+                composite_index = i;
+        }
+
         for (auto & group_data : groups_data)
         {
+            if (group_data.num_workers == 0 || group_data.type == WorkerGroupType::Composite)
+            {
+                LOG_WARNING(log, "Get an empty worker group from RM:{}", group_data.id);
+                continue;
+            }
+
+            // Complete common WG with complement WG .
+            if (composite_index && group_data.type == WorkerGroupType::Physical)
+            {
+                LOG_DEBUG(log, "Use WG {} to complete WG {}", groups_data[*composite_index].id, group_data.id);
+                auto worker_complement = complementPhysicalWorkerGroup(group_data, groups_data[*composite_index]);
+                if (worker_complement)
+                {
+                    for (const auto & complement_info : worker_complement->complement_infos)
+                    {
+                        LOG_DEBUG(
+                            log,
+                            "Use host {} of WG {} to complete WG {} for index {}",
+                            complement_info.host_ports.toDebugString(),
+                            groups_data[*composite_index].id,
+                            group_data.id,
+                            complement_info.target_index);
+                        group_data.host_ports_vec.push_back(complement_info.host_ports);
+                        group_data.metrics.worker_metrics_vec.push_back(complement_info.worker_metrics);
+                        std::stable_sort(group_data.host_ports_vec.begin(), group_data.host_ports_vec.end());
+                    }
+                }
+            }
+
             if (auto it = old_groups.find(group_data.id); it == old_groups.end()) /// new worker group
                 worker_groups.try_emplace(group_data.id, std::make_shared<WorkerGroupHandleImpl>(group_data, getContext()));
             else if (!it->second->isSame(group_data)) /// replace with the new one because of diff
@@ -200,6 +290,14 @@ bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromRM()
             }
         }
 
+        updatePriorityGroups();
+
+        if (worker_groups.empty())
+        {
+            LOG_WARNING(log, "Get an empty VW from RM:{}", name);
+            return false;
+        }
+
         return true;
     }
     catch (...)
@@ -207,6 +305,150 @@ bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromRM()
         tryLogDebugCurrentException(__PRETTY_FUNCTION__);
         return false;
     }
+}
+
+std::optional<WorkerComplement> VirtualWarehouseHandleImpl::complementPhysicalWorkerGroup(WorkerGroupData & common_group, const WorkerGroupData & completion_group)
+{
+    WorkerComplement worker_complement;
+    String worker_prefix;
+    auto total_number = settings.num_workers;
+    std::unordered_set<UInt64> worker_id_suffixs;
+    UInt64 worker_idx = 0;
+    UInt64 max_worker_idx = 0;
+    bool failed = false;
+    // Find missing workers with suffix number of the worker_id
+    for (const auto & host_ports : common_group.host_ports_vec)
+    {
+        auto dash_idx = host_ports.id.rfind('-');
+        if (dash_idx == std::string::npos)
+        {
+            failed = true;
+            break;
+        }
+        if (worker_prefix.empty())
+            worker_prefix = host_ports.id.substr(0, dash_idx);
+        auto worker_suffix = host_ports.id.substr(dash_idx + 1);
+        try
+        {
+            worker_idx = boost::lexical_cast<UInt64>(worker_suffix);
+            if (worker_idx > max_worker_idx)
+                max_worker_idx = worker_idx;
+        }
+        catch (boost::bad_lexical_cast &)
+        {
+            failed = true;
+            break;
+        }
+        worker_id_suffixs.insert(worker_idx);
+    }
+    if (failed)
+    {
+        LOG_ERROR(log, "parse worker id failed");
+        return std::nullopt;
+    }
+
+    for (UInt64 idx = 0; idx < std::max(total_number, max_worker_idx + 1); idx++)
+    {
+        if (!worker_id_suffixs.contains(idx))
+            worker_complement.complement_infos.emplace_back(idx);
+    }
+
+    if (worker_complement.complement_infos.empty() || worker_complement.complement_infos.size() > completion_group.host_ports_vec.size())
+    {
+        LOG_DEBUG(log, "Don't need complete wg or too many missing workers : {}", worker_complement.complement_infos.size());
+        return std::nullopt;
+    }
+
+    worker_complement.candidates.resize(completion_group.host_ports_vec.size());
+
+    // first round selection use cnsistent hash.
+    for (auto & completion_info: worker_complement.complement_infos)
+    {
+        auto hash_index = ConsistentHashing(completion_info.target_index, completion_group.host_ports_vec.size());
+        if (!worker_complement.candidates[hash_index])
+        {
+            completion_info.source_index = hash_index;
+            worker_complement.candidates[hash_index] = true;
+        }
+        else
+        {
+            completion_info.candidate_index = hash_index;
+        }
+    }
+    // second round selection, Sequentialy select valid worker
+    size_t candidate_size = worker_complement.candidates.size();
+    for (auto & completion_info : worker_complement.complement_infos)
+    {
+        if (!completion_info.source_index)
+        {
+            for (size_t step = 1; step < completion_group.host_ports_vec.size(); step++)
+            {
+                if (!worker_complement.candidates[(step + completion_info.candidate_index) % candidate_size])
+                {
+                    //get result
+                    completion_info.source_index = (step + completion_info.candidate_index) % candidate_size;
+                    worker_complement.candidates[*completion_info.source_index] = true;
+                    break;
+                }
+            }
+        }
+        if (!completion_info.source_index)
+        {
+            LOG_ERROR(log, "Can't find candidate worker");
+            return std::nullopt;
+        }
+    }
+    // Prepare HostWithPorts for completion worker.
+    for (auto & completion_info : worker_complement.complement_infos)
+    {
+        completion_info.host_ports = completion_group.host_ports_vec.at(*completion_info.source_index);
+        completion_info.worker_metrics = completion_group.metrics.worker_metrics_vec.at(*completion_info.source_index);
+        completion_info.worker_metrics.id = completion_info.host_ports.id;
+        completion_info.host_ports.real_id = completion_info.host_ports.id;
+        completion_info.host_ports.replaceId(worker_prefix + "-" + std::to_string(completion_info.target_index));
+    }
+    return worker_complement;
+}
+
+void VirtualWarehouseHandleImpl::updateSettings(const VirtualWarehouseSettings & new_settings)
+{
+    std::lock_guard lock(state_mutex);
+    getQueueManager().updateQueue(new_settings.queue_datas);
+    settings = new_settings;
+}
+
+void VirtualWarehouseHandleImpl::updateWorkerStatusFromPSM(
+    const IServiceDiscovery::WorkerGroupMap & groups_data, const std::string & vw_name)
+{
+    auto worker_status_manager = getContext()->getWorkerStatusManager();
+    auto cannot_update_workers = worker_status_manager->getWorkersCannotUpdateFromRM();
+    if (log->trace())
+    {
+        for (const auto & [id, _] : cannot_update_workers)
+            LOG_TRACE(log, "adaptive cannot update unhealth worker : {}", id.ToString());
+    }
+
+    for (const auto & [wg_name, host_ports_vec] : groups_data)
+    {
+        for (const auto & host_ports : host_ports_vec)
+        {
+            auto worker_id = WorkerStatusManager::getWorkerId(vw_name, wg_name, host_ports.id);
+            if (!cannot_update_workers.count(worker_id))
+            {
+                worker_status_manager->restoreWorkerNode(worker_id);
+            }
+        }
+    }
+}
+void VirtualWarehouseHandleImpl::updatePriorityGroups()
+{
+    priority_groups.clear();
+    std::unordered_map<Int64, std::vector<WorkerGroupHandle>> priority_group_maps;
+    for (const auto & [_, group_handle] : worker_groups)
+        priority_group_maps[group_handle->getPriority()].push_back(group_handle);
+    for (auto & priority_group : priority_group_maps)
+        priority_groups.push_back(std::move(priority_group));
+    std::stable_sort(priority_groups.begin(), priority_groups.end());
 }
 
 bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromPSM()
@@ -222,7 +464,7 @@ bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromPSM()
             LOG_DEBUG(log, "No worker group found in VW {} from PSM {}", name, psm);
             return false;
         }
-
+        updateWorkerStatusFromPSM(groups_map, name);
         std::lock_guard lock(state_mutex);
 
         Container old_groups;
@@ -242,6 +484,8 @@ bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromPSM()
                 worker_groups.try_emplace(group_id, it->second);
         }
 
+        updatePriorityGroups();
+
         return true;
     }
     catch (...)
@@ -249,17 +493,6 @@ bool VirtualWarehouseHandleImpl::updateWorkerGroupsFromPSM()
         tryLogDebugCurrentException(__PRETTY_FUNCTION__);
         return false;
     }
-}
-
-using WorkerGroupAndMetrics = std::pair<WorkerGroupHandle, WorkerGroupMetrics>;
-static inline bool cmp_group_cpu(const WorkerGroupAndMetrics  & a, const WorkerGroupAndMetrics & b)
-{
-    return a.second.avg_cpu_usage < b.second.avg_cpu_usage;
-}
-
-static inline bool cmp_group_mem(const WorkerGroupAndMetrics & a, const WorkerGroupAndMetrics & b)
-{
-    return a.second.avg_mem_usage < b.second.avg_mem_usage;
 }
 
 /// pickLocally stage 1: filter worker groups by requirement.
@@ -278,75 +511,19 @@ void VirtualWarehouseHandleImpl::filterGroup(const Requirement & requirement, st
 }
 
 /// pickLocally stage 2: select one group by algo.
-WorkerGroupHandle VirtualWarehouseHandleImpl::selectGroup(const VWScheduleAlgo & algo, std::vector<WorkerGroupAndMetrics> & available_groups)
+WorkerGroupHandle VirtualWarehouseHandleImpl::selectGroup(
+    [[maybe_unused]] const VWScheduleAlgo & algo, [[maybe_unused]] std::vector<WorkerGroupAndMetrics> & available_groups)
 {
-    if (available_groups.size() == 1)
-        return available_groups[0].first;
-
-    auto comparator = cmp_group_cpu;
-    switch (algo)
-    {
-        case VWScheduleAlgo::Unknown:
-        case VWScheduleAlgo::Random:
-        {
-            std::uniform_int_distribution dist;
-            auto index = dist(thread_local_rng) % available_groups.size();
-            return available_groups[index].first;
-        }
-
-        case VWScheduleAlgo::LocalRoundRobin:
-        {
-            size_t index = pick_group_sequence.fetch_add(1, std::memory_order_relaxed) % available_groups.size();
-            return available_groups[index].first;
-        }
-        case VWScheduleAlgo::LocalLowCpu:
-            break;
-        case VWScheduleAlgo::LocalLowMem:
-            comparator = cmp_group_mem;
-            break;
-        default:
-            const auto & s = std::string(ResourceManagement::toString(algo));
-            throw Exception("Wrong vw_schedule_algo for local scheduler: " + s, ErrorCodes::RESOURCE_MANAGER_WRONG_VW_SCHEDULE_ALGO);
-    }
-
-    /// Choose from the two lowest CPU worker groups but not the lowest one as the metrics on server may be outdated.
-    if (available_groups.size() >= 3)
-    {
-        std::partial_sort(available_groups.begin(), available_groups.begin() + 2, available_groups.end(), comparator);
-        std::uniform_int_distribution dist;
-        auto index = (dist(thread_local_rng) % 3) >> 1; /// prefer index 0 than 1.
-        return available_groups[index].first;
-    }
-    else
-    {
-        auto it = std::min_element(available_groups.begin(), available_groups.end(), comparator);
-        return it->first;
-    }
+    return available_groups[0].first;
 }
 
 /// Picking a worker group from local cache. Two stages:
 /// - 1. filter worker groups by requirement.
 /// - 2. select one group by algo.
-WorkerGroupHandle VirtualWarehouseHandleImpl::pickLocally(const VWScheduleAlgo & algo, const Requirement & requirement)
+WorkerGroupHandle
+VirtualWarehouseHandleImpl::pickLocally([[maybe_unused]] const VWScheduleAlgo & algo, [[maybe_unused]] const Requirement & requirement)
 {
-    std::vector<WorkerGroupAndMetrics> available_groups;
-    filterGroup(requirement, available_groups);
-    if (available_groups.empty())
-    {
-        LOG_WARNING(log, "No available worker groups for requirement: {}, choose one randomly.", requirement.toDebugString());
-        return randomWorkerGroup();
-    }
-    return selectGroup(algo, available_groups);
-}
-
-CnchWorkerClientPtr VirtualWarehouseHandleImpl::getWorkerByHash(const String & key)
-{
-    /// TODO: Should we expand the worker list first?
-    UInt64 val = std::hash<String>{}(key);
-    std::lock_guard lock(state_mutex);
-    auto wg_index = val % worker_groups.size();
-    auto & group = std::next(worker_groups.begin(), wg_index)->second;
-    return group->getWorkerClientByHash(key);
+    return randomWorkerGroup();
 }
 
 /// Get a worker from the VW using a random strategy.
@@ -356,8 +533,27 @@ CnchWorkerClientPtr VirtualWarehouseHandleImpl::getWorker()
     return wg_handle->getWorkerClient();
 }
 
+CnchWorkerClientPtr VirtualWarehouseHandleImpl::getWorkerByHash(const String & key)
+{
+    tryUpdateWorkerGroups(TryUpdate);
+    /// TODO: Should we expand the worker list first?
+    UInt64 val = std::hash<String>{}(key);
+    std::lock_guard lock(state_mutex);
+    auto wg_index = val % worker_groups.size();
+    auto & group = std::next(worker_groups.begin(), wg_index)->second;
+    return group->getWorkerClient(val, false).second;
+}
+
+CnchWorkerClientPtr VirtualWarehouseHandleImpl::getWorkerByHostWithPorts(const HostWithPorts & host_ports)
+{
+    auto wg_handle = randomWorkerGroup();
+    return wg_handle->getWorkerClient(host_ports);
+}
+
 std::vector<CnchWorkerClientPtr> VirtualWarehouseHandleImpl::getAllWorkers()
 {
+    tryUpdateWorkerGroups(UpdateMode::TryUpdate);
+
     std::vector<CnchWorkerClientPtr> res;
     std::lock_guard lock(state_mutex);
     for (const auto & [_, wg_handle] : worker_groups)
@@ -368,8 +564,10 @@ std::vector<CnchWorkerClientPtr> VirtualWarehouseHandleImpl::getAllWorkers()
     return res;
 }
 
-WorkerGroupHandle VirtualWarehouseHandleImpl::randomWorkerGroup() const
+WorkerGroupHandle VirtualWarehouseHandleImpl::randomWorkerGroup(UpdateMode mode)
 {
+    tryUpdateWorkerGroups(mode);
+
     std::uniform_int_distribution dist;
 
     {
@@ -380,7 +578,7 @@ WorkerGroupHandle VirtualWarehouseHandleImpl::randomWorkerGroup() const
             for (size_t i = 0; i < size; i++)
             {
                 auto index = (begin + i) % size;
-                auto & group = std::next(worker_groups.begin(), index)->second;
+                const auto & group = std::next(worker_groups.begin(), index)->second;
                 if (!group->getHostWithPortsVec().empty())
                     return group;
             }
@@ -404,6 +602,23 @@ std::optional<HostWithPorts> VirtualWarehouseHandleImpl::tryPickWorkerFromRM(VWS
         }
     }
     return {};
+}
+
+CnchWorkerClientPtr VirtualWarehouseHandleImpl::pickWorker(const String & worker_group_id, bool skip_busy_worker)
+{
+    if (!worker_group_id.empty())
+        return getWorkerGroup(worker_group_id)->getWorkerClient(skip_busy_worker);
+
+    return randomWorkerGroup()->getWorkerClient(skip_busy_worker);
+}
+
+std::pair<UInt64, CnchWorkerClientPtr>
+VirtualWarehouseHandleImpl::pickWorker(const String & worker_group_id, UInt64 sequence, bool skip_busy_worker)
+{
+    if (!worker_group_id.empty())
+        return getWorkerGroup(worker_group_id)->getWorkerClient(sequence, skip_busy_worker);
+
+    return randomWorkerGroup()->getWorkerClient(sequence, skip_busy_worker);
 }
 
 }

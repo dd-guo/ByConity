@@ -66,6 +66,7 @@ private:
       */
     static void splitMutationCommands(
         MergeTreeMetaBase::DataPartPtr part,
+        const StorageMetadataPtr & metadata_snapshot,
         const MutationCommands & commands,
         MutationCommands & for_interpreter,
         MutationCommands & for_file_renames);
@@ -77,7 +78,6 @@ private:
     static NameToNameVector collectFilesForRenames(MergeTreeMetaBase::DataPartPtr source_part, const MutationCommands & commands_for_removes, const String & mrk_extension);
 
     /// Collect necessary implicit files for clear map key commands.
-    /// If the part enables compact map data and all implicit keys of the map column has been removed, the compacted file need to remove too.
     static NameSet collectFilesForClearMapKey(MergeTreeMetaBase::DataPartPtr source_part, const MutationCommands & commands);
 
     /// Get the columns list of the resulting part in the same order as storage_columns.
@@ -85,7 +85,8 @@ private:
         MergeTreeMetaBase::DataPartPtr source_part,
         const Block & updated_header,
         NamesAndTypesList storage_columns,
-        const MutationCommands & commands_for_removes);
+        const MutationCommands & commands_for_removes,
+        bool with_row_exists_column);
 
     /// Get skip indices, that should exists in the resulting data part.
     static MergeTreeIndices getIndicesForNewDataPart(
@@ -112,7 +113,7 @@ private:
         const NameSet & materialized_projections,
         const MergeTreeMetaBase::DataPartPtr & source_part);
 
-    void writeWithProjections(
+    std::optional<size_t> writeWithProjections(
         MergeTreeMetaBase::MutableDataPartPtr new_data_part,
         const StorageMetadataPtr & metadata_snapshot,
         const MergeTreeProjections & projections_to_build,
@@ -158,6 +159,13 @@ private:
         TableLockHolder & holder,
         ContextPtr context);
 
+    // For projections that needed to be recaluated, we collect all the columns that are depended on by the projections
+    static void addColumnsForRecalculateProjections(
+        MergeTreeData::DataPartPtr part,
+        const StorageMetadataPtr & metadata_snapshot,
+        const NameSet & mutated_columns,
+        MutationCommands & for_interpreter);
+
 public :
     /// Initialize and write to disk new part fields like checksums, columns, etc.
     static void finalizeMutatedPart(
@@ -177,6 +185,8 @@ private:
     const size_t background_pool_size;
 
     Poco::Logger * log;
+
+    bool is_delete_command = false;
 };
 
 

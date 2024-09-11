@@ -16,6 +16,10 @@ extern "C"
 }
 #endif
 
+#if defined(__clang__) && __clang_major__ >= 13
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+#endif
+
 namespace
 {
 
@@ -159,6 +163,7 @@ LineReader::InputStatus LineReader::readOneLine(const String & prompt)
                 {
                     break;
                 }
+                dlclose(dl_handle);
             }
         }
     }

@@ -1,8 +1,11 @@
+SET enable_optimizer = 1;
+
 CREATE DATABASE IF NOT EXISTS test;
 
 DROP TABLE IF EXISTS people;
 DROP TABLE IF EXISTS city;
 
+set data_type_default_nullable=0;
 CREATE TABLE people(`id` Int32, `name` String, `city_id` Int32)
     ENGINE = CnchMergeTree()
     PARTITION BY `id`

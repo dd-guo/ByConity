@@ -11,6 +11,7 @@
 #include <Common/HashTable/HashMap.h>
 #include <Common/typeid_cast.h>
 #include <common/StringRef.h>
+#include "DataTypes/IDataType.h"
 #include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
@@ -66,6 +67,7 @@ public:
     }
 
     bool isVariadic() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1, 2}; }
@@ -138,7 +140,7 @@ public:
             if (type_arr_to_nested->isValueRepresentedByNumber() && type_default->isValueRepresentedByNumber())
             {
                 /// We take the smallest common type for the elements of the array of values `to` and for `default`.
-                return getLeastSupertype({type_arr_to_nested, type_default});
+                return getLeastSupertype(DataTypes{type_arr_to_nested, type_default});
             }
 
             /// TODO More checks.
@@ -850,7 +852,7 @@ private:
 
 }
 
-void registerFunctionTransform(FunctionFactory & factory)
+REGISTER_FUNCTION(Transform)
 {
     factory.registerFunction<FunctionTransform>();
 }

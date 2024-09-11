@@ -1,4 +1,3 @@
-
 # Put all targets defined here and in added subfolders under "contrib/" folder in GUI-based IDEs by default.
 # Some of third-party projects may override CMAKE_FOLDER or FOLDER property of their targets, so they will
 # appear not in "contrib/" as originally planned here.
@@ -12,8 +11,36 @@ unset (_current_dir_name)
 
 # Third-party libraries may have substandard code.
 # Also remove a possible source of nondeterminism.
-set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -D__DATE__= -D__TIME__= -D__TIMESTAMP__=")
-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -D__DATE__= -D__TIME__= -D__TIMESTAMP__=")
+set (CMAKE_C_FLAGS "-w -Wno-implicit-function-declaration ${CMAKE_C_FLAGS} -D__DATE__= -D__TIME__= -D__TIMESTAMP__=")
+set (CMAKE_CXX_FLAGS "-w -Wno-implicit-function-declaration ${CMAKE_CXX_FLAGS} -D__DATE__= -D__TIME__= -D__TIMESTAMP__=")
+
+# add_contrib cmake_folder[ base_folder1[, ...base_folderN]]
+function(add_contrib cmake_folder)
+    if (ARGN)
+        set(base_folders ${ARGN})
+    else()
+        set(base_folders ${cmake_folder})
+    endif()
+
+    foreach (base_folder ${base_folders})
+        # some typos in the code
+        if (NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${base_folder}")
+            message(FATAL_ERROR "No such base folder '${base_folder}' (for '${cmake_folder}' cmake folder). Typo in the base folder name?")
+        endif()
+
+        file(GLOB contrib_files "${base_folder}/*")
+        if (NOT contrib_files)
+            # Checking out *all* submodules takes > 5 min. Therefore, the smoke build ("FastTest") in CI initializes only the set of
+            # submodules minimally needed for a build and we cannot assume here that all submodules are populated.
+            message(STATUS "submodule ${base_folder} is missing or empty. to fix try run:")
+            message(STATUS "    git submodule update --init")
+            return()
+        endif()
+    endforeach()
+
+    message(STATUS "Adding contrib module ${base_folders} (configuring with ${cmake_folder})")
+    add_subdirectory (${cmake_folder})
+endfunction()
 
 if (WITH_COVERAGE)
   set (WITHOUT_COVERAGE_LIST ${WITHOUT_COVERAGE})
@@ -34,6 +61,7 @@ endif()
 set_property(DIRECTORY PROPERTY EXCLUDE_FROM_ALL 1)
 
 add_subdirectory (abseil-cpp-cmake)
+add_subdirectory (magic-enum-cmake)
 add_subdirectory (boost-cmake)
 add_subdirectory (cctz-cmake)
 add_subdirectory (consistent-hashing)
@@ -51,6 +79,14 @@ add_subdirectory (nanodbc-cmake)
 add_subdirectory (jsonc-cmake)
 add_subdirectory (ipdb-cmake)
 add_subdirectory (maxminddb-cmake)
+add_subdirectory (liburing-cmake)
+add_subdirectory (libevent-cmake)
+add_subdirectory (glog-cmake)
+add_subdirectory (folly-cmake)
+
+if (USE_LIBDEFLATE)
+  add_subdirectory (libdeflate-cmake)
+endif()
 
 if (USE_YAML_CPP)
     add_subdirectory (yaml-cpp-cmake)
@@ -71,8 +107,7 @@ endif ()
 
 if (USE_INTERNAL_RE2_LIBRARY)
     set(RE2_BUILD_TESTING 0 CACHE INTERNAL "")
-    add_subdirectory (re2)
-    add_subdirectory (re2_st)
+    add_subdirectory (re2-cmake)
 endif ()
 
 if (USE_INTERNAL_DOUBLE_CONVERSION_LIBRARY)
@@ -197,9 +232,11 @@ if (USE_INTERNAL_PARQUET_LIBRARY)
     add_subdirectory(arrow-cmake)
 
     # The library is large - avoid bloat.
-    target_compile_options (${ARROW_LIBRARY} PRIVATE -g0)
-    target_compile_options (${THRIFT_LIBRARY} PRIVATE -g0)
-    target_compile_options (${PARQUET_LIBRARY} PRIVATE -g0)
+    if( NOT (CMAKE_BUILD_TYPE STREQUAL "Debug"))
+        target_compile_options (${ARROW_LIBRARY} PRIVATE -g0)
+        target_compile_options (${THRIFT_LIBRARY} PRIVATE -g0)
+        target_compile_options (${PARQUET_LIBRARY} PRIVATE -g0)
+    endif()
 endif()
 
 if (USE_INTERNAL_AVRO_LIBRARY)
@@ -209,12 +246,14 @@ endif()
 if(USE_INTERNAL_GTEST_LIBRARY)
     set(GOOGLETEST_VERSION 1.10.0) # master
     # Google Test from sources
-    add_subdirectory(${ClickHouse_SOURCE_DIR}/contrib/googletest/googletest ${CMAKE_CURRENT_BINARY_DIR}/googletest)
+    add_subdirectory(${ClickHouse_SOURCE_DIR}/contrib/googletest ${CMAKE_CURRENT_BINARY_DIR}/googletest)
     # avoid problems with <regexp.h>
     target_compile_definitions (gtest INTERFACE GTEST_HAS_POSIX_RE=0)
+    target_compile_definitions (gmock INTERFACE)
 elseif(GTEST_SRC_DIR)
-    add_subdirectory(${GTEST_SRC_DIR}/googletest ${CMAKE_CURRENT_BINARY_DIR}/googletest)
+    add_subdirectory(${GTEST_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/googletest)
     target_compile_definitions(gtest INTERFACE GTEST_HAS_POSIX_RE=0)
+    target_compile_definitions(gmock INTERFACE)
 endif()
 
 if (USE_EMBEDDED_COMPILER)
@@ -265,14 +304,31 @@ if (USE_INTERNAL_GRPC_LIBRARY)
     add_subdirectory(grpc-cmake)
 endif ()
 
-if (USE_INTERNAL_AWS_S3_LIBRARY)
-    add_subdirectory(aws-s3-cmake)
+if (ENABLE_MSGPACK)
+    add_library(_msgpack INTERFACE)
+    target_include_directories(_msgpack SYSTEM BEFORE INTERFACE "${ClickHouse_SOURCE_DIR}/contrib/msgpack-c/include")
+    add_library(ch_contrib::msgpack ALIAS _msgpack)
+endif()
 
-    # The library is large - avoid bloat.
-    target_compile_options (aws_s3 PRIVATE -g0)
-    target_compile_options (aws_s3_checksums PRIVATE -g0)
+add_contrib (aws-cmake
+    aws
+    aws-c-auth
+    aws-c-cal
+    aws-c-common
+    aws-c-compression
+    aws-c-event-stream
+    aws-c-http
+    aws-c-io
+    aws-c-mqtt
+    aws-c-s3
+    aws-c-sdkutils
+    aws-s2n-tls
+    aws-checksums
+    aws-crt-cpp
+    aws-cmake
+)
 
-endif ()
+add_subdirectory(corrosion-cmake)
 
 if (USE_BASE64)
     add_subdirectory (base64-cmake)
@@ -280,6 +336,10 @@ endif()
 
 if (USE_SIMDJSON)
     add_subdirectory (simdjson-cmake)
+endif()
+
+if (USE_RAPIDJSON)
+    add_subdirectory (rapidjson-cmake)
 endif()
 
 if (USE_BREAKPAD)
@@ -352,10 +412,40 @@ add_subdirectory(incubator-brpc)
 if(OPENSSL_INCLUDE_DIR)
     target_include_directories(brpc-static BEFORE PRIVATE ${OPENSSL_INCLUDE_DIR})
 endif()
+add_subdirectory(hashidsxx-cmake)
+
+add_subdirectory(morton-nd-cmake)
+
+add_subdirectory(xxHash-cmake)
 
 if (ENABLE_BENCHMARK)
     add_subdirectory(benchmark)
 endif()
 
-add_subdirectory(numactl-cmake)
+add_subdirectory(ulid-c-cmake)
 add_subdirectory(hivemetastore-cmake)
+add_subdirectory(wyhash-cmake)
+if (USE_NLP)
+    add_subdirectory(libstemmer-c-cmake)
+    add_subdirectory(wordnet-blast-cmake)
+    add_subdirectory(lemmagen-c-cmake)
+    add_subdirectory (nlp-data-cmake)
+    add_subdirectory (cld2-cmake)
+endif()
+
+set(BUILD_SHARED_LIBS_BEFORE_MSGPACK ${BUILD_SHARED_LIBS})
+unset (BUILD_SHARED_LIBS)
+add_subdirectory(msgpack-c)
+set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_BEFORE_MSGPACK})
+unset(BUILD_SHARED_LIBS_BEFORE_MSGPACK)
+if (USE_CPP_JIEBA)
+    add_subdirectory(cppjieba-cmake)
+endif()
+
+if (USE_TSQUERY)
+    add_subdirectory(TSQuery-cmake)
+endif()
+
+if (ENABLE_HUALLOC)
+add_subdirectory (hualloc-cmake)
+endif()

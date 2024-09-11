@@ -11,7 +11,9 @@
 #include <Interpreters/PartLog.h>
 #include <Interpreters/Context.h>
 
+#include "common/types.h"
 #include <Common/CurrentThread.h>
+#include <Common/time.h>
 
 namespace DB
 {
@@ -27,6 +29,8 @@ NamesAndTypesList PartLogElement::getNamesAndTypes()
             {"RemovePart",    static_cast<Int8>(REMOVE_PART)},
             {"MutatePart",    static_cast<Int8>(MUTATE_PART)},
             {"MovePart",      static_cast<Int8>(MOVE_PART)},
+            {"PreloadPart",   static_cast<Int8>(PRELOAD_PART)},
+            {"DROPCACHE_PART", static_cast<Int8>(DROPCACHE_PART)},
         }
     );
 
@@ -36,6 +40,7 @@ NamesAndTypesList PartLogElement::getNamesAndTypes()
         {"query_id", std::make_shared<DataTypeString>()},
         {"event_type", std::move(event_type_datatype)},
         {"event_date", std::make_shared<DataTypeDate>()},
+        {"start_time", std::make_shared<DataTypeDateTime>()},
 
         {"event_time", std::make_shared<DataTypeDateTime>()},
         {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6)},
@@ -46,9 +51,12 @@ NamesAndTypesList PartLogElement::getNamesAndTypes()
         {"table", std::make_shared<DataTypeString>()},
         {"part_name", std::make_shared<DataTypeString>()},
         {"partition_id", std::make_shared<DataTypeString>()},
+        {"partition", std::make_shared<DataTypeString>()},
         {"path_on_disk", std::make_shared<DataTypeString>()},
 
         {"rows", std::make_shared<DataTypeUInt64>()},
+        {"segments", std::make_shared<DataTypeUInt64>()},
+        {"preload_level", std::make_shared<DataTypeUInt64>()},
         {"size_in_bytes", std::make_shared<DataTypeUInt64>()}, // On disk
 
         /// Merge-specific info
@@ -71,6 +79,7 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(query_id);
     columns[i++]->insert(event_type);
     columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
+    columns[i++]->insert(start_time);
     columns[i++]->insert(event_time);
     columns[i++]->insert(event_time_microseconds);
     columns[i++]->insert(duration_ms);
@@ -79,9 +88,12 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(table_name);
     columns[i++]->insert(part_name);
     columns[i++]->insert(partition_id);
+    columns[i++]->insert(partition);
     columns[i++]->insert(path_on_disk);
 
     columns[i++]->insert(rows);
+    columns[i++]->insert(segments);
+    columns[i++]->insert(preload_level);
     columns[i++]->insert(bytes_compressed_on_disk);
 
     Array source_part_names_array;
@@ -105,17 +117,6 @@ bool PartLog::addNewPart(
     ContextPtr current_context, const MutableDataPartPtr & part, UInt64 elapsed_ns, const ExecutionStatus & execution_status)
 {
     return addNewParts(current_context, {part}, elapsed_ns, execution_status);
-}
-
-inline UInt64 time_in_microseconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(timepoint.time_since_epoch()).count();
-}
-
-
-inline UInt64 time_in_seconds(std::chrono::time_point<std::chrono::system_clock> timepoint)
-{
-    return std::chrono::duration_cast<std::chrono::seconds>(timepoint.time_since_epoch()).count();
 }
 
 bool PartLog::addNewParts(
@@ -154,6 +155,10 @@ bool PartLog::addNewParts(
             elem.database_name = table_id.database_name;
             elem.table_name = table_id.table_name;
             elem.partition_id = part->info.partition_id;
+            {
+                WriteBufferFromString out(elem.partition);
+                part->partition.serializeText(part->storage, out, {});
+            }
             elem.part_name = part->name;
             elem.path_on_disk = part->getFullPath();
 
@@ -173,6 +178,30 @@ bool PartLog::addNewParts(
     }
 
     return true;
+}
+
+PartLogElement PartLog::createElement(PartLogElement::Type event_type, const IMergeTreeDataPartPtr & part, UInt64 elapsed_ns, const String & exception, UInt64 submit_ts, UInt64 segments, UInt64 preload_level)
+{
+    PartLogElement elem;
+
+    elem.event_type = event_type;
+    elem.start_time = submit_ts;
+    elem.event_time = time(nullptr);
+    elem.duration_ms = elapsed_ns / 1000000;
+
+    elem.database_name = part->storage.getDatabaseName();
+    elem.table_name = part->storage.getTableName();
+    elem.partition_id = part->info.partition_id;
+    elem.part_name = part->name;
+
+    elem.rows = part->rows_count;
+    elem.segments = segments;
+    elem.preload_level = preload_level;
+    elem.bytes_compressed_on_disk = part->bytes_on_disk;
+
+    elem.exception = exception;
+
+    return elem;
 }
 
 }

@@ -35,6 +35,7 @@ public:
 
     bool useDefaultImplementationForNulls() const override { return true; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -56,13 +57,14 @@ public:
             for (size_t i = 0; i < size; ++i)
                 arguments[i].column->get(j, row[i]);
             MergeTreePartition partition(std::move(row));
-            result_column->insert(partition.getID(sample_block));
+            /// TODO: (zuochuang.zema) how to get extract_nullable_date_value
+            result_column->insert(partition.getID(sample_block, false));
         }
         return result_column;
     }
 };
 
-void registerFunctionPartitionId(FunctionFactory & factory)
+REGISTER_FUNCTION(PartitionId)
 {
     factory.registerFunction<FunctionPartitionId>();
 }

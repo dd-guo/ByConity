@@ -23,7 +23,6 @@
 
 #include <Core/QueryProcessingStage.h>
 #include <Interpreters/IInterpreterUnionOrSelectQuery.h>
-#include <QueryPlan/QueryCacheStep.h>
 
 namespace DB
 {
@@ -65,16 +64,16 @@ public:
 
 private:
 
-    void checkQueryCache(QueryPlan & query_plan);
-
     std::vector<std::unique_ptr<IInterpreterUnionOrSelectQuery>> nested_interpreters;
 
-    static Block getCommonHeaderForUnion(const Blocks & headers, bool allow_extended_conversion);
+    Block getCommonHeaderForUnion(const Blocks & headers, bool allow_extended_conversion);
 
     Block getCurrentChildResultHeader(const ASTPtr & ast_ptr_, const Names & required_result_column_names);
 
     std::unique_ptr<IInterpreterUnionOrSelectQuery>
     buildCurrentChildInterpreter(const ASTPtr & ast_ptr_, const Names & current_required_result_column_names);
+
+    Poco::Logger * log;
 };
 
 }

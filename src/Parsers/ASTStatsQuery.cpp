@@ -14,6 +14,7 @@
  */
 
 #include <Parsers/ASTStatsQuery.h>
+#include <Common/FieldVisitorToString.h>
 
 namespace DB
 {
@@ -28,49 +29,6 @@ String formatStatsQueryKind(StatsQueryKind kind)
         return "STATS";
     else
         throw Exception("Not supported kind of stats query kind.", ErrorCodes::SYNTAX_ERROR);
-}
-
-String ASTCreateStatsQuery::getID(char delim) const
-{
-    std::ostringstream res;
-
-    res << CreateStatsQueryInfo::QueryPrefix << delim << formatStatsQueryKind(kind);
-
-    if (if_not_exists)
-        res << delim << "ifNotExists";
-
-    if (!target_all)
-    {
-        if (!database.empty())
-            res << delim << database;
-
-        res << delim << table;
-    }
-
-    if (!columns.empty())
-    {
-        for (auto & col : columns)
-        {
-            res << delim << col;
-        }
-    }
-
-    if (sample_type == SampleType::FullScan)
-    {
-        res << delim << "fullScan";
-    }
-    else if (sample_type == SampleType::Sample)
-    {
-        res << delim << "sample";
-
-        if (sample_rows)
-            res << delim << "rows=" << *sample_rows;
-
-        if (sample_ratio)
-            res << delim << "ratio=" << *sample_ratio;
-    }
-
-    return res.str();
 }
 
 ASTPtr ASTCreateStatsQuery::clone() const
@@ -105,6 +63,12 @@ void ASTCreateStatsQuery::formatQueryImpl(const FormatSettings & settings, Forma
         partition->formatImpl(settings, state, frame);
     }
 
+    if (sync_mode != SyncMode::Default)
+    {
+        String str = sync_mode == SyncMode::Sync ? " SYNC" : " ASYNC";
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << str << (settings.hilite ? hilite_none : "");
+    }
+
     bool printed = false;
     auto printWithIfNeeded = [&printed, &settings] {
         if (!printed)
@@ -133,6 +97,22 @@ void ASTCreateStatsQuery::formatQueryImpl(const FormatSettings & settings, Forma
         {
             settings.ostr << ' ' << *sample_ratio;
             settings.ostr << (settings.hilite ? hilite_keyword : "") << " RATIO" << (settings.hilite ? hilite_none : "");
+        }
+    }
+
+    if (settings_changes_opt)
+    {
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << " WITH " << (settings.hilite ? hilite_none : "");
+        bool is_first = true;
+        for (auto [k, v] : settings_changes_opt.value())
+        {
+            if (!is_first)
+            {
+                settings.ostr << ", ";
+            }
+            is_first = false;
+
+            settings.ostr << k << "=" << applyVisitor(FieldVisitorToString(), v);
         }
     }
 }

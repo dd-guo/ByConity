@@ -48,6 +48,8 @@ std::string HostWithPorts::toDebugString() const
         wb << " exc/" << exchange_port;
     if (exchange_status_port != 0)
         wb << " exs/" << exchange_status_port;
+    if (real_id)
+        wb << " real_id/" << *real_id;
     wb << '}';
 
     return wb.str();
@@ -107,6 +109,18 @@ std::string getVirtualWareHouseID(ContextPtr context)
 {
     static std::string virtual_warehouse_id = getFromEnvOrConfig(context, "VIRTUAL_WAREHOUSE_ID");
     return virtual_warehouse_id;
+}
+
+/// for some system getIPOrFQDNOrHostName() returns ip address with network interface at the end like fe80::f24c:28af:6150:e261%enp1s0f0
+std::string truncateNetworkInterfaceIfHas(const std::string & s)
+{
+    auto pos = s.find('%');
+    if (pos != std::string::npos)
+    {
+        std::string truncated = s.substr(0, pos);
+        return truncated;
+    }
+    return s;
 }
 
 }

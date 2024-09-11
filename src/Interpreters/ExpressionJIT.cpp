@@ -18,6 +18,8 @@
 #include <Functions/FunctionsComparison.h>
 #include <DataTypes/Native.h>
 #include <Functions/IFunctionAdaptors.h>
+#include <Columns/IColumn.h>
+#include <Columns/ColumnString.h>
 
 #include <Interpreters/JIT/CHJIT.h>
 #include <Interpreters/JIT/CompileDAG.h>
@@ -100,9 +102,41 @@ public:
             }
 
             columns[arguments.size()] = getColumnData(result_column.get());
+            auto result_type_without_nullable = removeNullable(result_type);
+            WhichDataType which_type(result_type);
+            WhichDataType which_type_without_nullable(result_type_without_nullable);
+            if (which_type_without_nullable.isString())
+            {
+                columns[arguments.size()].data = reinterpret_cast<const char *>(malloc(1));
+            }
 
             auto jit_compiled_function = compiled_function_holder->compiled_function.compiled_function;
             jit_compiled_function(input_rows_count, columns.data());
+
+            /// for string, re construct Column
+            if (which_type_without_nullable.isString())
+            {
+                ColumnString * column_string = nullptr;
+                if (which_type.isNullable())
+                {
+                    auto * column_nullable = typeid_cast<ColumnNullable *>(result_column.get());
+                    column_string = typeid_cast<ColumnString *>(column_nullable->getNestedColumnPtr()->assumeMutable().get());
+                }
+                else
+                {
+                    column_string = typeid_cast<ColumnString *>(result_column.get());
+                }
+                auto & result_column_data = columns[arguments.size()];
+                ColumnString::Chars & chars = column_string->getChars();
+                auto char_length = column_string->getOffsets().back();
+                chars.resize(char_length);
+                // if not some address, it means realloc a new memory,so do memcpy and free ColumnData.data
+                if (reinterpret_cast<intptr_t>(chars.data()) != reinterpret_cast<intptr_t>(const_cast<char *>(result_column_data.data)))
+                {
+                    memcpy(chars.data(), result_column_data.data, char_length);
+                    free(const_cast<char *>(result_column_data.data));
+                }
+            }
 
             #if defined(MEMORY_SANITIZER)
             /// Memory sanitizer don't know about stores from JIT-ed code.
@@ -161,9 +195,18 @@ public:
 
     bool isCompilable() const override { return true; }
 
-    llvm::Value * compile(llvm::IRBuilderBase & builder, Values values) const override
+    llvm::Value * compile(llvm::IRBuilderBase & builder, Values values, JITContext & jit_context) const override
     {
-        return dag.compile(builder, values);
+        return dag.compile(builder, values, jit_context);
+    }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & arguments) const override
+    {
+        for (const auto & f : nested_functions)
+            if (!f->isSuitableForShortCircuitArgumentsExecution(arguments))
+                return false;
+
+        return true;
     }
 
     String getName() const override { return name; }
@@ -313,12 +356,34 @@ static bool isCompilableConstant(const ActionsDAG::Node & node)
     return node.column && isColumnConst(*node.column) && canBeNativeType(*node.result_type);
 }
 
-static bool isCompilableFunction(const ActionsDAG::Node & node)
+static bool hasLazyExecutedChild(const ActionsDAG::Node & node, const std::unordered_set<const ActionsDAG::Node *> & lazy_executed_nodes)
 {
     if (node.type != ActionsDAG::ActionType::FUNCTION)
         return false;
 
     auto & function = *node.function_base;
+
+    IFunction::ShortCircuitSettings settings;
+    if (function.isShortCircuit(settings, node.children.size()))
+    {
+        for (const auto & child : node.children)
+        {
+            if (lazy_executed_nodes.contains(child))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool isCompilableFunction(const ActionsDAG::Node & node, const std::unordered_set<const ActionsDAG::Node *> & lazy_executed_nodes)
+{
+    if (node.type != ActionsDAG::ActionType::FUNCTION)
+        return false;
+
+    auto & function = *node.function_base;
+
+    if (hasLazyExecutedChild(node, lazy_executed_nodes))
+        return false;
 
     if (!canBeNativeType(*function.getResultType()))
         return false;
@@ -357,7 +422,7 @@ static CompileDAG getCompilableDAG(
         const auto * node = frame.node;
 
         bool is_compilable_constant = isCompilableConstant(*node);
-        bool is_compilable_function = isCompilableFunction(*node);
+        bool is_compilable_function = isCompilableFunction(*node, {});
 
         if (!is_compilable_function || is_compilable_constant)
         {
@@ -420,11 +485,12 @@ static CompileDAG getCompilableDAG(
     return dag;
 }
 
-void ActionsDAG::compileFunctions(size_t min_count_to_compile_expression)
+void ActionsDAG::compileFunctions(size_t min_count_to_compile_expression, const std::unordered_set<const ActionsDAG::Node *> & lazy_executed_nodes)
 {
     struct Data
     {
         bool is_compilable_in_isolation = false;
+        bool has_lazy_executed_child = false;
         bool all_parents_compilable = true;
         size_t compilable_children_size = 0;
         size_t children_size = 0;
@@ -436,8 +502,10 @@ void ActionsDAG::compileFunctions(size_t min_count_to_compile_expression)
 
     for (const auto & node : nodes)
     {
-        bool node_is_compilable_in_isolation = isCompilableFunction(node) && !isCompilableConstant(node);
+        bool node_is_compilable_in_isolation = isCompilableFunction(node, lazy_executed_nodes) && !isCompilableConstant(node);
+        bool node_has_lazy_executed_child = hasLazyExecutedChild(node, lazy_executed_nodes);
         node_to_data[&node].is_compilable_in_isolation = node_is_compilable_in_isolation;
+        node_to_data[&node].has_lazy_executed_child = node_has_lazy_executed_child;
     }
 
     struct Frame
@@ -498,6 +566,11 @@ void ActionsDAG::compileFunctions(size_t min_count_to_compile_expression)
                         current_node_data.compilable_children_size += 1;
                     }
 
+                    if (child_data.has_lazy_executed_child)
+                    {
+                        current_node_data.has_lazy_executed_child = true;
+                    }
+
                     current_node_data.children_size += node_to_data[child].children_size;
                 }
 
@@ -512,16 +585,16 @@ void ActionsDAG::compileFunctions(size_t min_count_to_compile_expression)
     for (const auto & node : nodes)
     {
         auto & node_data = node_to_data[&node];
-        bool node_is_valid_for_compilation = node_data.is_compilable_in_isolation && node_data.compilable_children_size > 0;
+        bool node_is_valid_for_compilation = node_data.is_compilable_in_isolation && !node_data.has_lazy_executed_child && node_data.compilable_children_size > 0;
 
         for (const auto & child : node.children)
             node_to_data[child].all_parents_compilable &= node_is_valid_for_compilation;
     }
 
-    for (const auto & node : index)
+    for (const auto & output_node : outputs)
     {
-        /// Force result nodes to compile
-        node_to_data[node].all_parents_compilable = false;
+        /// Force output nodes to compile
+        node_to_data[output_node].all_parents_compilable = false;
     }
 
     std::vector<Node *> nodes_to_compile;
@@ -530,7 +603,7 @@ void ActionsDAG::compileFunctions(size_t min_count_to_compile_expression)
     {
         auto & node_data = node_to_data[&node];
 
-        bool node_is_valid_for_compilation = node_data.is_compilable_in_isolation && node_data.compilable_children_size > 0;
+        bool node_is_valid_for_compilation = node_data.is_compilable_in_isolation && !node_data.has_lazy_executed_child && node_data.compilable_children_size > 0;
 
         /// If all parents are compilable then this node should not be standalone compiled
         bool should_compile = node_is_valid_for_compilation && !node_data.all_parents_compilable;

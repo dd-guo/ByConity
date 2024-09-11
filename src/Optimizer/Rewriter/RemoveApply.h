@@ -17,6 +17,7 @@
 
 #include <Interpreters/Context.h>
 #include <Optimizer/Rewriter/Rewriter.h>
+#include <Optimizer/Rule/Rule.h>
 #include <QueryPlan/SimplePlanRewriter.h>
 #include <QueryPlan/TranslationMap.h>
 
@@ -60,8 +61,11 @@ namespace DB
 class RemoveCorrelatedScalarSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveCorrelatedScalarSubquery"; }
+
+private:
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_remove_correlated_scalar_subquery; }
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
 };
 
 /**
@@ -125,8 +129,14 @@ private:
 class RemoveUnCorrelatedScalarSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveUnCorrelatedScalarSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override
+    {
+        return context->getSettingsRef().enable_remove_uncorrelated_scalar_subquery;
+    }
 };
 
 class UnCorrelatedScalarSubqueryVisitor : public SimplePlanRewriter<Void>
@@ -163,8 +173,11 @@ private:
 class RemoveCorrelatedInSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveCorrelatedInSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_remove_correlated_in_subquery; }
 };
 
 class CorrelatedInSubqueryVisitor : public SimplePlanRewriter<Void>
@@ -203,8 +216,11 @@ public:
 class RemoveUnCorrelatedInSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveUnCorrelatedInSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_remove_uncorrelated_in_subquery; }
 };
 
 class UnCorrelatedInSubqueryVisitor : public SimplePlanRewriter<Void>
@@ -223,8 +239,11 @@ public:
 class RemoveCorrelatedExistsSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveCorrelatedExistsSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_remove_correlated_exists_subquery; }
 };
 
 class CorrelatedExistsSubqueryVisitor : public SimplePlanRewriter<Void>
@@ -243,8 +262,14 @@ public:
 class RemoveUnCorrelatedExistsSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveUnCorrelatedExistsSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override
+    {
+        return context->getSettingsRef().enable_remove_uncorrelated_exists_subquery;
+    }
 };
 
 class UnCorrelatedExistsSubqueryVisitor : public SimplePlanRewriter<Void>
@@ -263,14 +288,23 @@ public:
 class RemoveUnCorrelatedQuantifiedComparisonSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveUnCorrelatedQuantifiedComparisonSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override
+    {
+        return context->getSettingsRef().enable_remove_uncorrelated_quantified_comparison_subquery;
+    }
 };
 
 class UnCorrelatedQuantifiedComparisonSubqueryVisitor : public SimplePlanRewriter<Void>
 {
 public:
-    UnCorrelatedQuantifiedComparisonSubqueryVisitor(ContextMutablePtr context_, CTEInfo & cte_info) : SimplePlanRewriter(context_, cte_info) { }
+    UnCorrelatedQuantifiedComparisonSubqueryVisitor(ContextMutablePtr context_, CTEInfo & cte_info) : SimplePlanRewriter(context_, cte_info)
+    {
+    }
+
 private:
     PlanNodePtr visitApplyNode(ApplyNode &, Void &) override;
 };
@@ -284,17 +318,71 @@ private:
 class RemoveCorrelatedQuantifiedComparisonSubquery : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "RemoveCorrelatedQuantifiedComparisonSubquery"; }
+
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override
+    {
+        return context->getSettingsRef().enable_remove_correlated_quantified_comparison_subquery;
+    }
 };
 
 class CorrelatedQuantifiedComparisonSubqueryVisitor : public SimplePlanRewriter<Void>
 {
 public:
-    CorrelatedQuantifiedComparisonSubqueryVisitor(ContextMutablePtr context_, CTEInfo & cte_info) : SimplePlanRewriter(context_, cte_info) { }
+    CorrelatedQuantifiedComparisonSubqueryVisitor(ContextMutablePtr context_, CTEInfo & cte_info) : SimplePlanRewriter(context_, cte_info)
+    {
+    }
 
 private:
     PlanNodePtr visitApplyNode(ApplyNode &, Void &) override;
+};
+
+
+class UnnestingWithWindow : public Rule
+{
+public:
+    RuleType getType() const override { return RuleType::UNNESTING_WITH_WINDOW; }
+    String getName() const override { return "UNNESTING_WITH_WINDOW"; }
+    ConstRefPatternPtr getPattern() const override;
+    bool isEnabled(ContextPtr context) const override { return context->getSettingsRef().enable_unnesting_subquery_with_window; }
+
+protected:
+    TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
+};
+
+class UnnestingWithProjectionWindow : public UnnestingWithWindow
+{
+public:
+    RuleType getType() const override { return RuleType::UNNESTING_WITH_PROJECTION_WINDOW; }
+    String getName() const override { return "UNNESTING_WITH_PROJECTION_WINDOW"; }
+    bool isEnabled(ContextPtr context) const override { return context->getSettingsRef().enable_unnesting_subquery_with_window; }
+    ConstRefPatternPtr getPattern() const override;
+};
+
+class ExistsToSemiJoin : public Rule
+{
+public:
+    RuleType getType() const override { return RuleType::EXISTS_TO_SEMI_JOIN; }
+    String getName() const override { return "EXISTS_TO_SEMI_JOIN"; }
+    bool isEnabled(ContextPtr context) const override { return context->getSettingsRef().enable_unnesting_subquery_with_semi_anti_join; }
+    ConstRefPatternPtr getPattern() const override;
+
+protected:
+    TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
+};
+
+class InToSemiJoin : public Rule
+{
+public:
+    RuleType getType() const override { return RuleType::IN_TO_SEMI_JOIN; }
+    String getName() const override { return "IN_TO_SEMI_JOIN"; }
+    bool isEnabled(ContextPtr context) const override { return context->getSettingsRef().enable_unnesting_subquery_with_semi_anti_join; }
+    ConstRefPatternPtr getPattern() const override;
+
+protected:
+    TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext & context) override;
 };
 
 }

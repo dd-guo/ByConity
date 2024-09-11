@@ -18,7 +18,9 @@ struct EnabledRolesInfo
     boost::container::flat_set<UUID> enabled_roles_with_admin_option;
     std::unordered_map<UUID, String> names_of_roles;
     AccessRights access;
+    SensitiveAccessRights sensitive_access;
     SettingsProfileElements settings_from_enabled_roles;
+    bool is_admin = false;
 
     Strings getCurrentRolesNames() const;
     Strings getEnabledRolesNames() const;

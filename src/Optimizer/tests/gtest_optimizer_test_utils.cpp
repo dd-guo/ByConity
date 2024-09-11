@@ -29,6 +29,8 @@
 using namespace DB;
 using namespace DB::Patterns;
 
+extern const char * auto_config_build[];
+
 namespace DB
 {
 namespace
@@ -99,7 +101,7 @@ createTableScanNode(std::string database, std::string table, std::optional<DataS
 std::shared_ptr<PlanNode<MockedFilterStep>>
 createFilterNode(std::string column, std::string filter, std::optional<DataStream> output_stream_, PlanNodes children)
 {
-    auto step = std::make_unique<const MockedFilterStep>(column, filter, output_stream_);
+    auto step = std::make_unique<MockedFilterStep>(column, filter, output_stream_);
     auto node = std::make_shared<PlanNode<MockedFilterStep>>(id_allocator->nextId(), std::move(step));
     replaceChildrenAndInputStream(node, children);
     return node;
@@ -135,7 +137,7 @@ createAggregatingNode(std::string key, std::string aggregator, bool final, std::
 std::shared_ptr<PlanNode<UnionStep>> createUnionNode(std::optional<DataStream> output_stream_, DB::PlanNodes children)
 {
     DataStreams input_stream_ = collectInputStreams(children);
-    auto step = std::make_unique<UnionStep>(input_stream_, output_stream_ ? *output_stream_ : DataStream{}, false);
+    auto step = std::make_unique<UnionStep>(input_stream_, output_stream_ ? *output_stream_ : DataStream{});
     return std::make_shared<PlanNode<UnionStep>>(id_allocator->nextId(), std::move(step), children);
 }
 
@@ -254,5 +256,17 @@ std::string executeTestDBQuery(const std::string & query, ContextMutablePtr cont
         std::cout << "Finish test DB query, got result: " << std::endl << "\033[1;32m" << res << "\033[0m" << std::flush;
 
     return res;
+}
+
+bool isDebugBuild()
+{
+    for (auto * it = auto_config_build; *it; it += 2)
+    {
+        if (strcmp(it[0], "BUILD_TYPE") == 0)
+        {
+            return strcmp(it[1], "Debug") == 0;
+        }
+    }
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "");
 }
 }

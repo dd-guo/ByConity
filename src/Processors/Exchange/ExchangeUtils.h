@@ -18,15 +18,17 @@
 #include <memory>
 #include <Interpreters/Context.h>
 #include <Interpreters/DistributedStages/AddressInfo.h>
-#include <Processors/Exchange/DataTrans/DataTransKey.h>
 #include <Processors/Exchange/DataTrans/IBroadcastSender.h>
 #include <Processors/Exchange/ExchangeDataKey.h>
 #include <Processors/Exchange/ExchangeOptions.h>
 #include <absl/strings/str_split.h>
+#include <fmt/core.h>
+#include <Common/CurrentThread.h>
 #include <Common/Allocator.h>
 #include <Common/CurrentMemoryTracker.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
+#include <Common/time.h>
 #include <common/types.h>
 
 namespace DB
@@ -35,6 +37,8 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int EXCHANGE_DATA_TRANS_EXCEPTION;
+    extern const int BRPC_EXCEPTION;
+    extern const int TIMEOUT_EXCEEDED;
 }
 class ExchangeUtils
 {
@@ -51,7 +55,7 @@ public:
     {
         const auto & settings = context->getSettingsRef();
         return {
-            .exhcange_timeout_ms = static_cast<UInt32>(settings.exchange_timeout_ms),
+            .exchange_timeout_ts = context->getQueryExpirationTimeStamp(),
             .send_threshold_in_bytes = settings.exchange_buffer_send_threshold_in_bytes,
             .send_threshold_in_row_num = settings.exchange_buffer_send_threshold_in_row,
             .force_remote_mode = settings.exchange_enable_force_remote_mode,
@@ -61,11 +65,28 @@ public:
     static inline BroadcastStatus sendAndCheckReturnStatus(IBroadcastSender & sender, Chunk chunk)
     {
         BroadcastStatus status = sender.send(std::move(chunk));
-        if (status.is_modifer && status.code > 0)
+        if (status.is_modified_by_operator && status.code > 0)
         {
-            throw Exception(
-                sender.getName() + " fail to send data: " + status.message + " code: " + std::to_string(status.code),
-                ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
+            if(status.code == BroadcastStatusCode::SEND_TIMEOUT)
+            {
+                throw Exception(
+                    ErrorCodes::TIMEOUT_EXCEEDED,
+                    "Query {} send data timeout, maybe you can increase settings max_execution_time. Debug info: sender {}, msg : {}",
+                    CurrentThread::getQueryId(),
+                    sender.getName(),
+                    status.message);
+
+            }
+            else 
+            {
+                throw Exception(
+                    ErrorCodes::BRPC_EXCEPTION,
+                    "Query {} cancel sending data: sender {}, code: {}, msg : {}",
+                    CurrentThread::getQueryId(),
+                    sender.getName(),
+                    status.code,
+                    status.message);
+            }
         }
         return status;
     }
@@ -91,13 +112,6 @@ public:
             merged_sender->merge(std::move(*senders_to_merge[i]));
         }
         senders.emplace_back(std::move(merged_sender));
-    }
-
-    static inline void transferThreadMemoryToGlobal(Int64 bytes)
-    {
-        CurrentMemoryTracker::free(bytes);
-        if (DB::MainThreadStatus::get())
-            total_memory_tracker.alloc(bytes);
     }
 
     static inline void transferGlobalMemoryToThread(Int64 bytes)

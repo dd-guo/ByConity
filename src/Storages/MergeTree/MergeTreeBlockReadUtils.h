@@ -22,10 +22,12 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 #include <Core/NamesAndTypes.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/MergeTreeRangeReader.h>
-
+#include <Storages/SelectQueryInfo.h>
+#include <Storages/MergeTree/LateMaterialize/MergeTreeRangeReaderLM.h>
 
 namespace DB
 {
@@ -43,8 +45,28 @@ using MergeTreeBlockSizePredictorPtr = std::unique_ptr<MergeTreeBlockSizePredict
   * so that you can calculate the DEFAULT expression for these columns.
   * Adds them to the `columns`.
   */
-NameSet injectRequiredColumns(const MergeTreeMetaBase & storage, const StorageMetadataPtr & metadata_snapshot, const MergeTreeMetaBase::DataPartPtr & part, Names & columns);
+NameSet injectRequiredColumns(const MergeTreeMetaBase & storage,
+    const StorageMetadataPtr & metadata_snapshot, const MergeTreeMetaBase::DataPartPtr & part,
+    Names & columns, const String& default_injected_column);
 
+
+struct MergeTreeReadTaskColumns
+{
+    /// column names to read during WHERE
+    NamesAndTypesList columns;
+    /// column names to read during PREWHERE
+    NamesAndTypesList pre_columns;
+    /// bitmap columns read during WHERE
+    NameSet bitmap_index_columns;
+    /// bitmap columns read during PREWHERE
+    NameSet bitmap_index_pre_columns;
+    /// resulting block may require reordering in accordance with `ordered_names`
+    bool should_reorder;
+    /// column names to read in each stage in chain when using early materialize read
+    std::vector<NamesAndTypesList> per_stage_columns;
+    /// nameset for bitmap column for each stage
+    std::vector<NameSet> per_stage_bitmap_nameset;
+};
 
 /// A batch of work for MergeTreeThreadSelectBlockInputStream
 struct MergeTreeReadTask
@@ -53,18 +75,16 @@ struct MergeTreeReadTask
     MergeTreeMetaBase::DataPartPtr data_part;
     /// used to filter out deleted rows from part, could be nullptr if no deleted rows
     ImmutableDeleteBitmapPtr delete_bitmap;
-    /// Ranges to read from `data_part`.
-    MarkRanges mark_ranges;
+    /// Ranges to batch read once from `data_part`.
+    MarkRanges mark_ranges_once_read;
     /// for virtual `part_index` virtual column
     size_t part_index_in_query;
     /// ordered list of column names used in this query, allows returning blocks with consistent ordering
     const Names & ordered_names;
     /// used to determine whether column should be filtered during PREWHERE or WHERE
     const NameSet & column_name_set;
-    /// column names to read during WHERE
-    NamesAndTypesList & columns;
-    /// column names to read during PREWHERE
-    NamesAndTypesList & pre_columns;
+    /// task columns
+    const MergeTreeReadTaskColumns & task_columns;
     /// should PREWHERE column be returned to requesting side?
     const bool remove_prewhere_column;
     /// resulting block may require reordering in accordance with `ordered_names`
@@ -74,34 +94,36 @@ struct MergeTreeReadTask
     /// Used to save current range processing status
     MergeTreeRangeReader range_reader;
     MergeTreeRangeReader pre_range_reader;
+    MergeTreeRangeReaderLM * msr_range_reader = nullptr;
+    /// Ranges to total read, which will be used for to calc buffer size and disk-cache caching data ranges
+    MarkRanges mark_ranges_total_read;
 
-    bool isFinished() const { return mark_ranges.empty() && range_reader.isCurrentRangeFinished(); }
+    bool isFinished() const
+    {
+        if (!msr_range_reader)
+            return mark_ranges_once_read.empty() && range_reader.isCurrentRangeFinished();
+        else
+            return mark_ranges_once_read.empty() && msr_range_reader->isCurrentRangeFinished();
+    }
 
     MergeTreeReadTask(
-        const MergeTreeMetaBase::DataPartPtr & data_part_, ImmutableDeleteBitmapPtr delete_bitmap_, const MarkRanges & mark_ranges_, const size_t part_index_in_query_,
-        const Names & ordered_names_, const NameSet & column_name_set_, NamesAndTypesList & columns_,
-        NamesAndTypesList & pre_columns_, const bool remove_prewhere_column_, const bool should_reorder_,
-        MergeTreeBlockSizePredictorPtr && size_predictor_);
+        const MergeTreeMetaBase::DataPartPtr & data_part_, ImmutableDeleteBitmapPtr delete_bitmap_, const MarkRanges & mark_ranges_once_read_, const size_t part_index_in_query_,
+        const Names & ordered_names_, const NameSet & column_name_set_,
+        const MergeTreeReadTaskColumns & task_columns_,
+        bool remove_prewhere_column_, bool should_reorder_,
+        MergeTreeBlockSizePredictorPtr && size_predictor_, const MarkRanges & mark_ranges_total_read_);
 
     virtual ~MergeTreeReadTask();
 };
 
-struct MergeTreeReadTaskColumns
-{
-    /// column names to read during WHERE
-    NamesAndTypesList columns;
-    /// column names to read during PREWHERE
-    NamesAndTypesList pre_columns;
-    /// resulting block may require reordering in accordance with `ordered_names`
-    bool should_reorder;
-};
-
 MergeTreeReadTaskColumns getReadTaskColumns(
     const MergeTreeMetaBase & storage,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     const MergeTreeMetaBase::DataPartPtr & data_part,
     const Names & required_columns,
     const PrewhereInfoPtr & prewhere_info,
+    const MergeTreeIndexContextPtr & index_context,
+    const std::deque<AtomicPredicatePtr> & atomic_predicates,
     bool check_columns);
 
 struct MergeTreeBlockSizePredictor

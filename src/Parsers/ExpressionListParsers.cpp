@@ -29,7 +29,7 @@
 #include <Parsers/ParserUnionQueryElement.h>
 #include <Parsers/ASTQuantifiedComparison.h>
 #include <Common/StringUtils/StringUtils.h>
-
+#include <Interpreters/misc.h>
 
 namespace DB
 {
@@ -52,10 +52,35 @@ const char * ParserUnaryExpression::operators[] =
     nullptr
 };
 
+const char * ParserBitwiseXorExpression::operators[] =
+{
+    "^", "bitXor",
+    nullptr
+};
+
 const char * ParserAdditiveExpression::operators[] =
 {
     "+",     "plus",
     "-",     "minus",
+    nullptr
+};
+
+const char * ParserShiftExpression::operators[] =
+{
+    "<<", "bitShiftLeft",
+    ">>", "bitShiftRight",
+    nullptr
+};
+
+const char * ParserBitwiseAndExpression::operators[] =
+{
+    "&", "bitAnd",
+    nullptr
+};
+
+const char * ParserBitwiseOrExpression::operators[] =
+{
+    "|", "bitOr",
     nullptr
 };
 
@@ -64,6 +89,7 @@ const char * ParserComparisonExpression::operators[] =
     "==",            "equals",
     "!=",            "notEquals",
     "<>",            "notEquals",
+    "<=>",           "bitEquals",
     "<=",            "lessOrEquals",
     ">=",            "greaterOrEquals",
     "<",             "less",
@@ -71,12 +97,16 @@ const char * ParserComparisonExpression::operators[] =
     "=",             "equals",
     "LIKE",          "like",
     "ILIKE",         "ilike",
+    "RLIKE",         "rlike",
+    "REGEXP",        "regexp",
     "NOT LIKE",      "notLike",
     "NOT ILIKE",     "notILike",
     "IN",            "in",
     "NOT IN",        "notIn",
     "GLOBAL IN",     "globalIn",
     "GLOBAL NOT IN", "globalNotIn",
+    "IS NOT DISTINCT FROM", "bitEquals",
+    "IS DISTINCT FROM",     "bitNotEquals",
     nullptr
 };
 
@@ -154,58 +184,38 @@ bool ParserUnionList::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         return true;
     };
 
-    /// Parse UNION type
+    /// Parse UNION / INTERSECT / EXCEPT mode
+    /// The mode can be DEFAULT (unspecified) / DISTINCT / ALL
     auto parse_separator = [&]
     {
         if (s_union_parser.ignore(pos, expected))
         {
-            // SELECT ... UNION ALL SELECT ...
             if (s_all_parser.check(pos, expected))
-            {
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::ALL);
-            }
-            // SELECT ... UNION DISTINCT SELECT ...
+                union_modes.push_back(SelectUnionMode::UNION_ALL);
             else if (s_distinct_parser.check(pos, expected))
-            {
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::DISTINCT);
-            }
-            // SELECT ... UNION SELECT ...
+                union_modes.push_back(SelectUnionMode::UNION_DISTINCT);
             else
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::Unspecified);
+                union_modes.push_back(SelectUnionMode::UNION_DEFAULT);
             return true;
         }
         else if (s_except_parser.check(pos, expected))
         {
-            // SELECT ... EXCEPT ALL SELECT ...
             if (s_all_parser.check(pos, expected))
-            {
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::EXCEPT_ALL);
-            }
-            // SELECT ... EXCEPT DISTINCT SELECT ...
+                union_modes.push_back(SelectUnionMode::EXCEPT_ALL);
             else if (s_distinct_parser.check(pos, expected))
-            {
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::EXCEPT_DISTINCT);
-            }
-            // SELECT ... EXCEPT SELECT ...
+                union_modes.push_back(SelectUnionMode::EXCEPT_DISTINCT);
             else
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::EXCEPT_UNSPECIFIED);
+                union_modes.push_back(SelectUnionMode::EXCEPT_DEFAULT);
             return true;
         }
         else if (s_intersect_parser.check(pos, expected))
         {
-            // SELECT ... INTERSECT ALL SELECT ...
             if (s_all_parser.check(pos, expected))
-            {
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::INTERSECT_ALL);
-            }
-            // SELECT ... INTERSECT DISTINCT SELECT ...
+                union_modes.push_back(SelectUnionMode::INTERSECT_ALL);
             else if (s_distinct_parser.check(pos, expected))
-            {
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::INTERSECT_DISTINCT);
-            }
-            // SELECT ... INTERSECT SELECT ...
+                union_modes.push_back(SelectUnionMode::INTERSECT_DISTINCT);
             else
-                union_modes.push_back(ASTSelectWithUnionQuery::Mode::INTERSECT_UNSPECIFIED);
+                union_modes.push_back(SelectUnionMode::INTERSECT_DEFAULT);
             return true;
         }
         return false;
@@ -286,26 +296,46 @@ bool ParserLeftAssociativeBinaryOperatorList::parseImpl(Pos & pos, ASTPtr & node
             ASTPtr elem;
             QuantifierType quantified_type_node = QuantifierType::ANY;
             bool have_quantifier_comparison =  false;
-            if (allow_any_all_operators && ParserKeyword("ANY").ignore(pos, expected))
+            if (allow_any_all_operators)
             {
-                quantified_type_node = QuantifierType::ANY;
-                have_quantifier_comparison = true;
+                auto old_pos = pos;
+                if (ParserKeyword("ANY").ignore(pos, expected) && ParserSubquery().parse(pos, elem, expected))
+                {
+                    quantified_type_node = QuantifierType::ANY;
+                    have_quantifier_comparison = true;
+                }
+                else if (ParserKeyword("ALL").ignore(pos, expected) && ParserSubquery().parse(pos, elem, expected))
+                {
+                    quantified_type_node = QuantifierType::ALL;
+                    have_quantifier_comparison = true;
+                }
+                else if (ParserKeyword("SOME").ignore(pos, expected) && ParserSubquery().parse(pos, elem, expected))
+                {
+                    quantified_type_node = QuantifierType::SOME;
+                    have_quantifier_comparison = true;
+                }
+                else
+                {
+                    pos = old_pos;
+                }
             }
-            else if (allow_any_all_operators && ParserKeyword("ALL").ignore(pos, expected))
-            {
-                quantified_type_node = QuantifierType::ALL;
-                have_quantifier_comparison = true;
-            }
-            else if (allow_any_all_operators && ParserKeyword("SOME").ignore(pos, expected))
-            {
-                quantified_type_node = QuantifierType::SOME;
-                have_quantifier_comparison = true;
-            }
-            else if (!(remaining_elem_parser ? remaining_elem_parser : first_elem_parser)->parse(pos, elem, expected))
+
+            if (!have_quantifier_comparison && !(remaining_elem_parser ? remaining_elem_parser : first_elem_parser)->parse(pos, elem, expected))
                 return false;
 
-            if (allow_any_all_operators && have_quantifier_comparison && !ParserSubquery().parse(pos, elem, expected))
-                return false;
+            ASTPtr escape_elem;
+            bool has_escape_char = false;
+
+            ParserKeyword s_escape("escape");
+            if (s_escape.check(pos, expected))
+            {
+                has_escape_char = true;
+                s_escape.ignore(pos, expected);
+                ParserEscapeExpression p_escape;
+
+                if (!p_escape.parse(pos, escape_elem, expected))
+                    return false;
+            }
 
             if (!have_quantifier_comparison)
             {
@@ -317,7 +347,24 @@ bool ParserLeftAssociativeBinaryOperatorList::parseImpl(Pos & pos, ASTPtr & node
                 exp_list->children.push_back(node);
                 exp_list->children.push_back(elem);
 
-                /** special exception for the access operator to the element of the array `x[y]`, which
+                if (has_escape_char && function->name.size() >= 4 && functionIsLikeOperator(function->name))
+                {
+                    exp_list->children.push_back(escape_elem);
+
+                if (function->name == "like")
+                    function->name = "escapeLike";
+                else if (function->name == "notLike")
+                    function->name = "escapeNotLike";
+                else if (function->name == "ilike")
+                    function->name = "escapeILike";
+                else if (function->name == "notILike")
+                    function->name = "escapeNotILike";
+                else if (function->name == "rlike")
+                    function->name = "escapeRLike";
+                else if (function->name == "regexp")
+                    function->name = "escapeRegexp";
+            }
+            /** special exception for the access operator to the element of the array `x[y]`, which
               * contains the infix part '[' and the suffix ''] '(specified as' [')
               */
                 if (0 == strcmp(it[0], "["))
@@ -689,7 +736,7 @@ bool ParserCastExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expect
 
     ASTPtr type_ast;
     if (ParserToken(TokenType::DoubleColon).ignore(pos, expected)
-        && ParserDataType().parse(pos, type_ast, expected))
+        && ParserDataType(dt).parse(pos, type_ast, expected))
     {
         node = createFunctionCast(expr_ast, type_ast);
     }
@@ -843,6 +890,38 @@ bool ParserNullityChecking::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     return true;
 }
 
+bool ParserDate32OperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    auto begin = pos;
+
+    /// If no DATE32 keyword, go to the nested parser.
+    if (!ParserKeyword("DATE32").ignore(pos, expected))
+        return next_parser.parse(pos, node, expected);
+
+    ASTPtr expr;
+    if (!ParserStringLiteral().parse(pos, expr, expected))
+    {
+        pos = begin;
+        return next_parser.parse(pos, node, expected);
+    }
+
+    /// the function corresponding to the operator
+    auto function = std::make_shared<ASTFunction>();
+
+    /// function arguments
+    auto exp_list = std::make_shared<ASTExpressionList>();
+
+    /// the first argument of the function is the previous element, the second is the next one
+    function->name = "toDate32";
+    function->arguments = exp_list;
+    function->children.push_back(exp_list);
+
+    exp_list->children.push_back(expr);
+
+    node = function;
+    return true;
+}
+
 bool ParserDateOperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     auto begin = pos;
@@ -875,12 +954,44 @@ bool ParserDateOperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected 
     return true;
 }
 
-bool ParserTimestampOperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+bool ParserTimestampDatetime64OperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     auto begin = pos;
 
-    /// If no TIMESTAMP keyword, go to the nested parser.
-    if (!ParserKeyword("TIMESTAMP").ignore(pos, expected))
+    /// If no TIMESTAMP64/DATETIME64 keyword, go to the nested parser.
+    if (!ParserKeyword("TIMESTAMP64").ignore(pos, expected) && !ParserKeyword("DATETIME64").ignore(pos, expected))
+        return next_parser.parse(pos, node, expected);
+
+    ASTPtr expr;
+    if (!ParserStringLiteral().parse(pos, expr, expected))
+    {
+        pos = begin;
+        return next_parser.parse(pos, node, expected);
+    }
+
+    /// the function corresponding to the operator
+    auto function = std::make_shared<ASTFunction>();
+
+    /// function arguments
+    auto exp_list = std::make_shared<ASTExpressionList>();
+
+    /// the first argument of the function is the previous element, the second is the next one
+    function->name = "toDateTime64";
+    function->arguments = exp_list;
+    function->children.push_back(exp_list);
+
+    exp_list->children.push_back(expr);
+
+    node = function;
+    return true;
+}
+
+bool ParserTimestampDatetimeOperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    auto begin = pos;
+
+    /// If no TIMESTAMP/DATETIME keyword, go to the nested parser.
+    if (!ParserKeyword("TIMESTAMP").ignore(pos, expected) && !ParserKeyword("DATETIME").ignore(pos, expected))
         return next_parser.parse(pos, node, expected);
 
     ASTPtr expr;
@@ -898,6 +1009,38 @@ bool ParserTimestampOperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expe
 
     /// the first argument of the function is the previous element, the second is the next one
     function->name = "toDateTime";
+    function->arguments = exp_list;
+    function->children.push_back(exp_list);
+
+    exp_list->children.push_back(expr);
+
+    node = function;
+    return true;
+}
+
+bool ParserTimeOperatorExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    auto begin = pos;
+
+    /// If no TIME keyword, go to the nested parser.
+    if (!ParserKeyword("TIME").ignore(pos, expected))
+        return next_parser.parse(pos, node, expected);
+
+    ASTPtr expr;
+    if (!ParserStringLiteral().parse(pos, expr, expected))
+    {
+        pos = begin;
+        return next_parser.parse(pos, node, expected);
+    }
+
+    /// the function corresponding to the operator
+    auto function = std::make_shared<ASTFunction>();
+
+    /// function arguments
+    auto exp_list = std::make_shared<ASTExpressionList>();
+
+    /// the first argument of the function is the previous element, the second is the next one
+    function->name = "toTimeType";
     function->arguments = exp_list;
     function->children.push_back(exp_list);
 

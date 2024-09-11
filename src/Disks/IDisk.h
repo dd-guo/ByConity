@@ -26,6 +26,7 @@
 #include <common/types.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
+#include "Core/Field.h"
 #include <IO/ReadSettings.h>
 #include <IO/WriteSettings.h>
 #include <Disks/Executor.h>
@@ -35,6 +36,7 @@
 #include <mutex>
 #include <utility>
 #include <boost/noncopyable.hpp>
+#include <fmt/core.h>
 #include <Poco/Timestamp.h>
 #include <filesystem>
 #include "Poco/Util/AbstractConfiguration.h"
@@ -99,6 +101,57 @@ using SyncGuardPtr = std::unique_ptr<ISyncGuard>;
  * - file management;
  * - space accounting and reservation.
  */
+
+ struct DiskStats
+ {
+    UInt64 bytes{0};
+    UInt64 inodes{0};
+
+    String toString() const
+    {
+        return fmt::format("DiskStats(bytes={},inodes={})", bytes, inodes);
+    }
+
+    void assertStats(const DiskStats & stats) const
+    {
+        if (bytes < stats.bytes || inodes < stats.inodes)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Current stats {} not allowed less stats {}", toString(), stats.toString());
+    }
+
+    DiskStats operator-(const DiskStats & stats) const
+    {
+        assertStats(stats);
+        return {bytes - stats.bytes, inodes - stats.inodes};
+    }
+
+    DiskStats operator-=(const DiskStats & stats)
+    {
+        assertStats(stats);
+        bytes -= stats.bytes;
+        inodes -= stats.inodes;
+
+        return *this;
+    }
+
+    DiskStats operator+(const DiskStats & stats) const
+    {
+        return {bytes + stats.bytes, inodes + stats.inodes};
+    }
+
+    DiskStats operator+=(const DiskStats & stats)
+    {
+        bytes += stats.bytes;
+        inodes += stats.inodes;
+
+        return *this;
+    }
+
+    bool isEmpty() const
+    {
+        return bytes <= 0 || inodes <= 0;
+    }
+
+ };
 class IDisk : public Space
 {
 public:
@@ -113,19 +166,23 @@ public:
     virtual const String & getPath() const = 0;
 
     /// Total available space on the disk.
-    virtual UInt64 getTotalSpace() const = 0;
+    virtual DiskStats getTotalSpace(bool with_keep_free = false) const = 0;
 
     /// Space currently available on the disk.
-    virtual UInt64 getAvailableSpace() const = 0;
+    virtual DiskStats getAvailableSpace() const = 0;
 
     /// Space available for reservation (available space minus reserved space).
-    virtual UInt64 getUnreservedSpace() const = 0;
+    virtual DiskStats getUnreservedSpace() const = 0;
 
     /// Amount of bytes which should be kept free on the disk.
-    virtual UInt64 getKeepingFreeSpace() const { return 0; }
+    virtual DiskStats getKeepingFreeSpace() const { return {0, 0}; }
 
     /// Return `true` if the specified file exists.
     virtual bool exists(const String & path) const = 0;
+
+    /// Return `true` if the specified file exists.
+    /// If this disk could be DiskByteS3, this function is more recommended than exists()
+    virtual bool fileExists(const String & file_path) const { return exists(file_path); }
 
     /// Return `true` if the specified file exists and it's a regular file (not a directory or special file type).
     virtual bool isFile(const String & path) const = 0;
@@ -167,6 +224,9 @@ public:
 
     /// Recursively copy data containing at `from_path` to `to_path` located at `to_disk`.
     virtual void copy(const String & from_path, const std::shared_ptr<IDisk> & to_disk, const String & to_path);
+
+    /// Copy specified files to `to_disk`, the parent directory of all files should exists.
+    virtual void copyFiles(const std::vector<std::pair<String, String>> & files_to_copy, const std::shared_ptr<IDisk> & to_disk);
 
     /// List files at `path` and add their names to `file_names`
     virtual void listFiles(const String & path, std::vector<String> & file_names) = 0;
@@ -250,6 +310,12 @@ public:
     /// Applies new settings for disk in runtime.
     virtual void applyNewSettings(const Poco::Util::AbstractConfiguration &, ContextPtr) {}
 
+    // return ‘true’ if disk support renameTo.
+    virtual bool supportRenameTo() { return true; }
+
+    // Get table relative_data_path from disk
+    virtual String getTableRelativePathOnDisk(const String & uuid){ return uuid;}
+
 protected:
     friend class DiskDecorator;
 
@@ -280,6 +346,8 @@ public:
 
     /// Name of the file that the iterator currently points to.
     virtual String name() const = 0;
+
+    virtual size_t size() const = 0;
 
     virtual ~IDiskDirectoryIterator() = default;
 };

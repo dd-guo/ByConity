@@ -48,6 +48,8 @@ public:
         return false;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     size_t getNumberOfArguments() const override
     {
         return 1;
@@ -97,7 +99,7 @@ template <>
 const char * FunctionPolygonConvexHull<CartesianPoint>::name = "polygonConvexHullCartesian";
 
 
-void registerFunctionPolygonConvexHull(FunctionFactory & factory)
+REGISTER_FUNCTION(PolygonConvexHull)
 {
     factory.registerFunction<FunctionPolygonConvexHull<CartesianPoint>>();
 }

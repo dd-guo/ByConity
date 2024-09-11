@@ -43,6 +43,8 @@ public:
 
     bool is_window_function = false;
 
+    bool compute_after_window_functions = false;
+
     // We have to make these fields ASTPtr because this is what the visitors
     // expect. Some of them take const ASTPtr & (makes no sense), and some
     // take ASTPtr & and modify it. I don't understand how the latter is
@@ -58,6 +60,18 @@ public:
 
     /// do not print empty parentheses if there are no args - compatibility with new AST for data types and engine names.
     bool no_empty_args = false;
+
+    /// Specifies where this function-like expression is used.
+    enum class Kind : UInt8
+    {
+        ORDINARY_FUNCTION,
+        WINDOW_FUNCTION,
+        LAMBDA_FUNCTION,
+        TABLE_ENGINE,
+        DATABASE_ENGINE,
+        BACKUP_NAME,
+    };
+    Kind kind = Kind::ORDINARY_FUNCTION;
 
     /** Get text identifying the AST node. */
     String getID(char delim) const override;
@@ -77,10 +91,14 @@ public:
     void serialize(WriteBuffer & buf) const override;
     void deserializeImpl(ReadBuffer & buf) override;
     static ASTPtr deserialize(ReadBuffer & buf);
+    static std::shared_ptr<ASTFunction> makeASTFunctionWithVectorArgs(const String & name, std::vector<ASTPtr> && args);
 
+    bool hasSecretParts() const override;
 protected:
     void formatImplWithoutAlias(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
     void appendColumnNameImpl(WriteBuffer & ostr) const override;
+private:
+    void finishFormatWithWindow(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const;
 };
 
 
@@ -97,5 +115,15 @@ std::shared_ptr<ASTFunction> makeASTFunction(const String & name, Args &&... arg
 
     return function;
 }
+
+/// ASTFunction Helpers: hide casts and semantic.
+
+String getFunctionName(const IAST * ast);
+std::optional<String> tryGetFunctionName(const IAST * ast);
+bool tryGetFunctionNameInto(const IAST * ast, String & name);
+
+inline String getFunctionName(const ASTPtr & ast) { return getFunctionName(ast.get()); }
+inline std::optional<String> tryGetFunctionName(const ASTPtr & ast) { return tryGetFunctionName(ast.get()); }
+inline bool tryGetFunctionNameInto(const ASTPtr & ast, String & name) { return tryGetFunctionNameInto(ast.get(), name); }
 
 }

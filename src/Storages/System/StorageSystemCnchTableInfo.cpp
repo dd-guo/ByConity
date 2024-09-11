@@ -23,10 +23,12 @@
 #include <Common/RpcClientPool.h>
 #include <Common/HostWithPorts.h>
 #include <CloudServices/CnchServerClient.h>
+#include <CloudServices/CnchMergeMutateThread.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
 #include <Catalog/Catalog.h>
 #include <TSO/TSOClient.h>
 #include <DataStreams/NullBlockInputStream.h>
+#include <Protos/DataModelHelpers.h>
 
 namespace DB
 {
@@ -44,9 +46,11 @@ public:
         const Block & header_,
         UInt64 max_block_size_,
         std::vector<DB::Protos::DataModelTableInfo> all_table_info_,
-        UInt64 current_ts_)
+        UInt64 current_ts_,
+        std::vector<ClusterTaskProgress> recluster_tasks_progress_)
         : columns_mask(columns_mask_), header(header_), max_block_size(max_block_size_)
         , all_table_info(all_table_info_), current_ts(current_ts_)
+        , recluster_tasks_progress(recluster_tasks_progress_)
     {
     }
 
@@ -65,6 +69,7 @@ protected:
 
         while (rows_count < max_block_size && table_num < all_table_info.size())
         {
+            auto cluster_task_progress = recluster_tasks_progress[table_num];
             auto & current_table_info = all_table_info[table_num++];
 
             size_t src_index = 0;
@@ -85,6 +90,14 @@ protected:
             {
                 res_columns[res_index++]->insert(current_table_info.cluster_status());
             }
+            if (columns_mask[src_index++])
+            {
+                // If clustering has started but progress is still at 100%, set it to 0%
+                if (current_table_info.cluster_status() == 0 && cluster_task_progress.progress == 100 && cluster_task_progress.start_time_seconds == 0)
+                    cluster_task_progress.progress = 0;
+                res_columns[res_index++]->insert(cluster_task_progress.toString());
+            }
+
 
             rows_count++;
         }
@@ -99,6 +112,7 @@ private:
     UInt64 max_block_size;
     std::vector<DB::Protos::DataModelTableInfo> all_table_info;
     UInt64 current_ts;
+    std::vector<ClusterTaskProgress> recluster_tasks_progress;
     size_t table_num = 0;
 };
 
@@ -111,14 +125,16 @@ StorageSystemCnchTableInfo::StorageSystemCnchTableInfo(const StorageID & table_i
             {"database", std::make_shared<DataTypeString>()},
             {"table", std::make_shared<DataTypeString>()},
             {"last_modification_time", std::make_shared<DataTypeDateTime>()},
-            {"cluster_status", std::make_shared<DataTypeUInt8>()}
+            {"cluster_status", std::make_shared<DataTypeUInt8>()},
+            {"cluster_progress", std::make_shared<DataTypeString>()}
+
         }));
     setInMemoryMetadata(storage_metadata);
 }
 
 Pipe StorageSystemCnchTableInfo::read(
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum /*processed_stage*/,
@@ -130,7 +146,7 @@ Pipe StorageSystemCnchTableInfo::read(
         throw Exception("Table system.cnch_table_info only support cnch_server", ErrorCodes::LOGICAL_ERROR);
 
     NameSet names_set(column_names.begin(), column_names.end());
-    Block sample_block = metadata_snapshot->getSampleBlock();
+    Block sample_block = storage_snapshot->metadata->getSampleBlock();
     Block res_block;
     std::vector<UInt8> columns_mask(sample_block.columns());
     for (size_t i = 0, size = columns_mask.size(); i < size; ++i)
@@ -180,10 +196,11 @@ Pipe StorageSystemCnchTableInfo::read(
     std::unordered_map<HostWithPorts, std::vector<std::shared_ptr<Protos::TableIdentifier>>, std::hash<HostWithPorts>, HostWithPorts::IsExactlySame> distribution;
 
     UInt64 ts = context->getTimestamp();
+    std::vector<ClusterTaskProgress> recluster_tasks_progress;
     for (size_t i=0; i<filtered_index_column->size(); i++)
     {
         auto current_table = table_ids[(*filtered_index_column)[i].get<UInt64>()];
-        auto host_ports = context->getCnchTopologyMaster()->getTargetServer(current_table->uuid(), ts, true);
+        auto host_ports = context->getCnchTopologyMaster()->getTargetServer(current_table->uuid(), getServerVwNameFrom(*current_table.get()), ts, true);
         /// TODO: If cannot determine target server for the table, should we return some info to user?
         if (host_ports.empty())
             continue;
@@ -197,6 +214,8 @@ Pipe StorageSystemCnchTableInfo::read(
             std::vector<std::shared_ptr<Protos::TableIdentifier>> table_models{current_table};
             distribution.emplace(host_ports, table_models);
         }
+        auto storage_id = StorageID(current_table->database(), current_table->name(), UUID(stringToUUID(current_table->uuid())));
+        recluster_tasks_progress.push_back(context->getTableReclusterTaskProgress(storage_id));
     }
 
     std::vector<DB::Protos::DataModelTableInfo> all_table_info;
@@ -214,7 +233,7 @@ Pipe StorageSystemCnchTableInfo::read(
 
 
     BlockInputStreamPtr input = std::make_shared<CnchTableInfoBlockInputStream>(std::move(columns_mask), std::move(res_block), max_block_size,
-        all_table_info, current_timestamp);
+        all_table_info, current_timestamp, recluster_tasks_progress);
     ProcessorPtr source = std::make_shared<SourceFromInputStream>(input);
     pipe.addSource(source);
 

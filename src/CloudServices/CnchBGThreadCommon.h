@@ -15,8 +15,18 @@
 
 #pragma once
 
+#include <cstddef>
+#include <Common/Exception.h>
+#include <common/defines.h>
+
 namespace DB
 {
+namespace ErrorCodes
+{
+    extern const int UNKNOWN_CNCH_BG_THREAD_ACTION;
+    extern const int UNKNOWN_CNCH_BG_THREAD_TYPE;
+}
+
 /**
  *  Use enum in nested namespace instead enum class.
  *  Because we want to pass it to protos easily, while it offers weaker compile-time check.
@@ -24,30 +34,42 @@ namespace DB
  */
 namespace CnchBGThread
 {
+    /// NOTE: when introducing a new type, remember to update
+    /// 1. {Server|Daemon}{Min|Max}Type accordingly
+    /// 2. toString(CnchBGThreadType type)
     enum Type : unsigned int
     {
         Empty = 0,
 
+        /// server types
         PartGC = 1,
         MergeMutate = 2,
         Consumer = 3,
-        DedupWorker = 4,
-        Clustering = 5,
-        ServerMinType = PartGC,
-        ServerMaxType = Clustering,
+        MemoryBuffer = 4, /// NOTE: Just reserved for compatibility.
+        DedupWorker = 5,
+        Clustering = 6,
+        MaterializedMySQL = 7,
+        ObjectSchemaAssemble = 8,
+        CnchRefreshMaterializedView = 9,
+        PartMover = 10,
+        ManifestCheckpoint = 11,
 
+        /// DM types
         GlobalGC = 20, /// reserve several entries
         TxnGC = 21,
-        DaemonMinType = GlobalGC,
-        DaemonMaxType = TxnGC,
+        AutoStatistics = 22,
 
-        ResourceReport = 30, /// worker
-        WorkerMinType = ResourceReport, /// Enum to mark start of worker types
-        WorkerMaxType = ResourceReport, /// Enum to mark end of worker types
+        /// worker types (perhaps this should not be included in CnchBGThread?)
+        ResourceReport = 30,
     };
 
-    constexpr unsigned int NumType = WorkerMaxType + 1;
+    constexpr unsigned int ServerMinType = PartGC;
+    constexpr unsigned int ServerMaxType = ManifestCheckpoint;
+    constexpr unsigned int NumServerType = ServerMaxType + 1;
+    constexpr unsigned int DaemonMinType = GlobalGC;
+    constexpr unsigned int DaemonMaxType = AutoStatistics;
 
+    /// when introducing a new type, remember to update toCnchBGThreadAction()
     enum Action : unsigned int
     {
         Start = 0,
@@ -86,22 +108,51 @@ constexpr auto toString(CnchBGThreadType type)
             return "DedupWorkerManager";
         case CnchBGThreadType::GlobalGC:
             return "GlobalGCThread";
+        case CnchBGThreadType::AutoStatistics:
+            return "AutoStatistics";
         case CnchBGThreadType::TxnGC:
             return "TxnGCThread";
         case CnchBGThreadType::ResourceReport:
             return "ResourceReport";
+        case CnchBGThreadType::ObjectSchemaAssemble:
+            return "ObjectSchemaAssembleThread";
+        case CnchBGThreadType::MemoryBuffer:
+            return "MemoryBuffer";
+        case CnchBGThreadType::MaterializedMySQL:
+            return "MaterializedMySQL";
+        case CnchBGThreadType::CnchRefreshMaterializedView:
+            return "CnchRefreshMaterializedView";
+        case CnchBGThreadType::PartMover:
+            return "PartMoverThread";
+        case CnchBGThreadType::ManifestCheckpoint:
+            return "ManifestCheckpoint";
     }
     __builtin_unreachable();
 }
 
-constexpr auto isServerBGThreadType(CnchBGThreadType t)
+constexpr auto isServerBGThreadType(size_t t)
 {
-    return CnchBGThreadType::ServerMinType <= t && t <= CnchBGThreadType::ServerMaxType;
+    return CnchBGThread::ServerMinType <= t && t <= CnchBGThread::ServerMaxType;
 }
 
-constexpr auto iDaemonBGThreadType(CnchBGThreadType t)
+inline CnchBGThreadType toServerBGThreadType(size_t t)
 {
-    return CnchBGThreadType::DaemonMinType <= t && t <= CnchBGThreadType::DaemonMaxType;
+    if (unlikely(!isServerBGThreadType(t)))
+        throw Exception(ErrorCodes::UNKNOWN_CNCH_BG_THREAD_TYPE, "Unknown server bg thread type: {}", t);
+    return static_cast<CnchBGThreadType>(t);
+}
+
+constexpr auto iDaemonBGThreadType(size_t t)
+{
+    return CnchBGThread::DaemonMinType <= t && t <= CnchBGThread::DaemonMaxType;
+}
+
+inline CnchBGThreadAction toCnchBGThreadAction(size_t action)
+{
+    if (unlikely(action > CnchBGThreadAction::Wakeup))
+        throw Exception(ErrorCodes::UNKNOWN_CNCH_BG_THREAD_ACTION, "Unknown bg thread action: {}", action);
+
+    return static_cast<CnchBGThreadAction>(action);
 }
 
 constexpr auto toString(CnchBGThreadAction action)

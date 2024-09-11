@@ -35,6 +35,8 @@ public:
         return 1;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (checkAndGetDataType<DataTypeString>(arguments[0].get()) == nullptr)
@@ -94,7 +96,7 @@ struct ReadWktMultiPolygonNameHolder
     static constexpr const char * name = "readWktMultiPolygon";
 };
 
-void registerFunctionReadWkt(FunctionFactory & factory)
+REGISTER_FUNCTION(ReadWkt)
 {
     factory.registerFunction<FunctionReadWkt<DataTypePointName, CartesianPoint, PointSerializer<CartesianPoint>, ReadWktPointNameHolder>>();
     factory.registerFunction<FunctionReadWkt<DataTypeRingName, CartesianRing, RingSerializer<CartesianPoint>, ReadWktRingNameHolder>>();

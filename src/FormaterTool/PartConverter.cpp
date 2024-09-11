@@ -120,7 +120,7 @@ void PartConverter::execute()
         throw Exception("UUID should be specified in table definition.", ErrorCodes::LOGICAL_ERROR);
     String uuid = UUIDHelpers::UUIDToString(storage->getStorageUUID());
 
-    HDFSConnectionParams params{HDFSConnectionParams::CONN_NNPROXY, getContext()->getHdfsUser(), getContext()->getHdfsNNProxy()};
+    HDFSConnectionParams params = getContext()->getHdfsConnectionParams();
     std::shared_ptr<DiskByteHDFS> remote_disk = std::make_shared<DiskByteHDFS>("hdfs", source_path, params);
     auto single_volume = std::make_shared<SingleDiskVolume>("volume_single", remote_disk, 0);
 
@@ -190,9 +190,10 @@ void PartConverter::execute()
         out->writeSuffix();
     };
 
+    auto storage_snapshot = storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), getContext());
     for (auto & part : data_parts)
     {
-        auto input = std::make_shared<MergeTreeSequentialSource>(*storage, storage->getInMemoryMetadataPtr(), part, column_names, false, true);
+        auto input = std::make_shared<MergeTreeSequentialSource>(*storage, storage_snapshot, part, column_names, false, true);
         QueryPipeline pipeline;
         pipeline.init(Pipe(std::move(input)));
         pipeline.setMaxThreads(1);

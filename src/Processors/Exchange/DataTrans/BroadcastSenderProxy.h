@@ -20,22 +20,28 @@
 #include <Core/Block.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Context_fwd.h>
-#include <Processors/Exchange/DataTrans/DataTransKey.h>
 #include <Processors/Exchange/DataTrans/DataTrans_fwd.h>
 #include <Processors/Exchange/DataTrans/IBroadcastSender.h>
 #include <Processors/Exchange/ExchangeDataKey.h>
 #include <boost/core/noncopyable.hpp>
-#include <bthread/mtx_cv_base.h>
+#include <bthread/condition_variable.h>
+#include <bthread/mutex.h>
 
 namespace DB
 {
+struct SenderProxyOptions
+{
+    uint64_t wait_timeout_ms;
+};
+
 class BroadcastSenderProxy final : public IBroadcastSender, boost::noncopyable
 {
 public:
     virtual ~BroadcastSenderProxy() override;
-    BroadcastStatus send(Chunk chunk) override;
+    BroadcastStatus sendImpl(Chunk chunk) override;
     BroadcastStatus finish(BroadcastStatusCode status_code, String message) override;
     void merge(IBroadcastSender && /*sender*/) override;
+    bool needMetrics() override { return false; }
     String getName() const override;
     BroadcastSenderType getType() override;
     void accept(ContextPtr context_, Block header_);
@@ -46,18 +52,25 @@ public:
 
     ContextPtr getContext() const;
     Block getHeader() const;
-    DataTransKeyPtr getDataKey() const;
+    ExchangeDataKeyPtr getDataKey() const;
+
+    SenderMetrics & getSenderMetrics()
+    {
+        if (!has_real_sender.load(std::memory_order_relaxed))
+            waitBecomeRealSender(wait_timeout_ms);
+        return real_sender->getSenderMetrics();
+    }
 
 private:
     friend class BroadcastSenderProxyRegistry;
-    explicit BroadcastSenderProxy(DataTransKeyPtr data_key_);
+    explicit BroadcastSenderProxy(ExchangeDataKeyPtr data_key_, SenderProxyOptions options);
 
     mutable bthread::Mutex mutex;
     bthread::ConditionVariable wait_become_real;
     bthread::ConditionVariable wait_accept;
     std::atomic_bool has_real_sender {false};
     bool closed {false};
-    DataTransKeyPtr data_key;
+    ExchangeDataKeyPtr data_key;
 
     ContextPtr context;
     Block header;

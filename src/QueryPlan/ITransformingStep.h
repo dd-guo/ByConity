@@ -48,7 +48,7 @@ public:
         TransformTraits transform_traits;
     };
 
-    ITransformingStep(DataStream input_stream, Block output_header, Traits traits, bool collect_processors_ = true);
+    ITransformingStep(DataStream input_stream, Block output_header, Traits traits, bool collect_processors_ = true, PlanHints hints_ = {});
 
     QueryPipelinePtr updatePipeline(QueryPipelines pipelines, const BuildQueryPipelineSettings & settings) override;
 
@@ -57,9 +57,13 @@ public:
     const TransformTraits & getTransformTraits() const { return transform_traits; }
     const DataStreamTraits & getDataStreamTraits() const { return data_stream_traits; }
 
-    void describePipeline(FormatSettings & settings) const override;
+    // this won't be override, so use a different name
+    void serializeToProtoBase(Protos::ITransformingStep & proto) const;
 
-    Type getType() const override { return Type::ITransforming; }
+    // return step_description and base_input_stream
+    static std::pair<String, DataStream> deserializeFromProtoBase(const Protos::ITransformingStep & proto);
+
+    void describePipeline(FormatSettings & settings) const override;
 
 protected:
     /// Clear distinct_columns if res_header doesn't contain all of them.

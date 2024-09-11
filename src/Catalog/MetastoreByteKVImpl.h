@@ -38,6 +38,9 @@ using namespace bytekv::sdk;
 
 class MetastoreByteKVImpl : public IMetaStore
 {
+// Limitations of bytekv (in bytes)
+#define MAX_BYTEKV_KV_SIZE 1000000
+#define MAX_BYTEKV_BATCH_SIZE 10000000
 
 public:
     using ExpectedCodes = std::initializer_list<Errorcode>;
@@ -71,8 +74,13 @@ public:
         std::shared_ptr<bytekv::sdk::Iterator> inner_it;
     };
 
-    MetastoreByteKVImpl(const String & service_name_, const String & cluster_name_,
-                        const String & name_space_, const String & table_name_);
+    MetastoreByteKVImpl(
+        const String & discovery_type_,
+        const String & service_name_,
+        const UInt64 service_port_,
+        const String & cluster_name_,
+        const String & name_space_,
+        const String & table_name_);
 
     void init();
 
@@ -86,13 +94,19 @@ public:
 
     std::vector<std::pair<String, UInt64>> multiGet(const std::vector<String> & keys) override;
 
-    bool batchWrite(const BatchCommitRequest & req, BatchCommitResponse response) override;
+    bool batchWrite(const BatchCommitRequest & req, BatchCommitResponse & response) override;
 
     void drop(const String & key, const UInt64 & expected_version = 0) override;
 
+    void drop(const String & key, const String & expected_value) override;
+
     IteratorPtr getAll() override;
 
-    IteratorPtr getByPrefix(const String & partition_id, const size_t & limit = 0, uint32_t scan_batch_size = DEFAULT_SCAN_BATCH_COUNT) override;
+    IteratorPtr getByPrefix(
+        const String & key_prefix,
+        const size_t & limit = 0,
+        uint32_t scan_batch_size = DEFAULT_SCAN_BATCH_COUNT,
+        const String & start_key = "") override;
 
     IteratorPtr getByRange(const String & range_start, const String & range_end, const bool include_start, const bool include_end) override;
 
@@ -105,13 +119,20 @@ public:
 
     static void assertStatus(const OperationType & op, const Errorcode & code, const ExpectedCodes & expected);
 
+    // leave some margin
+    uint32_t getMaxBatchSize() final { return MAX_BYTEKV_BATCH_SIZE - 1000; }
+
+    // leave some margin
+    uint32_t getMaxKVSize() final { return MAX_BYTEKV_KV_SIZE - 200; }
+
 public:
     std::shared_ptr<ByteKVClient> client;
 
 
 private:
-
+    String discovery_type;
     String service_name;
+    UInt64 service_port;
     String cluster_name;
     String name_space;
     String table_name;

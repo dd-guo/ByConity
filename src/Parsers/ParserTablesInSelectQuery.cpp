@@ -19,6 +19,7 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ExpressionListParsers.h>
@@ -27,6 +28,7 @@
 #include <Parsers/ParserSelectQuery.h>
 #include <Parsers/ParserSampleRatio.h>
 #include <Parsers/ParserTablesInSelectQuery.h>
+#include <Parsers/ParserHints.h>
 
 
 namespace DB
@@ -68,8 +70,10 @@ bool ParserTableExpression::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
         }
     }
 
-    if (res->database_and_table_name)
+    if (res->database_and_table_name) {
+        tryRewriteCnchDatabaseName(res->database_and_table_name, pos.getContext());
         res->children.emplace_back(res->database_and_table_name);
+    }
     if (res->table_function)
         res->children.emplace_back(res->table_function);
     if (res->subquery)
@@ -144,11 +148,14 @@ void ParserTablesInSelectQueryElement::parseJoinStrictness(Pos & pos, ASTTableJo
 bool ParserTablesInSelectQueryElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     auto res = std::make_shared<ASTTablesInSelectQueryElement>();
+    ParserHints table_hints;
 
     if (is_first)
     {
         if (!ParserTableExpression(dt).parse(pos, res->table_expression, expected))
             return false;
+
+        table_hints.parse(pos, res->table_expression->hints, expected);
     }
     else if (ParserArrayJoin(dt).parse(pos, res->array_join, expected))
     {
@@ -219,18 +226,20 @@ bool ParserTablesInSelectQueryElement::parseImpl(Pos & pos, ASTPtr & node, Expec
 
             if (!ParserKeyword("JOIN").ignore(pos, expected))
                 return false;
+
+            table_hints.parse(pos, table_join->hints, expected);
         }
 
         if (!ParserTableExpression(dt).parse(pos, res->table_expression, expected))
             return false;
+
+        table_hints.parse(pos, res->table_expression->hints, expected);
 
         if (table_join->kind != ASTTableJoin::Kind::Comma
             && table_join->kind != ASTTableJoin::Kind::Cross)
         {
             if (ParserKeyword("USING").ignore(pos, expected))
             {
-                if (!dt.parse_outer_join_with_using && table_join->kind != ASTTableJoin::Kind::Inner)
-                    return false;
                 /// Expression for USING could be in parentheses or not.
                 bool in_parens = pos->type == TokenType::OpeningRoundBracket;
                 if (in_parens)
@@ -283,6 +292,8 @@ bool ParserTablesInSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & e
     auto res = std::make_shared<ASTTablesInSelectQuery>();
 
     ASTPtr child;
+    ParserHints tables_hints;
+    tables_hints.parse(pos, res->hints, expected);
 
     if (ParserTablesInSelectQueryElement(true, dt).parse(pos, child, expected))
         res->children.emplace_back(child);

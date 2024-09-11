@@ -16,6 +16,7 @@
 #include <DaemonManager/DaemonJob.h>
 #include <Common/Exception.h>
 #include <common/logger_useful.h>
+#include <CloudServices/CnchBGThreadCommon.h>
 #include <DaemonManager/Metrics.h>
 #include <Interpreters/Context.h>
 
@@ -47,10 +48,22 @@ bvar::Adder<int> & getExecuteMetric(CnchBGThreadType type)
             return g_executeImpl_DedupWorker;
         case CnchBGThreadType::GlobalGC:
             return g_executeImpl_GlobalGC;
+        case CnchBGThreadType::AutoStatistics:
+            return g_executeImpl_AutoStatistics;
         case CnchBGThreadType::TxnGC:
             return g_executeImpl_TxnGC;
         case CnchBGThreadType::Clustering:
             return g_executeImpl_Clustering;
+        case CnchBGThreadType::ObjectSchemaAssemble:
+            return g_executeImpl_ObjectSchemaAssemble;    
+        case CnchBGThreadType::MaterializedMySQL:
+            return g_executeImpl_MaterializedMySQL;
+        case CnchBGThreadType::CnchRefreshMaterializedView:
+            return g_executeImpl_CnchRefreshMaterializedView;
+        case CnchBGThreadType::PartMover:
+            return g_executeImpl_PartMover;
+        case CnchBGThreadType::ManifestCheckpoint:
+            return g_executeImpl_ManifestCheckpoint;
         default:
             throw Exception(String{"No metric add for daemon job type "} + toString(type) + ", this is coding mistake", ErrorCodes::LOGICAL_ERROR);
     }
@@ -71,10 +84,22 @@ bvar::Adder<int> & getExecuteErrorMetric(CnchBGThreadType type)
             return g_executeImpl_DedupWorker_error;
         case CnchBGThreadType::GlobalGC:
             return g_executeImpl_GlobalGC_error;
+        case CnchBGThreadType::AutoStatistics:
+            return g_executeImpl_AutoStatistics_error;
         case CnchBGThreadType::TxnGC:
             return g_executeImpl_TxnGC_error;
         case CnchBGThreadType::Clustering:
             return g_executeImpl_Clustering_error;
+        case CnchBGThreadType::ObjectSchemaAssemble:
+            return g_executeImpl_ObjectSchemaAssemble_error;   
+        case CnchBGThreadType::MaterializedMySQL:
+            return g_executeImpl_MaterializedMySQL_error;
+        case CnchBGThreadType::CnchRefreshMaterializedView:
+            return g_executeImpl_CnchRefreshMaterializedView_error;
+        case DB::CnchBGThreadType::PartMover:
+            return g_executeImpl_PartMover_error;
+        case DB::CnchBGThreadType::ManifestCheckpoint:
+            return g_executeImpl_ManifestCheckpoint_error;
         default:
             throw Exception(String{"No error metric add for daemon job type "} + toString(type) + ", this is coding mistake", ErrorCodes::LOGICAL_ERROR);
     }
@@ -120,6 +145,7 @@ void DaemonJob::execute()
         bool ret = executeImpl();
         if (!ret)
             getExecuteErrorMetric(getType()) << 1;
+
         task->scheduleAfter(interval_ms);
         LOG_TRACE(log, "finish execute {}, try again after {}", toString(getType()), interval_ms);
     }

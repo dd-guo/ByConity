@@ -23,6 +23,9 @@
 #include <Columns/ColumnVector.h>
 #include <Common/typeid_cast.h>
 #include <Common/HashTable/HashSet.h>
+#include <Columns/ColumnSketchBinary.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnBitMap64.h>
 #include "ColumnsCommon.h"
 
 
@@ -128,6 +131,20 @@ bool memoryIsByte(const void * data, size_t size, uint8_t byte)
 bool memoryIsZero(const void * data, size_t size)
 {
     return memoryIsByte(data, size, 0x0);
+}
+
+bool memoryIsByte(const void * data, size_t start, size_t end, uint8_t byte)
+{
+    size_t size = end - start;
+    if (size == 0)
+        return true;
+    const auto * ptr = reinterpret_cast<const uint8_t *>(data) + start;
+    return *ptr == byte && memcmp(ptr, ptr + 1, size - 1) == 0;
+}
+
+bool memoryIsZero(const void * data, size_t start, size_t end)
+{
+    return memoryIsByte(data, start, end, 0x0);
 }
 
 namespace ErrorCodes
@@ -320,6 +337,7 @@ void filterArraysImplOnlyData(
 {
     return filterArraysImplGeneric<T, NoResultOffsetsBuilder>(src_elems, src_offsets, res_elems, nullptr, filt, result_size_hint);
 }
+
 
 
 /// Explicit instantiations - not to place the implementation of the function above in the header file.

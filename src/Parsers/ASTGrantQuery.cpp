@@ -1,8 +1,9 @@
 #include <Parsers/ASTGrantQuery.h>
 #include <Parsers/ASTRolesOrUsersSet.h>
+#include <Parsers/formatTenantDatabaseName.h>
 #include <Common/quoteString.h>
 #include <IO/Operators.h>
-
+#include <Interpreters/Context.h>
 
 namespace DB
 {
@@ -37,7 +38,9 @@ namespace
         else
         {
             if (!database.empty())
+            {
                 settings.ostr << backQuoteIfNeed(database) << ".";
+            }
             if (any_table)
                 settings.ostr << "*";
             else
@@ -105,16 +108,24 @@ void ASTGrantQuery::formatImpl(const FormatSettings & settings, FormatState &, F
     settings.ostr << (settings.hilite ? IAST::hilite_keyword : "") << (attach_mode ? "ATTACH " : "") << (is_revoke ? "REVOKE" : "GRANT")
                   << (settings.hilite ? IAST::hilite_none : "");
 
+    if (is_sensitive)
+    {
+        settings.ostr << (settings.hilite ? IAST::hilite_keyword : "") << (" SENSITIVE")
+                      << (settings.hilite ? IAST::hilite_none : "");
+    }
+
     if (!access_rights_elements.sameOptions())
         throw Exception("Elements of an ASTGrantQuery are expected to have the same options", ErrorCodes::LOGICAL_ERROR);
     if (!access_rights_elements.empty() &&  access_rights_elements[0].is_partial_revoke && !is_revoke)
         throw Exception("A partial revoke should be revoked, not granted", ErrorCodes::LOGICAL_ERROR);
     bool grant_option = !access_rights_elements.empty() && access_rights_elements[0].grant_option;
 
-    formatOnCluster(settings);
+    // formatOnCluster(settings);
 
     if (is_revoke)
     {
+        if (if_exists)
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " IF EXISTS" << (settings.hilite ? hilite_none : "");
         if (grant_option)
             settings.ostr << (settings.hilite ? hilite_keyword : "") << " GRANT OPTION FOR" << (settings.hilite ? hilite_none : "");
         else if (admin_option)
@@ -155,6 +166,52 @@ void ASTGrantQuery::replaceCurrentUserTag(const String & current_user_name) cons
 {
     if (grantees)
         grantees->replaceCurrentUserTag(current_user_name);
+}
+
+void ASTGrantQuery::rewriteNamesWithTenant(const Context *)
+{
+    if (!tenant_rewritten)
+    {
+        if (roles && !attach_mode)
+        {
+            for (auto & name : roles->names)
+                name = formatTenantEntityName(name);
+            for (auto & name : roles->except_names)
+                name = formatTenantEntityName(name);
+        }
+        if (grantees && !attach_mode)
+        {
+            for (auto & name : grantees->names)
+                name = formatTenantEntityName(name);
+            for (auto & name : grantees->except_names)
+                name = formatTenantEntityName(name);
+        }
+
+        tenant_rewritten = true;
+    }
+}
+
+void ASTGrantQuery::rewriteNamesWithoutTenant(const Context *)
+{
+    if (roles)
+    {
+        for (auto & name : roles->names)
+            name = getOriginalEntityName(name);
+        for (auto & name : roles->except_names)
+            name = getOriginalEntityName(name);
+    }
+    if (grantees)
+    {
+        for (auto & name : grantees->names)
+            name = getOriginalEntityName(name);
+        for (auto & name : grantees->except_names)
+            name = getOriginalEntityName(name);
+    }
+    for (auto & access_rights_element : access_rights_elements)
+    {
+        access_rights_element.database = getOriginalDatabaseName(access_rights_element.database);
+    }
+
 }
 
 }

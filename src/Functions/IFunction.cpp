@@ -21,21 +21,24 @@
 
 #include <Functions/IFunctionAdaptors.h>
 
-#include <Common/typeid_cast.h>
-#include <Common/assert_cast.h>
-#include <Common/LRUCache.h>
-#include <Common/SipHash.h>
-#include <Columns/ColumnConst.h>
-#include <Columns/ColumnNullable.h>
-#include <Columns/ColumnTuple.h>
-#include <Columns/ColumnLowCardinality.h>
-#include <DataTypes/DataTypeNothing.h>
-#include <DataTypes/DataTypeNullable.h>
-#include <DataTypes/Native.h>
-#include <DataTypes/DataTypeLowCardinality.h>
-#include <Functions/FunctionHelpers.h>
 #include <cstdlib>
 #include <memory>
+#include <Columns/ColumnConst.h>
+#include <Columns/ColumnLowCardinality.h>
+#include <Columns/ColumnNothing.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnTuple.h>
+#include <Columns/ColumnUnique.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNothing.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/Native.h>
+#include <Functions/FunctionHelpers.h>
+#include <Common/LRUCache.h>
+#include <Common/SipHash.h>
+#include <Common/assert_cast.h>
+#include <Common/typeid_cast.h>
 
 #if !defined(ARCADIA_BUILD)
 #    include <Common/config.h>
@@ -213,7 +216,7 @@ ColumnPtr IExecutableFunction::defaultImplementationForNulls(
         if (!result_type->isNullable())
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                             "Function {} with Null argument and default implementation for Nulls "
-                            "is expected to return Nullable result, got {}", result_type->getName());
+                            "is expected to return Nullable result, got {}", getName(), result_type->getName());
 
         return result_type->createColumnConstWithDefaultValue(input_rows_count);
     }
@@ -230,13 +233,43 @@ ColumnPtr IExecutableFunction::defaultImplementationForNulls(
     return nullptr;
 }
 
+ColumnPtr IExecutableFunction::defaultImplementationForNothing(
+    const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count) const
+{
+    if (!useDefaultImplementationForNothing())
+        return nullptr;
+
+    bool is_nothing_type_presented = false;
+    for (const auto & arg : args)
+        is_nothing_type_presented |= isNothing(arg.type);
+
+    if (!is_nothing_type_presented)
+        return nullptr;
+
+    if (!isNothing(result_type))
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Function {} with argument with type Nothing and default implementation for Nothing "
+            "is expected to return result with type Nothing, got {}",
+            getName(),
+            result_type->getName());
+
+    return ColumnConst::create(ColumnNothing::create(1), input_rows_count);
+}
+
 ColumnPtr IExecutableFunction::executeWithoutLowCardinalityColumns(
     const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run) const
 {
+    if (isPreviledgedFunction())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Tenant cannot execute this function {} for security reason.", getName());
+
     if (auto res = defaultImplementationForConstantArguments(args, result_type, input_rows_count, dry_run))
         return res;
 
     if (auto res = defaultImplementationForNulls(args, result_type, input_rows_count, dry_run))
+        return res;
+
+    if (auto res = defaultImplementationForNothing(args, result_type, input_rows_count))
         return res;
 
     ColumnPtr res;
@@ -270,6 +303,11 @@ ColumnPtr IExecutableFunction::executeWithoutLowCardinalityColumns(
 
 ColumnPtr IExecutableFunction::execute(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count, bool dry_run) const
 {
+    /// Result type Nothing means that we don't need to execute function at all.
+    /// Example: select arrayMap(x -> 2 * x, []);
+    if (isNothing(result_type))
+        return result_type->createColumn();
+
     ColumnPtr result;
 
     if (useDefaultImplementationForLowCardinalityColumns())
@@ -288,7 +326,13 @@ ColumnPtr IExecutableFunction::execute(const ColumnsWithTypeAndName & arguments,
             if (is_full_stat) // for full state lc column
             {
                 convertLowCardinalityColumnsToFull(columns_without_low_cardinality);
-                return executeWithoutLowCardinalityColumns(columns_without_low_cardinality, dictionary_type, input_rows_count, dry_run);
+                MutableColumnPtr res_index = DataTypeUInt8().createColumn();
+                MutableColumnPtr res_dictionary
+                    = DataTypeLowCardinality::createColumnUnique(*res_low_cardinality_type->getDictionaryType());
+                return ColumnLowCardinality::create(
+                    std::move(res_dictionary),
+                    std::move(res_index),
+                    executeWithoutLowCardinalityColumns(columns_without_low_cardinality, dictionary_type, input_rows_count, dry_run));
             }
 
             size_t new_input_rows_count = columns_without_low_cardinality.empty()
@@ -393,6 +437,15 @@ DataTypePtr IFunctionOverloadResolver::getReturnTypeWithoutLowCardinality(const 
 {
     checkNumberOfArguments(arguments.size());
 
+    if (!arguments.empty() && useDefaultImplementationForNothing())
+    {
+        for (const auto & arg : arguments)
+        {
+            if (isNothing(arg.type))
+                return std::make_shared<DataTypeNothing>();
+        }
+    }
+
     if (!arguments.empty() && useDefaultImplementationForNulls())
     {
         NullPresence null_presence = getNullPresense(arguments);
@@ -431,13 +484,14 @@ static std::optional<DataTypes> removeNullables(const DataTypes & types)
 
 bool IFunction::isCompilable(const DataTypes & arguments) const
 {
+
     if (useDefaultImplementationForNulls())
         if (auto denulled = removeNullables(arguments))
             return isCompilableImpl(*denulled);
     return isCompilableImpl(arguments);
 }
 
-llvm::Value * IFunction::compile(llvm::IRBuilderBase & builder, const DataTypes & arguments, Values values) const
+llvm::Value * IFunction::compile(llvm::IRBuilderBase & builder, const DataTypes & arguments, Values values, JITContext & jit_context) const
 {
     auto denulled_arguments = removeNullables(arguments);
     if (useDefaultImplementationForNulls() && denulled_arguments)
@@ -466,7 +520,7 @@ llvm::Value * IFunction::compile(llvm::IRBuilderBase & builder, const DataTypes 
             }
         }
 
-        auto * result = compileImpl(builder, *denulled_arguments, unwrapped_values);
+        auto * result = compileImpl(builder, *denulled_arguments, unwrapped_values, jit_context);
 
         auto * nullable_structure_type = toNativeType(b, makeNullable(getReturnTypeImpl(*denulled_arguments)));
         auto * nullable_structure_value = llvm::Constant::getNullValue(nullable_structure_type);
@@ -480,7 +534,7 @@ llvm::Value * IFunction::compile(llvm::IRBuilderBase & builder, const DataTypes 
         return b.CreateInsertValue(nullable_structure_with_result_value, nullable_structure_result_null, {1});
     }
 
-    return compileImpl(builder, arguments, std::move(values));
+    return compileImpl(builder, arguments, std::move(values), jit_context);
 }
 
 #endif

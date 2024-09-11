@@ -52,6 +52,8 @@ public:
         return 1;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
         if (arguments.size() != 1)
@@ -151,7 +153,7 @@ private:
 
 }
 
-void registerFunctionAddressToLine(FunctionFactory & factory)
+REGISTER_FUNCTION(AddressToLine)
 {
     factory.registerFunction<FunctionAddressToLine>();
 }

@@ -1,12 +1,19 @@
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypesDecimal.h>
-#include <DataTypes/DataTypeDateTime64.h>
-#include <Columns/ColumnsNumber.h>
-#include <Columns/ColumnDecimal.h>
-#include "FunctionArrayMapped.h"
-#include <Functions/FunctionFactory.h>
 #include <common/defines.h>
 
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnDecimal.h>
+#include <Columns/ColumnsNumber.h>
+
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeDate.h>
+#include <DataTypes/DataTypeDate32.h>
+#include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
+
+#include <Functions/FunctionFactory.h>
+#include "FunctionArrayMapped.h"
 
 namespace DB
 {
@@ -71,10 +78,14 @@ struct ArrayAggregateResultImpl<ArrayElement, AggregateOperation::sum>
         std::conditional_t<std::is_same_v<ArrayElement, UInt128>, UInt128,
         std::conditional_t<std::is_same_v<ArrayElement, Int256>, Int256,
         std::conditional_t<std::is_same_v<ArrayElement, UInt256>, UInt256,
-        std::conditional_t<IsDecimalNumber<ArrayElement>, Decimal128,
+        std::conditional_t<std::is_same_v<ArrayElement, Decimal32>, Decimal128,
+        std::conditional_t<std::is_same_v<ArrayElement, Decimal64>, Decimal128,
+        std::conditional_t<std::is_same_v<ArrayElement, Decimal128>, Decimal128,
+        std::conditional_t<std::is_same_v<ArrayElement, Decimal256>, Decimal256,
+        std::conditional_t<std::is_same_v<ArrayElement, DateTime64>, Decimal128,
         std::conditional_t<std::is_floating_point_v<ArrayElement>, Float64,
         std::conditional_t<std::is_signed_v<ArrayElement>, Int64,
-            UInt64>>>>>>>;
+            UInt64>>>>>>>>>>>;
 };
 
 template <typename ArrayElement, AggregateOperation operation>
@@ -83,6 +94,9 @@ using ArrayAggregateResult = typename ArrayAggregateResultImpl<ArrayElement, ope
 template<AggregateOperation aggregate_operation>
 struct ArrayAggregateImpl
 {
+    using column_type = ColumnArray;
+    using data_type = DataTypeArray;
+
     static bool needBoolean() { return false; }
     static bool needExpression() { return false; }
     static bool needOneArray() { return false; }
@@ -96,26 +110,53 @@ struct ArrayAggregateImpl
             using Types = std::decay_t<decltype(types)>;
             using DataType = typename Types::LeftType;
 
-            if constexpr (aggregate_operation == AggregateOperation::average || aggregate_operation == AggregateOperation::product)
-            {
-                result = std::make_shared<DataTypeFloat64>();
 
-                return true;
+            if constexpr (!IsDataTypeDateOrDateTime<DataType>)
+            {
+                if constexpr (aggregate_operation == AggregateOperation::average || aggregate_operation == AggregateOperation::product)
+                {
+                    result = std::make_shared<DataTypeFloat64>();
+                    return true;
+                }
+                else if constexpr (IsDataTypeNumber<DataType>)
+                {
+                    using NumberReturnType = ArrayAggregateResult<typename DataType::FieldType, aggregate_operation>;
+                    result = std::make_shared<DataTypeNumber<NumberReturnType>>();
+
+                    return true;
+                }
+                else if constexpr (IsDataTypeDecimal<DataType> && !IsDataTypeDateOrDateTime<DataType>)
+                {
+                    using DecimalReturnType = ArrayAggregateResult<typename DataType::FieldType, aggregate_operation>;
+                    UInt32 scale = getDecimalScale(*expression_return);
+                    result = std::make_shared<DataTypeDecimal<DecimalReturnType>>(DecimalUtils::max_precision<DecimalReturnType>, scale);
+
+                    return true;
+                }
+
             }
-            else if constexpr (IsDataTypeNumber<DataType>)
+            else if constexpr (aggregate_operation == AggregateOperation::max || aggregate_operation == AggregateOperation::min)
             {
-                using NumberReturnType = ArrayAggregateResult<typename DataType::FieldType, aggregate_operation>;
-                result = std::make_shared<DataTypeNumber<NumberReturnType>>();
+                if constexpr (IsDataTypeDate<DataType>)
+                {
+                    result = std::make_shared<DataType>();
+                    return true;
+                }
+                else if constexpr (!IsDataTypeDecimal<DataType>)
+                {
+                    std::string timezone = getDateTimeTimezone(*expression_return);
+                    result = std::make_shared<DataTypeDateTime>(timezone);
 
-                return true;
-            }
-            else if constexpr (IsDataTypeDecimal<DataType> && !IsDataTypeDateOrDateTime<DataType>)
-            {
-                using DecimalReturnType = ArrayAggregateResult<typename DataType::FieldType, aggregate_operation>;
-                UInt32 scale = getDecimalScale(*expression_return);
-                result = std::make_shared<DataTypeDecimal<DecimalReturnType>>(DecimalUtils::max_precision<DecimalReturnType>, scale);
+                    return true;
+                }
+                else
+                {
+                    std::string timezone = getDateTimeTimezone(*expression_return);
+                    UInt32 scale = getDecimalScale(*expression_return);
+                    result = std::make_shared<DataTypeDateTime64>(scale, timezone);
 
-                return true;
+                    return true;
+                }
             }
 
             return false;
@@ -356,8 +397,12 @@ struct ArrayAggregateImpl
             executeType<Float64>(mapped, offsets, res) ||
             executeType<Decimal32>(mapped, offsets, res) ||
             executeType<Decimal64>(mapped, offsets, res) ||
-            executeType<Decimal128>(mapped, offsets, res))
+            executeType<Decimal128>(mapped, offsets, res) ||
+            executeType<Decimal256>(mapped, offsets, res) ||
+            executeType<DateTime64>(mapped, offsets, res))
+        {
             return res;
+        }
         else
             throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unexpected column for arraySum: {}" + mapped->getName());
     }
@@ -378,10 +423,11 @@ using FunctionArrayAverage = FunctionArrayMapped<ArrayAggregateImpl<AggregateOpe
 struct NameArrayProduct { static constexpr auto name = "arrayProduct"; };
 using FunctionArrayProduct = FunctionArrayMapped<ArrayAggregateImpl<AggregateOperation::product>, NameArrayProduct>;
 
-void registerFunctionArrayAggregation(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayAggregation)
 {
     factory.registerFunction<FunctionArrayMin>();
     factory.registerFunction<FunctionArrayMax>();
+
     factory.registerFunction<FunctionArraySum>();
     factory.registerFunction<FunctionArrayAverage>();
     factory.registerFunction<FunctionArrayProduct>();

@@ -13,14 +13,16 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <Optimizer/Rule/Rewrite/PushAggThroughJoinRules.h>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Core/SortDescription.h>
+#include <Interpreters/join_common.h>
 #include <Optimizer/DistinctOutputUtil.h>
 #include <Optimizer/PredicateUtils.h>
 #include <Optimizer/Rule/Patterns.h>
 #include <Parsers/ASTIdentifier.h>
-#include <Interpreters/join_common.h>
 #include <QueryPlan/AggregatingStep.h>
 #include <QueryPlan/JoinStep.h>
 #include <QueryPlan/ProjectionStep.h>
@@ -127,11 +129,13 @@ static MappedAggregationInfo createAggregationOverNull(const AggregatingStep * r
     }
 
     // create an aggregation node whose source is the null row.
-    auto aggregation_over_null_row_step
-        = std::make_shared<AggregatingStep>(null_row->getStep()->getOutputStream(), Names{}, aggregations_over_null, GroupingSetsParamsList{}, true, GroupingDescriptions{}, false, false);
-    auto aggregation_over_null_row = PlanNodeBase::createPlanNode(context.nextNodeId(), std::move(aggregation_over_null_row_step), {null_row});
+    auto aggregation_over_null_row_step = std::make_shared<AggregatingStep>(
+        null_row->getStep()->getOutputStream(), Names{}, NameSet{}, aggregations_over_null, GroupingSetsParamsList{}, true);
+    auto aggregation_over_null_row
+        = PlanNodeBase::createPlanNode(context.nextNodeId(), std::move(aggregation_over_null_row_step), {null_row});
 
-    return MappedAggregationInfo{.aggregation_node = std::move(aggregation_over_null_row), .symbolMapping = std::move(aggregations_symbol_mapping)};
+    return MappedAggregationInfo{
+        .aggregation_node = std::move(aggregation_over_null_row), .symbol_mapping = std::move(aggregations_symbol_mapping)};
 }
 
 // When the aggregation is done after the join, there will be a null value that gets aggregated over
@@ -139,13 +143,17 @@ static MappedAggregationInfo createAggregationOverNull(const AggregatingStep * r
 // of an aggregation over a single null row is one or zero rather than null. In order to ensure correct results,
 // we add a coalesce function with the output of the new outer join and the aggregation performed over a single
 // null row.
-static PlanNodePtr coalesceWithNullAggregation(const AggregatingStep * aggregation_step, const PlanNodePtr & outerJoin, Context & context)
+static PlanNodePtr coalesceWithNullAggregation(
+    const AggregatingStep * aggregation_step,
+    const PlanNodePtr & outerJoin,
+    const NameToNameMap & rewritten_aggregates_to_outputs,
+    Context & context)
 {
     // Create an aggregation node over a row of nulls.
     MappedAggregationInfo aggregation_over_null_info = createAggregationOverNull(aggregation_step, context);
 
     auto & aggregation_over_null = aggregation_over_null_info.aggregation_node;
-    auto & source_aggregation_to_over_null_mapping = aggregation_over_null_info.symbolMapping;
+    auto & source_aggregation_to_over_null_mapping = aggregation_over_null_info.symbol_mapping;
 
     // Do a cross join with the aggregation over null
     Block names_and_types;
@@ -165,10 +173,13 @@ static PlanNodePtr coalesceWithNullAggregation(const AggregatingStep * aggregati
         DataStream{names_and_types},
         ASTTableJoin::Kind::Cross,
         ASTTableJoin::Strictness::All,
+        context.getSettingsRef().max_threads,
+        context.getSettingsRef().optimize_read_in_order,
         Names{},
         Names{});
 
-    PlanNodePtr cross_join = PlanNodeBase::createPlanNode(context.nextNodeId(), std::move(cross_join_step), {outerJoin, aggregation_over_null});
+    PlanNodePtr cross_join
+        = PlanNodeBase::createPlanNode(context.nextNodeId(), std::move(cross_join_step), {outerJoin, aggregation_over_null});
 
     // Add coalesce expressions for all aggregation functions
     Assignments assignments_builder;
@@ -188,26 +199,47 @@ static PlanNodePtr coalesceWithNullAggregation(const AggregatingStep * aggregati
                 ASTs{
                     std::make_shared<ASTIdentifier>(symbol.name),
                     std::make_shared<ASTIdentifier>(source_aggregation_to_over_null_mapping[symbol.name])});
-            assignments_builder.emplace_back(symbol.name, coalesce);
+            assignments_builder.emplace_back(rewritten_aggregates_to_outputs.at(symbol.name), coalesce);
+            name_to_type[rewritten_aggregates_to_outputs.at(symbol.name)] = symbol.type;
         }
         else
         {
             assignments_builder.emplace_back(symbol.name, std::make_shared<ASTIdentifier>(symbol.name));
+            name_to_type[symbol.name] = symbol.type;
         }
-        name_to_type[symbol.name] = symbol.type;
     }
 
     auto projection_step = std::make_shared<ProjectionStep>(cross_join->getStep()->getOutputStream(), std::move(assignments_builder), std::move(name_to_type));
     return PlanNodeBase::createPlanNode(context.nextNodeId(), std::move(projection_step), {cross_join});
 }
 
-
-PatternPtr PushAggThroughOuterJoin::getPattern() const
+static PlanNodePtr
+restoreOutputName(const PlanNodePtr & node, const NameToNameMap & rewritten_aggregates_to_outputs, ContextMutablePtr & context)
 {
-    return Patterns::aggregating()->withSingle(Patterns::join()->matchingStep<JoinStep>([](const JoinStep & s) {
-        return (s.getKind() == ASTTableJoin::Kind::Left || s.getKind() == ASTTableJoin::Kind::Right)
-            && PredicateUtils::isTruePredicate(s.getFilter());
-    }));
+    Assignments assignments_builder;
+    NameToType name_to_type;
+
+    for (const auto & symbol : node->getStep()->getOutputStream().header)
+    {
+        String output_name
+            = rewritten_aggregates_to_outputs.count(symbol.name) ? rewritten_aggregates_to_outputs.at(symbol.name) : symbol.name;
+        assignments_builder.emplace_back(output_name, std::make_shared<ASTIdentifier>(symbol.name));
+        name_to_type[output_name] = symbol.type;
+    }
+
+    auto projection_step = std::make_shared<ProjectionStep>(node->getStep()->getOutputStream(), assignments_builder, name_to_type);
+    return PlanNodeBase::createPlanNode(context->nextNodeId(), std::move(projection_step), {node});
+}
+
+ConstRefPatternPtr PushAggThroughOuterJoin::getPattern() const
+{
+    static auto pattern = Patterns::aggregating()
+        .withSingle(Patterns::join().matchingStep<JoinStep>([](const JoinStep & s) {
+            return (s.getKind() == ASTTableJoin::Kind::Left || s.getKind() == ASTTableJoin::Kind::Right)
+                && PredicateUtils::isTruePredicate(s.getFilter());
+        }))
+        .result();
+    return pattern;
 }
 
 /**
@@ -244,8 +276,8 @@ PatternPtr PushAggThroughOuterJoin::getPattern() const
  *            avg(null_literal)
  *              - Values (null_literal)
  */
- // @jingpeng TODO: wrong answer
- // select a, groupArray(s) from (select distinct 1 as a) left join (select 2 as b, 'foo' as s) on a=b group by a SETTINGS join_use_nulls=0;
+// @jingpeng TODO: wrong answer
+// select a, groupArray(s) from (select distinct 1 as a) left join (select 2 as b, 'foo' as s) on a=b group by a SETTINGS join_use_nulls=0;
 TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, const Captures &, RuleContext & context)
 {
     const auto * agg_step = dynamic_cast<const AggregatingStep *>(aggregation->getStep().get());
@@ -269,10 +301,31 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
 
     auto grouping_keys = join_step->getKind() == ASTTableJoin::Kind::Right ? join_step->getLeftKeys() : join_step->getRightKeys();
 
+    // Use new names for pushed aggregates to avoid name conflict when aggregation over null is needed.
+    // Keep the name mappings to restore the output name at the end.
+    auto rewritten_aggregates = agg_step->getAggregates();
+    NameToNameMap rewritten_aggregates_to_outputs;
+    for (auto & agg_desc : rewritten_aggregates)
+    {
+        auto rewritten_name = context.context->getSymbolAllocator()->newSymbol(agg_desc.column_name);
+        rewritten_aggregates_to_outputs.emplace(rewritten_name, agg_desc.column_name);
+        agg_desc.column_name = rewritten_name;
+    }
+
     auto rewritten_aggregation = std::make_shared<AggregatingStep>(
-        inner_table->getStep()->getOutputStream(), grouping_keys, agg_step->getAggregates(), agg_step->getGroupingSetsParams(), agg_step->isFinal(),
-        GroupingDescriptions{}, false,  !(agg_step->isFinal()) && context.context->getSettingsRef().distributed_aggregation_memory_efficient
-        );
+        inner_table->getStep()->getOutputStream(),
+        grouping_keys,
+        agg_step->getKeysNotHashed(),
+        rewritten_aggregates,
+        agg_step->getGroupingSetsParams(),
+        agg_step->isFinal(),
+        SortDescription{},
+        GroupingDescriptions{},
+        agg_step->needOverflowRow(),
+        false,
+        agg_step->isNoShuffle(),
+        agg_step->isStreamingForCache(),
+        agg_step->getHints());
     auto rewritten_agg_node = PlanNodeBase::createPlanNode(context.context->nextNodeId(), std::move(rewritten_aggregation), {inner_table});
 
     PlanNodePtr rewritten_join;
@@ -290,6 +343,8 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
             DataStream{output_header},
             join_step->getKind(),
             join_step->getStrictness(),
+            join_step->getMaxStreams(),
+            join_step->getKeepLeftReadInOrder(),
             join_step->getLeftKeys(),
             join_step->getRightKeys(),
             join_step->getFilter(),
@@ -297,7 +352,12 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
             join_step->getRequireRightKeys(),
             join_step->getAsofInequality(),
             join_step->getDistributionType(),
-            join_step->isMagic());
+            join_step->getJoinAlgorithm(),
+            join_step->isMagic(),
+            join_step->isOrdered(),
+            join_step->isSimpleReordered(),
+            join_step->getRuntimeFilterBuilders(),
+            join_step->getHints());
         rewritten_join = PlanNodeBase::createPlanNode(
             context.context->nextNodeId(), std::move(rewritten_join_step), {join->getChildren()[0], rewritten_agg_node});
     }
@@ -314,6 +374,8 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
             DataStream{output_header},
             join_step->getKind(),
             join_step->getStrictness(),
+            join_step->getMaxStreams(),
+            join_step->getKeepLeftReadInOrder(),
             join_step->getLeftKeys(),
             join_step->getRightKeys(),
             join_step->getFilter(),
@@ -321,7 +383,12 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
             join_step->getRequireRightKeys(),
             join_step->getAsofInequality(),
             join_step->getDistributionType(),
-            join_step->isMagic());
+            join_step->getJoinAlgorithm(),
+            join_step->isMagic(),
+            join_step->isOrdered(),
+            join_step->isSimpleReordered(),
+            join_step->getRuntimeFilterBuilders(),
+            join_step->getHints());
         rewritten_join = PlanNodeBase::createPlanNode(
             context.context->nextNodeId(), std::move(rewritten_join_step), {rewritten_agg_node, join->getChildren()[1]});
     }
@@ -344,7 +411,10 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
     if (add_null)
     {
         auto result_node = coalesceWithNullAggregation(
-            dynamic_cast<const AggregatingStep *>(rewritten_agg_node->getStep().get()), rewritten_join, *context.context);
+            dynamic_cast<const AggregatingStep *>(rewritten_agg_node->getStep().get()),
+            rewritten_join,
+            rewritten_aggregates_to_outputs,
+            *context.context);
         if (!result_node)
         {
             return {};
@@ -357,8 +427,119 @@ TransformResult PushAggThroughOuterJoin::transformImpl(PlanNodePtr aggregation, 
         {
             return {};
         }
-        return rewritten_join;
+        return restoreOutputName(rewritten_join, rewritten_aggregates_to_outputs, context.context);
     }
 }
+
+ConstRefPatternPtr PushAggThroughInnerJoin::getPattern() const
+{
+    static auto pattern = Patterns::aggregating()
+        .matchingStep<AggregatingStep>([](const AggregatingStep & s) { return s.getAggregates().empty(); })
+        .withSingle(Patterns::join()
+                        .matchingStep<JoinStep>([](const JoinStep & s) {
+                            return (s.getKind() == ASTTableJoin::Kind::Inner) && PredicateUtils::isTruePredicate(s.getFilter());
+                        })
+                        .with(Patterns::any(), Patterns::tableScan()))
+        .result();
+    return pattern;
+}
+
+TransformResult PushAggThroughInnerJoin::transformImpl(PlanNodePtr aggregation, const Captures &, RuleContext & context)
+{
+    const auto * agg_step = dynamic_cast<const AggregatingStep *>(aggregation->getStep().get());
+
+    auto join = aggregation->getChildren()[0];
+    const auto * join_step = dynamic_cast<const JoinStep *>(join->getStep().get());
+    auto left_table = join->getChildren()[0];
+    auto right_table = join->getChildren()[1];
+
+    if (left_table->getStep()->getType() == IQueryPlanStep::Type::Aggregating
+        || right_table->getStep()->getType() == IQueryPlanStep::Type::Aggregating)
+    {
+        return {};
+    }
+
+    std::set<String> join_keys{join_step->getLeftKeys().begin(), join_step->getLeftKeys().end()};
+    std::set<String> grouping_keys{agg_step->getKeys().begin(), agg_step->getKeys().end()};
+    join_keys.insert(join_step->getRightKeys().begin(), join_step->getRightKeys().end());
+
+    if (agg_step->getKeys().size() != join_step->getLeftKeys().size() || !agg_step->isNormal()
+        || !std::includes(join_keys.begin(), join_keys.end(), grouping_keys.begin(), grouping_keys.end()))
+    {
+        return {};
+    }
+
+    Names left_grouping;
+    Names right_grouping;
+    for (size_t index = 0; index < join_step->getLeftKeys().size(); index++)
+    {
+        if (grouping_keys.contains(join_step->getLeftKeys()[index]) || grouping_keys.contains(join_step->getRightKeys()[index]))
+        {
+            left_grouping.emplace_back(join_step->getLeftKeys()[index]);
+            right_grouping.emplace_back(join_step->getRightKeys()[index]);
+        }
+    }
+
+    auto left_aggregation = std::make_shared<AggregatingStep>(
+        left_table->getStep()->getOutputStream(),
+        left_grouping,
+        agg_step->getKeysNotHashed(),
+        agg_step->getAggregates(),
+        agg_step->getGroupingSetsParams(),
+        agg_step->isFinal(),
+        SortDescription{},
+        GroupingDescriptions{},
+        agg_step->needOverflowRow(),
+        false,
+        agg_step->isNoShuffle(),
+        agg_step->isStreamingForCache(),
+        agg_step->getHints());
+    auto left_agg_node = PlanNodeBase::createPlanNode(context.context->nextNodeId(), std::move(left_aggregation), {left_table});
+
+    auto right_aggregation = std::make_shared<AggregatingStep>(
+        right_table->getStep()->getOutputStream(),
+        right_grouping,
+        agg_step->getKeysNotHashed(),
+        agg_step->getAggregates(),
+        agg_step->getGroupingSetsParams(),
+        agg_step->isFinal(),
+        SortDescription{},
+        GroupingDescriptions{},
+        agg_step->needOverflowRow(),
+        false,
+        agg_step->isNoShuffle(),
+        agg_step->isStreamingForCache(),
+        agg_step->getHints());
+    auto right_agg_node = PlanNodeBase::createPlanNode(context.context->nextNodeId(), std::move(right_aggregation), {right_table});
+
+    auto output_stream = agg_step->getInputStreams()[0];
+    auto rewritten_join_step = std::make_shared<JoinStep>(
+        DataStreams{left_agg_node->getCurrentDataStream(), right_agg_node->getCurrentDataStream()},
+        output_stream,
+        join_step->getKind(),
+        join_step->getStrictness(),
+        join_step->getMaxStreams(),
+        join_step->getKeepLeftReadInOrder(),
+        join_step->getLeftKeys(),
+        join_step->getRightKeys(),
+        join_step->getFilter(),
+        join_step->isHasUsing(),
+        join_step->getRequireRightKeys(),
+        join_step->getAsofInequality(),
+        join_step->getDistributionType(),
+        join_step->getJoinAlgorithm(),
+        join_step->isMagic(),
+        join_step->isOrdered(),
+        join_step->isSimpleReordered(),
+        join_step->getRuntimeFilterBuilders(),
+        join_step->getHints());
+    auto rewritten_join
+        = PlanNodeBase::createPlanNode(context.context->nextNodeId(), std::move(rewritten_join_step), {left_agg_node, right_agg_node});
+
+    auto result = aggregation->copy(aggregation->getId(), context.context);
+    result->replaceChildren({rewritten_join});
+    return result;
+}
+
 
 }

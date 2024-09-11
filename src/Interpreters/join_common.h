@@ -4,6 +4,7 @@
 #include <Interpreters/IJoin.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ExpressionActions.h>
+#include <DataTypes/IDataType.h>
 
 namespace DB
 {
@@ -15,24 +16,34 @@ using ColumnRawPtrs = std::vector<const IColumn *>;
 
 namespace JoinCommon
 {
+bool isNullable(const DataTypePtr & type);
 bool canBecomeNullable(const DataTypePtr & type);
 DataTypePtr convertTypeToNullable(const DataTypePtr & type);
+DataTypePtr tryConvertTypeToNullable(const DataTypePtr & type);
 void convertColumnToNullable(ColumnWithTypeAndName & column, bool remove_low_card = false);
 void convertColumnsToNullable(Block & block, size_t starting_pos = 0);
+void convertColumnToNullable2(ColumnWithTypeAndName & column);
+
+ColumnPtr tryConvertColumnToNullable(ColumnPtr col);
+DataTypePtr removeTypeNullability(const DataTypePtr & type);
 void removeColumnNullability(ColumnWithTypeAndName & column);
 void changeColumnRepresentation(const ColumnPtr & src_column, ColumnPtr & dst_column);
 ColumnPtr emptyNotNullableClone(const ColumnPtr & column);
-Columns materializeColumns(const Block & block, const Names & names);
-ColumnRawPtrs materializeColumnsInplace(Block & block, const Names & names);
+Columns materializeColumns(const Block & block, const Names & names,
+                           const std::vector<bool> *null_safeColumns);
+ColumnRawPtrs materializeColumnsInplace(Block & block, const Names & names,
+                                        const std::vector<bool> *null_safeColumns);
 ColumnRawPtrs getRawPointers(const Columns & columns);
 void removeLowCardinalityInplace(Block & block);
 void removeLowCardinalityInplace(Block & block, const Names & names, bool change_type = true);
 void restoreLowCardinalityInplace(Block & block);
 
-ColumnRawPtrs extractKeysForJoin(const Block & block_keys, const Names & key_names_right);
+ColumnRawPtrs extractKeysForJoin(Block & block_keys, const Names & key_names_right,
+                                 const std::vector<bool> *null_safeColumns);
 
 /// Throw an exception if blocks have different types of key columns. Compare up to Nullability.
 void checkTypesOfKeys(const Block & block_left, const Names & key_names_left, const Block & block_right, const Names & key_names_right);
+bool isJoinCompatibleTypes(const DataTypePtr & left, const DataTypePtr & right);
 
 void createMissedColumns(Block & block);
 void joinTotals(Block left_totals, Block right_totals, const TableJoin & table_join, Block & out_block);

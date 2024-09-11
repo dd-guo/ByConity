@@ -89,6 +89,8 @@ ProjectionDescription ProjectionDescription::clone() const
     other.required_columns = required_columns;
     other.column_names = column_names;
     other.data_types = data_types;
+    for (const auto & column_ast: column_asts)
+        other.column_asts.push_back(column_ast->clone());
     other.sample_block = sample_block;
     other.sample_block_for_keys = sample_block_for_keys;
     other.metadata = metadata;
@@ -132,7 +134,7 @@ ProjectionDescription::getProjectionFromAST(const ASTPtr & definition_ast, const
     auto query = projection_definition->query->as<ASTProjectionSelectQuery &>();
     result.query_ast = query.cloneToASTSelect();
 
-    auto external_storage_holder = std::make_shared<TemporaryTableHolder>(query_context, columns, ConstraintsDescription{});
+    auto external_storage_holder = std::make_shared<TemporaryTableHolder>(query_context, columns, ConstraintsDescription{}, ForeignKeysDescription{}, UniqueNotEnforcedDescription{});
     StoragePtr storage = external_storage_holder->getTable();
     InterpreterSelectQuery select(
         result.query_ast, query_context, storage, {}, SelectQueryOptions{QueryProcessingStage::WithMergeableState}.modify().ignoreAlias());
@@ -180,8 +182,18 @@ ProjectionDescription::getProjectionFromAST(const ASTPtr & definition_ast, const
                 function_node->name = "tuple";
                 function_node->arguments = group_expression_list->clone();
                 result.key_size = function_node->arguments->children.size();
+                std::unordered_set<std::string> column_names;
                 for (auto & child : function_node->arguments->children)
-                    child = std::make_shared<ASTIdentifier>(child->getColumnName());
+                {
+                    if (column_names.find(child->getColumnName()) != column_names.end())
+	                {
+		                throw Exception(
+		                    "Projection already has the same dimension Column ' " + child->getColumnName() + " '.",
+                			ErrorCodes::INCORRECT_QUERY);
+                    }
+		            column_names.insert(child->getColumnName());
+    	            child = std::make_shared<ASTIdentifier>(child->getColumnName());
+                }
                 function_node->children.push_back(function_node->arguments);
                 order_expression = function_node;
             }
@@ -205,6 +217,35 @@ ProjectionDescription::getProjectionFromAST(const ASTPtr & definition_ast, const
     }
     metadata.primary_key.definition_ast = nullptr;
     result.metadata = std::make_shared<StorageInMemoryMetadata>(metadata);
+
+    std::unordered_map<String, ASTPtr> name_to_ast;
+
+    if (result.type == ProjectionDescription::Type::Aggregate)
+    {
+        const auto * select_analyzer = select.getQueryAnalyzer();
+
+        // keys
+        for (const auto & key_ast: select_analyzer->aggregationKeyAsts())
+            name_to_ast.emplace(key_ast->getColumnName(), key_ast);
+
+        // aggregates
+        for (const auto & agg_ast: select_analyzer->aggregateAsts())
+            name_to_ast.emplace(agg_ast->getColumnName(), agg_ast->clone());
+    }
+    else
+    {
+        for (const auto & select_elem: result.query_ast->as<ASTSelectQuery &>().select()->children)
+            name_to_ast.emplace(select_elem->getColumnName(), select_elem);
+    }
+
+    for (const auto & col_name: result.column_names)
+    {
+        if (!name_to_ast.count(col_name))
+            throw Exception("Unable to determine origin ast for projection column: " + col_name, ErrorCodes::LOGICAL_ERROR);
+
+        result.column_asts.push_back(name_to_ast.at(col_name));
+    }
+
     return result;
 }
 

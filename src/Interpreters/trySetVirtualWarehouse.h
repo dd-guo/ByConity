@@ -17,6 +17,8 @@
 
 #include <Parsers/IAST_fwd.h>
 #include <Interpreters/Context_fwd.h>
+#include <ResourceManagement/VirtualWarehouseType.h>
+#include <Storages/IStorage_fwd.h>
 
 namespace DB
 {
@@ -29,14 +31,20 @@ using VirtualWarehouseHandle = std::shared_ptr<VirtualWarehouseHandleImpl>;
 
 class WorkerGroupHandleImpl;
 using WorkerGroupHandle = std::shared_ptr<WorkerGroupHandleImpl>;
+using VirtualWarehouseType = ResourceManagement::VirtualWarehouseType;
+
+const static std::string EMPTY_VIRTUAL_WAREHOUSE_NAME;
 
 bool trySetVirtualWarehouse(const ASTPtr & ast, ContextMutablePtr & context);
-bool trySetVirtualWarehouseAndWorkerGroup(const ASTPtr & ast, ContextMutablePtr & context);
+bool trySetVirtualWarehouseAndWorkerGroup(const ASTPtr & ast, ContextMutablePtr & context, bool use_router = false);
+bool trySetVirtualWarehouseAndWorkerGroup(const std::string & vw_name, ContextMutablePtr & context);
+std::string tryGetVirtualWarehouseName(const ASTPtr & ast, ContextMutablePtr & context);
 
 /// Won't set virtual warehouse
 VirtualWarehouseHandle getVirtualWarehouseForTable(const MergeTreeMetaBase & storage, const ContextPtr & context);
 
 /// Won't set virtual warehouse or worker group
 WorkerGroupHandle getWorkerGroupForTable(const MergeTreeMetaBase & storage, const ContextPtr & context);
+WorkerGroupHandle getWorkerGroupForTable(ContextPtr local_context, StoragePtr storage);
 
 }

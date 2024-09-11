@@ -15,9 +15,10 @@
 
 #include <WorkerTasks/CloudMergeTreeMutateTask.h>
 
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Interpreters/Context.h>
 #include <Storages/StorageCloudMergeTree.h>
+#include <Transaction/ICnchTransaction.h>
 #include <WorkerTasks/MergeTreeDataMutator.h>
 
 namespace DB
@@ -35,6 +36,11 @@ CloudMergeTreeMutateTask::CloudMergeTreeMutateTask(
     : ManipulationTask(std::move(params_), std::move(context_))
     , storage(storage_)
 {
+    if (/*params.source_parts.empty() && */params.source_data_parts.empty())
+        throw Exception("Expected non-empty source parts in ManipulationTaskParams", ErrorCodes::BAD_ARGUMENTS);
+
+    if (params.new_part_names.empty())
+        throw Exception("Expected non-empty new part names in ManipulationTaskParams", ErrorCodes::BAD_ARGUMENTS);
 }
 
 void CloudMergeTreeMutateTask::executeImpl()
@@ -47,9 +53,20 @@ void CloudMergeTreeMutateTask::executeImpl()
     if (isCancelled())
         throw Exception("Merge task " + params.task_id + " is cancelled", ErrorCodes::ABORTED);
 
-    CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Mutate, params.task_id);
+    UInt64 peak_memory_usage = 0;
+
+    ManipulationListElement * manipulation_list_element = getManipulationListElement();
+    if (manipulation_list_element)
+    {
+        peak_memory_usage = manipulation_list_element->getMemoryTracker().getPeak();
+    }
+
+    CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Mutate, params.task_id,
+        /*consumer_group_*/ {}, /*tpl_*/ {}, /*binlog*/ {}, peak_memory_usage);
     auto res = cnch_writer.dumpAndCommitCnchParts(data_parts);
-    cnch_writer.preload(res.parts);
+    getContext()->getCurrentTransaction()->commitV2();
+    if (params.parts_preload_level)
+        cnch_writer.preload(res.parts);
 }
 
 }

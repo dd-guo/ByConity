@@ -52,6 +52,19 @@ namespace
             return Poco::Net::DNS::hostName();
         }
     }
+
+    std::string getPodOrHostNameImpl()
+    {
+        if (const char * p = std::getenv("MY_POD_NAME"))
+        {
+            return std::string(p);
+        }
+        if (const char * p = std::getenv("POD_NAME"))
+        {
+            return std::string(p);
+        }
+        return getIPOrFQDNOrHostNameImpl();
+    }
 }
 
 
@@ -64,5 +77,12 @@ const std::string & getFQDNOrHostName()
 const std::string & getIPOrFQDNOrHostName()
 {
     static std::string result = getIPOrFQDNOrHostNameImpl();
+    return result;
+}
+
+
+const std::string & getPodOrHostName()
+{
+    static std::string result = getPodOrHostNameImpl(); 
     return result;
 }

@@ -1,0 +1,41 @@
+Projection Est. ? rows
+│     Expressions: count():=`expr#count()`
+└─ MergingAggregated Est. ? rows
+   └─ Gather Exchange Est. ? rows
+      └─ Aggregating Est. ? rows
+         │     Group by: {}
+         │     Aggregates: expr#count():=AggNull(count)()
+         └─ Filter Est. ? rows
+            │     Condition: `__string_params__\'enter_from\'` = \'homepage_fresh\'
+            └─ TableScan test.t40053 Est. ? rows
+                     Where: `__string_params__\'enter_from\'` = \'homepage_fresh\'
+                     Prewhere: `__string_params__\'enter_from\'` IN (\'homepage_fresh\')
+                     Outputs: [__string_params__\'enter_from\']
+Projection Est. ? rows
+│     Expressions: x:=`expr#count()`, y:=`expr#count()_1`
+└─ Inner Join Est. ? rows
+   │     Condition: 
+   ├─ MergingAggregated Est. ? rows
+   │  └─ Gather Exchange Est. ? rows
+   │     └─ Aggregating Est. ? rows
+   │        │     Group by: {}
+   │        │     Aggregates: expr#count():=AggNull(count)()
+   │        └─ Filter Est. ? rows
+   │           │     Condition: `__string_params__\'enter_from\'` = \'homepage_fresh\'
+   │           └─ TableScan test.t40053 Est. ? rows
+   │                    Where: `__string_params__\'enter_from\'` = \'homepage_fresh\'
+   │                    Prewhere: `__string_params__\'enter_from\'` IN (\'homepage_fresh\')
+   │                    Outputs: [__string_params__\'enter_from\']
+   └─ Broadcast Exchange Est. ? rows
+      └─ MergingAggregated Est. ? rows
+         └─ Gather Exchange Est. ? rows
+            └─ Aggregating Est. ? rows
+               │     Group by: {}
+               │     Aggregates: expr#count()_1:=AggNull(count)()
+               └─ Filter Est. ? rows
+                  │     Condition: `__string_params__\'enter_to\'` = \'homepage_click\'
+                  └─ TableScan test.t40053 Est. ? rows
+                           Where: `__string_params__\'enter_to\'` = \'homepage_click\'
+                           Prewhere: `__string_params__\'enter_to\'` IN (\'homepage_click\')
+                           Outputs: [__string_params__\'enter_to\']
+1

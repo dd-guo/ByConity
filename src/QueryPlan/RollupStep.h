@@ -14,8 +14,8 @@
  */
 
 #pragma once
-#include <QueryPlan/ITransformingStep.h>
 #include <DataStreams/SizeLimits.h>
+#include <QueryPlan/ITransformingStep.h>
 
 namespace DB
 {
@@ -32,11 +32,10 @@ public:
     String getName() const override { return "Rollup"; }
 
     Type getType() const override { return Type::Rollup; }
+    AggregatingTransformParamsPtr getParams() const { return params; }
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 

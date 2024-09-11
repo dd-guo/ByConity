@@ -1,3 +1,4 @@
+#include <cassert>
 #include <Parsers/Lexer.h>
 #include <Common/StringUtils/StringUtils.h>
 #include <common/find_symbols.h>
@@ -42,6 +43,36 @@ Token quotedString(const char *& pos, const char * const token_begin, const char
 
         __builtin_unreachable();
     }
+}
+
+Token quotedHexOrBinString(const char *& pos, const char * const token_begin, const char * const end)
+{
+    constexpr char quote = '\'';
+
+    assert(pos[1] == quote);
+
+    bool hex = (*pos == 'x' || *pos == 'X');
+
+    pos += 2;
+
+    if (hex)
+    {
+        while (pos < end && isHexDigit(*pos))
+            ++pos;
+    }
+    else
+    {
+        pos = find_first_not_symbols<'0', '1'>(pos, end);
+    }
+
+    if (pos >= end || *pos != quote)
+    {
+        pos = end;
+        return Token(TokenType::ErrorSingleQuoteIsNotClosed, token_begin, end);
+    }
+
+    ++pos;
+    return Token(TokenType::StringLiteral, token_begin, pos);
 }
 
 }
@@ -168,9 +199,9 @@ Token Lexer::nextTokenImpl()
         case '\'':
             return quotedString<'\'', TokenType::StringLiteral, TokenType::ErrorSingleQuoteIsNotClosed>(pos, token_begin, end);
         case '"':
-            return quotedString<'"', TokenType::QuotedIdentifier, TokenType::ErrorDoubleQuoteIsNotClosed>(pos, token_begin, end);
+            return quotedString<'"', TokenType::DoubleQuotedIdentifier, TokenType::ErrorDoubleQuoteIsNotClosed>(pos, token_begin, end);
         case '`':
-            return quotedString<'`', TokenType::QuotedIdentifier, TokenType::ErrorBackQuoteIsNotClosed>(pos, token_begin, end);
+            return quotedString<'`', TokenType::BackQuotedIdentifier, TokenType::ErrorBackQuoteIsNotClosed>(pos, token_begin, end);
 
         case '(':
             return Token(TokenType::OpeningRoundBracket, token_begin, ++pos);
@@ -197,7 +228,8 @@ Token Lexer::nextTokenImpl()
                     || prev_significant_token_type == TokenType::ClosingRoundBracket
                     || prev_significant_token_type == TokenType::ClosingSquareBracket
                     || prev_significant_token_type == TokenType::BareWord
-                    || prev_significant_token_type == TokenType::QuotedIdentifier
+                    || prev_significant_token_type == TokenType::BackQuotedIdentifier
+                    || prev_significant_token_type == TokenType::DoubleQuotedIdentifier
                     || prev_significant_token_type == TokenType::Number))
                 return Token(TokenType::Dot, token_begin, ++pos);
 
@@ -281,6 +313,18 @@ Token Lexer::nextTokenImpl()
             }
             return Token(TokenType::Slash, token_begin, pos);
         }
+        case '#':   /// start of single line comment, MySQL style
+        {           /// PostgreSQL has some operators using '#' character.
+                    /// For less ambiguity, we will recognize a comment only if # is followed by whitespace.
+                    /// or #! as a special case for "shebang".
+                    /// #hello - not a comment
+                    /// # hello - a comment
+                    /// #!/usr/bin/clickhouse-local --queries-file - a comment
+            ++pos;
+            if (pos < end && (*pos == ' ' || *pos == '!' || *pos == '#'))
+                return comment_until_end_of_line();
+            return Token(TokenType::Error, token_begin, pos);
+        }
         case '%':
             return Token(TokenType::Percent, token_begin, ++pos);
         case '=':   /// =, ==
@@ -297,11 +341,17 @@ Token Lexer::nextTokenImpl()
                 return Token(TokenType::NotEquals, token_begin, ++pos);
             return Token(TokenType::ErrorSingleExclamationMark, token_begin, pos);
         }
-        case '<':   /// <, <=, <>
+        case '<':   /// <, <=, <>, <=>, <<, >>
         {
             ++pos;
-            if (pos < end && *pos == '=')
-                return Token(TokenType::LessOrEquals, token_begin, ++pos);
+            if (pos < end && *pos == '<')
+                return Token(TokenType::BitLeftShift, token_begin, ++pos);
+            if (pos < end && *pos == '=') {
+                ++pos;
+                if (pos < end && *pos == '>')
+                    return Token(TokenType::BitEquals, token_begin, ++pos);
+                return Token(TokenType::LessOrEquals, token_begin, pos);
+            }
             if (pos < end && *pos == '>')
                 return Token(TokenType::NotEquals, token_begin, ++pos);
             return Token(TokenType::Less, token_begin, pos);
@@ -309,6 +359,8 @@ Token Lexer::nextTokenImpl()
         case '>':   /// >, >=
         {
             ++pos;
+            if (pos < end && *pos == '>')
+                return Token(TokenType::BitRightShift, token_begin, ++pos);
             if (pos < end && *pos == '=')
                 return Token(TokenType::GreaterOrEquals, token_begin, ++pos);
             return Token(TokenType::Greater, token_begin, pos);
@@ -322,12 +374,22 @@ Token Lexer::nextTokenImpl()
                 return Token(TokenType::DoubleColon, token_begin, ++pos);
             return Token(TokenType::Colon, token_begin, pos);
         }
+        case '&':
+        {
+            ++pos;
+            return Token(TokenType::BitAnd, token_begin, pos);
+        }
         case '|':
         {
             ++pos;
             if (pos < end && *pos == '|')
                 return Token(TokenType::Concatenation, token_begin, ++pos);
-            return Token(TokenType::ErrorSinglePipeMark, token_begin, pos);
+            return Token(TokenType::BitOr, token_begin, pos);
+        }
+        case '^':
+        {
+            ++pos;
+            return Token(TokenType::BitXor, token_begin, pos);
         }
         case '@':
         {
@@ -338,11 +400,40 @@ Token Lexer::nextTokenImpl()
         }
 
         default:
-            if (*pos == '$' && ((pos + 1 < end && !isWordCharASCII(pos[1])) || pos + 1 == end))
+            if (*pos == '$')
             {
-                /// Capture standalone dollar sign
-                return Token(TokenType::DollarSign, token_begin, ++pos);
+                /// Try to capture dollar sign as start of here doc
+
+                std::string_view token_stream(pos, end - pos);
+                auto heredoc_name_end_position = token_stream.find('$', 1);
+                if (heredoc_name_end_position != std::string::npos)
+                {
+                    size_t heredoc_size = heredoc_name_end_position + 1;
+                    std::string_view heredoc = {token_stream.data(), heredoc_size};
+
+                    size_t heredoc_end_position = token_stream.find(heredoc, heredoc_size);
+                    if (heredoc_end_position != std::string::npos)
+                    {
+
+                        pos += heredoc_end_position;
+                        pos += heredoc_size;
+
+                        return Token(TokenType::HereDoc, token_begin, pos);
+                    }
+                }
+
+                if (((pos + 1 < end && !isWordCharASCII(pos[1])) || pos + 1 == end))
+                {
+                    /// Capture standalone dollar sign
+                    return Token(TokenType::DollarSign, token_begin, ++pos);
+                }
             }
+
+            if (pos + 2 < end && pos[1] == '\'' && (*pos == 'x' || *pos == 'b' || *pos == 'X' || *pos == 'B'))
+            {
+                return quotedHexOrBinString(pos, token_begin, end);
+            }
+
             if (isWordCharASCII(*pos) || *pos == '$')
             {
                 ++pos;
@@ -393,8 +484,6 @@ const char * getErrorTokenDescription(TokenType type)
             return "Back quoted string is not closed";
         case TokenType::ErrorSingleExclamationMark:
             return "Exclamation mark can only occur in != operator";
-        case TokenType::ErrorSinglePipeMark:
-            return "Pipe symbol could only occur in || operator";
         case TokenType::ErrorWrongNumber:
             return "Wrong number";
         case TokenType::ErrorMaxQuerySizeExceeded:

@@ -9,6 +9,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/Serializations/SerializationArray.h>
 #include <DataTypes/Serializations/SerializationTupleElement.h>
 #include <DataTypes/Serializations/SerializationNumber.h>
@@ -95,26 +96,26 @@ ColumnPtr DataTypeArray::getSubcolumnImpl(const String & subcolumn_name, const I
     return ColumnArray::create(subcolumn, column_array.getOffsetsPtr());
 }
 
-SerializationPtr DataTypeArray::getSubcolumnSerialization(
-    const String & subcolumn_name, const BaseSerializationGetter & base_serialization_getter) const
-{
-    return getSubcolumnSerializationImpl(subcolumn_name, base_serialization_getter, 0);
-}
+// SerializationPtr DataTypeArray::getSubcolumnSerialization(
+//     const String & subcolumn_name, const BaseSerializationGetter & base_serialization_getter) const
+// {
+//     return getSubcolumnSerializationImpl(subcolumn_name, base_serialization_getter, 0);
+// }
 
-SerializationPtr DataTypeArray::getSubcolumnSerializationImpl(
-    const String & subcolumn_name, const BaseSerializationGetter & base_serialization_getter, size_t level) const
-{
-    if (subcolumn_name == "size" + std::to_string(level))
-        return std::make_shared<SerializationTupleElement>(base_serialization_getter(DataTypeUInt64()), subcolumn_name, false);
+// SerializationPtr DataTypeArray::getSubcolumnSerializationImpl(
+//     const String & subcolumn_name, const BaseSerializationGetter & base_serialization_getter, size_t level) const
+// {
+//     if (subcolumn_name == "size" + std::to_string(level))
+//         return std::make_shared<SerializationTupleElement>(base_serialization_getter(DataTypeUInt64()), subcolumn_name, false);
 
-    SerializationPtr subcolumn;
-    if (const auto * nested_array = typeid_cast<const DataTypeArray *>(nested.get()))
-        subcolumn = nested_array->getSubcolumnSerializationImpl(subcolumn_name, base_serialization_getter, level + 1);
-    else
-        subcolumn = nested->getSubcolumnSerialization(subcolumn_name, base_serialization_getter);
+//     SerializationPtr subcolumn;
+//     if (const auto * nested_array = typeid_cast<const DataTypeArray *>(nested.get()))
+//         subcolumn = nested_array->getSubcolumnSerializationImpl(subcolumn_name, base_serialization_getter, level + 1);
+//     else
+//         subcolumn = nested->getSubcolumnSerialization(subcolumn_name, base_serialization_getter);
 
-    return std::make_shared<SerializationArray>(subcolumn);
-}
+//     return std::make_shared<SerializationArray>(subcolumn);
+// }
 
 SerializationPtr DataTypeArray::doGetDefaultSerialization() const
 {
@@ -123,7 +124,9 @@ SerializationPtr DataTypeArray::doGetDefaultSerialization() const
 
 size_t DataTypeArray::getNumberOfDimensions() const
 {
-    const DataTypeArray * nested_array = typeid_cast<const DataTypeArray *>(nested.get());
+    /// for MySQL, array(nullable(array)) is allowed
+    /// therefore, removeNullabel(nested) to get the real nested
+    const DataTypeArray * nested_array = typeid_cast<const DataTypeArray *>(removeNullable(nested).get());
     if (!nested_array)
         return 1;
     return 1 + nested_array->getNumberOfDimensions();   /// Every modern C++ compiler optimizes tail recursion.
@@ -141,7 +144,7 @@ static DataTypePtr create(const ASTPtr & arguments)
 
 void registerDataTypeArray(DataTypeFactory & factory)
 {
-    factory.registerDataType("Array", create);
+    factory.registerDataType("Array", create, DataTypeFactory::CaseInsensitive);
 }
 
 }

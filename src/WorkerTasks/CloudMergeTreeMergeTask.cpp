@@ -15,10 +15,12 @@
 
 #include <WorkerTasks/CloudMergeTreeMergeTask.h>
 
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
 #include <Interpreters/Context.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
 #include <Storages/StorageCloudMergeTree.h>
+#include <Transaction/Actions/MergeMutateAction.h>
+#include <Transaction/ICnchTransaction.h>
 #include <WorkerTasks/MergeTreeDataMerger.h>
 
 namespace DB
@@ -36,24 +38,21 @@ CloudMergeTreeMergeTask::CloudMergeTreeMergeTask(
     : ManipulationTask(std::move(params_), std::move(context_))
     , storage(storage_)
 {
+    if (/*params.source_parts.empty() && */params.source_data_parts.empty())
+        throw Exception("Expected non-empty source parts in ManipulationTaskParams", ErrorCodes::BAD_ARGUMENTS);
+
+    if (params.new_part_names.empty())
+        throw Exception("Expected non-empty new part names in ManipulationTaskParams", ErrorCodes::BAD_ARGUMENTS);
 }
 
 void CloudMergeTreeMergeTask::executeImpl()
 {
+    auto heartbeat_timeout = getContext()->getSettingsRef().cloud_task_auto_stop_timeout.value;
     auto lock = storage.lockForShare(RWLockImpl::NO_QUERY, storage.getSettings()->lock_acquire_timeout_for_background_operations);
 
     auto & cloud_table = dynamic_cast<StorageCloudMergeTree &>(*params.storage.get());
     MergeTreeDataMerger merger(cloud_table, params, getContext(), manipulation_entry->get(), [&]() {
-        if (isCancelled())
-            return true;
-
-        auto last_touch_time = getManipulationListElement()->last_touch_time.load(std::memory_order_relaxed);
-
-        /// TODO: add settings
-        if (time(nullptr) - last_touch_time > 600)
-            setCancelled();
-
-        return isCancelled();
+        return isCancelled(heartbeat_timeout);
     });
 
     auto merged_part = merger.mergePartsToTemporaryPart();
@@ -87,17 +86,38 @@ void CloudMergeTreeMergeTask::executeImpl()
         /// rows_count and bytes_on_disk is required for parts info statistics.
         drop_part->covered_parts_rows = part->rows_count;
         drop_part->covered_parts_size = part->bytes_on_disk;
+        drop_part->last_modification_time = part->last_modification_time? part->last_modification_time : part->commit_time;
         temp_parts.push_back(std::move(drop_part));
     }
 
+    /// 0 rows part may come from unique table or DELETE mutation, and we can safely mark it as deleted.
+    if (merged_part->rows_count == 0)
+        merged_part->deleted = true;
+
     temp_parts.push_back(std::move(merged_part));
 
-    if (isCancelled())
+    if (isCancelled(heartbeat_timeout))
         throw Exception("Merge task " + params.task_id + " is cancelled", ErrorCodes::ABORTED);
 
-    CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Merge, params.task_id);
+    UInt64 peak_memory_usage = 0;
+
+    ManipulationListElement * manipulation_list_element = getManipulationListElement();
+    if (manipulation_list_element)
+    {
+        peak_memory_usage = manipulation_list_element->getMemoryTracker().getPeak();
+    }
+
+    CnchDataWriter cnch_writer(storage, getContext(), ManipulationType::Merge, params.task_id,
+        /*consumer_group_*/ {}, /*tpl_*/ {}, /*binlog*/ {}, peak_memory_usage);
     DumpedData data = cnch_writer.dumpAndCommitCnchParts(temp_parts);
-    cnch_writer.preload(data.parts);
+    auto commit_time = getContext()->getCurrentTransaction()->commitV2();
+    for (const auto & part : data.parts)
+    {
+        MergeMutateAction::updatePartData(part, commit_time);
+        part->relative_path = part->info.getPartNameWithHintMutation();
+    }
+    if (params.parts_preload_level)
+        cnch_writer.preload(data.parts);
 }
 
 }

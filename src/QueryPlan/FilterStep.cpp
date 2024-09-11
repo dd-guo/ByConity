@@ -13,21 +13,25 @@
  * limitations under the License.
  */
 
+#include <utility>
 #include <QueryPlan/FilterStep.h>
 
 #include <IO/Operators.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Interpreters/RuntimeFilter/RuntimeFilterManager.h>
+#include <Optimizer/PredicateUtils.h>
+#include <Optimizer/RuntimeFilterUtils.h>
 #include <Parsers/ASTSerDerHelper.h>
+#include <Processors/Port.h>
 #include <Processors/QueryPipeline.h>
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/FilterTransform.h>
 #include <Common/JSONBuilder.h>
+#include <QueryPlan/IQueryPlanStep.h>
 #include <Processors/Port.h>
-#include <Optimizer/DynamicFilters.h>
-#include <Functions/FunctionsInBloomFilter.h>
-#include <Optimizer/PredicateUtils.h>
+#include <Parsers/ASTFunction.h>
 
 namespace DB
 {
@@ -86,31 +90,23 @@ void FilterStep::updateInputStream(DataStream input_stream, bool keep_header)
     input_streams.emplace_back(std::move(input_stream));
 }
 
-ActionsDAGPtr FilterStep::createActions(ContextPtr context, const ASTPtr & rewrite_filter) const
-{
-    Names output;
-    for (const auto & item : input_streams[0].header)
-        output.emplace_back(item.name);
-    output.push_back(rewrite_filter->getColumnName());
-
-    return createExpressionActions(context, input_streams[0].header.getNamesAndTypesList(), output, rewrite_filter);
-}
-
-
 void FilterStep::transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings & settings)
 {
+    ConstASTPtr rewrite_filter = filter;
     if (!actions_dag)
     {
-        auto rewrite_filter = rewriteDynamicFilter(filter, pipeline, settings);
-        actions_dag = createActions(settings.context, rewrite_filter->clone());
+        rewrite_filter = rewriteRuntimeFilter(filter, pipeline, settings);
+        actions_dag = IQueryPlanStep::createFilterExpressionActions(settings.context, rewrite_filter->clone(), input_streams[0].header);
         filter_column_name = rewrite_filter->getColumnName();
     }
 
+    bool contains_runtime_filter = RuntimeFilterUtils::containsRuntimeFilters(rewrite_filter);
     auto expression = std::make_shared<ExpressionActions>(actions_dag, settings.getActionsSettings());
 
     pipeline.addSimpleTransform([&](const Block & header, QueryPipeline::StreamType stream_type) {
         bool on_totals = stream_type == QueryPipeline::StreamType::Totals;
-        return std::make_shared<FilterTransform>(header, expression, filter_column_name, remove_filter_column, on_totals);
+        return std::make_shared<FilterTransform>(
+            header, expression, filter_column_name, remove_filter_column, on_totals, contains_runtime_filter);
     });
 
     if (!blocksHaveEqualStructure(pipeline.getHeader(), output_stream->header))
@@ -158,100 +154,124 @@ void FilterStep::describeActions(JSONBuilder::JSONMap & map) const
     map.add("Expression", expression->toTree());
 }
 
-void FilterStep::serialize(WriteBuffer & buf) const
+std::shared_ptr<FilterStep> FilterStep::fromProto(const Protos::FilterStep & proto, ContextPtr)
 {
-    IQueryPlanStep::serializeImpl(buf);
-
-    if (!actions_dag)
-    {
-        writeBinary(false, buf);
-        if (filter)
-        {
-            serializeAST(filter, buf);
-        }
-        else
-        {
-            throw Exception("ActionsDAG cannot be nullptr", ErrorCodes::LOGICAL_ERROR);
-        }
-    }
-    else
-    {
-        writeBinary(true, buf);
-        actions_dag->serialize(buf);
-    }
-
-    writeBinary(filter_column_name, buf);
-    writeBinary(remove_filter_column, buf);
-}
-
-QueryPlanStepPtr FilterStep::deserialize(ReadBuffer & buf, ContextPtr context)
-{
-    String step_description;
-    readBinary(step_description, buf);
-
-    DataStream input_stream = deserializeDataStream(buf);
-    bool has_actions;
-    readBinary(has_actions, buf);
-
-    ActionsDAGPtr actions_dag;
-    ASTPtr filter;
-    if (has_actions)
-    {
-        actions_dag = ActionsDAG::deserialize(buf, context);
-    }
-    else
-    {
-        filter = deserializeAST(buf);
-    }
-
-    String filter_column_name;
-    readBinary(filter_column_name, buf);
-
-    bool remove_filter_column;
-    readBinary(remove_filter_column, buf);
-    QueryPlanStepPtr step;
-    if (actions_dag)
-    {
-        step = std::make_unique<FilterStep>(input_stream, std::move(actions_dag), filter_column_name, remove_filter_column);
-    }
-    else
-    {
-        step = std::make_unique<FilterStep>(input_stream, filter, remove_filter_column);
-    }
-
+    auto [step_description, base_input_stream] = ITransformingStep::deserializeFromProtoBase(proto.query_plan_base());
+    auto filter = deserializeASTFromProto(proto.filter());
+    auto remove_filter_column = proto.remove_filter_column();
+    auto step = std::make_shared<FilterStep>(base_input_stream, filter, remove_filter_column);
     step->setStepDescription(step_description);
     return step;
 }
 
-std::shared_ptr<IQueryPlanStep> FilterStep::copy(ContextPtr) const
+void FilterStep::toProto(Protos::FilterStep & proto, bool) const
 {
-    return std::make_shared<FilterStep>(input_streams[0], filter, remove_filter_column);
+    if (actions_dag)
+    {
+        throw Exception("actions dag is not supported in protobuf", ErrorCodes::PROTOBUF_BAD_CAST);
+    }
+    ITransformingStep::serializeToProtoBase(*proto.mutable_query_plan_base());
+    serializeASTToProto(filter, *proto.mutable_filter());
+    proto.set_remove_filter_column(remove_filter_column);
 }
 
-ConstASTPtr FilterStep::rewriteDynamicFilter(const ConstASTPtr & filter, QueryPipeline & pipeline, const BuildQueryPipelineSettings & build_context)
+std::shared_ptr<IQueryPlanStep> FilterStep::copy(ContextPtr) const
 {
-    auto filters = DynamicFilters::extractDynamicFilters(filter);
+    return std::make_shared<FilterStep>(input_streams[0], filter->clone(), remove_filter_column);
+}
+
+ConstASTPtr FilterStep::rewriteRuntimeFilter(const ConstASTPtr & filter, QueryPipeline &, const BuildQueryPipelineSettings & build_context)
+{
+    auto filters = RuntimeFilterUtils::extractRuntimeFilters(filter);
     if (filters.first.empty())
         return filter;
 
-    std::vector<ConstASTPtr> predicates = std::move(filters.second);
-    for (auto & dynamic_filter : filters.first)
-    {
-        auto description = DynamicFilters::extractDescription(dynamic_filter).value();
-        pipeline.addRuntimeFilterHolder(RuntimeFilterHolder{
-            build_context.distributed_settings.query_id, build_context.distributed_settings.plan_segment_id, description.id});
+    bool only_bf = build_context.context->getSettingsRef().enable_rewrite_bf_into_prewhere;
 
-        auto dynamic_filters = DynamicFilters::createDynamicFilterRuntime(
-            description,
-            build_context.context->getInitialQueryId(),
-            build_context.distributed_settings.plan_segment_id,
-            build_context.context->getSettingsRef().wait_runtime_filter_timeout_for_filter,
-            RuntimeFilterManager::getInstance(),
-            "FilterStep");
-        predicates.insert(predicates.end(), dynamic_filters.begin(), dynamic_filters.end());
+    std::vector<ConstASTPtr> predicates = std::move(filters.second);
+
+    if (build_context.context->getSettingsRef().enable_two_stages_prewhere)
+    {
+        //skip all runtime_filters in FilterStep, since all runtime_filters has been moved into TableScanStep.
+    }
+    else
+    {
+        for (auto & runtime_filter : filters.first)
+        {
+            auto description = RuntimeFilterUtils::extractDescription(runtime_filter).value();
+            auto runtime_filters
+                = RuntimeFilterUtils::createRuntimeFilterForFilter(description, build_context.context->getInitialQueryId(), only_bf);
+            predicates.insert(predicates.end(), runtime_filters.begin(), runtime_filters.end());
+        }
     }
 
     return PredicateUtils::combineConjuncts(predicates);
+}
+
+void FilterStep::prepare(const PreparedStatementContext & prepared_context)
+{
+    prepared_context.prepare(filter);
+}
+
+std::pair<ConstASTPtr, ConstASTPtr> FilterStep::splitLargeInValueList(const ConstASTPtr & filter, UInt64 limit)
+{
+    std::vector<ConstASTPtr> removed_large_in_value_list;
+    std::vector<ConstASTPtr> large_in_value_list;
+    for (auto & predicate : PredicateUtils::extractConjuncts(filter))
+    {
+        LOG_DEBUG(&Poco::Logger::get("FilterStep"), " predicate : {}", predicate->formatForErrorMessage());
+
+        if (predicate->as<ASTFunction>() &&
+            (predicate->as<const ASTFunction &>().name == "in" ||
+             predicate->as<const ASTFunction &>().name == "globalIn" ||
+             predicate->as<const ASTFunction &>().name == "notIn" ||
+             predicate->as<const ASTFunction &>().name == "globalNotIn"))
+        {
+            const auto & function = predicate->as<const ASTFunction &>();
+            if (function.arguments->getChildren()[1]->as<ASTFunction>())
+            {
+                ASTFunction & tuple = function.arguments->getChildren()[1]->as<ASTFunction &>();
+                size_t size = tuple.arguments->getChildren().size();
+                if (size > limit)
+                {
+                    large_in_value_list.emplace_back(predicate);
+                    continue;
+                }
+            }
+        }
+        removed_large_in_value_list.emplace_back(predicate);
+    }
+
+    return std::make_pair(
+        PredicateUtils::combineConjuncts(removed_large_in_value_list), PredicateUtils::combineConjuncts(large_in_value_list));
+}
+
+std::vector<ConstASTPtr> FilterStep::removeLargeInValueList(const std::vector<ConstASTPtr> & filters, UInt64 limit)
+{
+    std::vector<ConstASTPtr> removed_large_in_value_list;
+    for (const auto & predicate : filters)
+    {
+        if (predicate->as<ASTFunction>() &&
+           (predicate->as<const ASTFunction &>().name == "in" ||
+            predicate->as<const ASTFunction &>().name == "globalIn" ||
+            predicate->as<const ASTFunction &>().name == "notIn" ||
+            predicate->as<const ASTFunction &>().name == "globalNotIn")
+        )
+        {
+            const auto & function = predicate->as<const ASTFunction &>();
+            if (function.arguments->getChildren()[1]->as<ASTFunction>())
+            {
+                ASTFunction & tuple = function.arguments->getChildren()[1]->as<ASTFunction &>();
+                size_t size = tuple.arguments->getChildren().size();
+                if (size > limit)
+                {
+                    continue;
+                }
+            }
+        }
+        removed_large_in_value_list.emplace_back(predicate);
+    }
+    return removed_large_in_value_list;
 }
 
 }

@@ -24,10 +24,12 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <common/strong_typedef.h>
 #include <common/extended_types.h>
 #include <common/defines.h>
 #include <roaring64map.hh>
+#include <common/IPv4andIPv6.h>
 
 
 namespace DB
@@ -84,9 +86,12 @@ enum class TypeIndex
     AggregateFunction,
     LowCardinality,
     Map,
-    ByteMap,
     BitMap64,
     Time,
+    SketchBinary,
+    Object,
+    IPv4,
+    IPv6,
 };
 #if !defined(__clang__)
 #pragma GCC diagnostic pop
@@ -101,37 +106,6 @@ using Int256 = ::Int256;
 STRONG_TYPEDEF(UInt128, UUID)
 
 using BitMap64 = roaring::Roaring64Map;
-
-struct PairInt64
-{
-    /// This naming assumes little endian.
-    UInt64 low;
-    UInt64 high;
-
-    PairInt64() = default;
-    explicit PairInt64(const UInt64 low_, const UInt64 high_) : low(low_), high(high_) {}
-    explicit PairInt64(const UInt64 rhs) : low(rhs), high() {}
-
-    auto tuple() const { return std::tie(high, low); }
-
-    bool inline operator== (const PairInt64 rhs) const { return tuple() == rhs.tuple(); }
-    bool inline operator!= (const PairInt64 rhs) const { return tuple() != rhs.tuple(); }
-    bool inline operator<  (const PairInt64 rhs) const { return tuple() < rhs.tuple(); }
-    bool inline operator<= (const PairInt64 rhs) const { return tuple() <= rhs.tuple(); }
-    bool inline operator>  (const PairInt64 rhs) const { return tuple() > rhs.tuple(); }
-    bool inline operator>= (const PairInt64 rhs) const { return tuple() >= rhs.tuple(); }
-
-    template <typename T> bool inline operator== (const T rhs) const { return *this == PairInt64(rhs); }
-    template <typename T> bool inline operator!= (const T rhs) const { return *this != PairInt64(rhs); }
-    template <typename T> bool inline operator>= (const T rhs) const { return *this >= PairInt64(rhs); }
-    template <typename T> bool inline operator>  (const T rhs) const { return *this >  PairInt64(rhs); }
-    template <typename T> bool inline operator<= (const T rhs) const { return *this <= PairInt64(rhs); }
-    template <typename T> bool inline operator<  (const T rhs) const { return *this <  PairInt64(rhs); }
-
-    template <typename T> explicit operator T() const { return static_cast<T>(low); }
-
-    PairInt64 & operator= (const UInt64 rhs) { low = rhs; high = 0; return *this; }
-};
 
 template <typename T> constexpr const char * TypeName = "";
 
@@ -151,6 +125,8 @@ template <> inline constexpr const char * TypeName<Float32> = "Float32";
 template <> inline constexpr const char * TypeName<Float64> = "Float64";
 template <> inline constexpr const char * TypeName<String> = "String";
 template <> inline constexpr const char * TypeName<UUID> = "UUID";
+template <> inline constexpr const char * TypeName<IPv4> = "IPv4";
+template <> inline constexpr const char * TypeName<IPv6> = "IPv6";
 
 /// TODO Try to remove it.
 template <typename T> constexpr TypeIndex TypeId = TypeIndex::Nothing;
@@ -169,10 +145,12 @@ template <> inline constexpr TypeIndex TypeId<Int256> = TypeIndex::Int256;
 template <> inline constexpr TypeIndex TypeId<Float32> = TypeIndex::Float32;
 template <> inline constexpr TypeIndex TypeId<Float64> = TypeIndex::Float64;
 template <> inline constexpr TypeIndex TypeId<UUID> = TypeIndex::UUID;
-
+template <> inline constexpr TypeIndex TypeId<IPv4> = TypeIndex::IPv4;
+template <> inline constexpr TypeIndex TypeId<IPv6> = TypeIndex::IPv6;
 
 /// Not a data type in database, defined just for convenience.
 using Strings = std::vector<String>;
+using TypeIndexesSet = std::unordered_set<TypeIndex>;
 
 /// Own FieldType for Decimal.
 /// It is only a "storage" for decimal. To perform operations, you also have to provide a scale (number of digits after point).
@@ -263,6 +241,26 @@ public:
     {}
 };
 
+template <class T>
+concept is_decimal =
+    std::is_same_v<T, Decimal32>
+    || std::is_same_v<T, Decimal64>
+    || std::is_same_v<T, Decimal128>
+    || std::is_same_v<T, Decimal256>
+    || std::is_same_v<T, DateTime64>;
+
+template <class T>
+concept is_over_big_int =
+    std::is_same_v<T, Int128>
+    || std::is_same_v<T, UInt128>
+    || std::is_same_v<T, Int256>
+    || std::is_same_v<T, UInt256>
+    || std::is_same_v<T, Decimal128>
+    || std::is_same_v<T, Decimal256>;
+
+template <class T>
+concept is_over_big_decimal = is_decimal<T> && is_over_big_int<typename T::NativeType>;
+
 template <> inline constexpr const char * TypeName<Decimal32> = "Decimal32";
 template <> inline constexpr const char * TypeName<Decimal64> = "Decimal64";
 template <> inline constexpr const char * TypeName<Decimal128> = "Decimal128";
@@ -302,7 +300,6 @@ constexpr bool IsNumberMemComparable = !OverBigInt<T>;
 template <> inline constexpr bool IsNumberMemComparable<Float32> = false;
 template <> inline constexpr bool IsNumberMemComparable<Float64> = false;
 
-
 inline constexpr const char * getTypeName(TypeIndex idx)
 {
     switch (idx)
@@ -336,6 +333,8 @@ inline constexpr const char * getTypeName(TypeIndex idx)
         case TypeIndex::Decimal128: return "Decimal128";
         case TypeIndex::Decimal256: return "Decimal256";
         case TypeIndex::UUID:       return "UUID";
+        case TypeIndex::IPv4:       return "IPv4";
+        case TypeIndex::IPv6:       return "IPv6";
         case TypeIndex::Array:      return "Array";
         case TypeIndex::Tuple:      return "Tuple";
         case TypeIndex::Set:        return "Set";
@@ -345,8 +344,9 @@ inline constexpr const char * getTypeName(TypeIndex idx)
         case TypeIndex::AggregateFunction: return "AggregateFunction";
         case TypeIndex::LowCardinality: return "LowCardinality";
         case TypeIndex::Map:        return "Map";
-        case TypeIndex::ByteMap:    return "Map";
         case TypeIndex::BitMap64:  return "BitMap64";
+        case TypeIndex::SketchBinary: return "SketchBinary";
+        case TypeIndex::Object: return "Object";
     }
 
     __builtin_unreachable();

@@ -17,6 +17,7 @@ struct BitAndImpl
 {
     using ResultType = typename NumberTraits::ResultOfBit<A, B>::Type;
     static constexpr const bool allow_fixed_string = true;
+    static const constexpr bool allow_string_integer = false;
 
     template <typename Result = ResultType>
     static inline Result apply(A a, B b)
@@ -37,11 +38,11 @@ struct BitAndImpl
 };
 
 struct NameBitAnd { static constexpr auto name = "bitAnd"; };
-using FunctionBitAnd = BinaryArithmeticOverloadResolver<BitAndImpl, NameBitAnd, true, false>;
+using FunctionBitAnd = BinaryArithmeticOverloadResolver<BitAndImpl, NameBitAnd, true, true>;
 
 }
 
-void registerFunctionBitAnd(FunctionFactory & factory)
+REGISTER_FUNCTION(BitAnd)
 {
     factory.registerFunction<FunctionBitAnd>();
 }

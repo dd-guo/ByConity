@@ -6,6 +6,7 @@
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeEnum.h>
 #include <Interpreters/ClusterProxy/executeQuery.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
 #include <Interpreters/Context.h>
@@ -22,6 +23,12 @@ namespace DB
 StorageSystemCnchKafkaTables::StorageSystemCnchKafkaTables(const StorageID & table_id_)
     : IStorage(table_id_)
 {
+    auto consumer_switch_datatype = std::make_shared<DataTypeEnum8>(
+            DataTypeEnum8::Values {
+            {"OFF",         static_cast<Int8>(false)},
+            {"ON",          static_cast<Int8>(true)},
+        });
+
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(ColumnsDescription({
         { "database",                   std::make_shared<DataTypeString>()  },
@@ -30,7 +37,11 @@ StorageSystemCnchKafkaTables::StorageSystemCnchKafkaTables(const StorageID & tab
         { "kafka_cluster",              std::make_shared<DataTypeString>()  },
         { "topics",                     std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()) },
         { "consumer_group",             std::make_shared<DataTypeString>()  },
+        { "vw_write",                   std::make_shared<DataTypeString>()  },
+        { "max_block_size",             std::make_shared<DataTypeUInt64>()  },
+        { "max_poll_interval_ms",       std::make_shared<DataTypeUInt64>()  },
         { "num_consumers",              std::make_shared<DataTypeUInt32>()  },
+        { "consumer_switch",            consumer_switch_datatype },
         { "consumer_tables",            std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())  },
         { "consumer_hosts",             std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())  },
         { "consumer_partitions",        std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())  },
@@ -77,7 +88,7 @@ static ASTPtr getSelectQuery(const SelectQueryInfo & query_info)
 
 Pipe StorageSystemCnchKafkaTables::read(
     const Names & /*column_names*/,
-    const StorageMetadataPtr & /*metadata_snapshot*/,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum /*processed_stage*/,
@@ -90,8 +101,16 @@ Pipe StorageSystemCnchKafkaTables::read(
 
     auto select_query = getSelectQuery(query_info);
     Block header = materializeBlock(InterpreterSelectQuery(select_query, context, QueryProcessingStage::Complete).getSampleBlock());
+
     ClusterProxy::SelectStreamFactory select_stream_factory = ClusterProxy::SelectStreamFactory(
-                                            header, QueryProcessingStage::Complete, StorageID("system", "kafka_tables"), {}, false, {});
+        header,
+        {},
+        storage_snapshot,
+        QueryProcessingStage::Complete,
+        StorageID("system", "kafka_tables"),
+        {},
+        false,
+        {});
 
     /// Set `query_info.cluster` to forward query to all instances of `server cluster`
     query_info.cluster = context->mockCnchServersCluster();

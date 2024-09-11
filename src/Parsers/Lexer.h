@@ -15,7 +15,8 @@ namespace DB
     M(Number)                 /** Always non-negative. No leading plus. 123 or something like 123.456e12, 0x123p12 */ \
     M(StringLiteral)          /** 'hello word', 'hello''word', 'hello\'word\\' */ \
     \
-    M(QuotedIdentifier)       /** "x", `x` */ \
+    M(DoubleQuotedIdentifier)     /** "x" */ \
+    M(BackQuotedIdentifier)       /** `x` */ \
     \
     M(OpeningRoundBracket) \
     M(ClosingRoundBracket) \
@@ -33,17 +34,25 @@ namespace DB
     \
     M(Asterisk)               /** Could be used as multiplication operator or on it's own: "SELECT *" */ \
     \
+    M(HereDoc) \
+    \
     M(DollarSign) \
     M(Plus) \
     M(Minus) \
     M(Slash) \
     M(Percent) \
+    M(BitLeftShift) \
+    M(BitRightShift) \
     M(Arrow)                  /** ->. Should be distinguished from minus operator. */ \
     M(QuestionMark) \
     M(Colon) \
     M(DoubleColon) \
     M(Equals) \
     M(NotEquals) \
+    M(BitEquals) \
+    M(BitOr) \
+    M(BitAnd) \
+    M(BitXor) \
     M(Less) \
     M(Greater) \
     M(LessOrEquals) \
@@ -65,7 +74,6 @@ namespace DB
     M(ErrorDoubleQuoteIsNotClosed) \
     M(ErrorBackQuoteIsNotClosed) \
     M(ErrorSingleExclamationMark) \
-    M(ErrorSinglePipeMark) \
     M(ErrorWrongNumber) \
     M(ErrorMaxQuerySizeExceeded) \
 

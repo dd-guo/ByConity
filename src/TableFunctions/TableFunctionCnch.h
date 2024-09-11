@@ -14,6 +14,7 @@
  */
 
 #pragma once
+#include <vector>
 #include <TableFunctions/ITableFunction.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/StorageID.h>
@@ -28,6 +29,7 @@ public:
     std::string getName() const override {return name;}
     ColumnsDescription getActualTableStructure(ContextPtr context) const override;
     bool needStructureConversion() const override { return false; }
+    bool isPreviledgedFunction() const override { return true; }
 
 private:
     StoragePtr executeImpl(const ASTPtr & ast_function, ContextPtr context, const std::string & table_name, ColumnsDescription cached_columns) const override;
@@ -37,7 +39,7 @@ private:
 
     std::string name;
 
-    String cluster_name;
+    std::vector<String> vw_names;
     ClusterPtr cluster;
     StorageID remote_table_id = StorageID::createEmpty();
 
@@ -51,10 +53,16 @@ The third parameter if have is table name. In that case the second parameter mus
 Example:
     select * from cnch(server, system.one)
     select * from cnch(server, system, one)
-    select * from cnch(vw_default, system, one)
+    select * from cnch(worker, system.one)
+    select * from cnch(worker, system, one)
+    select * from cnch(vw_default, system.one)
+    select * from cnch(vw_default, system,one)
+    select * from cnch([vw_name_1, vw_name_2], system.one)
+    select * from cnch([vw_name_1, vw_name_2], system, one)
 )#";
 };
 
 std::shared_ptr<Cluster> mockVWCluster(const Context & context, const String & vw_name);
-
+std::shared_ptr<Cluster> mockMultiVWCluster(const Context & context);
+std::shared_ptr<Cluster> mockMultiVWCluster(const Context & context, const std::vector<String> & vw_names);
 }

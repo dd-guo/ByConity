@@ -16,6 +16,12 @@
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 
 #include <Catalog/Catalog.h>
+#include <Common/escapeForFileName.h>
+#include <Common/quoteString.h>
+#include <Common/RowExistsColumnInfo.h>
+#include <Common/SipHash.h>
+#include <Common/StringUtils/StringUtils.h>
+#include <Storages/DataDestinationType.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
@@ -24,32 +30,54 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypeTuple.h>
-#include <DataTypes/DataTypeByteMap.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/MapHelpers.h>
 #include <DataTypes/NestedUtils.h>
+#include <DataTypes/ObjectUtils.h>
 #include <IO/ConcatReadBuffer.h>
 #include <Parsers/ASTClusterByElement.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTNameTypePair.h>
 #include <Parsers/ASTPartition.h>
+#include <Parsers/ASTSetQuery.h>
+#include <Parsers/ExpressionElementParsers.h>
 #include <Formats/FormatFactory.h>
 #include <Processors/Formats/InputStreamFromInputFormat.h>
 #include <Storages/AlterCommands.h>
+#include <Storages/StorageDictCloudMergeTree.h>
 #include <Storages/MergeTree/CnchMergeTreeMutationEntry.h>
 #include <Storages/MergeTree/MergeTreeDataPartCompact.h>
 #include <Storages/MergeTree/MergeTreeDataPartInMemory.h>
 #include <Storages/MergeTree/MergeTreeDataPartWide.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH.h>
 #include <Storages/MergeTree/localBackup.h>
+#include <Storages/VirtualColumnUtils.h>
 #include <Storages/MutationCommands.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/CnchSystemLog.h>
 #include <Functions/IFunction.h>
 #include <QueryPlan/QueryIdHolder.h>
 #include <Parsers/queryToString.h>
+#include <Parsers/parseQuery.h>
+#include <Interpreters/PartitionPredicateVisitor.h>
+#include <Optimizer/CardinalityEstimate/FilterEstimator.h>
+#include <Optimizer/EqualityASTMap.h>
+#include <Optimizer/PredicateUtils.h>
+#include <Optimizer/SelectQueryInfoHelper.h>
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeWhereOptimizer.h>
+#include <MergeTreeCommon/IMergeTreePartMeta.h>
+#include <CloudServices/CnchPartsHelper.h>
 
+
+namespace ProfileEvents
+{
+    extern const Event CatalogTime;
+}
 
 namespace
 {
@@ -69,6 +97,9 @@ namespace ErrorCodes
     extern const int DIRECTORY_ALREADY_EXISTS;
     extern const int ILLEGAL_COLUMN;
     extern const int BAD_TTL_EXPRESSION;
+    extern const int CANNOT_PARSE_TEXT;
+    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int UNSUPPORTED_PARAMETER;
 }
 
 void MergeTreeMetaBase::checkSampleExpression(const StorageInMemoryMetadata & metadata, bool allow_sampling_expression_not_in_primary_key)
@@ -86,6 +117,7 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     const String & date_column_name,
     const MergingParams & merging_params_,
     std::unique_ptr<MergeTreeSettings> storage_settings_,
+    const String & logger_name_,
     bool require_part_metadata_,
     bool attach_,
     BrokenPartCallback broken_part_callback_)
@@ -95,13 +127,12 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     , merging_params(merging_params_)
     , require_part_metadata(require_part_metadata_)
     , broken_part_callback(broken_part_callback_)
-    , log_name(table_id_.getNameForLogs())
+    , log_name(logger_name_)
     , log(&Poco::Logger::get(log_name))
     , storage_settings(std::move(storage_settings_))
     , pinned_part_uuids(std::make_shared<PinnedPartUUIDs>())
     , data_parts_by_info(data_parts_indexes.get<TagByInfo>())
     , data_parts_by_state_and_info(data_parts_indexes.get<TagByStateAndInfo>())
-    , primary_index_cache(context_->getPrimaryIndexCache())
     , relative_data_path(relative_data_path_)
 {
     const auto & settings = getSettings();
@@ -110,9 +141,7 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     {
         try
         {
-
             checkPartitionKeyAndInitMinMax(metadata_.partition_key);
-            setProperties(metadata_, metadata_, false);
             if (minmax_idx_date_column_pos == -1)
                 throw Exception("Could not find Date column", ErrorCodes::BAD_TYPE_OF_FIELD);
         }
@@ -127,34 +156,18 @@ MergeTreeMetaBase::MergeTreeMetaBase(
     {
         is_custom_partitioned = true;
         checkPartitionKeyAndInitMinMax(metadata_.partition_key);
-        setProperties(metadata_, metadata_, false);
     }
 
-    format_version = MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING;
+    storage_address = fmt::format("{}", fmt::ptr(this));
 
     /// NOTE: using the same columns list as is read when performing actual merges.
-    merging_params.check(metadata_, metadata_.hasUniqueKey());
-
-    if (merging_params.partitionValueAsVersion())
-    {
-        if (metadata_.partition_key.sample_block.columns() == 0)
-            throw Exception("Table is not partitioned, can't use partition value as version", ErrorCodes::BAD_ARGUMENTS);
-        if (metadata_.partition_key.sample_block.columns() > 1)
-            throw Exception("Partition key contains more than one column, can't use it as version", ErrorCodes::BAD_ARGUMENTS);
-        auto partition_key_type = metadata_.partition_key.sample_block.getDataTypes()[0];
-        if (!partition_key_type->canBeUsedAsVersion())
-            throw Exception("Partition key has type " + partition_key_type->getName() + ", can't be used as version", ErrorCodes::BAD_ARGUMENTS);
-    }
+    merging_params.check(metadata_, attach_);
 
     if (metadata_.sampling_key.definition_ast != nullptr)
     {
         /// This is for backward compatibility.
         checkSampleExpression(metadata_, getSettings()->compatibility_allow_sampling_expression_not_in_primary_key);
     }
-
-    checkTTLExpressions(metadata_, metadata_);
-
-    storage_address = fmt::format("{}", fmt::ptr(this));
 }
 
 StoragePolicyPtr MergeTreeMetaBase::getStoragePolicy(StorageLocation location) const
@@ -177,7 +190,7 @@ const String& MergeTreeMetaBase::getRelativeDataPath(StorageLocation location) c
     return relative_data_path;
 }
 
-void MergeTreeMetaBase::setRelativeDataPath(StorageLocation location, const String& rel_path)
+void MergeTreeMetaBase::setRelativeDataPath(StorageLocation location, const String & rel_path)
 {
     if (unlikely(location == StorageLocation::AUXILITY))
     {
@@ -246,8 +259,9 @@ void MergeTreeMetaBase::checkProperties(
                     + toString(i) + " is " + sorting_key_column +", not " + pk_column,
                     ErrorCodes::BAD_ARGUMENTS);
 
-            if (!primary_key_columns_set.emplace(pk_column).second)
-                throw Exception("Primary key contains duplicate columns", ErrorCodes::BAD_ARGUMENTS);
+            // for compatibility with cnch-1.4, which allows dup key in `order by`
+ //           if (!primary_key_columns_set.emplace(pk_column).second)
+ //               throw Exception("Primary key contains duplicate columns", ErrorCodes::BAD_ARGUMENTS);
 
         }
     }
@@ -509,6 +523,9 @@ void MergeTreeMetaBase::checkTTLExpressions(const StorageInMemoryMetadata & new_
     {
         for (const auto & move_ttl : new_table_ttl.move_ttl)
         {
+            if (move_ttl.destination_type == DataDestinationType::BYTECOOL)
+                continue;
+
             if (!getDestinationForMoveTTL(move_ttl))
             {
                 String message;
@@ -567,6 +584,31 @@ MergeTreeMetaBase::AlterConversions MergeTreeMetaBase::getAlterConversionsForPar
     return result;
 }
 
+void MergeTreeMetaBase::addMutationEntry(const CnchMergeTreeMutationEntry & entry)
+{
+    std::lock_guard lock(mutations_by_version_mutex);
+    mutations_by_version.try_emplace(entry.commit_time, entry);
+}
+
+void MergeTreeMetaBase::removeMutationEntry(TxnTimestamp create_time)
+{
+    std::lock_guard lock(mutations_by_version_mutex);
+    /// Maybe erase all entries <= create_time?
+    mutations_by_version.erase(create_time);
+}
+
+Strings MergeTreeMetaBase::getPlainMutationEntries()
+{
+    Strings res;
+    std::lock_guard lock(mutations_by_version_mutex);
+    res.reserve(mutations_by_version.size());
+    for (auto const & [_, entry] : mutations_by_version)
+    {
+        res.push_back(entry.toString());
+    }
+    return res;
+}
+
 MergeTreeMetaBase::MutableDataPartPtr MergeTreeMetaBase::cloneAndLoadDataPartOnSameDisk(
     const MergeTreeMetaBase::DataPartPtr & src_part,
     const String & tmp_part_prefix,
@@ -603,7 +645,7 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeMetaBase::cloneAndLoadDataPartOnS
     if (auto src_part_in_memory = asInMemoryPart(src_part))
     {
         const auto & src_relative_data_path = src_part_in_memory->storage.getRelativeDataPath(IStorage::StorageLocation::MAIN);
-        auto flushed_part_path = src_part_in_memory->getRelativePathForPrefix(tmp_part_prefix);
+        auto flushed_part_path = src_part_in_memory->getRelativePathForPrefix(tmp_part_prefix, /*is_detach*/false);
         src_part_in_memory->flushToDisk(src_relative_data_path, flushed_part_path, metadata_snapshot);
         src_part_path = fs::path(src_relative_data_path) / flushed_part_path / "";
     }
@@ -642,7 +684,10 @@ NamesAndTypesList MergeTreeMetaBase::getVirtuals() const
         NameAndTypePair("_partition_id", std::make_shared<DataTypeString>()),
         NameAndTypePair("_partition_value", getPartitionValueType()),
         NameAndTypePair("_sample_factor", std::make_shared<DataTypeFloat64>()),
+        NameAndTypePair("_part_offset", std::make_shared<DataTypeUInt64>()),
         NameAndTypePair("_part_row_number", std::make_shared<DataTypeUInt64>()),
+        NameAndTypePair("_bucket_number", std::make_shared<DataTypeInt64>()),
+        RowExistsColumn::ROW_EXISTS_COLUMN,
     };
 }
 
@@ -681,6 +726,27 @@ DataTypePtr MergeTreeMetaBase::getPartitionValueType() const
     return partition_value_type;
 }
 
+ASTs MergeTreeMetaBase::getPartVirtualExpr() const
+{
+    return {
+        std::make_shared<ASTIdentifier>("_part"),
+        std::make_shared<ASTIdentifier>("_partition_id"),
+        std::make_shared<ASTIdentifier>("_part_uuid"),
+        std::make_shared<ASTIdentifier>("_partition_value"),
+        std::make_shared<ASTIdentifier>("_bucket_number")};
+}
+
+Block MergeTreeMetaBase::getSampleBlockWithVirtualColumns() const
+{
+    DataTypePtr partition_value_type = getPartitionValueType();
+    return {
+        ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_part"),
+        ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_partition_id"),
+        ColumnWithTypeAndName(ColumnUUID::create(), std::make_shared<DataTypeUUID>(), "_part_uuid"),
+        ColumnWithTypeAndName(partition_value_type->createColumn(), partition_value_type, "_partition_value"),
+        ColumnWithTypeAndName(ColumnInt64::create(), std::make_shared<DataTypeInt64>(), "_bucket_number")};
+}
+
 Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & parts, bool one_part) const
 {
     DataTypePtr partition_value_type = getPartitionValueType();
@@ -689,7 +755,8 @@ Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & 
         ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_part"),
         ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_partition_id"),
         ColumnWithTypeAndName(ColumnUUID::create(), std::make_shared<DataTypeUUID>(), "_part_uuid"),
-        ColumnWithTypeAndName(partition_value_type->createColumn(), partition_value_type, "_partition_value")};
+        ColumnWithTypeAndName(partition_value_type->createColumn(), partition_value_type, "_partition_value"),
+        ColumnWithTypeAndName(ColumnInt64::create(), std::make_shared<DataTypeInt64>(), "_bucket_number")};
 
     MutableColumns columns = block.mutateColumns();
 
@@ -697,6 +764,7 @@ Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & 
     auto & partition_id_column = columns[1];
     auto & part_uuid_column = columns[2];
     auto & partition_value_column = columns[3];
+    auto & bucket_number_column = columns[4];
 
     for (const auto & part_or_projection : parts)
     {
@@ -704,6 +772,8 @@ Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & 
         part_column->insert(part->name);
         partition_id_column->insert(part->info.partition_id);
         part_uuid_column->insert(part->uuid);
+        bucket_number_column->insert(part->bucket_number);
+        // coverity[mismatched_iterator]
         Tuple tuple(part->partition.value.begin(), part->partition.value.end());
         if (has_partition_value)
             partition_value_column->insert(tuple);
@@ -713,6 +783,7 @@ Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & 
             part_column = ColumnConst::create(std::move(part_column), 1);
             partition_id_column = ColumnConst::create(std::move(partition_id_column), 1);
             part_uuid_column = ColumnConst::create(std::move(part_uuid_column), 1);
+            bucket_number_column = ColumnConst::create(std::move(bucket_number_column), 1);
             if (has_partition_value)
                 partition_value_column = ColumnConst::create(std::move(partition_value_column), 1);
             break;
@@ -722,6 +793,36 @@ Block MergeTreeMetaBase::getBlockWithVirtualPartColumns(const DataPartsVector & 
     block.setColumns(std::move(columns));
     if (!has_partition_value)
         block.erase("_partition_value");
+    return block;
+}
+
+Block MergeTreeMetaBase::getBlockWithVirtualPartitionColumns(
+    const std::vector<std::shared_ptr<MergeTreePartition>> & partition_list) const
+{
+    DataTypePtr partition_value_type = getPartitionValueType();
+    bool has_partition_value = typeid_cast<const DataTypeTuple *>(partition_value_type.get());
+    Block block{
+        ColumnWithTypeAndName(ColumnString::create(), std::make_shared<DataTypeString>(), "_partition_id"),
+        ColumnWithTypeAndName(partition_value_type->createColumn(), partition_value_type, "_partition_value")};
+
+
+    MutableColumns columns = block.mutateColumns();
+
+    auto & partition_id_column = columns[0];
+    auto & partition_value_column = columns[1];
+
+    for (const auto & partition : partition_list)
+    {
+        partition_id_column->insert(partition->getID(*this));
+        if (has_partition_value)
+        {
+            Tuple tuple(partition->value.begin(), partition->value.end());
+            partition_value_column->insert(std::move(tuple));
+        }
+    }
+    block.setColumns(std::move(columns));
+    if (!has_partition_value)
+        block.erase(block.getPositionByName("_partition_value"));
     return block;
 }
 
@@ -783,7 +884,7 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeMetaBase::createPart(
                 throw Exception("Create CNCH part in auxility storage is forbidden",
                     ErrorCodes::LOGICAL_ERROR);
             }
-            return std::make_shared<MergeTreeDataPartCNCH>(*this, name, part_info, volume, relative_path);
+            return std::make_shared<MergeTreeDataPartCNCH>(*this, name, part_info, volume, relative_path, parent_part);
         case MergeTreeDataPartType::UNKNOWN:
             throw Exception("Unknown type of part " + relative_path, ErrorCodes::UNKNOWN_PART_TYPE);
     }
@@ -842,6 +943,53 @@ MergeTreeMetaBase::DataParts MergeTreeMetaBase::getDataParts(const DataPartState
             res.insert(range.begin(), range.end());
         }
     }
+    return res;
+}
+
+MergeTreeMetaBase::DataPartsVector MergeTreeMetaBase::getDataPartsVectorUnlocked(
+    const DataPartStates & affordable_states,
+    const DataPartsLock & /*lock*/,
+    DataPartStateVector * out_states,
+    bool require_projection_parts) const
+{
+    DataPartsVector res;
+    DataPartsVector buf;
+
+    for (auto state : affordable_states)
+    {
+        auto range = getDataPartsStateRange(state);
+
+        if (require_projection_parts)
+        {
+            for (const auto & part : range)
+            {
+                for (const auto & [_, projection_part] : part->getProjectionParts())
+                    res.push_back(projection_part);
+            }
+        }
+        else
+        {
+            std::swap(buf, res);
+            res.clear();
+            std::merge(range.begin(), range.end(), buf.begin(), buf.end(), std::back_inserter(res), LessDataPart()); //-V783
+        }
+    }
+
+    if (out_states != nullptr)
+    {
+        out_states->resize(res.size());
+        if (require_projection_parts)
+        {
+            for (size_t i = 0; i < res.size(); ++i)
+                (*out_states)[i] = res[i]->getParentPart()->getState();
+        }
+        else
+        {
+            for (size_t i = 0; i < res.size(); ++i)
+                (*out_states)[i] = res[i]->getState();
+        }
+    }
+
     return res;
 }
 
@@ -964,6 +1112,11 @@ MergeTreeMetaBase::DataPartPtr MergeTreeMetaBase::getPartIfExistsWithoutLock(con
 
 String MergeTreeMetaBase::getPartitionIDFromQuery(const ASTPtr & ast, ContextPtr local_context) const
 {
+    if (const auto & ast_literal = ast->as<ASTLiteral>())
+    {
+        return ast_literal->value.get<String>();
+    }
+
     const auto & partition_ast = ast->as<ASTPartition &>();
 
     if (!partition_ast.value)
@@ -1150,7 +1303,7 @@ SpacePtr MergeTreeMetaBase::getDestinationForMoveTTL(const TTLDescription & move
     auto policy = getStoragePolicy(location);
     if (move_ttl.destination_type == DataDestinationType::VOLUME)
     {
-        auto volume = policy->getVolumeByName(move_ttl.destination_name);
+        auto volume = policy->getVolumeByName(move_ttl.destination_name, true);
 
         if (!volume)
             return {};
@@ -1184,7 +1337,7 @@ bool MergeTreeMetaBase::isPartInTTLDestination(const TTLDescription & ttl, const
     auto policy = getStoragePolicy(IStorage::StorageLocation::MAIN);
     if (ttl.destination_type == DataDestinationType::VOLUME)
     {
-        for (const auto & disk : policy->getVolumeByName(ttl.destination_name)->getDisks())
+        for (const auto & disk : policy->getVolumeByName(ttl.destination_name, true)->getDisks())
             if (disk->getName() == part.volume->getDisk()->getName())
                 return true;
     }
@@ -1232,8 +1385,9 @@ MergeTreeMetaBase::DataPartPtr MergeTreeMetaBase::getAnyPartInPartition(
     return nullptr;
 }
 
-void MergeTreeMetaBase::MergingParams::check(const StorageInMemoryMetadata & metadata, bool has_unique_key) const
+void MergeTreeMetaBase::MergingParams::check(const StorageInMemoryMetadata & metadata, bool attach) const
 {
+    const bool has_unique_key = metadata.hasUniqueKey();
     const auto columns = metadata.getColumns().getAllPhysical();
 
     if (!sign_column.empty() && mode != MergingParams::Collapsing && mode != MergingParams::VersionedCollapsing)
@@ -1337,8 +1491,31 @@ void MergeTreeMetaBase::MergingParams::check(const StorageInMemoryMetadata & met
         }
     }
 
-    if (has_unique_key && !partitionValueAsVersion())
-        check_version_column(true, "Unique Key");
+
+    if (has_unique_key)
+    {
+        if (partitionValueAsVersion())
+        {
+            if (metadata.partition_key.sample_block.columns() == 0)
+                throw Exception("Table is not partitioned, can't use partition value as version", ErrorCodes::BAD_ARGUMENTS);
+            if (metadata.partition_key.sample_block.columns() > 1)
+                throw Exception("Partition key contains more than one column, can't use it as version", ErrorCodes::BAD_ARGUMENTS);
+            auto partition_key_type = metadata.partition_key.sample_block.getDataTypes()[0];
+            if (!partition_key_type->canBeUsedAsVersion())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition key has type {}, can't be used as version", partition_key_type->getName());
+            // singed integer and types larger than 64 bits are not supported currently
+            if (!attach && TypeIndex::UInt64 < partition_key_type->getTypeId() && partition_key_type->getTypeId() <= TypeIndex::Int256)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition key has type {}, can't be used as version", partition_key_type->getName());
+        }
+        else
+        {
+            check_version_column(true, "Unique Key");
+        }
+    }
+    else if (partitionValueAsVersion())
+    {
+        throw Exception("Table doesn't have UNIQUE KEY, can't use partition value as version", ErrorCodes::BAD_ARGUMENTS);
+    }
 
     if (mode == MergingParams::Replacing)
         check_version_column(true, "ReplacingMergeTree");
@@ -1376,14 +1553,78 @@ String MergeTreeMetaBase::getStorageUniqueID() const
         return storage_address;
 }
 
-void MergeTreeMetaBase::calculateColumnSizesImpl()
+UUID MergeTreeMetaBase::getCnchStorageUUID() const
 {
-    column_sizes.clear();
+    if (getStorageID().hasUUID())
+        return getStorageID().uuid;
+    else
+    {
+        /// Get cnch table uuid from settings as CloudMergeTree has no uuid for Kafka task
+        String uuid_str = getSettings()->cnch_table_uuid.value;
+        if (!uuid_str.empty())
+            return UUIDHelpers::toUUID(uuid_str);
+        else
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage uuid of table {} can't be empty", getStorageID().getNameForLogs());
+    }
+}
 
+using DataPart = IMergeTreeDataPart;
+using DataPartPtr = std::shared_ptr<const DataPart>;
+using DataPartsVector = std::vector<DataPartPtr>;
+
+std::pair<DataPartsVector, double> MergeTreeMetaBase::getCalculatedPartsAndRatio() const
+{
     /// Take into account only committed parts
     auto committed_parts_range = getDataPartsStateRange(DataPartState::Committed);
-    for (const auto & part : committed_parts_range)
+    DataPartsVector committed_parts{committed_parts_range.begin(), committed_parts_range.end()};
+    DataPartsVector calculated_parts;
+
+    double ratio = 1.0;
+    size_t sample_number = getContext()->getSettingsRef().merge_tree_calculate_columns_size_sample;
+    if (getSettings()->enable_calculate_columns_size_with_sample == 1 && committed_parts.size() > sample_number*2)
+    {
+        calculated_parts.reserve(sample_number);
+        std::sample(committed_parts.begin(), committed_parts.end(),
+                    std::back_inserter(calculated_parts), sample_number,
+                    std::mt19937{std::random_device{}()});
+        size_t m = committed_parts.size() / sample_number;
+        ratio = m + static_cast<double>(committed_parts.size() - m * sample_number) / sample_number;
+    }
+    else
+    {
+        calculated_parts = committed_parts;
+    }
+    return std::make_pair(calculated_parts, ratio);
+}
+
+void MergeTreeMetaBase::calculateColumnSizesImpl()
+{
+    Stopwatch stopwatch;
+
+    column_sizes.clear();
+
+    auto parts_and_ratio = getCalculatedPartsAndRatio();
+    DataPartsVector calculated_parts = parts_and_ratio.first;
+    double ratio = parts_and_ratio.second;
+
+    for (const auto & part : calculated_parts)
         addPartContributionToColumnSizes(part);
+
+    if (ratio > 1.0)
+    {
+        ColumnSizeByName new_column_sizes = column_sizes;
+        /// Adjust size according to the sample ratio
+        for (auto & pair : new_column_sizes)
+        {
+            pair.second.marks = pair.second.marks * ratio;
+            pair.second.data_compressed = pair.second.data_compressed * ratio;
+            pair.second.data_uncompressed = pair.second.data_uncompressed * ratio;
+        }
+
+        column_sizes = std::move(new_column_sizes);
+    }
+
+    LOG_DEBUG(log, "Calculate columns size elapsed: {} ms.", stopwatch.elapsedMilliseconds());
 }
 
 
@@ -1482,12 +1723,12 @@ bool MergeTreeMetaBase::mayBenefitFromIndexForIn(
     }
 }
 
-UInt64 MergeTreeMetaBase::getTableHashForClusterBy() const
+TableDefinitionHash MergeTreeMetaBase::getTableHashForClusterBy() const
 {
-    const auto & metadata = getInMemoryMetadata();
-    const auto & partition_by_ast = metadata.getPartitionKeyAST();
-    const auto & order_by_ast = metadata.getSortingKeyAST();
-    const auto & cluster_by_ast = metadata.getClusterByKeyAST();
+    auto metadata = getInMemoryMetadataPtr();
+    const auto & partition_by_ast = metadata->getPartitionKeyAST();
+    const auto & order_by_ast = metadata->getSortingKeyAST();
+    const auto & cluster_by_ast = metadata->getClusterByKeyAST();
     String partition_by = partition_by_ast ? queryToString(partition_by_ast) : "";
     String order_by = order_by_ast ? queryToString(order_by_ast) : "";
     String cluster_by = cluster_by_ast ? queryToString(cluster_by_ast) : "";
@@ -1496,11 +1737,730 @@ UInt64 MergeTreeMetaBase::getTableHashForClusterBy() const
 
     cluster_definition.erase(remove(cluster_definition.begin(), cluster_definition.end(), '\''), cluster_definition.end());
 
-    std::hash<String> hasher;
-    auto cluster_definition_hash = hasher(cluster_definition);
+    UInt64 determin_hash = sipHash64(cluster_definition);
 
-    return cluster_definition_hash;
+    UInt64 v1_hash = compatibility::v1::hash(cluster_definition);
+    UInt64 v2_hash = compatibility::v2::hash(cluster_definition);
 
+    /// Get v1 quoted hash for backward compatibility
+    String quoted_partition_by = partition_by_ast ? queryToString(partition_by_ast, true) : "";
+    String quoted_order_by = order_by_ast ? queryToString(order_by_ast, true) : "";
+    String quoted_cluster_by = cluster_by_ast ? queryToString(cluster_by_ast, true) : "";
+    String quoted_cluster_definition = quoted_partition_by + quoted_order_by + quoted_cluster_by;
+    quoted_cluster_definition.erase(remove(quoted_cluster_definition.begin(), quoted_cluster_definition.end(), '\''), quoted_cluster_definition.end());
+    UInt64 v1_quoted_hash = compatibility::v1::hash(quoted_cluster_definition);
+
+    return {determin_hash, v1_hash, v2_hash, v1_quoted_hash};
+
+}
+
+bool MergeTreeMetaBase::isTableClustered(ContextPtr context_) const
+{
+    bool clustered;
+    context_->getCnchCatalog()->getTableClusterStatus(getStorageUUID(), clustered);
+    return clustered;
+}
+
+StorageSnapshotPtr MergeTreeMetaBase::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr  /*query_context*/) const
+{
+    return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, object_columns);
+}
+
+StorageSnapshotPtr MergeTreeMetaBase::getStorageSnapshotWithoutParts(const StorageMetadataPtr & metadata_snapshot) const
+{
+    return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, object_columns);
+}
+
+MergeTreeSettingsPtr MergeTreeMetaBase::getChangedSettings(const ASTPtr new_settings) const
+{
+    MergeTreeSettingsPtr changed_settings = getSettings();
+    if (new_settings)
+    {
+        const auto & new_changes = new_settings->as<const ASTSetQuery &>().changes;
+        auto copy = getDefaultSettings();
+        copy->applyChanges(new_changes);
+        changed_settings = std::move(copy);
+    }
+
+    return changed_settings;
+}
+
+void MergeTreeMetaBase::checkColumnsValidity(const ColumnsDescription & columns, const ASTPtr & new_settings) const
+{
+    NamesAndTypesList func_columns = getInMemoryMetadataPtr()->getFuncColumns();
+    MergeTreeSettingsPtr current_settings = getChangedSettings(new_settings);
+
+    auto columns_physical = columns.getAllPhysical();
+    for (auto & column: columns_physical)
+    {
+        /// Check func columns
+        for (auto & [name, type]: func_columns)
+        {
+            if (name == column.name)
+                throw Exception("Column " + backQuoteIfNeed(column.name) + " is reserved column", ErrorCodes::BAD_ARGUMENTS);
+        }
+
+        /// block implicit key name for MergeTree family
+        if (isMapImplicitKey(column.name))
+            throw Exception("Column " + backQuoteIfNeed(column.name) + " contains reserved prefix word", ErrorCodes::BAD_ARGUMENTS);
+
+        /// Block implicit key name for MergeTree family
+        if (column.type && column.type->isMap())
+        {
+            const auto & type_map = typeid_cast<const DataTypeMap &>(*column.type);
+            /// Check map validity
+            type_map.checkValidity();
+
+            /// Check constraint for KVMap
+            if (column.type->isKVMap())
+            {
+                // To facilitate the processing of file formats compatible with community map and ByteKV map, we restrict the column names of KV map.
+                for (const auto & key : MAP_KV_RESERVED_KEYS)
+                {
+                    if (column.name.find(key) != String::npos)
+                        throw Exception(
+                            "Column " + backQuoteIfNeed(column.name) + " contains reserved prefix word " + key, ErrorCodes::BAD_ARGUMENTS);
+                }
+            }
+            /// Check constraint for ByteMap
+            else
+            {
+                /// To compatible with old table which may have a Map(xx, Nullable(xx)) type, we can't check this in DataTypeMap
+                /// DataTypeLowCardinality->isNullable is false
+                if (type_map.getValueType()->isNullable())
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "ByteMap column in table cannot have nullable value type, but column {} has type {}",
+                        backQuoteIfNeed(column.name),
+                        type_map.getName());
+
+                auto escape_name = escapeForFileName(column.name + getMapSeparator());
+                auto pos = escape_name.find(getMapSeparator());
+                /// The name of map column should not contain map separator, which is convenient for extracting map column name from a implicit column name.
+                if (pos + getMapSeparator().size() != escape_name.size())
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Map column name {} is invalid because its escaped name {} contains reserved prefix word {} of map implicit column",
+                        backQuoteIfNeed(column.name),
+                        backQuoteIfNeed(escape_name),
+                        getMapSeparator());
+
+                if (current_settings->enable_compact_map_data && type_map.getValueType()->lowCardinality())
+                    throw Exception(
+                        "Column " + backQuoteIfNeed(column.name)
+                            + " compact map type not compatible with LowCardinality type, you need remove LowCardinality or disable "
+                              "enable_compact_map_data",
+                        ErrorCodes::BAD_ARGUMENTS);
+            }
+        }
+        else
+        {
+            /// Column names of non map types need to meet the following constraints, otherwise data will be written to the same file, resulting in errors.
+            /// For example: `col.key` UInt64, `col` Map<String, UInt64> KV, these two columns will both write data to file col%2Ekey.bin.
+            auto map_col = std::find_if(columns_physical.begin(), columns_physical.end(), [&](auto & col) {
+                if (col.type->isKVMap())
+                {
+                    for (const auto & key : MAP_KV_RESERVED_KEYS)
+                    {
+                        if (startsWith(column.name, col.name + key))
+                            return true;
+                    }
+                }
+                return false;
+            });
+            if (map_col != columns_physical.end())
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "The name of column {} is not compatible with that of KV map column {}",
+                    backQuoteIfNeed(column.name),
+                    backQuoteIfNeed(map_col->name));
+        }
+
+        // _row_exists is reserved for DELETE mutation.
+        if (column.name == RowExistsColumn::ROW_EXISTS_COLUMN.name)
+            throw Exception("Column name " + backQuoteIfNeed(column.name) + " is reserved for DELETE mutation.", ErrorCodes::ILLEGAL_COLUMN);
+    }
+}
+
+ColumnSize MergeTreeMetaBase::getMapColumnSizes(const DataPartPtr & part, const String & map_implicit_column_name) const
+{
+    auto part_checksums = part->getChecksums();
+    if (part_checksums->empty())
+        return {};
+
+    // we don't modify anything, maybe we do not need this lock
+    auto lock = lockPartsRead();
+
+    // __string_params__'btm' -> string_params
+    auto name = parseMapNameFromImplicitColName(map_implicit_column_name) ;
+    auto pair = part->columns_ptr->tryGetByName(name);
+    if (pair.has_value())
+    {
+        auto part_column_size = part->getMapColumnSize(map_implicit_column_name, *(pair->type));
+        return part_column_size;
+    }
+    return {};
+}
+
+ColumnSize MergeTreeMetaBase::calculateMapColumnSizesImpl(const String & map_implicit_column_name) const
+{
+    Stopwatch stopwatch;
+    auto parts_and_ratio = getCalculatedPartsAndRatio();
+    DataPartsVector calculated_parts = parts_and_ratio.first;
+    double ratio = parts_and_ratio.second;
+
+    ColumnSize map_column_size;
+    for (const auto & part : calculated_parts)
+    {
+        const ColumnSize & map_col_size = getMapColumnSizes(part, map_implicit_column_name);
+        map_column_size.add(map_col_size);
+    }
+
+    if (ratio > 1.0)
+    {
+        map_column_size.marks = map_column_size.marks * ratio;
+        map_column_size.data_compressed = map_column_size.data_compressed * ratio;
+        map_column_size.data_uncompressed = map_column_size.data_uncompressed * ratio;
+    }
+
+    LOG_DEBUG(log, "Calculate columns size elapsed: {} ms.", stopwatch.elapsedMilliseconds());
+
+    return map_column_size;
+}
+
+ASTPtr MergeTreeMetaBase::applyFilter(
+    ASTPtr query_filter, SelectQueryInfo & query_info, ContextPtr query_context, PlanNodeStatisticsPtr storage_statistics) const
+{
+    const auto & settings = query_context->getSettingsRef();
+    auto * select_query = query_info.getSelectQuery();
+    ASTs conjuncts = PredicateUtils::extractConjuncts(query_filter);
+
+    /// Set partition_filter
+    /// this should be done before setting query.where() to avoid partition filters being chosen as prewhere
+    if (settings.enable_partition_filter_push_down)
+    {
+        ASTs push_predicates;
+        ASTs remain_predicates;
+
+        Names partition_key_names = getInMemoryMetadataPtr()->getPartitionKey().column_names;
+        Names virtual_key_names = getSampleBlockWithVirtualColumns().getNames();
+        partition_key_names.insert(partition_key_names.end(), virtual_key_names.begin(), virtual_key_names.end());
+        auto iter = std::stable_partition(conjuncts.begin(), conjuncts.end(), [&](const auto & predicate) {
+            PartitionPredicateVisitor::Data visitor_data{query_context, partition_key_names};
+            PartitionPredicateVisitor(visitor_data).visit(predicate);
+            return visitor_data.getMatch();
+        });
+
+        push_predicates.insert(push_predicates.end(), conjuncts.begin(), iter);
+        remain_predicates.insert(remain_predicates.end(), iter, conjuncts.end());
+
+        ASTPtr new_partition_filter;
+
+        if (query_info.partition_filter)
+        {
+            push_predicates.push_back(query_info.partition_filter);
+            new_partition_filter = PredicateUtils::combineConjuncts(push_predicates);
+        }
+        else
+        {
+            new_partition_filter = PredicateUtils::combineConjuncts<false>(push_predicates);
+        }
+
+        if (!PredicateUtils::isTruePredicate(new_partition_filter))
+            query_info.partition_filter = std::move(new_partition_filter);
+
+        conjuncts.swap(remain_predicates);
+    }
+
+    /// Set query.where()
+    IStorage::applyFilter(PredicateUtils::combineConjuncts(conjuncts), query_info, query_context, storage_statistics);
+
+    /// Set query.prewhere(), strategy 1: by selectivity
+    if (select_query->where() && !select_query->prewhere() && supportsPrewhere() && settings.enable_active_prewhere && storage_statistics)
+    {
+        std::vector<ASTPtr> full_conjuncts = PredicateUtils::extractConjuncts(select_query->getWhere());
+        std::vector<ASTPtr> pre_conjuncts;
+        std::vector<ASTPtr> where_conjuncts;
+
+        IdentifierNameSet used_columns;
+        select_query->getWhere()->collectIdentifierNames(used_columns);
+        const auto & columns_desc = getInMemoryMetadataPtr()->getColumns();
+        NamesAndTypes names_and_types;
+        for (const auto & col_name : used_columns)
+            names_and_types.emplace_back(columns_desc.getPhysical(col_name));
+
+        for (const auto & conjunct : full_conjuncts)
+        {
+            double selectivity = FilterEstimator::estimateFilterSelectivity(storage_statistics, conjunct, names_and_types, query_context);
+            LOG_DEBUG(
+                &Poco::Logger::get("OptimizerActivePrewhere"),
+                "conjunct=" + serializeAST(*conjunct) + ", selectivity=" + std::to_string(selectivity));
+
+            if (selectivity <= query_context->getSettingsRef().max_active_prewhere_selectivity
+                && pre_conjuncts.size() < query_context->getSettingsRef().max_active_prewhere_size)
+                pre_conjuncts.push_back(conjunct);
+            else
+                where_conjuncts.push_back(conjunct);
+        }
+
+        if (!pre_conjuncts.empty())
+            select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, PredicateUtils::combineConjuncts(pre_conjuncts));
+
+        if (!where_conjuncts.empty())
+            select_query->setExpression(ASTSelectQuery::Expression::WHERE, PredicateUtils::combineConjuncts(where_conjuncts));
+        else
+            select_query->setExpression(ASTSelectQuery::Expression::WHERE, nullptr);
+    }
+
+    /// Set query.prewhere(), strategy 2: by IO cost
+    if (select_query->where() && !select_query->prewhere() && supportsPrewhere() && settings.enable_optimizer_early_prewhere_push_down)
+    {
+        /// PREWHERE optimization: transfer some condition from WHERE to PREWHERE if enabled and viable
+        if (const auto & column_size = getColumnSizes(); !column_size.empty())
+        {
+            /// Extract column compressed sizes.
+            std::unordered_map<std::string, UInt64> column_compressed_sizes;
+            for (const auto & [name, sizes] : column_size)
+                column_compressed_sizes[name] = sizes.data_compressed;
+
+            auto current_info = buildSelectQueryInfoForQuery(query_info.query, query_context);
+
+            for (const auto & column_name : current_info.syntax_analyzer_result->requiredSourceColumns())
+            {
+                UInt64 size = getColumnCompressedSize(column_name);
+                // Now get implicit column size only for prewhere pushdown
+                if (size == 0 && query_context->getSettingsRef().enable_implicit_column_prewhere_push && isMapImplicitKey(column_name))
+                {
+                    if (auto cloud_merge_tree = dynamic_cast<const StorageCloudMergeTree *>(this))
+                        size = cloud_merge_tree->calculateMapColumnSizesImpl(column_name).data_compressed;
+                }
+                column_compressed_sizes[column_name] = size;
+            }
+
+            MergeTreeWhereOptimizer{
+                current_info,
+                query_context,
+                std::move(column_compressed_sizes),
+                getInMemoryMetadataPtr(),
+                current_info.syntax_analyzer_result->requiredSourceColumns(),
+                &Poco::Logger::get("OptimizerEarlyPrewherePushdown")};
+        }
+    }
+
+    /// remove prewhere from query plan
+    if (auto prewhere = select_query->prewhere())
+        PredicateUtils::subtract(conjuncts, PredicateUtils::extractConjuncts(prewhere));
+
+    return PredicateUtils::combineConjuncts(conjuncts);
+}
+
+bool MergeTreeMetaBase::canFilterPartitionByTTL() const
+{
+    auto metadata_snapshot = getInMemoryMetadataPtr();
+    TTLTableDescription table_ttl = metadata_snapshot->getTableTTLs();
+    return metadata_snapshot->hasPartitionLevelTTL() && table_ttl.definition_ast;
+}
+
+void MergeTreeMetaBase::filterPartitionByTTL(std::vector<std::shared_ptr<MergeTreePartition>> & partition_list, time_t query_time) const
+{
+    if (canFilterPartitionByTTL())
+    {
+        const auto & metadata_snapshot = getInMemoryMetadataPtr();
+        if (!metadata_snapshot->hasRowsTTL())
+            return;
+
+        /// make a copy of rows_ttl, we may rewrite it later.
+        auto rows_ttl = metadata_snapshot->table_ttl.rows_ttl;
+
+        /// Construct a block consists of partition keys then compute ttl values according to this block
+        const auto & partition_key_sample = metadata_snapshot->getPartitionKey().sample_block;
+        MutableColumns columns = partition_key_sample.cloneEmptyColumns();
+
+        for (const auto & partition : partition_list)
+        {
+            /// This can happen when ALTER query is implemented improperly; finish ALTER query should bypass this check.
+            if (columns.size() != partition->value.size())
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Partition key columns definition missmatch between inmemory and metastore, this is a bug, expect block ({}), got values "
+                    "({})\n",
+                    partition_key_sample.dumpNames(),
+                    fmt::join(partition->value, ", "));
+
+            for (size_t i = 0; i < partition->value.size(); ++i)
+                columns[i]->insert(partition->value[i]);
+        }
+
+        auto block = partition_key_sample.cloneWithColumns(std::move(columns));
+        TTLDescription::tryRewriteTTLWithPartitionKey(rows_ttl, metadata_snapshot->columns, metadata_snapshot->partition_key, metadata_snapshot->primary_key, getContext());
+        rows_ttl.expression->execute(block);
+
+        // got the ttl values for each partition based on ttl expression
+        const auto & ttl_values = block.getByName(rows_ttl.result_column);
+        const IColumn * column = ttl_values.column.get();
+
+        if (column->size() != partition_list.size())
+            throw Exception("Calculated TTL column size cannot match input partitions column size.", ErrorCodes::LOGICAL_ERROR);
+
+        if (query_time == 0)
+            query_time = std::time(nullptr);
+
+        std::vector<std::shared_ptr<MergeTreePartition>> filtered_result;
+
+        if (column->isNullable())
+            column = static_cast<const ColumnNullable *>(column)->getNestedColumnPtr().get();
+
+        if (const ColumnUInt16 * column_date = typeid_cast<const ColumnUInt16 *>(column))
+        {
+            const auto & date_lut = DateLUT::instance();
+            for (size_t index = 0; index < column->size(); index++)
+            {
+                auto ttl_value = date_lut.fromDayNum(DayNum(column_date->getElement(index)));
+                if (ttl_value >= query_time)
+                    filtered_result.push_back(partition_list[index]);
+            }
+        }
+        else if (const ColumnUInt32 * column_date_time = typeid_cast<const ColumnUInt32 *>(column))
+        {
+            for (size_t index = 0; index < column->size(); index++)
+            {
+                auto ttl_value = column_date_time->getElement(index);
+                if (ttl_value >= query_time)
+                    filtered_result.push_back(partition_list[index]);
+            }
+        }
+        else
+            throw Exception("Unexpected type of result ttl column", ErrorCodes::LOGICAL_ERROR);
+
+        // for (size_t index = 0; index < column->size(); index++)
+        // {
+        //     time_t ttl_value = 0;
+        //     if (const ColumnUInt16 * column_date = typeid_cast<const ColumnUInt16 *>(column))
+        //     {
+        //         const auto & date_lut = DateLUT::instance();
+        //         ttl_value = date_lut.fromDayNum(DayNum(column_date->getElement(index)));
+        //     }
+        //     else if (const ColumnUInt32 * column_date_time = typeid_cast<const ColumnUInt32 *>(column))
+        //     {
+        //         ttl_value = column_date_time->getElement(index);
+        //     }
+        //     else
+        //         throw Exception("Unexpected type of result ttl column", ErrorCodes::LOGICAL_ERROR);
+
+        //     if (ttl_value >= query_time)
+        //         filtered_result.push_back(partition_list[index]);
+        // }
+
+        if (filtered_result.size() < partition_list.size())
+            LOG_DEBUG(log, "TTL rules dropped {} partitions (before: {}).", partition_list.size() - filtered_result.size(), partition_list.size());
+        filtered_result.swap(partition_list);
+    }
+}
+
+Strings MergeTreeMetaBase::selectPartitionsByPredicate(
+    const SelectQueryInfo & query_info,
+    std::vector<std::shared_ptr<MergeTreePartition>> & partition_list,
+    const Names & column_names_to_return,
+    ContextPtr local_context) const
+{
+    /// Coarse grained partition pruner: filter out the partition which will definitely not satisfy the query predicate. The benefit
+    /// is 2-folded: (1) we can prune data parts and (2) we can reduce numbers of calls to catalog to get parts 's metadata.
+    /// Note that this step still leaves false-positive parts. For example, the partition key is `toMonth(date)` and the query
+    /// condition is `date > '2022-02-22' and date < '2022-03-22'` then this step won't eliminate any partition.
+
+    /// The partition pruning rules come from 3 types:
+    /// (1) TTL
+    /// (2) Columns in predicate that exactly match the partition key
+    /// (3) `_partition_id` or `_partition_value` if they're in predicate
+
+    /// (1) Prune partition by partition level TTL
+    filterPartitionByTTL(partition_list, local_context->tryGetCurrentTransactionID().toSecond());
+
+    const auto partition_key = MergeTreePartition::adjustPartitionKey(getInMemoryMetadataPtr(), local_context);
+    const auto & partition_key_expr = partition_key.expression;
+    const auto & partition_key_sample = partition_key.sample_block;
+    if (local_context->getSettingsRef().enable_partition_prune && partition_key_sample.columns() > 0)
+    {
+        /// (2) Prune partitions if there's a column in predicate that exactly match the partition key
+        Names partition_key_columns;
+        for (const auto & name : partition_key_sample)
+        {
+            partition_key_columns.emplace_back(name.name);
+        }
+
+        KeyCondition partition_condition(query_info, local_context, partition_key_columns, partition_key_expr);
+        DataTypes result;
+        result.reserve(partition_key_sample.getDataTypes().size());
+        for (const auto & data_type : partition_key_sample.getDataTypes())
+        {
+            result.push_back(DataTypeFactory::instance().get(data_type->getName(), data_type->getFlags()));
+        }
+        size_t prev_sz = partition_list.size();
+        std::erase_if(partition_list, [&](const auto & partition) {
+            const auto & partition_value = partition->value;
+            std::vector<FieldRef> index_value(partition_value.begin(), partition_value.end());
+            auto res = partition_condition.mayBeTrueInRange(partition_key_columns.size(), index_value.data(), index_value.data(), result);
+            LOG_TRACE(
+                log,
+                "Key condition {} is {} in [ ({}) - ({}) )",
+                partition_condition.toString(),
+                res,
+                fmt::join(index_value, " "),
+                fmt::join(index_value, " "));
+            return !res;
+        });
+        if (partition_list.size() < prev_sz)
+            LOG_DEBUG(log, "Query predicates on physical columns dropped {} partitions", prev_sz - partition_list.size());
+
+        /// (3) Prune partitions if there's `_partition_id` or `_partition_value` in query predicate
+        bool has_partition_column = std::any_of(column_names_to_return.begin(), column_names_to_return.end(), [](const auto & name) {
+            return name == "_partition_id" || name == "_partition_value";
+        });
+
+        if (has_partition_column && !partition_list.empty())
+        {
+            Block partition_block = getBlockWithVirtualPartitionColumns(partition_list);
+            ASTPtr expression_ast;
+
+            /// Generate valid expressions for filtering
+            VirtualColumnUtils::prepareFilterBlockWithQuery(query_info.query, local_context, partition_block, expression_ast);
+
+            /// Generate list of partition id that fit the query predicate
+            NameSet partition_ids;
+            if (expression_ast)
+            {
+                VirtualColumnUtils::filterBlockWithQuery(query_info.query, partition_block, local_context, expression_ast);
+                partition_ids = VirtualColumnUtils::extractSingleValueFromBlock<String>(partition_block, "_partition_id");
+                /// Prunning
+                prev_sz = partition_list.size();
+                std::erase_if(partition_list, [this, &partition_ids](const auto & partition) {
+                    return partition_ids.find(partition->getID(*this)) == partition_ids.end();
+                });
+                if (partition_list.size() < prev_sz)
+                    LOG_DEBUG(
+                        log,
+                        "Query predicates on `_partition_id` and `_partition_value` droped {} partitions",
+                        prev_sz - partition_list.size());
+            }
+        }
+    }
+    Strings res_partitions;
+    for (const auto & partition : partition_list)
+        res_partitions.emplace_back(partition->getID(*this));
+
+    return res_partitions;
+}
+
+void MergeTreeMetaBase::getDeleteBitmapMetaForServerParts(const ServerDataPartsVector & parts, DeleteBitmapMetaPtrVector & all_bitmaps, bool force_found) const
+{
+    DeleteBitmapMetaPtrVector bitmaps;
+    CnchPartsHelper::calcVisibleDeleteBitmaps(all_bitmaps, bitmaps);
+
+    /// Both the parts and bitmaps are sorted in (partition_id, min_block, max_block, commit_time) order
+    auto bitmap_it = bitmaps.begin();
+    for (const auto & part : parts)
+    {
+        if (force_found)
+        {
+            /// search for the first bitmap
+            while (bitmap_it != bitmaps.end() && !(*bitmap_it)->sameBlock(part->info()))
+                bitmap_it++;
+
+            if (bitmap_it == bitmaps.end())
+            {
+                if (auto unique_table_log = getContext()->getCloudUniqueTableLog())
+                {
+                    auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, getCnchStorageID());
+                    current_log.metric = ErrorCodes::LOGICAL_ERROR;
+                    current_log.event_msg = "Delete bitmap metadata of " + part->name() + " is not found";
+                    unique_table_log->add(current_log);
+                }
+                throw Exception("Delete bitmap metadata of " + part->name() + " is not found", ErrorCodes::LOGICAL_ERROR);
+            }
+
+            /// add all visible bitmaps (from new to old) part
+            bool found_base = false;
+            auto list_it = part->delete_bitmap_metas.before_begin();
+            for (auto bitmap_meta = *bitmap_it; bitmap_meta; bitmap_meta = bitmap_meta->tryGetPrevious())
+            {
+                list_it = part->delete_bitmap_metas.insert_after(list_it, bitmap_meta->getModel());
+                if (bitmap_meta->getType() == DeleteBitmapMetaType::Base)
+                {
+                    found_base = true;
+                    break;
+                }
+            }
+            if (!found_base)
+            {
+                if (auto unique_table_log = getContext()->getCloudUniqueTableLog())
+                {
+                    auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, getCnchStorageID());
+                    current_log.metric = ErrorCodes::LOGICAL_ERROR;
+                    current_log.event_msg = "Base delete bitmap of " + part->name() + " is not found";
+                    unique_table_log->add(current_log);
+                }
+                throw Exception("Base delete bitmap of " + part->name() + " is not found", ErrorCodes::LOGICAL_ERROR);
+            }
+
+            bitmap_it++;
+        }
+        else
+        {
+            while (bitmap_it != bitmaps.end() && (*(*bitmap_it)) <= part->info())
+            {
+                if (!(*bitmap_it)->sameBlock(part->info()))
+                    bitmap_it++;
+                else
+                {
+                    /// add all visible bitmaps (from new to old) part
+                    bool found_base = false;
+                    auto list_it = part->delete_bitmap_metas.before_begin();
+                    for (auto bitmap_meta = *bitmap_it; bitmap_meta; bitmap_meta = bitmap_meta->tryGetPrevious())
+                    {
+                        list_it = part->delete_bitmap_metas.insert_after(list_it, bitmap_meta->getModel());
+                        if (bitmap_meta->getType() == DeleteBitmapMetaType::Base)
+                        {
+                            found_base = true;
+                            break;
+                        }
+                    }
+                    if (!found_base)
+                    {
+                        if (auto unique_table_log = getContext()->getCloudUniqueTableLog())
+                        {
+                            auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, getCnchStorageID());
+                            current_log.metric = ErrorCodes::LOGICAL_ERROR;
+                            current_log.event_msg = "Base delete bitmap of " + part->name() + " is not found";
+                            unique_table_log->add(current_log);
+                        }
+                        throw Exception("Base delete bitmap of " + part->name() + " is not found", ErrorCodes::LOGICAL_ERROR);
+                    }
+                    bitmap_it++;
+                }
+            }
+        }
+
+    }
+}
+
+void MergeTreeMetaBase::getDeleteBitmapMetaForCnchParts(MutableMergeTreeDataPartsCNCHVector & parts, DeleteBitmapMetaPtrVector & all_bitmaps, bool force_found)
+{
+    MergeTreeDataPartsCNCHVector cnch_parts;
+    cnch_parts.reserve(parts.size());
+    for (auto & part : parts)
+        cnch_parts.emplace_back(const_pointer_cast<const MergeTreeDataPartCNCH>(part));
+    getDeleteBitmapMetaForCnchParts(cnch_parts, all_bitmaps, force_found);
+}
+
+void MergeTreeMetaBase::getDeleteBitmapMetaForCnchParts(const MergeTreeDataPartsCNCHVector & parts, DeleteBitmapMetaPtrVector & all_bitmaps, bool force_found)
+{
+    DeleteBitmapMetaPtrVector bitmaps;
+    CnchPartsHelper::calcVisibleDeleteBitmaps(all_bitmaps, bitmaps);
+
+    /// Both the parts and bitmaps are sorted in (partition_id, min_block, max_block, commit_time) order
+    auto bitmap_it = bitmaps.begin();
+    for (auto & part : parts)
+    {
+        if (force_found)
+        {
+            /// search for the first bitmap
+            while (bitmap_it != bitmaps.end() && !(*bitmap_it)->sameBlock(part->info))
+                bitmap_it++;
+
+            if (bitmap_it == bitmaps.end())
+            {
+                if (auto unique_table_log = getContext()->getCloudUniqueTableLog())
+                {
+                    auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, getCnchStorageID());
+                    current_log.metric = ErrorCodes::LOGICAL_ERROR;
+                    current_log.event_msg = "Delete bitmap metadata of " + part->name + " is not found";
+                    unique_table_log->add(current_log);
+                }
+                throw Exception("Delete bitmap metadata of " + part->name + " is not found", ErrorCodes::LOGICAL_ERROR);
+            }
+
+            /// add all visible bitmaps (from new to old) part
+            part->setDeleteBitmapMeta(*bitmap_it);
+            bitmap_it++;
+        }
+        else
+        {
+            while (bitmap_it != bitmaps.end() && (*(*bitmap_it)) <= part->info)
+            {
+                if (!(*bitmap_it)->sameBlock(part->info))
+                    bitmap_it++;
+                else
+                {
+                    /// add all visible bitmaps (from new to old) part
+                    part->setDeleteBitmapMeta(*bitmap_it, /*force_set*/ false);
+                    bitmap_it++;
+                }
+            }
+        }
+    }
+}
+
+void MergeTreeMetaBase::getDeleteBitmapMetaForParts(IMergeTreeDataPartsVector & parts, DeleteBitmapMetaPtrVector & delete_bitmap_metas, bool force_found)
+{
+    MergeTreeDataPartsCNCHVector cnch_parts;
+    cnch_parts.reserve(parts.size());
+    for (auto & part : parts)
+        cnch_parts.emplace_back(dynamic_pointer_cast<const MergeTreeDataPartCNCH>(part));
+    getDeleteBitmapMetaForCnchParts(cnch_parts, delete_bitmap_metas, force_found);
+}
+
+void MergeTreeMetaBase::getDeleteBitmapMetaForStagedParts(
+    const MergeTreeDataPartsCNCHVector & parts, ContextPtr local_context, TxnTimestamp start_time)
+{
+    auto catalog = local_context->getCnchCatalog();
+    if (!catalog)
+        return;
+
+    std::set<String> request_partitions;
+    std::set<int64_t> request_buckets;
+    for (const auto & part : parts)
+    {
+        const auto & partition_id = part->info.partition_id;
+        request_partitions.insert(partition_id);
+        request_buckets.insert(part->bucket_number);
+    }
+
+    /// NOTE: Get all the bitmap meta needed only once from kv instead of getting many times for every partition to save time.
+    Stopwatch watch;
+    auto all_bitmaps = catalog->getDeleteBitmapsInPartitions(
+        shared_from_this(),
+        {request_partitions.begin(), request_partitions.end()},
+        start_time,
+        nullptr,
+        Catalog::VisibilityLevel::Visible,
+        request_buckets);
+    ProfileEvents::increment(ProfileEvents::CatalogTime, watch.elapsedMilliseconds());
+    LOG_DEBUG(
+        log,
+        "Get delete bitmap meta for total {} parts, take {} ms and read {} number of bitmap metas",
+        parts.size(),
+        watch.elapsedMilliseconds(),
+        all_bitmaps.size());
+
+    DeleteBitmapMetaPtrVector bitmaps;
+    CnchPartsHelper::calcVisibleDeleteBitmaps(all_bitmaps, bitmaps);
+
+    /// Both the parts and bitmaps are sorted in (partitioin_id, min_block, max_block, commit_time) order
+    auto bitmap_it = bitmaps.begin();
+    for (const auto & part : parts)
+    {
+        while (bitmap_it != bitmaps.end() && (*(*bitmap_it)) <= part->info)
+        {
+            if (!(*bitmap_it)->sameBlock(part->info))
+                bitmap_it++;
+            else
+            {
+                /// add all visible bitmaps (from new to old) part
+                part->setDeleteBitmapMeta(*bitmap_it);
+                bitmap_it++;
+            }
+        }
+    }
 }
 
 }

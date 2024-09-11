@@ -13,32 +13,52 @@
  * limitations under the License.
  */
 
-#include <Parsers/ParserPartToolkitQuery.h>
+#include <Interpreters/StorageID.h>
+#include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTPartToolKit.h>
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ParserCreateQuery.h>
-#include <Parsers/ASTCreateQuery.h>
-#include <Parsers/ASTPartToolKit.h>
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/ASTFunction.h>
-#include <Interpreters/StorageID.h>
+#include <Parsers/ParserPartToolkitQuery.h>
+#include "Parsers/parseIdentifierOrStringLiteral.h"
 
 namespace DB
 {
 
 bool ParserPWStorage::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
+    ParserKeyword s_engine("ENGINE");
+    ParserToken s_eq(TokenType::Equals);
     ParserKeyword s_partition_by("PARTITION BY");
     ParserKeyword s_primary_key("PRIMARY KEY");
     ParserKeyword s_order_by("ORDER BY");
     ParserKeyword s_unique_key("UNIQUE KEY");
+    ParserKeyword s_cluster_by("CLUSTER BY");
+    ParserKeyword s_sample_by("SAMPLE BY");
+    ParserKeyword s_ttl("TTL");
 
+    ParserIdentifierWithOptionalParameters ident_with_optional_params_p(dt);
     ParserExpression expression_p(dt);
+    ParserClusterByElement cluster_p;
 
+    ASTPtr engine;
     ASTPtr partition_by;
     ASTPtr primary_key;
     ASTPtr order_by;
     ASTPtr unique_key;
+    ASTPtr cluster_by;
+    ASTPtr sample_by;
+    ASTPtr ttl_table;
 
+    bool has_explicit_engine = s_engine.checkWithoutMoving(pos, expected);
+    if (has_explicit_engine)
+    {
+        s_engine.ignore(pos, expected);
+        s_eq.ignore(pos, expected);
+        if (!ident_with_optional_params_p.parse(pos, engine, expected))
+            return false;
+    }
 
     while (true)
     {
@@ -66,13 +86,35 @@ bool ParserPWStorage::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
                 return false;
         }
 
-        /// only parse but never used. PW do not support HaUnique table.
         if (!unique_key && s_unique_key.ignore(pos, expected))
         {
             if (expression_p.parse(pos, unique_key, expected))
                 continue;
             else
                 return false;
+        }
+
+        if (!cluster_by && s_cluster_by.ignore(pos, expected))
+        {
+            if (!cluster_p.parse(pos, cluster_by, expected))
+                return false;
+
+            continue;
+        }
+
+        if (!sample_by && s_sample_by.ignore(pos, expected))
+        {
+            if (!expression_p.parse(pos, sample_by, expected))
+                return false;
+            continue;
+        }
+
+        /// parse TTL as well to prevent parse error
+        if (!ttl_table && s_ttl.ignore(pos, expected))
+        {
+            if (!expression_p.parse(pos, ttl_table, expected))
+                return false;
+            continue;
         }
 
         break;
@@ -83,15 +125,23 @@ bool ParserPWStorage::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     storage->set(storage->primary_key, primary_key);
     storage->set(storage->order_by, order_by);
     storage->set(storage->unique_key, unique_key);
+    storage->set(storage->cluster_by, cluster_by);
+    storage->set(storage->sample_by, sample_by);
+    storage->set(storage->ttl_table, ttl_table);
 
-    /// Mock a CloudMergeTree engine
-    std::shared_ptr<ASTFunction> engine = std::make_shared<ASTFunction>();
-    engine->name = "CloudMergeTree";
-    engine->arguments = std::make_shared<ASTExpressionList>();
-    engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>("default"));
-    engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>("tmp"));
-    engine->no_empty_args = true;
-    storage->set(storage->engine, engine);
+    if (has_explicit_engine)
+        storage->set(storage->engine, engine);
+    else
+    {
+        /// Mock a CloudMergeTree engine
+        std::shared_ptr<ASTFunction> implicit_engine = std::make_shared<ASTFunction>();
+        implicit_engine->name = "CloudMergeTree";
+        implicit_engine->arguments = std::make_shared<ASTExpressionList>();
+        implicit_engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>("default"));
+        implicit_engine->arguments->children.emplace_back(std::make_shared<ASTIdentifier>("tmp"));
+        implicit_engine->no_empty_args = true;
+        storage->set(storage->engine, implicit_engine);
+    }
 
     node = storage;
     return true;
@@ -100,11 +150,12 @@ bool ParserPWStorage::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 bool ParserPartToolkitQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     ParserKeyword s_load("LOAD");
+    ParserKeyword s_clean("CLEAN");
     ParserKeyword s_file("FILE");
     ParserKeyword s_merge("MERGE PARTS");
     ParserKeyword s_converter("CONVERT PARTS FROM");
     ParserKeyword s_to("TO");
-    ParserKeyword s_asTable("AS TABLE");
+    ParserKeyword s_as_table("AS TABLE");
     ParserKeyword s_location("LOCATION");
     ParserKeyword s_setting("SETTINGS");
     ParserToken s_lparen(TokenType::OpeningRoundBracket);
@@ -156,18 +207,72 @@ bool ParserPartToolkitQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expe
 
         type = PartToolType::CONVERTER;
     }
+    else if (s_clean.ignore(pos, expected))
+    {
+        // CLEAN
+        // `clean s3 task all '<task_id>' settings s3_config='./s3.conf'`
+        type = PartToolType::NOTYPE;
+
+        auto clean_info = std::make_shared<S3CleanTaskInfo>();
+        ParserKeyword s_s3("S3");
+        ParserKeyword s_task("TASK");
+        ParserKeyword s_meta("META");
+        ParserKeyword s_data("DATA");
+        ParserKeyword s_all("ALL");
+
+        ParserSetQuery settings_p_local(/* parse_only_internals_ = */ true);
+
+        if (!s_s3.ignore(pos, expected))
+            return false;
+
+        if (!s_task.ignore(pos, expected))
+            return false;
+
+        if (s_meta.ignore(pos, expected))
+        {
+            clean_info->type = S3CleanTaskInfo::CleanType::META;
+        }
+        else if (s_all.ignore(pos, expected))
+        {
+            clean_info->type = S3CleanTaskInfo::CleanType::ALL;
+        }
+        else if (s_data.ignore(pos, expected))
+        {
+            clean_info->type = S3CleanTaskInfo::CleanType::DATA;
+        }
+        else
+            return false;
+
+        if (!parseIdentifierOrStringLiteral(pos, expected, clean_info->task_id))
+            return false;
+
+        if (s_setting.ignore(pos, expected))
+        {
+            if (!settings_p_local.parse(pos, settings, expected))
+                return false;
+        }
+
+        auto part_toolkit_ast = std::make_shared<ASTPartToolKit>();
+        node = part_toolkit_ast;
+        part_toolkit_ast->type = type;
+        part_toolkit_ast->s3_clean_task_info = clean_info;
+        part_toolkit_ast->settings = settings;
+
+        return true;
+    }
     else
         return false;
 
 
-    if (type!=PartToolType::CONVERTER && !string_literal_parser.parse(pos, source_path, expected))
+    if (type != PartToolType::CONVERTER && !string_literal_parser.parse(pos, source_path, expected))
         return false;
 
-    if (!s_asTable.ignore(pos, expected))
+    if (!s_as_table.ignore(pos, expected))
         return false;
 
     /// table name is optional, just ignore it.
     table_name_p.parse(pos, table, expected);
+    tryRewriteCnchDatabaseName(table, pos.getContext());
 
     if (!s_lparen.ignore(pos, expected))
         return false;

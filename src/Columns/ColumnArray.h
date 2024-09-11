@@ -49,6 +49,22 @@ private:
 
     ColumnArray(const ColumnArray &) = default;
 
+    struct ComparatorBase;
+
+    using ComparatorAscendingUnstable = ComparatorAscendingUnstableImpl<ComparatorBase>;
+    using ComparatorAscendingStable = ComparatorAscendingStableImpl<ComparatorBase>;
+    using ComparatorDescendingUnstable = ComparatorDescendingUnstableImpl<ComparatorBase>;
+    using ComparatorDescendingStable = ComparatorDescendingStableImpl<ComparatorBase>;
+    using ComparatorEqual = ComparatorEqualImpl<ComparatorBase>;
+
+    struct ComparatorCollationBase;
+
+    using ComparatorCollationAscendingUnstable = ComparatorAscendingUnstableImpl<ComparatorCollationBase>;
+    using ComparatorCollationAscendingStable = ComparatorAscendingStableImpl<ComparatorCollationBase>;
+    using ComparatorCollationDescendingUnstable = ComparatorDescendingUnstableImpl<ComparatorCollationBase>;
+    using ComparatorCollationDescendingStable = ComparatorDescendingStableImpl<ComparatorCollationBase>;
+    using ComparatorCollationEqual = ComparatorEqualImpl<ComparatorCollationBase>;
+
 public:
     /** Create immutable column using immutable arguments. This arguments may be shared with other columns.
       * Use IColumn::mutate in order to make mutable column and mutate shared nested columns.
@@ -93,6 +109,7 @@ public:
     void insertDefault() override;
     void popBack(size_t n) override;
     ColumnPtr filter(const Filter & filt, ssize_t result_size_hint) const override;
+    void expand(const Filter & mask, bool inverted) override;
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
     ColumnPtr index(const IColumn & indexes, size_t limit) const override;
     template <typename Type> ColumnPtr indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const;
@@ -102,10 +119,14 @@ public:
                        int direction, int nan_direction_hint) const override;
     int compareAtWithCollation(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint, const Collator & collator) const override;
     bool hasEqualValues() const override;
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
-    void updatePermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res, EqualRanges & equal_range) const override;
-    void getPermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
-    void updatePermutationWithCollation(const Collator & collator, bool reverse, size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_range) const override;
+    void getPermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                            size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void updatePermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                            size_t limit, int nan_direction_hint, Permutation & res, EqualRanges & equal_ranges) const override;
+    void getPermutationWithCollation(const Collator & collator, PermutationSortDirection direction, PermutationSortStability stability,
+                                    size_t limit, int nan_direction_hint, Permutation & res) const override;
+    void updatePermutationWithCollation(const Collator & collator, PermutationSortDirection direction, PermutationSortStability stability,
+                                    size_t limit, int nan_direction_hint, Permutation & res, EqualRanges& equal_ranges) const override;
     void reserve(size_t n) override;
     size_t byteSize() const override;
     size_t byteSizeAt(size_t n) const override;
@@ -115,6 +136,15 @@ public:
     ColumnPtr convertToFullColumnIfConst() const override;
     void getExtremes(Field & min, Field & max) const override;
 
+    void tryToFlushZeroCopyBuffer() const override
+    {
+        
+        if (data)
+            data->tryToFlushZeroCopyBuffer();
+        if (offsets)
+            offsets->tryToFlushZeroCopyBuffer();
+    }
+
     /// Map support array key
     bool canBeInsideNullable() const override { return true; }
 
@@ -123,6 +153,7 @@ public:
     /** More efficient methods of manipulation */
     IColumn & getData() { return *data; }
     const IColumn & getData() const { return *data; }
+    bool isDefaultAt(size_t n) const override;
 
     IColumn & getOffsetsColumn() { return *offsets; }
     const IColumn & getOffsetsColumn() const { return *offsets; }
@@ -152,10 +183,18 @@ public:
 
     ColumnPtr compress() const override;
 
-    void forEachSubcolumn(ColumnCallback callback) override
+    void forEachSubcolumn(MutableColumnCallback callback) override
     {
         callback(offsets);
         callback(data);
+    }
+
+    void forEachSubcolumnRecursively(RecursiveMutableColumnCallback callback) override
+    {
+        callback(*offsets);
+        offsets->forEachSubcolumnRecursively(callback);
+        callback(*data);
+        data->forEachSubcolumnRecursively(callback);
     }
 
     bool structureEquals(const IColumn & rhs) const override
@@ -165,10 +204,16 @@ public:
         return false;
     }
 
+    double getRatioOfDefaultRows(double sample_ratio) const override;
+    UInt64 getNumberOfDefaultRows() const override;
+    void getIndicesOfNonDefaultRows(Offsets & indices, size_t from, size_t limit) const override;
+
     bool isCollationSupported() const override { return getData().isCollationSupported(); }
 
     size_t ALWAYS_INLINE offsetAt(ssize_t i) const { return getOffsets()[i - 1]; }
     size_t ALWAYS_INLINE sizeAt(ssize_t i) const { return getOffsets()[i] - getOffsets()[i - 1]; }
+
+    size_t getNumberOfDimensions() const;
 
 private:
     WrappedPtr data;
@@ -205,12 +250,6 @@ private:
     ColumnPtr filterGeneric(const Filter & filt, ssize_t result_size_hint) const;
 
     int compareAtImpl(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint, const Collator * collator=nullptr) const;
-
-    template <typename Comparator>
-    void getPermutationImpl(size_t limit, Permutation & res, Comparator cmp) const;
-
-    template <typename Comparator>
-    void updatePermutationImpl(size_t limit, Permutation & res, EqualRanges & equal_range, Comparator cmp) const;
 };
 
 

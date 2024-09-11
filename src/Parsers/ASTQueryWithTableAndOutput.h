@@ -29,19 +29,34 @@
 namespace DB
 {
 
-
+struct StorageID;
 /** Query specifying table name and, possibly, the database and the FORMAT section.
   */
 class ASTQueryWithTableAndOutput : public ASTQueryWithOutput
 {
 public:
+    String catalog;
     String database;
     String table;
     UUID uuid = UUIDHelpers::Nil;
     bool temporary{false};
 
     ASTType getType() const override { return ASTType::ASTQueryWithTableAndOutput; }
+    void setTableInfo(const StorageID& storage_id);
+    StorageID getTableInfo() const;
 
+    void toLowerCase() override
+    {
+        boost::to_lower(catalog);
+        boost::to_lower(database);
+        boost::to_lower(table);
+    }
+    void toUpperCase() override
+    {
+        boost::to_upper(catalog);
+        boost::to_upper(database);
+        boost::to_upper(table);
+    }
 protected:
     void formatHelper(const FormatSettings & settings, const char * name) const;
 };

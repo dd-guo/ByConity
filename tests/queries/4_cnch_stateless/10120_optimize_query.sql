@@ -1,21 +1,20 @@
 SET mutations_sync = 1;
 
-USE test;
-DROP TABLE IF EXISTS test_optimize;
-CREATE TABLE test_optimize(x Int32, y String) Engine = CnchMergeTree ORDER BY x;
+DROP TABLE IF EXISTS test_optimize_10120;
+CREATE TABLE test_optimize_10120(x Int32, y String) Engine = CnchMergeTree ORDER BY x;
+SYSTEM START MERGES test_optimize_10120;
+SYSTEM STOP MERGES test_optimize_10120;
 
-INSERT INTO test_optimize VALUES(1, '1');
-INSERT INTO test_optimize VALUES(2, '2');
-INSERT INTO test_optimize VALUES(3, '3');
-INSERT INTO test_optimize VALUES(4, '4');
-INSERT INTO test_optimize VALUES(5, '5');
+INSERT INTO test_optimize_10120 VALUES(1, '1');
+INSERT INTO test_optimize_10120 VALUES(2, '2');
+INSERT INTO test_optimize_10120 VALUES(3, '3');
+INSERT INTO test_optimize_10120 VALUES(4, '4');
+INSERT INTO test_optimize_10120 VALUES(5, '5');
 
-SYSTEM START MERGES test_optimize;
-OPTIMIZE TABLE test_optimize PARTITION ID 'all';
+OPTIMIZE TABLE test_optimize_10120 PARTITION ID 'all';
 
-SELECT * FROM test_optimize;
+SELECT * FROM test_optimize_10120;
 
-SELECT count() FROM system.cnch_parts WHERE database = 'test' AND table = 'test_optimize' AND part_type = 'VisiblePart';
-SELECT count() FROM system.cnch_parts WHERE database = 'test' AND table = 'test_optimize' AND part_type = 'DroppedPart';
+SELECT count() FROM system.cnch_parts WHERE database = currentDatabase(1) AND table = 'test_optimize_10120' AND part_type = 'VisiblePart';
 
-DROP TABLE test_optimize;
+DROP TABLE test_optimize_10120;

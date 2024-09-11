@@ -31,6 +31,7 @@
 #include <Interpreters/IJoin.h>
 #include <Interpreters/AggregationCommon.h>
 #include <Interpreters/RowRefs.h>
+#include <Interpreters/RuntimeFilter/RuntimeFilterBuilder.h>
 
 #include <Common/Arena.h>
 #include <Common/ColumnsHashing.h>
@@ -50,7 +51,7 @@ namespace DB
 
 class TableJoin;
 class DictionaryReader;
-
+class RuntimeFilterConsumer;
 namespace JoinStuff
 {
 
@@ -81,6 +82,8 @@ public:
 };
 
 }
+
+constexpr size_t kMaxAllowedJoinedBlockRows = DEFAULT_BLOCK_SIZE * 2;
 
 /** Data structure for implementation of JOIN.
   * It is just a hash table: keys -> rows of joined ("right") table.
@@ -158,6 +161,7 @@ public:
     JoinType getType() const override { return JoinType::Hash; }
 
     const TableJoin & getTableJoin() const override { return *table_join; }
+    TableJoin & getTableJoin() override { return *table_join; }
 
     /** Add block of data from right hand of JOIN to the map.
       * Returns false, if some limit was exceeded and you should not insert more data.
@@ -187,7 +191,7 @@ public:
       * Use only after all calls to joinBlock was done.
       * left_sample_block is passed without account of 'use_nulls' setting (columns will be converted to Nullable inside).
       */
-    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & result_sample_block, UInt64 max_block_size) const override;
+    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & result_sample_block, UInt64 max_block_size, size_t total_size, size_t index) const override;
 
     /// Number of keys in all built JOIN maps.
     size_t getTotalRowCount() const final;
@@ -338,6 +342,17 @@ public:
         Block sample_block; /// Block as it would appear in the BlockList
         BlocksList blocks; /// Blocks of "right" table.
         BlockNullmapList blocks_nullmaps; /// Nullmaps for blocks of "right" table (if needed)
+        // TODO: optimize it, we can encode the block *, and use a flat array to record bools.
+        std::unordered_map<const Block *, std::vector<bool>> used_map; /// bool flags for right table when there is inequal conditions.
+        bthread::Mutex mutex;
+
+        bool checkUsed(const Block* block, size_t row_number) const
+        {
+            if (used_map.empty())
+                return false;
+            
+            return used_map.at(block)[row_number];
+        }
 
         /// Additional data - strings for string keys and continuation elements of single-linked lists of references to rows.
         Arena pool;
@@ -357,13 +372,29 @@ public:
         return data;
     }
 
+    BlocksList releaseJoinedBlocks(bool restructure = false);
+
+    /// Modify right block (update structure according to sample block) to save it in block list
+    static Block prepareRightBlock(const Block & block, const Block & saved_block_sample_);
+    Block prepareRightBlock(const Block & block) const;
+
     bool isUsed(size_t off) const { return used_flags.getUsedSafe(off); }
 
-    void serialize(WriteBuffer & buf) const override;
-    static JoinPtr deserialize(ReadBuffer & buf, ContextPtr context);
+    bool isEqualNull(const String& name) const;
+    void tryBuildRuntimeFilters() const override;
+    void bypassRuntimeFilters(BypassType type, size_t total_size) const;
+    const Block & savedBlockSample() const { return data->sample_block; }
+    void buildBloomFilterRF(
+        const RuntimeFilterBuildInfos & rf_info, const String & name, size_t ht_size, const std::vector<const BlocksList *> & blocks,
+        RuntimeFilterConsumer * rf_consumer) const;
+    void buildValueSetRF(const RuntimeFilterBuildInfos & rf_info, const String & name, const std::vector<const BlocksList *> & blocks,
+                         RuntimeFilterConsumer * rf_consumer) const;
+    void buildAllRF(size_t total_size, const std::vector<const BlocksList *> & all_blocks, RuntimeFilterConsumer * rf_consumer) const;
 
 private:
     friend class NonJoinedBlockInputStream;
+    friend class ConcurrentNotJoinedBlockInputStream;
+    friend class ConcurrentHashJoin;
     friend class JoinSource;
 
     std::shared_ptr<TableJoin> table_join;
@@ -381,6 +412,10 @@ private:
     bool any_take_last_row; /// Overwrite existing values when encountering the same key again
     std::optional<TypeIndex> asof_type;
     ASOF::Inequality asof_inequality;
+
+    ExpressionActionsPtr inequal_condition_actions;
+    String ineuqal_column_name;
+    bool has_inequal_condition {false};
 
     /// Right table data. StorageJoin shares it between many Join objects.
     std::shared_ptr<RightTableData> data;
@@ -413,15 +448,22 @@ private:
 
     void init(Type type_);
 
-    const Block & savedBlockSample() const { return data->sample_block; }
-
     /// Modify (structure) right block to save it in block list
     Block structureRightBlock(const Block & stored_block) const;
     void initRightBlockStructure(Block & saved_block_sample);
-
+    
+    /// Join Block imple without inequal condition 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
-    void joinBlockImpl(
+    Block joinBlockImpl(
         Block & block,
+        const Names & key_names_left,
+        const Block & block_with_columns_to_add,
+        const Maps & maps,
+        bool is_join_get = false) const;
+    
+    /// Join Block imple with inequal condition 
+    template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
+    Block joinBlockImplIneuqalCondition(Block & block,
         const Names & key_names_left,
         const Block & block_with_columns_to_add,
         const Maps & maps,
@@ -433,6 +475,7 @@ private:
 
     bool empty() const;
     bool overDictionary() const;
+    void validateInequalConditions(const ExpressionActionsPtr & inequal_conditions_actions_);
 };
 
 }

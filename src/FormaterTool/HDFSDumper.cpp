@@ -61,13 +61,13 @@ void HDFSDumper::uploadPartsToRemote(const String & local_path, const String & r
         {
             uploadFileToRemote(zip_file, remote_file);
         }
-        catch(Exception & e)
+        catch (const Exception &)
         {
             // clean incomplete file.
             if (hdfs_filesystem->exists(remote_file))
                 hdfs_filesystem->remove(remote_file);
 
-            throw e;
+            throw;
         }
     };
 
@@ -118,7 +118,8 @@ std::vector<std::pair<String, DiskPtr>> HDFSDumper::fetchPartsFromRemote(const D
 
     String source_dir = Poco::URI(remote_path).getPath();
     std::vector<String> remote_files;
-    hdfs_filesystem->list(source_dir, remote_files);
+    std::vector<size_t> file_sizes;
+    hdfs_filesystem->list(source_dir, remote_files, file_sizes);
     ThreadPool pool;
     for (auto & file_name : remote_files)
     {
@@ -152,7 +153,7 @@ std::vector<std::pair<String, DiskPtr>> HDFSDumper::fetchPartsFromRemote(const D
                     ZipHelper zip;
                     zip.unzipFile(target_local_file, fs::path(full_local_path) / part_name);
                 }
-                catch (Exception & e)
+                catch (const Exception &)
                 {
                     /// remove dirty download file
                     Poco::File dirty_file(fs::path(full_local_path) / file_name);
@@ -164,7 +165,7 @@ std::vector<std::pair<String, DiskPtr>> HDFSDumper::fetchPartsFromRemote(const D
                     if (dirty_part.exists())
                         dirty_part.remove(true);
 
-                    throw e;
+                    throw;
                 }
 
             }
@@ -204,7 +205,7 @@ void HDFSDumper::getFileFromRemote(const String & remote_path, const String & lo
 {
     LOG_DEBUG(log, "Downloading remote file {} to local {}", remote_path, local_path);
     // open remote file for read
-    ReadBufferFromByteHDFS read_buffer(remote_path, false, hdfs_params);
+    ReadBufferFromByteHDFS read_buffer(remote_path, hdfs_params);
 
     // open local file for write
     FILE * fout = std::fopen(local_path.data(), "w+");

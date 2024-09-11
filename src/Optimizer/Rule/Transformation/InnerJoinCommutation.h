@@ -42,8 +42,8 @@ class InnerJoinCommutation : public Rule
 public:
     RuleType getType() const override { return RuleType::INNER_JOIN_COMMUTATION; }
     String getName() const override { return "INNER_JOIN_COMMUTATION"; }
-
-    PatternPtr getPattern() const override;
+    bool isEnabled(ContextPtr context) const override {return context->getSettingsRef().enable_inner_join_commutation; }
+    ConstRefPatternPtr getPattern() const override;
 
     const std::vector<RuleType> & blockRules() const override;
 

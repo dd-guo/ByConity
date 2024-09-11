@@ -14,30 +14,44 @@
  */
 
 #include <stack>
+#include <QueryPlan/QueryPlan.h>
+
 #include <IO/Operators.h>
+#include <IO/ReadHelpers.h>
 #include <IO/WriteBuffer.h>
+#include <IO/WriteHelpers.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ArrayJoinAction.h>
 #include <Processors/QueryPipeline.h>
+#include <Protos/EnumMacros.h>
+#include <Protos/plan_node.pb.h>
 #include <QueryPlan/BuildQueryPipelineSettings.h>
 #include <QueryPlan/IQueryPlanStep.h>
 #include <QueryPlan/Optimizations/Optimizations.h>
 #include <QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <QueryPlan/PlanNode.h>
+#include <QueryPlan/PlanNodeIdAllocator.h>
 #include <QueryPlan/PlanSerDerHelper.h>
 #include <QueryPlan/QueryPlan.h>
 #include <QueryPlan/TableScanStep.h>
-#include <common/logger_useful.h>
+#include <google/protobuf/util/json_util.h>
 #include <Common/JSONBuilder.h>
 #include <Common/Stopwatch.h>
+#include <common/logger_useful.h>
+
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
 }
+
+ENUM_WITH_PROTO_CONVERTER(
+    QueryPlanMode, // enum name
+    Protos::QueryPlan::PlanMode, // protobuf enum message
+    (TreeLike, 1),
+    (Flatten, 2));
 
 QueryPlan::QueryPlan() = default;
 QueryPlan::~QueryPlan() = default;
@@ -81,17 +95,21 @@ const DataStream & QueryPlan::getCurrentDataStream() const
 void QueryPlan::unitePlans(QueryPlanStepPtr step, std::vector<std::unique_ptr<QueryPlan>> plans)
 {
     if (isInitialized())
-        throw Exception("Cannot unite plans because current QueryPlan is already initialized",
-                        ErrorCodes::LOGICAL_ERROR);
+        throw Exception("Cannot unite plans because current QueryPlan is already initialized", ErrorCodes::LOGICAL_ERROR);
 
     const auto & inputs = step->getInputStreams();
     size_t num_inputs = step->getInputStreams().size();
     if (num_inputs != plans.size())
     {
-        throw Exception("Cannot unite QueryPlans using " + step->getName() +
-                        " because step has different number of inputs. "
-                        "Has " + std::to_string(plans.size()) + " plans "
-                        "and " + std::to_string(num_inputs) + " inputs", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(
+            "Cannot unite QueryPlans using " + step->getName()
+                + " because step has different number of inputs. "
+                  "Has "
+                + std::to_string(plans.size())
+                + " plans "
+                  "and "
+                + std::to_string(num_inputs) + " inputs",
+            ErrorCodes::LOGICAL_ERROR);
     }
 
     for (size_t i = 0; i < num_inputs; ++i)
@@ -99,10 +117,15 @@ void QueryPlan::unitePlans(QueryPlanStepPtr step, std::vector<std::unique_ptr<Qu
         const auto & step_header = inputs[i].header;
         const auto & plan_header = plans[i]->getCurrentDataStream().header;
         if (!blocksHaveEqualStructure(step_header, plan_header))
-            throw Exception("Cannot unite QueryPlans using " + step->getName() + " because "
-                            "it has incompatible header with plan " + root->step->getName() + " "
-                            "plan header: " + plan_header.dumpStructure() +
-                            "step header: " + step_header.dumpStructure(), ErrorCodes::LOGICAL_ERROR);
+            throw Exception(
+                "Cannot unite QueryPlans using " + step->getName()
+                    + " because "
+                      "it has incompatible header with plan "
+                    + root->step->getName()
+                    + " "
+                      "plan header: "
+                    + plan_header.dumpStructure() + "step header: " + step_header.dumpStructure(),
+                ErrorCodes::LOGICAL_ERROR);
     }
 
     for (auto & plan : plans)
@@ -117,51 +140,55 @@ void QueryPlan::unitePlans(QueryPlanStepPtr step, std::vector<std::unique_ptr<Qu
     for (auto & plan : plans)
     {
         max_threads = std::max(max_threads, plan->max_threads);
-        interpreter_context.insert(interpreter_context.end(),
-                                   plan->interpreter_context.begin(), plan->interpreter_context.end());
+        interpreter_context.insert(interpreter_context.end(), plan->interpreter_context.begin(), plan->interpreter_context.end());
     }
 }
 
 void QueryPlan::addStep(QueryPlanStepPtr step, PlanNodes children)
 {
+    (void)children;
     checkNotCompleted();
 
     size_t num_input_streams = step->getInputStreams().size();
-
     if (num_input_streams == 0)
     {
         if (isInitialized())
-            throw Exception("Cannot add step " + step->getName() + " to QueryPlan because "
-                            "step has no inputs, but QueryPlan is already initialized", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(
+                "Cannot add step " + step->getName()
+                    + " to QueryPlan because "
+                      "step has no inputs, but QueryPlan is already initialized",
+                ErrorCodes::LOGICAL_ERROR);
 
         nodes.emplace_back(Node{.step = std::move(step)});
         root = &nodes.back();
         return;
     }
-
-    if (num_input_streams >= 1)
+    else
     {
         if (!isInitialized())
-            throw Exception("Cannot add step " + step->getName() + " to QueryPlan because "
-                            "step has input, but QueryPlan is not initialized", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(
+                "Cannot add step " + step->getName()
+                    + " to QueryPlan because "
+                      "step has input, but QueryPlan is not initialized",
+                ErrorCodes::LOGICAL_ERROR);
 
         const auto & root_header = root->step->getOutputStream().header;
         const auto & step_header = step->getInputStreams().front().header;
         if (!blocksHaveEqualStructure(root_header, step_header))
-            throw Exception("Cannot add step " + step->getName() + " to QueryPlan because "
-                            "it has incompatible header with root step " + root->step->getName() + " "
-                            "root header: " + root_header.dumpStructure() +
-                            "step header: " + step_header.dumpStructure(), ErrorCodes::LOGICAL_ERROR);
+            throw Exception(
+                "Cannot add step " + step->getName()
+                    + " to QueryPlan because "
+                      "it has incompatible header with root step "
+                    + root->step->getName()
+                    + " "
+                      "root header: "
+                    + root_header.dumpStructure() + "step header: " + step_header.dumpStructure(),
+                ErrorCodes::LOGICAL_ERROR);
 
         nodes.emplace_back(Node{.step = std::move(step), .children = {root}});
         root = &nodes.back();
         return;
     }
-    plan_node = plan_node->addStep(id_allocator->nextId(), std::move(step), std::move(children));
-
-    throw Exception("Cannot add step " + step->getName() + " to QueryPlan because it has " +
-                    std::to_string(num_input_streams) + " inputs but " + std::to_string(isInitialized() ? 1 : 0) +
-                    " input expected", ErrorCodes::LOGICAL_ERROR);
 }
 
 void QueryPlan::addNode(Node && node_)
@@ -215,8 +242,9 @@ QueryPlan QueryPlan::getSubPlan(QueryPlan::Node * node_)
     QueryPlan sub_plan;
 
     std::stack<QueryPlan::Node *> plan_nodes;
-    sub_plan.addRoot(Node{.step = std::move(node_->step), .children = std::move(node_->children), .id = node_->id});
+    sub_plan.addRoot(Node{.step = node_->step, .children = node_->children, .id = node_->id});
     plan_nodes.push(sub_plan.getRoot());
+    sub_plan.setResetStepId(reset_step_id);
 
     while (!plan_nodes.empty())
     {
@@ -226,7 +254,7 @@ QueryPlan QueryPlan::getSubPlan(QueryPlan::Node * node_)
         std::vector<Node *> result_children;
         for (auto & child : current->children)
         {
-            sub_plan.addNode(Node{.step = std::move(child->step), .children = std::move(child->children), .id = child->id});
+            sub_plan.addNode(Node{.step = child->step, .children = child->children, .id = child->id});
             result_children.push_back(sub_plan.getLastNode());
             plan_nodes.push(sub_plan.getLastNode());
         }
@@ -239,8 +267,7 @@ QueryPlan QueryPlan::getSubPlan(QueryPlan::Node * node_)
 }
 
 QueryPipelinePtr QueryPlan::buildQueryPipeline(
-    const QueryPlanOptimizationSettings & optimization_settings,
-    const BuildQueryPipelineSettings & build_pipeline_settings)
+    const QueryPlanOptimizationSettings & optimization_settings, const BuildQueryPipelineSettings & build_pipeline_settings)
 {
     checkInitialized();
 
@@ -277,23 +304,24 @@ QueryPipelinePtr QueryPlan::buildQueryPipeline(
             try
             {
                 last_pipeline = frame.node->step->updatePipeline(std::move(frame.pipelines), build_pipeline_settings);
+                updatePipelineStepInfo(last_pipeline, frame.node->step, frame.node->id);
             }
             catch (const Exception & e) /// Typical for an incorrect username, password, or address.
             {
                 LOG_ERROR(log, "Build pipeline error {}", e.what());
                 throw;
             }
-// #ifndef NDEBUG
-//             if (optimization_settings.enable_optimizer)
-//             {
-//                 const auto & output_header = frame.node->step->getOutputStream().header;
-//                 const auto & pipeline_header = last_pipeline->getHeader();
-//                 assertBlocksHaveEqualStructure(
-//                     output_header,
-//                     pipeline_header,
-//                     "QueryPlan::buildQueryPipeline for " + frame.node->step->getName() + " (output header, pipeline header)");
-//             }
-// #endif
+            // #ifndef NDEBUG
+            //             if (optimization_settings.enable_optimizer)
+            //             {
+            //                 const auto & output_header = frame.node->step->getOutputStream().header;
+            //                 const auto & pipeline_header = last_pipeline->getHeader();
+            //                 assertBlocksHaveEqualStructure(
+            //                     output_header,
+            //                     pipeline_header,
+            //                     "QueryPlan::buildQueryPipeline for " + frame.node->step->getName() + " (output header, pipeline header)");
+            //             }
+            // #endif
 
             if (limit_max_threads && max_threads)
                 last_pipeline->limitMaxThreads(max_threads);
@@ -307,13 +335,20 @@ QueryPipelinePtr QueryPlan::buildQueryPipeline(
     for (auto & context : interpreter_context)
         last_pipeline->addInterpreterContext(std::move(context));
 
-    LOG_DEBUG(log, "Build pipeline takes:{}", watch.elapsedMilliseconds());
+    LOG_DEBUG(log, "Build pipeline takes: {}ms", watch.elapsedMilliseconds());
     return last_pipeline;
 }
 
+void QueryPlan::updatePipelineStepInfo(QueryPipelinePtr & pipeline_ptr, QueryPlanStepPtr & step, size_t step_id)
+{
+    auto * source_step = dynamic_cast<ISourceStep *>(step.get());
+    for (const auto & processor : pipeline_ptr->getProcessors())
+        if (processor->getStepId() == -1 || source_step)
+            processor->setStepId(step_id);
+}
+
 Pipe QueryPlan::convertToPipe(
-    const QueryPlanOptimizationSettings & optimization_settings,
-    const BuildQueryPipelineSettings & build_pipeline_settings)
+    const QueryPlanOptimizationSettings & optimization_settings, const BuildQueryPipelineSettings & build_pipeline_settings)
 {
     if (!isInitialized())
         return {};
@@ -416,10 +451,8 @@ JSONBuilder::ItemPtr QueryPlan::explainPlan(const ExplainPlanOptions & options)
     return tree;
 }
 
-static void explainStep(
-    const IQueryPlanStep & step,
-    IQueryPlanStep::FormatSettings & settings,
-    const QueryPlan::ExplainPlanOptions & options)
+static void
+explainStep(const IQueryPlanStep & step, IQueryPlanStep::FormatSettings & settings, const QueryPlan::ExplainPlanOptions & options)
 {
     std::string prefix(settings.offset, ' ');
     settings.out << prefix;
@@ -512,7 +545,10 @@ void QueryPlan::explainPlan(WriteBuffer & buffer, const ExplainPlanOptions & opt
 
 static void explainPipelineStep(IQueryPlanStep & step, IQueryPlanStep::FormatSettings & settings)
 {
-    settings.out << String(settings.offset, settings.indent_char) << "(" << step.getName() << ")\n";
+    settings.out << String(settings.offset, settings.indent_char) << "(" << step.getName() << ")";
+    if (dynamic_cast<TableScanStep *>(&step))
+        settings.out << " # " << step.getStepDescription();
+    settings.out << "\n";
     size_t current_offset = settings.offset;
     step.describePipeline(settings);
     if (current_offset == settings.offset)
@@ -563,27 +599,32 @@ void QueryPlan::optimize(const QueryPlanOptimizationSettings & optimization_sett
     QueryPlanOptimizations::optimizeTree(optimization_settings, *root, nodes);
 }
 
+// TODO: deprecate when proto rpc is ready
 void QueryPlan::serialize(WriteBuffer & buffer) const
 {
+    // serialize nodes
     writeBinary(nodes.size(), buffer);
     /**
      * we first encode the query plan node for serialize / deserialize
      */
-    size_t id = 0;
-    for (auto it = nodes.begin(); it != nodes.end(); ++it)
-        it->id = id++;
-
-    for (auto it = nodes.begin(); it != nodes.end(); ++it)
+    if (reset_step_id)
     {
-        serializePlanStep(it->step, buffer);
+        size_t id = 0;
+        for (auto it = nodes.begin(); it != nodes.end(); ++it)
+            it->id = id++;
+    }
+
+    for (const auto & node : nodes)
+    {
+        serializePlanStep(node.step, buffer);
         /**
          * serialize its children ids
          */
-        writeBinary(it->children.size(), buffer);
-        for (auto jt = it->children.begin(); jt != it->children.end(); ++jt)
+        writeBinary(node.children.size(), buffer);
+        for (auto jt = node.children.begin(); jt != node.children.end(); ++jt)
             writeBinary((*jt)->id, buffer);
 
-        writeBinary(it->id, buffer);
+        writeBinary(node.id, buffer);
     }
 
     if (root)
@@ -593,8 +634,220 @@ void QueryPlan::serialize(WriteBuffer & buffer) const
     }
     else
         writeBinary(false, buffer);
+
+    // serialize plan node
+
+    if (plan_node)
+    {
+        writeBinary(true, buffer);
+        writeBinary(plan_node->getId(), buffer);
+
+        PlanNodes tmp_nodes;
+        std::queue<PlanNodePtr> q;
+        q.push(plan_node);
+
+        for (const auto & item : cte_info.getCTEs())
+        {
+            q.push(item.second);
+        }
+
+        while (!q.empty())
+        {
+            tmp_nodes.push_back(q.front());
+            for (const auto & child : q.front()->getChildren())
+            {
+                q.push(child);
+            }
+            q.pop();
+        }
+
+        writeBinary(tmp_nodes.size(), buffer);
+        for (auto & node : tmp_nodes)
+        {
+            writeBinary(node->getId(), buffer);
+            serializePlanStep(node->getStep(), buffer);
+
+            writeBinary(node->getChildren().size(), buffer);
+            for (const auto & child : node->getChildren())
+            {
+                writeBinary(child->getId(), buffer);
+            }
+        }
+
+        writeBinary(cte_info.size(), buffer);
+        for (const auto & item : cte_info.getCTEs())
+        {
+            writeBinary(item.first, buffer);
+            writeBinary(item.second->getId(), buffer);
+        }
+    }
+    else
+    {
+        writeBinary(false, buffer);
+    }
+}
+// handle when plan is tree-like, i.e., plan_node + cte_info
+void QueryPlan::toProto(Protos::QueryPlan & proto) const
+{
+    if (plan_node)
+    {
+        proto.set_mode(QueryPlanModeConverter::toProto(QueryPlanMode::TreeLike));
+        toProtoTreeLike(proto);
+    }
+    else if (root)
+    {
+        proto.set_mode(QueryPlanModeConverter::toProto(QueryPlanMode::Flatten));
+        toProtoFlatten(proto);
+    }
+    else
+    {
+        throw Exception("Invalid QueryPlan", ErrorCodes::LOGICAL_ERROR);
+    }
 }
 
+void QueryPlan::fromProto(const Protos::QueryPlan & proto)
+{
+    auto mode = QueryPlanModeConverter::fromProto(proto.mode());
+    switch (mode)
+    {
+        case QueryPlanMode::TreeLike:
+            this->fromProtoTreeLike(proto);
+            break;
+        case QueryPlanMode::Flatten:
+            this->fromProtoFlatten(proto);
+            break;
+        default: {
+            throw Exception("Invalid QueryPlan Proto", ErrorCodes::LOGICAL_ERROR);
+        }
+    }
+}
+
+// handle when plan is flatten, i.e., root + nodes + cte_nodes
+void QueryPlan::toProtoFlatten(Protos::QueryPlan & proto) const
+{
+    if (!root)
+        throw Exception("QueryPlan::toProtoFlatten() failed", ErrorCodes::LOGICAL_ERROR);
+
+    if (reset_step_id)
+    {
+        size_t id = 0;
+        for (const auto & node : nodes)
+            node.id = id++; // this is mutable field
+    }
+
+    for (const auto & node : nodes)
+    {
+        auto id = node.id;
+        auto & node_proto = (*proto.mutable_plan_nodes())[id];
+        node_proto.set_plan_id(id);
+        serializeQueryPlanStepToProto(node.step, *node_proto.mutable_step());
+        for (const auto & child : node.children)
+        {
+            node_proto.add_children(child->id);
+        }
+    }
+
+    proto.set_root_id(root->id);
+}
+
+void QueryPlan::fromProtoFlatten(const Protos::QueryPlan & proto)
+{
+    std::unordered_map<size_t, Node *> id_to_node;
+    const auto & id_to_node_proto = proto.plan_nodes();
+
+    auto context = !interpreter_context.empty() ? interpreter_context.back() : nullptr;
+
+    for (const auto & [id, node_proto] : id_to_node_proto)
+    {
+        if (node_proto.plan_id() != id)
+            throw Exception("Invalid Proto", ErrorCodes::LOGICAL_ERROR);
+        auto step = deserializeQueryPlanStepFromProto(node_proto.step(), context);
+        nodes.emplace_back(Node{step, {}, id});
+        id_to_node[id] = &nodes.back();
+    }
+
+    for (auto & node : nodes)
+    {
+        auto id = node.id;
+        for (auto child_id : id_to_node_proto.at(id).children())
+        {
+            auto * child = id_to_node[child_id];
+            node.children.emplace_back(child);
+        }
+    }
+
+    auto root_id = proto.root_id();
+    root = id_to_node[root_id];
+}
+
+// support optimizer mode
+void QueryPlan::toProtoTreeLike(Protos::QueryPlan & proto) const
+{
+    if (!plan_node)
+        throw Exception("QueryPlan::toProtoTreeLike() failed", ErrorCodes::LOGICAL_ERROR);
+
+    std::queue<PlanNodePtr> queue;
+    queue.push(plan_node);
+
+    proto.set_root_id(plan_node->getId());
+    for (const auto & [cte_id, ptr] : this->cte_info.getCTEs())
+    {
+        queue.push(ptr);
+        (*proto.mutable_cte_id_mapping())[cte_id] = ptr->getId();
+    }
+
+    while (!queue.empty())
+    {
+        auto cur = queue.front();
+
+        auto plan_id = cur->getId();
+        auto * cur_pb = &(*proto.mutable_plan_nodes())[plan_id];
+
+        cur_pb->set_plan_id(plan_id);
+        serializeQueryPlanStepToProto(cur->getStep(), *cur_pb->mutable_step());
+        for (const auto & child : cur->getChildren())
+        {
+            queue.push(child);
+            cur_pb->add_children(child->getId());
+        }
+
+        queue.pop();
+    }
+}
+
+void QueryPlan::fromProtoTreeLike(const Protos::QueryPlan & proto)
+{
+    std::unordered_map<Int64, PlanNodePtr> id_to_plan;
+    ContextPtr context = interpreter_context.empty() ? nullptr : interpreter_context.back();
+    for (const auto & [plan_id, plan_pb] : proto.plan_nodes())
+    {
+        if (plan_pb.plan_id() != plan_id)
+            throw Exception("Invalid Proto", ErrorCodes::LOGICAL_ERROR);
+        auto step = deserializeQueryPlanStepFromProto(plan_pb.step(), context);
+        auto plan = PlanNodeBase::createPlanNode(plan_id, step);
+        id_to_plan[plan_id] = std::move(plan);
+    }
+
+    // set children
+    for (const auto & [plan_id, plan_pb] : proto.plan_nodes())
+    {
+        PlanNodes children;
+        for (auto child_id : plan_pb.children())
+        {
+            children.emplace_back(id_to_plan.at(child_id));
+        }
+        id_to_plan.at(plan_id)->replaceChildren(children);
+    }
+
+    for (auto [cte_id, plan_id] : proto.cte_id_mapping())
+    {
+        this->cte_info.add(cte_id, id_to_plan.at(plan_id));
+    }
+    auto root_id = proto.root_id();
+    this->setPlanNode(id_to_plan.at(root_id));
+}
+
+// TODO: deprecate when proto rpc is ready
 void QueryPlan::deserialize(ReadBuffer & buffer)
 {
     size_t nodes_size;
@@ -611,10 +864,6 @@ void QueryPlan::deserialize(ReadBuffer & buffer)
          */
         size_t children_size;
         readBinary(children_size, buffer);
-        if (children_size > 100)
-        {
-            std::cout << "bug";
-        }
         std::vector<size_t> children(children_size);
         for (size_t j = 0; j < children_size; ++j)
             readBinary(children[j], buffer);
@@ -639,28 +888,140 @@ void QueryPlan::deserialize(ReadBuffer & buffer)
      * After we have node-id mapping and id-children mapping,
      * fill the children infomation to each node.
      */
-    for (auto it = nodes.begin(); it != nodes.end(); ++it)
+    for (auto & node : nodes)
     {
-        size_t id = it->id;
+        size_t id = node.id;
         auto & children = map_to_children[id];
         for (auto & child_id : children)
-            it->children.push_back(map_to_node[child_id]);
+            node.children.push_back(map_to_node[child_id]);
     }
 
     if (has_root)
         root = map_to_node[root_id];
+
+    bool has_plan_node;
+    readBinary(has_plan_node, buffer);
+    if (has_plan_node)
+    {
+        PlanNodeId root_plan_id;
+        readBinary(root_plan_id, buffer);
+
+        PlanNodeId max_plan_id = root_plan_id;
+
+        size_t node_count;
+        readBinary(node_count, buffer);
+
+        std::map<PlanNodeId, std::vector<PlanNodeId>> id_to_children;
+        std::map<PlanNodeId, PlanNodePtr> id_to_node;
+        for (size_t i = 0; i < node_count; ++i)
+        {
+            PlanNodeId id;
+            readBinary(id, buffer);
+            max_plan_id = std::max(max_plan_id, id);
+            auto step = deserializePlanStep(buffer, interpreter_context.empty() ? nullptr : interpreter_context.back());
+
+            PlanNodePtr plan = PlanNodeBase::createPlanNode(id, step);
+
+            id_to_node[id] = plan;
+
+            if (id == root_plan_id)
+                plan_node = id_to_node[id];
+
+            size_t child_size;
+            readBinary(child_size, buffer);
+            for (size_t child_index = 0; child_index < child_size; ++child_index)
+            {
+                PlanNodeId child_id;
+                readBinary(child_id, buffer);
+                id_to_children[id].emplace_back(child_id);
+            }
+        }
+
+        for (const auto & item : id_to_children)
+            for (auto child_id : item.second)
+                id_to_node[item.first]->getChildren().emplace_back(id_to_node[child_id]);
+
+        size_t cte_size;
+        readBinary(cte_size, buffer);
+        for (size_t i = 0; i < cte_size; i++)
+        {
+            CTEId cte_id;
+            readBinary(cte_id, buffer);
+            PlanNodeId refer_node_id;
+            readBinary(refer_node_id, buffer);
+            cte_info.add(cte_id, id_to_node[refer_node_id]);
+        }
+    }
 }
 
-void QueryPlan::allocateLocalTable(ContextPtr context)
+std::set<StorageID> QueryPlan::allocateLocalTable(ContextPtr context)
 {
+    std::set<StorageID> res;
     for (const auto & node : nodes)
     {
         if (node.step->getType() == IQueryPlanStep::Type::TableScan)
         {
             auto * table_scan = dynamic_cast<TableScanStep *>(node.step.get());
+            /// have to get storage_id before allocate to get original storage_id
+            /// instead of storage_id in cloud
+            res.insert(table_scan->getStorageID());
             table_scan->allocate(context);
         }
+        else if (node.step->getType() == IQueryPlanStep::Type::TableWrite)
+        {
+            auto write_step = dynamic_cast<TableWriteStep *>(node.step.get());
+            write_step->allocate(context);
+        }
     }
+    return res;
 }
 
+PlanNodePtr QueryPlan::getPlanNodeById(PlanNodeId node_id) const
+{
+    if (plan_node)
+        if (auto res = plan_node->getNodeById(node_id))
+            return res;
+
+    for (const auto & cte : cte_info.getCTEs())
+    {
+        if (auto res = cte.second->getNodeById(node_id))
+            return res;
+    }
+
+    return nullptr;
+}
+
+UInt32 QueryPlan::getPlanNodeCount(PlanNodePtr node)
+{
+    UInt32 size = 1;
+    for (auto & child : node->getChildren())
+        size += getPlanNodeCount(child);
+    return size;
+}
+
+static PlanNodePtr copyPlanNode(const PlanNodePtr & plan, ContextMutablePtr & context)
+{
+    PlanNodes children;
+    for (auto & child : plan->getChildren())
+        children.emplace_back(copyPlanNode(child, context));
+    return PlanNodeBase::createPlanNode(plan->getId(), plan->getStep()->copy(context), children, plan->getStatistics());
+}
+
+QueryPlanPtr QueryPlan::copy(ContextMutablePtr context)
+{
+    auto copy_plan_node = copyPlanNode(plan_node, context);
+    CTEInfo copy_cte_info;
+    for (const auto & [cte_id, cte_def] : cte_info.getCTEs())
+        copy_cte_info.add(cte_id, copyPlanNode(cte_def, context));
+    return std::make_unique<QueryPlan>(copy_plan_node, copy_cte_info, context->getPlanNodeIdAllocator());
+}
+
+void QueryPlan::prepare(const PreparedStatementContext & prepared_context)
+{
+    if (plan_node)
+        plan_node->prepare(prepared_context);
+
+    for (const auto & [cte_id, cte_def] : cte_info.getCTEs())
+        cte_def->prepare(prepared_context);
+}
 }

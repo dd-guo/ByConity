@@ -43,7 +43,7 @@ struct NdvBucketsData
 
     NdvBucketsData() = default;
 
-    NdvBucketsData(std::string_view blob)
+    explicit NdvBucketsData(std::string_view blob)
     {
         Statistics::BucketBoundsImpl<EmbeddedType> bounds;
         bounds.deserialize(blob);
@@ -72,9 +72,8 @@ struct NdvBucketsData
 
     void insertResultInto(IColumn & to) const
     {
-        auto blob_raw = data_.serialize();
-        auto blob_b64 = base64Encode(blob_raw);
-        static_cast<ColumnString &>(to).insertData(blob_b64.c_str(), blob_b64.size());
+        auto blob = data_.serialize();
+        static_cast<ColumnString &>(to).insertData(blob.c_str(), blob.size());
     }
 
     static String getName() { return "ndv_buckets"; }
@@ -116,10 +115,7 @@ createAggregateFunctionNdvBuckets(const std::string & name, const DataTypes & ar
         // TODO: add bounds
         res.reset(createWithNumericBasedType<Function>(*data_type, argument_types, blob));
     }
-    else if (isStringOrFixedString(data_type))
-    {
-        res = std::make_shared<AggregateFunctionCboFamilyForString<NdvBucketsData<String>>>(argument_types, blob);
-    }
+
 
     if (!res)
         throw Exception(

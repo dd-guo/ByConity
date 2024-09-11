@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <AggregateFunctions/IAggregateFunction.h>
 
 #include <Columns/IColumn.h>
@@ -147,6 +148,12 @@ public:
         return getData().size();
     }
 
+    void tryToFlushZeroCopyBuffer() const override
+    {
+        if (src)
+            src->tryToFlushZeroCopyBuffer();
+    }
+
     MutableColumnPtr cloneEmpty() const override;
 
     Field operator[](size_t n) const override;
@@ -171,6 +178,11 @@ public:
     void insert(const Field & x) override;
 
     void insertDefault() override;
+
+    bool isDefaultAt(size_t) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method isDefaultAt is not supported for ColumnAggregateFunction");
+    }
 
     StringRef serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const override;
 
@@ -200,6 +212,8 @@ public:
 
     ColumnPtr filter(const Filter & filter, ssize_t result_size_hint) const override;
 
+    void expand(const Filter & mask, bool inverted) override;
+
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
 
     ColumnPtr index(const IColumn & indexes, size_t limit) const override;
@@ -228,8 +242,26 @@ public:
         throw Exception("Method hasEqualValues is not supported for ColumnAggregateFunction", ErrorCodes::NOT_IMPLEMENTED);
     }
 
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
-    void updatePermutation(bool reverse, size_t limit, int, Permutation & res, EqualRanges & equal_range) const override;
+    double getRatioOfDefaultRows(double) const override
+    {
+        return 0.0;
+    }
+
+    UInt64 getNumberOfDefaultRows() const override
+    {
+        return 0;
+    }
+
+    void getIndicesOfNonDefaultRows(Offsets &, size_t, size_t) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getIndicesOfNonDefaultRows is not supported for ColumnAggregateFunction");
+    }
+
+    void getPermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, Permutation & res) const override;
+
+    void updatePermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                        size_t limit, int, Permutation & res, EqualRanges & equal_ranges) const override;
 
     /** More efficient manipulation methods */
     Container & getData()

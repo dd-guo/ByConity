@@ -19,28 +19,37 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Storages/MergeTree/MergeTreeDataWriter.h>
-#include <Storages/MergeTree/MergedBlockOutputStream.h>
-#include <MergeTreeCommon/CnchBucketTableCommon.h>
+#include <common/logger_useful.h>
+#include <common/types.h>
 #include <Columns/ColumnConst.h>
-#include "common/logger_useful.h"
-#include "common/types.h"
-#include <Common/HashTable/HashMap.h>
-#include <Common/Exception.h>
-#include <Disks/createVolume.h>
-#include <Interpreters/AggregationCommon.h>
-#include <Interpreters/Context.h>
-#include <Interpreters/InterpreterSelectQuery.h>
-#include <IO/HashingWriteBuffer.h>
-#include <DataTypes/DataTypeDateTime.h>
-#include <DataTypes/DataTypeDate.h>
-#include <IO/WriteHelpers.h>
-#include <Common/typeid_cast.h>
 #include <Common/filesystemHelpers.h>
+#include <Common/typeid_cast.h>
+#include <Common/Exception.h>
+#include <Common/HashTable/HashMap.h>
 #include <DataStreams/ITTLAlgorithm.h>
 #include <DataStreams/OneBlockInputStream.h>
 #include <DataStreams/SquashingBlockInputStream.h>
-#include <DataTypes/DataTypeByteMap.h>
+#include <DataTypes/DataTypeDate.h>
+#include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeMap.h>
+#include <Disks/createVolume.h>
+#include <IO/HashingWriteBuffer.h>
+#include <IO/WriteHelpers.h>
+#include <Interpreters/AggregationCommon.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/InterpreterSelectQuery.h>
+#include <MergeTreeCommon/CnchBucketTableCommon.h>
+#include <Storages/MergeTree/MergeTreeDataWriter.h>
+#include <Storages/MergeTree/MergedBlockOutputStream.h>
+#include <common/logger_useful.h>
+#include <common/types.h>
+#include <Common/Exception.h>
+#include <Common/HashTable/HashMap.h>
+#include <Common/filesystemHelpers.h>
+#include <Common/typeid_cast.h>
+#include <Columns/ColumnNullable.h>
+#include <DataTypes/ObjectUtils.h>
+#include <Storages/MergeTree/MergeTreeIOSettings.h>
 
 #include <Parsers/queryToString.h>
 
@@ -130,6 +139,9 @@ void updateTTL(
     bool update_part_min_max_ttls)
 {
     auto ttl_column = ITTLAlgorithm::executeExpressionAndGetColumn(ttl_entry.expression, block, ttl_entry.result_column);
+
+    if (ttl_column->isNullable())
+        ttl_column = static_cast<const ColumnNullable *>(ttl_column.get())->getNestedColumnPtr();
 
     if (const ColumnUInt16 * column_date = typeid_cast<const ColumnUInt16 *>(ttl_column.get()))
     {
@@ -248,7 +260,7 @@ BlocksWithPartition MergeTreeDataWriter::splitBlockPartitionIntoPartsByClusterKe
 
     auto split_number = metadata_snapshot->getSplitNumberFromClusterByKey();
     auto is_with_range = metadata_snapshot->getWithRangeFromClusterByKey();
-    prepareBucketColumn(block_copy, metadata_snapshot->getClusterByKey().column_names, split_number, is_with_range, metadata_snapshot->getBucketNumberFromClusterByKey(), context);
+    prepareBucketColumn(block_copy, metadata_snapshot->getClusterByKey().column_names, split_number, is_with_range, metadata_snapshot->getBucketNumberFromClusterByKey(), context, metadata_snapshot->getIsUserDefinedExpressionFromClusterByKey());
 
     return populatePartitions(block, block_copy, max_parts, {COLUMN_BUCKET_NUMBER}, true);
 }
@@ -347,6 +359,18 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
     Block & block = block_with_partition.block;
     Int64 bucket_number = block_with_partition.bucket_info.bucket_number;
 
+    auto columns = metadata_snapshot->getColumns().getAllPhysical().filter(block.getNames());
+    auto storage_snapshot = data.getStorageSnapshot(metadata_snapshot, context);
+
+    if (metadata_snapshot->hasDynamicSubcolumns())
+    {
+        convertDynamicColumnsToTuples(block, storage_snapshot);
+    }
+
+    for (auto & column : columns)
+        if (column.type->hasDynamicSubcolumns())
+            column.type = block.getByName(column.name).type;
+
     static const String TMP_PREFIX = "tmp_insert_";
 
     /// This will generate unique name in scope of current server process.
@@ -357,7 +381,13 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
 
     MergeTreePartition partition(std::move(block_with_partition.partition));
 
-    MergeTreePartInfo new_part_info(partition.getID(metadata_snapshot->getPartitionKey().sample_block), temp_index, temp_index, 0, mutation, hint_mutation);
+    MergeTreePartInfo new_part_info(
+        partition.getID(metadata_snapshot->getPartitionKey().sample_block, data.extractNullableForPartitionID()),
+        /*min_block_*/temp_index,
+        /*max_block_*/temp_index,
+        /*level_*/0,
+        mutation,
+        hint_mutation);
     String part_name;
     if (data.format_version < MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
     {
@@ -405,6 +435,39 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
             ProfileEvents::increment(ProfileEvents::MergeTreeDataWriterBlocksAlreadySorted);
     }
 
+    DeleteBitmapPtr bitmap = std::make_shared<Roaring>();
+    /// Build bitmap for _delete_flag_ function columns which is must after sort and remove func columns
+    {
+        if (metadata_snapshot->hasUniqueKey() && block.has(StorageInMemoryMetadata::DELETE_FLAG_COLUMN_NAME))
+        {
+            std::vector<size_t> index_map;
+            if (perm_ptr)
+            {
+                index_map.resize(perm_ptr->size());
+                for (size_t i = 0; i < perm_ptr->size(); ++i)
+                    index_map[perm[i]] = i;
+            }
+
+            /// Convert delete_flag info into delete bitmap
+            const auto & delete_flag_column = block.getByName(StorageInMemoryMetadata::DELETE_FLAG_COLUMN_NAME);
+            for (size_t rowid = 0; rowid < delete_flag_column.column->size(); ++rowid)
+            {
+                if (delete_flag_column.column->getBool(rowid))
+                {
+                    if (perm_ptr)
+                        bitmap->add(index_map[rowid]);
+                    else
+                        bitmap->add(rowid);
+                }
+            }
+        }
+
+        /// Remove func columns
+        for (auto & [name, _]: metadata_snapshot->getFuncColumns())
+            if (block.has(name))
+                block.erase(name);
+    }
+
     Names partition_key_columns = metadata_snapshot->getPartitionKey().column_names;
     if (context->getSettingsRef().optimize_on_insert)
         block = mergeBlock(block, sort_description, partition_key_columns, perm_ptr);
@@ -422,7 +485,6 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
     for (const auto & ttl_entry : move_ttl_entries)
         updateTTL(ttl_entry, move_ttl_infos, move_ttl_infos.moves_ttl[ttl_entry.result_column], block, false);
 
-    NamesAndTypesList columns = metadata_snapshot->getColumns().getAllPhysical().filter(block.getNames());
     ReservationPtr reservation = data.reserveSpacePreferringTTLRules(
         metadata_snapshot, expected_size, move_ttl_infos, time(nullptr), 0, true,
         nullptr, write_location);
@@ -444,7 +506,7 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
         nullptr,
         write_location);
 
-    LOG_DEBUG(log, "Writing temp part to {}...\n", new_data_part->getFullRelativePath());
+    LOG_DEBUG(log, "Writing temp part to {}", new_data_part->getFullRelativePath());
 
     if (data.storage_settings.get()->assign_part_uuids)
         new_data_part->uuid = UUIDHelpers::generateV4();
@@ -525,6 +587,12 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
 
     const auto & index_factory = MergeTreeIndexFactory::instance();
 
+    BitmapBuildInfo bitmap_build_info;
+    if (!data.getSettings()->enable_build_ab_index)
+        bitmap_build_info.build_all_bitmap_index = false;
+    if (!data.getSettings()->enable_segment_bitmap_index)
+        bitmap_build_info.build_all_segment_bitmap_index = false;
+
     MergedBlockOutputStream out(
         new_data_part,
         metadata_snapshot,
@@ -532,7 +600,8 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
         index_factory.getMany(metadata_snapshot->getSecondaryIndices()),
         compression_codec,
         /* blocks_are_granules_size(default) */false,
-        context->getSettingsRef().optimize_map_column_serialization);
+        context->getSettingsRef().optimize_map_column_serialization,
+        bitmap_build_info);
     bool sync_on_insert = data.getSettings()->fsync_after_insert;
 
     // pre-handle low-cardinality fall-back
@@ -559,6 +628,10 @@ MergeTreeMetaBase::MutableDataPartPtr MergeTreeDataWriter::writeTempPart(
     ProfileEvents::increment(ProfileEvents::MergeTreeDataWriterRows, block.rows());
     ProfileEvents::increment(ProfileEvents::MergeTreeDataWriterUncompressedBytes, block.bytes());
     ProfileEvents::increment(ProfileEvents::MergeTreeDataWriterCompressedBytes, new_data_part->getBytesOnDisk());
+
+    /// Only add delete bitmap if it's not empty.
+    if (bitmap->cardinality())
+        new_data_part->setDeleteBitmap(bitmap);
 
     return new_data_part;
 }

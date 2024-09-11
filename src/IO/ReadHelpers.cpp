@@ -274,6 +274,8 @@ void readString(String & s, ReadBuffer & buf)
 }
 
 template void readStringInto<PaddedPODArray<UInt8>>(PaddedPODArray<UInt8> & s, ReadBuffer & buf);
+template void readStringInto<String>(String & s, ReadBuffer & buf);
+// template void readStringInto<NullOutput>(NullOutput & s, ReadBuffer & buf);
 
 template <typename Vector>
 void readWordInto(Vector & s, ReadBuffer & buf)
@@ -352,12 +354,24 @@ template void readStringUntilEOFInto<PaddedPODArray<UInt8>>(PaddedPODArray<UInt8
 /** Parse the escape sequence, which can be simple (one character after backslash) or more complex (multiple characters).
   * It is assumed that the cursor is located on the `\` symbol
   */
-template <typename Vector>
-static void parseComplexEscapeSequence(Vector & s, ReadBuffer & buf)
+template <typename Vector, typename ReturnType = void>
+static ReturnType parseComplexEscapeSequence(Vector & s, ReadBuffer & buf)
 {
+    static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
+
+    auto error = [](const char * message [[maybe_unused]], int code [[maybe_unused]])
+    {
+        if constexpr (throw_exception)
+            throw Exception(message, code);
+        return ReturnType(false);
+    };
+
     ++buf.position();
+
     if (buf.eof())
-        throw Exception("Cannot parse escape sequence", ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE);
+    {
+        return error("Cannot parse escape sequence", ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE);
+    }
 
     char char_after_backslash = *buf.position();
 
@@ -366,7 +380,14 @@ static void parseComplexEscapeSequence(Vector & s, ReadBuffer & buf)
         ++buf.position();
         /// escape sequence of the form \xAA
         char hex_code[2];
-        readPODBinary(hex_code, buf);
+
+        auto bytes_read = buf.read(hex_code, sizeof(hex_code));
+
+        if (bytes_read != sizeof(hex_code))
+        {
+            return error("Cannot parse escape sequence", ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE);
+        }
+
         s.push_back(unhex2(hex_code));
     }
     else if (char_after_backslash == 'N')
@@ -387,6 +408,7 @@ static void parseComplexEscapeSequence(Vector & s, ReadBuffer & buf)
             && decoded_char != '"'
             && decoded_char != '`'  /// MySQL style identifiers
             && decoded_char != '/'  /// JavaScript in HTML
+            && decoded_char != '='  /// TSKV format invented somewhere
             && !isControlASCII(decoded_char))
         {
             s.push_back('\\');
@@ -395,8 +417,14 @@ static void parseComplexEscapeSequence(Vector & s, ReadBuffer & buf)
         s.push_back(decoded_char);
         ++buf.position();
     }
+
+    return ReturnType(true);
 }
 
+bool parseComplexEscapeSequence(String & s, ReadBuffer & buf)
+{
+    return parseComplexEscapeSequence<String, bool>(s, buf);
+}
 
 template <typename Vector, typename ReturnType>
 static ReturnType parseJSONEscapeSequence(Vector & s, ReadBuffer & buf)
@@ -516,8 +544,8 @@ static ReturnType parseJSONEscapeSequence(Vector & s, ReadBuffer & buf)
 }
 
 
-template <typename Vector>
-void readEscapedStringInto(Vector & s, ReadBuffer & buf)
+template <typename Vector, bool parse_complex_escape_sequence>
+void readEscapedStringIntoImpl(Vector & s, ReadBuffer & buf)
 {
     while (!buf.eof())
     {
@@ -533,9 +561,31 @@ void readEscapedStringInto(Vector & s, ReadBuffer & buf)
             return;
 
         if (*buf.position() == '\\')
-            parseComplexEscapeSequence(s, buf);
+        {
+            if constexpr (parse_complex_escape_sequence)
+            {
+                parseComplexEscapeSequence(s, buf);
+            }
+            else
+            {
+                s.push_back(*buf.position());
+                ++buf.position();
+                if (!buf.eof())
+                {
+                    s.push_back(*buf.position());
+                    ++buf.position();
+                }
+            }
+        }
     }
 }
+
+template <typename Vector>
+void readEscapedStringInto(Vector & s, ReadBuffer & buf)
+{
+    readEscapedStringIntoImpl<Vector, true>(s, buf);
+}
+
 
 void readEscapedString(String & s, ReadBuffer & buf)
 {
@@ -553,14 +603,18 @@ template void readEscapedStringInto<NullOutput>(NullOutput & s, ReadBuffer & buf
   *  backslash escape sequences are also parsed,
   *  that could be slightly confusing.
   */
-template <char quote, bool enable_sql_style_quoting, typename Vector>
-static void readAnyQuotedStringInto(Vector & s, ReadBuffer & buf)
+template <char quote, bool enable_sql_style_quoting, typename Vector, typename ReturnType = void>
+static ReturnType readAnyQuotedStringInto(Vector & s, ReadBuffer & buf)
 {
+    static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
     if (buf.eof() || *buf.position() != quote)
     {
-        throw ParsingException(ErrorCodes::CANNOT_PARSE_QUOTED_STRING,
-            "Cannot parse quoted string: expected opening quote '{}', got '{}'",
-            std::string{quote}, buf.eof() ? "EOF" : std::string{*buf.position()});
+        if constexpr (throw_exception)
+            throw ParsingException(ErrorCodes::CANNOT_PARSE_QUOTED_STRING,
+                "Cannot parse quoted string: expected opening quote '{}', got '{}'",
+                std::string{quote}, buf.eof() ? "EOF" : std::string{*buf.position()});
+        else
+            return ReturnType(false);
     }
 
     ++buf.position();
@@ -586,15 +640,25 @@ static void readAnyQuotedStringInto(Vector & s, ReadBuffer & buf)
                 continue;
             }
 
-            return;
+            return ReturnType(true);
         }
 
         if (*buf.position() == '\\')
-            parseComplexEscapeSequence(s, buf);
+        {
+            if constexpr (throw_exception)
+                parseComplexEscapeSequence<Vector, ReturnType>(s, buf);
+            else
+            {
+                if (!parseComplexEscapeSequence<Vector, ReturnType>(s, buf))
+                    return ReturnType(false);
+            }
+        }
     }
 
-    throw ParsingException("Cannot parse quoted string: expected closing quote",
-        ErrorCodes::CANNOT_PARSE_QUOTED_STRING);
+    if constexpr (throw_exception)
+        throw ParsingException(ErrorCodes::CANNOT_PARSE_QUOTED_STRING, "Cannot parse quoted string: expected closing quote");
+    else
+        return ReturnType(false);
 }
 
 template <bool enable_sql_style_quoting, typename Vector>
@@ -813,11 +877,17 @@ template bool readJSONStringInto<PaddedPODArray<UInt8>, bool>(PaddedPODArray<UIn
 template void readJSONStringInto<NullOutput>(NullOutput & s, ReadBuffer & buf);
 template void readJSONStringInto<String>(String & s, ReadBuffer & buf);
 
-
 template <typename ReturnType>
 ReturnType readDateTextFallback(LocalDate & date, ReadBuffer & buf)
 {
     static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
+
+    /// YYYY-MM-DD
+    static constexpr auto date_broken_down_length = 10;
+
+    char * pos = buf.position();
+    char s[date_broken_down_length];
+    char * s_pos = s;
 
     auto error = []
     {
@@ -827,55 +897,51 @@ ReturnType readDateTextFallback(LocalDate & date, ReadBuffer & buf)
         return ReturnType(false);
     };
 
-    auto ignore_delimiter = [&]
+    while (s_pos < s + date_broken_down_length && pos < buf.buffer().end() && isNumericASCII(*pos))
+        *s_pos++ = *pos++;
+
+    /// 2015-01-01
+    if (s_pos == s + 4 && pos != buf.buffer().end() && !isNumericASCII(*pos))
     {
-        if (!buf.eof())
-        {
-            /// support YYYYMMDD
-            if (!isNumericASCII(*buf.position()))
-                ++buf.position();
-            return true;
-        }
-        else
-            return false;
-    };
+        UInt16 year = (pos[0] - '0') * 1000 + (pos[1] - '0') * 100 + (pos[2] - '0') * 10 + (pos[3] - '0');
+        pos += 4;
 
-    auto append_digit = [&](auto & x)
+        auto next = [&](auto & res)
+        {
+            /// skip delimiters
+            while (pos < buf.buffer().end() && !isNumericASCII(*pos))
+                ++pos;
+
+            if (pos == buf.buffer().end())
+                return false;
+
+            while (pos < buf.buffer().end() && isNumericASCII(*pos))
+                res = res * 10 + (*(pos++) - '0');
+
+            return true;
+        };
+
+        UInt64 month = 0;
+        if (!next(month))
+            return error();
+
+        UInt64 day = 0;
+        if (!next(day))
+            return error();
+
+        date = LocalDate(year, month, day);
+        buf.position() += s_pos - s;
+    }
+    /// unixtimestamp 00000...NNNNN OR +/-NNNNN
+    else if (s_pos - s >= 5 || *pos == '+' || *pos == '-')
     {
-        if (!buf.eof() && isNumericASCII(*buf.position()))
-        {
-            x = x * 10 + (*buf.position() - '0');
-            ++buf.position();
-            return true;
-        }
-        else
-            return false;
-    };
-
-    UInt16 year = 0;
-    if (!append_digit(year)
-        || !append_digit(year) // NOLINT
-        || !append_digit(year) // NOLINT
-        || !append_digit(year)) // NOLINT
+        ExtendedDayNum d(0);
+        readIntTextImpl<Int32, ReturnType, ReadIntTextCheckOverflow::CHECK_OVERFLOW>(d, buf);
+        date = LocalDate(d);
+    }
+    else
         return error();
 
-    if (!ignore_delimiter())
-        return error();
-
-    UInt8 month = 0;
-    if (!append_digit(month))
-        return error();
-    append_digit(month);
-
-    if (!ignore_delimiter())
-        return error();
-
-    UInt8 day = 0;
-    if (!append_digit(day))
-        return error();
-    append_digit(day);
-
-    date = LocalDate(year, month, day);
     return ReturnType(true);
 }
 
@@ -890,9 +956,8 @@ ReturnType readDateTimeTextFallback(time_t & datetime, ReadBuffer & buf, const D
 
     /// YYYY-MM-DD hh:mm:ss
     static constexpr auto date_time_broken_down_length = 19;
-    /// YYYY-MM-DD
-    static constexpr auto date_broken_down_length = 10;
 
+    char * pos = buf.position();
     char s[date_time_broken_down_length];
     char * s_pos = s;
 
@@ -903,50 +968,15 @@ ReturnType readDateTimeTextFallback(time_t & datetime, ReadBuffer & buf, const D
       */
 
     /// A piece similar to unix timestamp, maybe scaled to subsecond precision.
-    while (s_pos < s + date_time_broken_down_length && !buf.eof() && isNumericASCII(*buf.position()))
+    while (s_pos < s + date_time_broken_down_length && pos < buf.buffer().end() && isNumericASCII(*pos))
     {
-        *s_pos = *buf.position();
-        ++s_pos;
-        ++buf.position();
+        *s_pos++ = *pos++;
     }
 
     /// 2015-01-01 01:02:03 or 2015-01-01
-    if (s_pos == s + 4 && !buf.eof() && !isNumericASCII(*buf.position()))
+    if (s_pos == s + 4 && pos != buf.buffer().end() && !isNumericASCII(*pos))
     {
-        const auto already_read_length = s_pos - s;
-        const size_t remaining_date_time_size = date_time_broken_down_length - already_read_length;
-        const size_t remaining_date_size = date_broken_down_length - already_read_length;
-
-        size_t size = buf.read(s_pos, remaining_date_time_size);
-        if (size != remaining_date_time_size && size != remaining_date_size)
-        {
-            s_pos[size] = 0;
-
-            if constexpr (throw_exception)
-                throw ParsingException(std::string("Cannot parse datetime ") + s, ErrorCodes::CANNOT_PARSE_DATETIME);
-            else
-                return false;
-        }
-
-        UInt16 year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
-        UInt8 month = (s[5] - '0') * 10 + (s[6] - '0');
-        UInt8 day = (s[8] - '0') * 10 + (s[9] - '0');
-
-        UInt8 hour = 0;
-        UInt8 minute = 0;
-        UInt8 second = 0;
-
-        if (size == remaining_date_time_size)
-        {
-            hour = (s[11] - '0') * 10 + (s[12] - '0');
-            minute = (s[14] - '0') * 10 + (s[15] - '0');
-            second = (s[17] - '0') * 10 + (s[18] - '0');
-        }
-
-        if (unlikely(year == 0))
-            datetime = 0;
-        else
-            datetime = date_lut.makeDateTime(year, month, day, hour, minute, second);
+        return readDateTimeTextFallbackMySQL<ReturnType>(datetime, buf, date_lut);
     }
     else
     {
@@ -958,12 +988,24 @@ ReturnType readDateTimeTextFallback(time_t & datetime, ReadBuffer & buf, const D
             UInt8 day = (s[6] - '0') * 10 + (s[7] - '0');
             datetime = date_lut.makeDateTime(year, month, day, 0, 0, 0);
         }
-        else if (s_pos - s >= 5)
+        else if (s_pos - s == 14)
         {
-            /// Not very efficient.
+            /// YYYYMMDDhhmmss, not very efficient.
+            UInt16 year = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+            UInt8 month = (s[4] - '0') * 10 + (s[5] - '0');
+            UInt8 day = (s[6] - '0') * 10 + (s[7] - '0');
+
+            UInt8 hour = (s[8] - '0') * 10 + (s[9] - '0');
+            UInt8 minute = (s[10] - '0') * 10 + (s[11] - '0');
+            UInt8 second = (s[12] - '0') * 10 + (s[13] - '0');
+            datetime = date_lut.makeDateTime(year, month, day, hour, minute, second);
+        }
+        else if (s_pos - s >= 5 || *pos == '+' || *pos == '-')
+        {
+            /// unixtimestamp: +/-NNNNN
+            /// parsing of unix timestamp with leading zeros is supported: 000...NNNN.
             datetime = 0;
-            for (const char * digit_pos = s; digit_pos < s_pos; ++digit_pos)
-                datetime = datetime * 10 + *digit_pos - '0';
+            return readIntTextImpl<time_t, ReturnType, ReadIntTextCheckOverflow::CHECK_OVERFLOW>(datetime, buf);
         }
         else
         {
@@ -973,12 +1015,125 @@ ReturnType readDateTimeTextFallback(time_t & datetime, ReadBuffer & buf, const D
                 return false;
         }
     }
+    buf.position() += s_pos - s;
+    return ReturnType(true);
+}
+
+template <typename ReturnType>
+ReturnType readDateTimeTextFallbackMySQL(time_t & datetime, ReadBuffer & buf, const DateLUTImpl & date_lut)
+{
+    static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
+
+    /// mysql support YYYY-M-D h:m:s.nnnnnn
+    LocalDate local_date;
+    time_t time = 0;
+    if constexpr (throw_exception)
+    {
+        readDateTextImpl<ReturnType>(local_date, buf);
+        if (!buf.eof())
+            readTimeTextImpl(time, buf);
+    }
+    else if (!readDateTextImpl<ReturnType>(local_date, buf) || (!buf.eof() && !readTimeTextImpl(time, buf)))
+        return false;
+
+    /// Support year 0, warps around to start of the year range
+    if (unlikely(local_date.year() == 0)) {
+        datetime = 0;
+        if (current_thread)
+            current_thread->setOverflow(ThreadStatus::OverflowFlag::Date);
+        return ReturnType(true);
+    }
+
+    /// timezone offset support +/-mm:ss
+    auto s = buf.position();
+    if (s < buf.buffer().end() && *s == '.')
+        while(++s < buf.buffer().end() && isNumericASCII(*s));
+
+    if (s < buf.buffer().end() && hasTzSign(s))
+    {
+        Int32 timezone_offset;
+        if (!parseTimezoneOffset(timezone_offset, buf, s - buf.position()))
+        {
+            if constexpr (throw_exception)
+                throw Exception("Cannot parse datetime: timezone offset value",
+                    ErrorCodes::CANNOT_PARSE_DATETIME);
+            return ReturnType(false);
+        }
+        const DateLUTImpl & utc_lut = DateLUT::instance("UTC");
+        datetime = utc_lut.makeDateTime(local_date.year(), local_date.month(), local_date.day(), 0, 0, 0) + time + timezone_offset;
+    }
+    else
+        datetime = date_lut.makeDateTime(local_date.year(), local_date.month(), local_date.day(), 0, 0, 0) + time;
 
     return ReturnType(true);
 }
 
 template void readDateTimeTextFallback<void>(time_t &, ReadBuffer &, const DateLUTImpl &);
 template bool readDateTimeTextFallback<bool>(time_t &, ReadBuffer &, const DateLUTImpl &);
+
+template <typename Vector, typename ReturnType>
+ReturnType readJSONObjectPossiblyInvalid(Vector & s, ReadBuffer & buf)
+{
+    static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
+
+    auto error = [](const char * message [[maybe_unused]], int code [[maybe_unused]])
+    {
+        if constexpr (throw_exception)
+            throw ParsingException(code, std::move(message));
+        return ReturnType(false);
+    };
+
+    if (buf.eof() || *buf.position() != '{')
+        return error("JSON should start from opening curly bracket", ErrorCodes::INCORRECT_DATA);
+
+    s.push_back(*buf.position());
+    ++buf.position();
+
+    Int64 balance = 1;
+    bool quotes = false;
+
+    while (!buf.eof())
+    {
+        char * next_pos = find_first_symbols<'\\', '{', '}', '"'>(buf.position(), buf.buffer().end());
+        appendToStringOrVector(s, buf, next_pos);
+        buf.position() = next_pos;
+
+        if (!buf.hasPendingData())
+            continue;
+
+        s.push_back(*buf.position());
+
+        if (*buf.position() == '\\')
+        {
+            ++buf.position();
+            if (!buf.eof())
+            {
+                s.push_back(*buf.position());
+                ++buf.position();
+            }
+
+            continue;
+        }
+
+        if (*buf.position() == '"')
+            quotes = !quotes;
+        else if (!quotes) // can be only '{' or '}'
+            balance += *buf.position() == '{' ? 1 : -1;
+
+        ++buf.position();
+
+        if (balance == 0)
+            return ReturnType(true);
+
+        if (balance <    0)
+            break;
+    }
+
+    return error("JSON should have equal number of opening and closing brackets", ErrorCodes::INCORRECT_DATA);
+}
+
+template void readJSONObjectPossiblyInvalid<String>(String & s, ReadBuffer & buf);
+
 
 
 void skipJSONField(ReadBuffer & buf, const StringRef & name_of_field)
@@ -1227,6 +1382,35 @@ bool loadAtPosition(ReadBuffer & in, DB::Memory<> & memory, char * & current)
     current = in.position();
 
     return loaded_more;
+}
+
+template<>
+void readBinary(std::vector<bool> & x, ReadBuffer & buf)
+{
+    size_t size = 0;
+    readVarUInt(size, buf);
+
+    if (!size)
+        return;
+
+    size_t bitmap_cnt = (size + 63) / 64;
+
+    for (size_t i = 0; i < bitmap_cnt - 1; i++) {
+        uint64_t val = 0;
+        readBinary(val, buf);
+
+        for (size_t j = 0; j < 64; ++j)
+            x.push_back(!!(val & (1UL << j)));
+        size -= 64;
+    }
+
+    {
+        uint64_t val = 0;
+        readBinary(val, buf);
+
+        for (size_t j = 0; j < size; ++j)
+            x.push_back(!!(val & (1UL << j)));
+    }
 }
 
 }

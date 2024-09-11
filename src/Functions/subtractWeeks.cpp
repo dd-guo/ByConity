@@ -8,9 +8,9 @@ namespace DB
 
 using FunctionSubtractWeeks = FunctionDateOrDateTimeAddInterval<SubtractWeeksImpl>;
 
-void registerFunctionSubtractWeeks(FunctionFactory & factory)
+REGISTER_FUNCTION(SubtractWeeks)
 {
-    factory.registerFunction<FunctionSubtractWeeks>();
+    factory.registerFunction<FunctionSubtractWeeks>(FunctionFactory::CaseInsensitive);
 }
 
 }

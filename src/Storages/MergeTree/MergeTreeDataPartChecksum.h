@@ -38,7 +38,7 @@ namespace DB
 using StorageType = DiskType::Type;
 
 /// Checksum of one file.
-struct MergeTreeDataPartChecksum
+struct PACKED_LINLINE MergeTreeDataPartChecksum
 {
     using uint128 = CityHash_v1_0_2::uint128;
 
@@ -46,19 +46,26 @@ struct MergeTreeDataPartChecksum
     UInt64 file_size {};
     uint128 file_hash {};
 
-    bool is_compressed = false;
-    /// MOCK for MergeTreeCNCHDataDumper
-    bool is_deleted = false;
     Int64 mutation = 0;
 
     UInt64 uncompressed_size {};
     uint128 uncompressed_hash {};
 
-    MergeTreeDataPartChecksum() {}
+    bool is_compressed = false;
+    /// MOCK for MergeTreeCNCHDataDumper
+    bool is_deleted = false;
+
+    UInt16 padding1 {};
+    UInt32 padding2 {};
+
+    MergeTreeDataPartChecksum() = default;
     MergeTreeDataPartChecksum(UInt64 file_size_, uint128 file_hash_) : file_size(file_size_), file_hash(file_hash_) {}
+    MergeTreeDataPartChecksum(UInt64 file_offset_, UInt64 file_size_, uint128 file_hash_)
+        : file_offset(file_offset_), file_size(file_size_), file_hash(file_hash_)
+    {}
     MergeTreeDataPartChecksum(UInt64 file_size_, uint128 file_hash_, UInt64 uncompressed_size_, uint128 uncompressed_hash_)
-        : file_size(file_size_), file_hash(file_hash_), is_compressed(true),
-        uncompressed_size(uncompressed_size_), uncompressed_hash(uncompressed_hash_) {}
+        : file_size(file_size_), file_hash(file_hash_),
+        uncompressed_size(uncompressed_size_), uncompressed_hash(uncompressed_hash_), is_compressed(true) {}
 
     void checkEqual(const MergeTreeDataPartChecksum & rhs, bool have_uncompressed, const String & name) const;
     void checkSize(const DiskPtr & disk, const String & path) const;
@@ -83,6 +90,8 @@ struct MergeTreeDataPartChecksums
 
     void addFile(const String & file_name, UInt64 file_size, Checksum::uint128 file_hash);
 
+    void addFile(const String & file_name, UInt64 file_offset, UInt64 file_size, Checksum::uint128 file_hash);
+
     void add(MergeTreeDataPartChecksums && rhs_checksums);
 
     bool has(const String & file_name) const { return files.find(file_name) != files.end(); }
@@ -96,6 +105,11 @@ struct MergeTreeDataPartChecksums
     /// If have_uncompressed, for compressed files it compares the checksums of the decompressed data.
     /// Otherwise, it compares only the checksums of the files.
     void checkEqual(const MergeTreeDataPartChecksums & rhs, bool have_uncompressed) const;
+
+    /// Checks that if offset of implicit key is same with rhs, only handle the case for compact map.
+    /// For compact map, we need to adjust offset because it may be differ from source replica due to clear map key commands.
+    /// For compact map, clear map key only remove checksum item, only when all keys of the map column has been removed, we will delete compated files.
+    bool adjustDiffImplicitKeyOffset(const MergeTreeDataPartChecksums & rhs);
 
     /// Return if the checksums of the target column are same.
     bool isEqual(const MergeTreeDataPartChecksums & rhs, const String & col_name) const;
@@ -119,6 +133,8 @@ struct MergeTreeDataPartChecksums
     bool readV7(ReadBuffer & in);
 
     void write(WriteBuffer & to) const;
+    /// For rewrite checksum of ClickhouseDumper
+    void writeLocal(WriteBuffer & to) const;
 
     /// Checksum from the set of checksums of .bin files (for deduplication).
     void computeTotalChecksumDataOnly(SipHash & hash) const;
@@ -133,7 +149,7 @@ struct MergeTreeDataPartChecksums
 
     UInt64 getTotalSizeOnDisk() const;
 
-    Strings collectFilesForMapColumnNotKV(const String & map_column) const;
+    Strings collectImplicitColumnFilesForByteMap(const String & map_column) const;
 };
 
 

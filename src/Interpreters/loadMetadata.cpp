@@ -61,7 +61,7 @@ static void executeCreateQuery(
     const String & file_name,
     bool has_force_restore_data_flag)
 {
-    ParserCreateQuery parser(ParserSettings::valueOf(context->getSettingsRef().dialect_type));
+    ParserCreateQuery parser(ParserSettings::valueOf(context->getSettingsRef()));
     ASTPtr ast = parseQuery(
         parser, query.data(), query.data() + query.size(), "in file " + file_name, 0, context->getSettingsRef().max_parser_depth);
 
@@ -75,6 +75,14 @@ static void executeCreateQuery(
     interpreter.execute();
 }
 
+static bool isSystemOrInformationSchemaOrMySQL(const String & database_name)
+{
+    return database_name == DatabaseCatalog::SYSTEM_DATABASE ||
+           database_name == DatabaseCatalog::INFORMATION_SCHEMA ||
+           database_name == DatabaseCatalog::INFORMATION_SCHEMA_UPPERCASE ||
+           database_name == DatabaseCatalog::MYSQL ||
+           database_name == DatabaseCatalog::MYSQL_UPPERCASE;
+}
 
 static void loadDatabase(
     ContextMutablePtr context,
@@ -144,7 +152,7 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
             if (fs::path(current_file).extension() == ".sql")
             {
                 String db_name = fs::path(current_file).stem();
-                if (db_name != DatabaseCatalog::SYSTEM_DATABASE)
+                if (!isSystemOrInformationSchemaOrMySQL(db_name))
                     databases.emplace(unescapeForFileName(db_name), fs::path(path) / db_name);
             }
 
@@ -170,7 +178,7 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
         if (current_file.at(0) == '.')
             continue;
 
-        if (current_file == DatabaseCatalog::SYSTEM_DATABASE)
+        if (isSystemOrInformationSchemaOrMySQL(current_file))
             continue;
 
         databases.emplace(unescapeForFileName(current_file), it->path().string());
@@ -199,29 +207,38 @@ void loadMetadata(ContextMutablePtr context, const String & default_database_nam
     }
 }
 
-
-void loadMetadataSystem(ContextMutablePtr context)
+static void loadSystemDatabaseImpl(ContextMutablePtr context, const String & database_name, const String & default_engine)
 {
-    String path = context->getPath() + "metadata/" + DatabaseCatalog::SYSTEM_DATABASE;
+    String path = context->getPath() + "metadata/" + database_name;
     String metadata_file = path + ".sql";
     if (fs::exists(fs::path(path)) || fs::exists(fs::path(metadata_file)))
     {
         /// 'has_force_restore_data_flag' is true, to not fail on loading query_log table, if it is corrupted.
-        loadDatabase(context, DatabaseCatalog::SYSTEM_DATABASE, path, true);
+        loadDatabase(context, database_name, path, true);
     }
     else
     {
         /// Initialize system database manually
         String database_create_query = "CREATE DATABASE ";
-        database_create_query += DatabaseCatalog::SYSTEM_DATABASE;
-        database_create_query += " ENGINE=Atomic";
-        executeCreateQuery(database_create_query, context, DatabaseCatalog::SYSTEM_DATABASE, "<no file>", true);
+        database_create_query += database_name;
+        database_create_query += " ENGINE=";
+        database_create_query += default_engine;
+        executeCreateQuery(database_create_query, context, database_name, "<no file>", true);
     }
 
 }
 
+void loadMetadataSystem(ContextMutablePtr context)
+{
+    loadSystemDatabaseImpl(context, DatabaseCatalog::SYSTEM_DATABASE, "Atomic");
+    loadSystemDatabaseImpl(context, DatabaseCatalog::INFORMATION_SCHEMA, "Memory");
+    loadSystemDatabaseImpl(context, DatabaseCatalog::INFORMATION_SCHEMA_UPPERCASE, "Memory");
+    loadSystemDatabaseImpl(context, DatabaseCatalog::MYSQL, "Memory");
+    loadSystemDatabaseImpl(context, DatabaseCatalog::MYSQL_UPPERCASE, "Memory");
+}
+
 /* Load schema files from hdfs*/
-void reloadFormatSchema(String remote_format_schema_path, String format_schema_path, Poco::Logger * log)
+void reloadFormatSchema(ContextMutablePtr context, String remote_format_schema_path, String format_schema_path, Poco::Logger * log)
 {
 #if USE_HDFS
     if (!remote_format_schema_path.empty())
@@ -229,9 +246,9 @@ void reloadFormatSchema(String remote_format_schema_path, String format_schema_p
         remote_format_schema_path += "/"; // add it by default
         // try download files from remote_format_schema_path to format_schema_path
         Poco::URI remote_uri(remote_format_schema_path);
-        if (remote_uri.getScheme() == "hdfs")
+        if (isHdfsOrCfsScheme(remote_uri.getScheme()))
         {
-            HDFSBuilderPtr builder = createHDFSBuilder(remote_uri);
+            HDFSBuilderPtr builder = context->getHdfsConnectionParams().createBuilder(remote_uri);
             HDFSFSPtr fs = createHDFSFS(builder.get());
             int num = 0;
             hdfsFileInfo* files = hdfsListDirectory(fs.get(), remote_uri.getPath().c_str(), &num);
@@ -257,7 +274,7 @@ void reloadFormatSchema(String remote_format_schema_path, String format_schema_p
                 Poco::File file(format_schema_path+"/chtmp_" + shortFileName);
                 if (file.exists()) file.remove(); // remove last residual file
 
-                ReadBufferFromByteHDFS reader(fileName);
+                ReadBufferFromByteHDFS reader(fileName, context->getHdfsConnectionParams());
                 WriteBufferFromFile writer(file.path());
                 copyData(reader, writer, nullptr);
                 if (target_file.exists()) target_file.remove();
@@ -272,7 +289,7 @@ void reloadFormatSchema(String remote_format_schema_path, String format_schema_p
         }
         else
         {
-            if(log) {LOG_ERROR(log, "remote_format_schema_path only support hdfs");}
+            if(log) {LOG_ERROR(log, "remote_format_schema_path only support hdfs and cfs");}
         }
     }
 #endif

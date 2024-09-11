@@ -22,11 +22,13 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/copyData.h>
 #include <Storages/HDFS/ReadBufferFromByteHDFS.h>
+#include <Storages/DiskCache/IDiskCache.h>
 #include <Poco/DirectoryIterator.h>
 #include <Poco/File.h>
 #include <Common/LRUCache.h>
 #include <Common/Stopwatch.h>
 #include <Common/escapeForFileName.h>
+#include "IO/ReadSettings.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -122,7 +124,7 @@ struct KeyIndexFileCache::Rep
     Rep(Context & context_, size_t max_size)
         : context(context_)
         , base_path(context.getPath() + "unique_key_index_cache/")
-        , loading_thread_pool(context.getLocalDiskCacheThreadPool())
+        , loading_thread_pool(IDiskCache::getThreadPool())
         , cache(max_size, base_path)
     {
     }
@@ -137,6 +139,7 @@ KeyIndexFileCache::KeyIndexFileCache(Context & context, UInt64 max_size)
     : log(&Poco::Logger::get("KeyIndexFileCache")), rep(std::make_shared<Rep>(context, max_size))
 {
     initCacheFromFileSystem();
+    LOG_INFO(log, "Successfully init KeyIndexFileCache in path {} and KeyIndexFileCache max_size is {}", rep->base_path, max_size);
 }
 
 KeyIndexFileCache::~KeyIndexFileCache() = default;
@@ -195,17 +198,12 @@ int KeyIndexFileCache::get(const IndexFile::RemoteFileInfo & file)
                 try
                 {
                     Context & context = rep_inner->context;
-                    ReadBufferFromByteHDFS remote_buf(
-                        file.path,
-                        true,
-                        context.getHdfsConnectionParams(),
-                        DBMS_DEFAULT_BUFFER_SIZE,
-                        nullptr,
-                        0,
-                        false,
-                        context.getDiskCacheThrottler());
-                    remote_buf.seek(file.start_offset);
-                    LimitReadBuffer from(remote_buf, file.size, false);
+                    ReadSettings settings = context.getReadSettings();
+                    settings.remote_throttler = context.getDiskCacheThrottler();
+                    std::unique_ptr<ReadBufferFromFileBase> reader = file.disk->readFile(file.rel_path,
+                        settings);
+                    reader->seek(file.start_offset);
+                    LimitReadBuffer from(*reader, file.size, false);
 
                     /// download into tmp file
                     String tmp_file = rep_inner->base_path + "TMP_" + escapeForFileName(file.cache_key);
@@ -225,7 +223,7 @@ int KeyIndexFileCache::get(const IndexFile::RemoteFileInfo & file)
                     LOG_ERROR(
                         &Poco::Logger::get("KeyIndexFileCache"),
                         "Failed to cache {} to local disks: {}",
-                        file.path,
+                        String(std::filesystem::path(file.disk->getPath()) / file.rel_path),
                         getCurrentExceptionMessage(false));
                     rep_inner->cache.remove(file.cache_key);
                 }

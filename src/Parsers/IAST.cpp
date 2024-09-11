@@ -1,8 +1,12 @@
+#include <Parsers/IAST.h>
+
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <IO/Operators.h>
 #include <Common/SipHash.h>
-#include <Parsers/IAST.h>
+#include <Common/SensitiveDataMasker.h>
+#include <IO/WriteHelpers.h>
+#include <IO/ReadHelpers.h>
 
 
 namespace DB
@@ -87,11 +91,25 @@ size_t IAST::checkDepthImpl(size_t max_depth, size_t level) const
     return res;
 }
 
-std::string IAST::formatForErrorMessage() const
+String IAST::formatWithHiddenSecrets(size_t max_length, bool one_line, bool no_alias, DialectType dialect) const
 {
     WriteBufferFromOwnString buf;
-    format(FormatSettings(buf, true /* one line */));
-    return buf.str();
+    FormatSettings settings{buf, one_line, no_alias};
+    settings.show_secrets = false;
+    settings.dialect_type = dialect;
+    format(settings);
+
+    return wipeSensitiveDataAndCutToLength(buf.str(), max_length);
+}
+
+bool IAST::childrenHaveSecretParts() const
+{
+    for (const auto & child : children)
+    {
+        if (child->hasSecretParts())
+            return true;
+    }
+    return false;
 }
 
 void IAST::cloneChildren()
@@ -174,6 +192,68 @@ std::string IAST::dumpTree(size_t indent) const
     WriteBufferFromOwnString wb;
     dumpTree(wb, indent);
     return wb.str();
+}
+
+void SqlHint::serialize(WriteBuffer & buf) const
+{
+    writeBinary(name, buf);
+    writeBinary(options.size(), buf);
+    for (const auto & option : options)
+        writeBinary(option, buf);
+
+    writeBinary(kv_options.size(), buf);
+    for (const auto & item : kv_options)
+    {
+        writeBinary(item.first, buf);
+        writeBinary(item.second, buf);
+    }
+}
+
+SqlHint SqlHint::deserialize(ReadBuffer & buf)
+{
+    String name;
+    readBinary(name, buf);
+    SqlHint hint{name};
+
+    size_t size;
+    readBinary(size, buf);
+
+    for (size_t i = 0; i < size; ++i)
+    {
+        String option;
+        readBinary(option, buf);
+        hint.setOption(option);
+    }
+
+    readBinary(size, buf);
+    for (size_t i = 0; i < size; ++i)
+    {
+        String key;
+        readBinary(key, buf);
+        String value;
+        readBinary(value, buf);
+        hint.setKvOption(key, value);
+    }
+
+    return hint;
+}
+
+void SqlHints::serialize(WriteBuffer & buf) const
+{
+    writeBinary(size(), buf);
+    for (const auto & hint : *this)
+        hint.serialize(buf);
+}
+
+void SqlHints::deserialize(ReadBuffer & buf)
+{
+    size_t size;
+    readBinary(size, buf);
+    for (size_t i = 0; i < size; ++i)
+    {
+        SqlHint hint = SqlHint::deserialize(buf);
+        this->push_back(hint);
+    }
 }
 
 }

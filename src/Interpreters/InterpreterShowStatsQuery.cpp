@@ -13,24 +13,42 @@
  * limitations under the License.
  */
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <DataStreams/BlocksListBlockInputStream.h>
+#include <DataTypes/MapHelpers.h>
 #include <Interpreters/InterpreterShowStatsQuery.h>
-#include <Optimizer/Dump/PlanDump.h>
+#include <Optimizer/Dump/DDLDumper.h>
+#include <Optimizer/Dump/StatsLoader.h>
 #include <Parsers/ASTStatsQuery.h>
+#include <Statistics/ASTHelpers.h>
+#include <Statistics/AutoStatisticsHelper.h>
+#include <Statistics/ASTHelpers.h>
 #include <Statistics/FormattedOutput.h>
 #include <Statistics/StatisticsCollector.h>
 #include <Statistics/StatsColumnBasic.h>
 #include <Statistics/StatsTableBasic.h>
 #include <Statistics/TypeUtils.h>
 #include <Statistics/serde_extend.hpp>
+#include <Storages/StorageMaterializedView.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <Poco/Timestamp.h>
+#include "Core/Block.h"
+#include "Core/Types.h"
+#include "Core/UUID.h"
+#include "Interpreters/DatabaseCatalog.h"
+#include "Statistics/AutoStatisticsHelper.h"
 
 namespace DB
 {
+
+namespace Statistics
+{
+    std::shared_ptr<StatsTableBasic> getTableStatistics(ContextPtr context, const StatsTableIdentifier & table);
+}
+
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
@@ -38,24 +56,31 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int FILE_NOT_FOUND;
 }
+using Protos::DbStats;
+using Protos::DbStats_Version_V1;
+using Protos::DbStats_Version_V2;
 using namespace Statistics;
 
+
 std::vector<FormattedOutputData> getTableFormattedOutput(
-    ContextPtr context, CatalogAdaptorPtr catalog, const StatsTableIdentifier & table_info, const std::vector<String> & column_names)
+    ContextPtr context,
+    CatalogAdaptorPtr catalog,
+    const CollectorSettings & collector_settings,
+    const StatsTableIdentifier & table_info,
+    const std::vector<String> & column_names)
 {
     std::vector<FormattedOutputData> results;
-    StatisticsCollector collector_impl(context, catalog, table_info);
-    ColumnDescVector cols_desc;
+    StatisticsCollector collector_impl(context, catalog, table_info, collector_settings);
     if (column_names.empty())
     {
-        cols_desc = catalog->getCollectableColumns(table_info);
+        collector_impl.readAllFromCatalog();
     }
     else
     {
-        cols_desc = filterCollectableColumns(catalog->getCollectableColumns(table_info), column_names, true);
+        auto cols_desc = catalog->filterCollectableColumns(table_info, column_names, true);
+        collector_impl.readFromCatalogImpl(cols_desc);
     }
 
-    collector_impl.readFromCatalogImpl(cols_desc);
 
     auto plannode_stats_opt = collector_impl.toPlanNodeStatistics();
     if (!plannode_stats_opt.has_value())
@@ -74,11 +99,13 @@ std::vector<FormattedOutputData> getTableFormattedOutput(
     }
 
     auto symbols = plannode_stats->getSymbolStatistics();
+    auto cols_desc = catalog->getAllCollectableColumns(table_info);
     for (auto & col : cols_desc)
     {
         auto symbol_iter = symbols.find(col.name);
         if (symbol_iter == symbols.end())
         {
+            // TODO: should we output empty columns? to ensure no stats is correctly handled
             continue;
         }
         auto & symbol_stats = symbol_iter->second;
@@ -94,6 +121,7 @@ std::vector<FormattedOutputData> getTableFormattedOutput(
         auto null_count = symbol_stats->getNullsCount();
         fod.append("count", row_count - null_count);
         fod.append("null_count", null_count);
+        fod.append("avg_byte_size", symbol_stats->getAvg());
 
         fod.append("min", symbol_stats->getMin());
         fod.append("max", symbol_stats->getMax());
@@ -106,14 +134,14 @@ std::vector<FormattedOutputData> getTableFormattedOutput(
 
 void writeDbStats(ContextPtr context, const String & db_name, const String & path)
 {
-    Protos::DbStats db_stats;
+    DbStats db_stats;
     db_stats.set_db_name(db_name);
     db_stats.set_version(PROTO_VERSION);
     auto catalog = createCatalogAdaptor(context);
     auto tables = catalog->getAllTablesID(db_name);
     for (auto & table : tables)
     {
-        StatisticsCollector collector(context, catalog, table);
+        StatisticsCollector collector(context, catalog, table, {});
         collector.readAllFromCatalog();
         auto table_collection = collector.getTableStats().writeToCollection();
         if (table_collection.empty())
@@ -145,36 +173,23 @@ void writeDbStats(ContextPtr context, const String & db_name, const String & pat
     std::ofstream fout(path, std::ios::binary);
     db_stats.SerializeToOstream(&fout);
 }
-void writeDbStatsToJson(ContextPtr context, const String & db_name, const String & path)
+void writeDbStatsToJson(ContextPtr context, const String & db_name, const String & folder)
 {
-    Protos::DbStats db_stats;
-    db_stats.set_db_name(db_name);
-    db_stats.set_version(PROTO_VERSION);
-    auto catalog = createCatalogAdaptor(context);
-    auto tables = catalog->getAllTablesID(db_name);
-    Poco::JSON::Object stats_json;
-    for (auto & table : tables)
-    {
-        String table_name = table.getTableName();
-        if (table_name.find("_local") == String::npos)
-            stats_json.set(db_name + "." + table_name, tableJson(context, db_name, table_name));
-    }
-    std::ofstream fout(path);
-    Poco::Dynamic::Var stats_var(stats_json);
-    fout << stats_var.toString();
-    fout.close();
+    DDLDumper ddl_dumper(folder);
+    ddl_dumper.addTableFromDatabase(db_name, context);
+    ddl_dumper.dumpStats(folder + "/stats.json");
 }
 
 void readDbStats(ContextPtr context, const String & original_db_name, const String & path)
 {
     std::ifstream fin(path, std::ios::binary);
-    Protos::DbStats db_stats;
-    db_stats.ParseFromIstream(&fin);
+    DbStats db_stats;
+    ASSERT_PARSE(db_stats.ParseFromIstream(&fin));
 
-    auto version = db_stats.has_version() ? db_stats.version() : Protos::DbStats_Version_V1;
-    if (version == Protos::DbStats_Version_V1)
+    auto version = db_stats.has_version() ? db_stats.version() : DbStats_Version_V1;
+    if (version == DbStats_Version_V1)
     {
-        version = Protos::DbStats_Version_V2;
+        version = DbStats_Version_V2;
     }
     if (version != PROTO_VERSION)
     {
@@ -185,6 +200,7 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
     auto catalog = createCatalogAdaptor(context);
     auto logger = &Poco::Logger::get("load stats");
 
+    auto load_ts = AutoStats::convertToDateTime64(AutoStats::nowTimePoint());
     for (auto & table_pb : db_stats.tables())
     {
         auto table_name = table_pb.table_name();
@@ -196,7 +212,7 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
             continue;
         }
 
-        StatisticsCollector collector(context, catalog, table_id_opt.value());
+        StatisticsCollector collector(context, catalog, table_id_opt.value(), {});
 
         {
             StatsCollection collection;
@@ -204,10 +220,12 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
             {
                 auto tag = static_cast<StatisticsTag>(k);
                 auto obj = createStatisticsBase(tag, v);
-                collection[tag] = std::move(obj);
+                if (obj)
+                    collection[tag] = std::move(obj);
             }
             StatisticsCollector::TableStats table_stats;
             table_stats.readFromCollection(collection);
+            table_stats.basic->setTimestamp(load_ts);
             collector.setTableStats(std::move(table_stats));
         }
 
@@ -219,7 +237,8 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
             {
                 auto tag = static_cast<StatisticsTag>(k);
                 auto obj = createStatisticsBase(tag, v);
-                collection[tag] = std::move(obj);
+                if (obj)
+                    collection[tag] = std::move(obj);
             }
             StatisticsCollector::ColumnStats column_stats;
             column_stats.readFromCollection(collection);
@@ -229,44 +248,29 @@ void readDbStats(ContextPtr context, const String & original_db_name, const Stri
     }
 }
 
-static std::vector<StatsTableIdentifier> getTables(ContextPtr context, const ASTShowStatsQuery * query)
+void readDbStatsFromJson(ContextPtr context, const String & json_file)
 {
-    std::vector<StatsTableIdentifier> tables;
-    auto catalog = createCatalogAdaptor(context);
-    auto db = context->resolveDatabase(query->database);
-    if (query->target_all)
-    {
-        tables = catalog->getAllTablesID(db);
-    }
-    else
-    {
-        auto table_info_opt = catalog->getTableIdByName(db, query->table);
-        if (!table_info_opt)
-        {
-            auto msg = "Unknown Table (" + query->table + ") in database (" + db + ")";
-            throw Exception(msg, ErrorCodes::UNKNOWN_TABLE);
-        }
-        tables.emplace_back(table_info_opt.value());
-    }
-    return tables;
+    StatsLoader stats_loader(json_file, context);
+    stats_loader.loadStats(/*load_all=*/true);
 }
 
-BlockIO InterpreterShowStatsQuery::executeTable()
+BlockIO InterpreterShowStatsQuery::executeAll()
 {
     auto query = query_ptr->as<const ASTShowStatsQuery>();
     // Block sample_block = getSampleBlock();
     // MutableColumns res_columns = sample_block.cloneEmptyColumns();
     auto context = getContext();
-    auto tables = getTables(context, query);
+    auto tables = getTablesFromAST(context, query);
     auto catalog = createCatalogAdaptor(context);
 
     BlocksList blocks;
 
     for (auto & table_info : tables)
     {
-        auto fods = getTableFormattedOutput(context, catalog, table_info, query->columns);
+        auto fods = getTableFormattedOutput(context, catalog, collector_settings, table_info, query->columns);
         // adjust here to change the order
-        auto block = outputFormattedBlock(fods, {"identifier", "type", "count", "null_count", "ndv", "min", "max", "has_histogram"});
+        auto block = outputFormattedBlock(
+            fods, {"identifier", "type", "count", "null_count", "ndv", "min", "max", "avg_byte_size", "has_histogram"});
         blocks.emplace_back(std::move(block));
     }
 
@@ -317,13 +321,17 @@ std::vector<FormattedOutputData> getColumnFormattedOutput(const String & full_co
 }
 
 BlocksList getColumnsFormattedOutput(
-    ContextPtr context, CatalogAdaptorPtr catalog, const StatsTableIdentifier & table_info, const std::vector<String> & target_columns)
+    ContextPtr context,
+    CatalogAdaptorPtr catalog,
+    const CollectorSettings & collector_settings,
+    const StatsTableIdentifier & table_info,
+    const std::vector<String> & target_columns)
 {
-    StatisticsCollector collector_impl(context, catalog, table_info);
+    StatisticsCollector collector_impl(context, catalog, table_info, collector_settings);
 
     if (!target_columns.empty())
     {
-        auto cols_desc = filterCollectableColumns(catalog->getCollectableColumns(table_info), target_columns, true);
+        auto cols_desc = catalog->filterCollectableColumns(table_info, target_columns, true);
         collector_impl.readFromCatalog(target_columns);
     }
     else
@@ -345,7 +353,8 @@ BlocksList getColumnsFormattedOutput(
         return {};
     }
 
-    auto cols_desc = catalog->getCollectableColumns(table_info);
+    auto cols_desc = catalog->getAllCollectableColumns(table_info);
+
     for (auto & col_desc : cols_desc)
     {
         auto col_name = col_desc.name;
@@ -375,7 +384,7 @@ BlockIO InterpreterShowStatsQuery::executeColumn()
     auto context = getContext();
     // Block sample_block = getSampleBlock();
     // MutableColumns res_columns = sample_block.cloneEmptyColumns();
-    auto tables = getTables(context, query);
+    auto tables = getTablesFromAST(context, query);
     auto catalog = Statistics::createCatalogAdaptor(context);
 
     BlocksList blocks;
@@ -387,14 +396,14 @@ BlockIO InterpreterShowStatsQuery::executeColumn()
         }
 
         auto table_info = tables[0];
-        auto new_blocks = getColumnsFormattedOutput(context, catalog, table_info, query->columns);
+        auto new_blocks = getColumnsFormattedOutput(context, catalog, collector_settings, table_info, query->columns);
         blocks.splice(blocks.end(), std::move(new_blocks));
     }
     else
     {
         for (auto & table_info : tables)
         {
-            auto new_blocks = getColumnsFormattedOutput(context, catalog, table_info, {});
+            auto new_blocks = getColumnsFormattedOutput(context, catalog, collector_settings, table_info, {});
             blocks.splice(blocks.end(), std::move(new_blocks));
         }
     }
@@ -406,15 +415,27 @@ BlockIO InterpreterShowStatsQuery::executeColumn()
 
 static bool isSpecialFunction(const String & name)
 {
-    static std::set<String> specials({"__save", "__load", "__jsonsave", "__jsonload"});
+    static std::set<String> specials({"__save", "__load", "__jsonsave", "__jsonload", "__transfer"});
     return specials.count(name);
 }
 
-void InterpreterShowStatsQuery::executeSpecial()
+BlockIO InterpreterShowStatsQuery::executeSpecial()
 {
-    auto query = query_ptr->as<const ASTShowStatsQuery>();
+    const auto * query = query_ptr->as<const ASTShowStatsQuery>();
     auto context = getContext();
     auto catalog = Statistics::createCatalogAdaptor(context);
+
+    // when special, cache settings will be invalid
+    if (collector_settings.cache_policy() != StatisticsCachePolicy::Default)
+    {
+        throw Exception("cache policy is not supported for special functions", ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    if (context->getSettingsRef().statistics_cache_policy != StatisticsCachePolicy::Default)
+    {
+        throw Exception(
+            "statistics_cache_policy is not supported for special functions, must set it to default", ErrorCodes::BAD_ARGUMENTS);
+    }
 
     // refactor this into an explicit command
     if (query->table == "__save")
@@ -445,8 +466,8 @@ void InterpreterShowStatsQuery::executeSpecial()
         auto db_name = query->database;
         if (db_name.empty())
             db_name = context->getCurrentDatabase();
-        auto path = context->getSettingsRef().graphviz_path.toString() + "/" + db_name + ".json";
-        writeDbStatsToJson(context, db_name, path);
+        auto folder = context->getSettingsRef().graphviz_path.toString() + '/' + db_name;
+        writeDbStatsToJson(context, db_name, folder);
     }
     else if (query->table == "__jsonload")
     {
@@ -454,30 +475,76 @@ void InterpreterShowStatsQuery::executeSpecial()
         auto db_name = query->database;
         if (db_name.empty())
             db_name = context->getCurrentDatabase();
-        auto path = context->getSettingsRef().graphviz_path.toString() + "/" + db_name + ".json";
+        auto path = context->getSettingsRef().graphviz_path.toString() + '/' + db_name + "/stats.json";
         if (!std::filesystem::exists(path))
         {
             throw Exception("json_file " + path + " not exists", ErrorCodes::FILE_NOT_FOUND);
         }
 
-        loadStats(context, path);
+        readDbStatsFromJson(context, path);
     }
     else
     {
         throw Exception("unknown special action: " + query->table, ErrorCodes::NOT_IMPLEMENTED);
     }
+    return {};
 }
 
-BlockIO InterpreterShowStatsQuery::execute()
+
+BlockIO InterpreterShowStatsQuery::executeTable()
 {
     auto query = query_ptr->as<const ASTShowStatsQuery>();
     auto context = getContext();
     auto catalog = Statistics::createCatalogAdaptor(context);
+    auto tables = getTablesFromAST(context, query);
+    std::vector<FormattedOutputData> result;
+    for (auto & table : tables)
+    {
+        FormattedOutputData data;
+        auto obj = getTableStatistics(context, table);
+        auto storage = catalog->getStorageByTableId(table);
+        data.append("database", table.getDatabaseName());
+        data.append("table", table.getTableName());
+        data.append("engine", storage->getName());
+        data.append("unique_key", UUIDHelpers::UUIDToString(table.getUniqueKey()));
+        data.append("row_count", obj ? std::to_string(obj->getRowCount()) : "");
+        data.append("timestamp", obj ? AutoStats::serializeToText(obj->getTimestamp()) : "");
+        result.emplace_back(std::move(data));
+    }
+
+    auto block = outputFormattedBlock(result, {"database", "table", "engine", "unique_key", "row_count", "timestamp"});
+    BlocksList list = {std::move(block)};
+    BlockIO res;
+    // res.in = std::make_shared<Block>(sample_block.cloneWithColumns(std::move(res_columns)));
+    res.in = std::make_shared<BlocksListBlockInputStream>(std::move(list));
+    return res;
+}
+
+BlockIO InterpreterShowStatsQuery::execute()
+{
+    const auto * query = query_ptr->as<const ASTShowStatsQuery>();
+    auto context = getContext();
+    auto catalog = Statistics::createCatalogAdaptor(context);
+
+    if (query->cache_policy != StatisticsCachePolicy::Default)
+    {
+        collector_settings.set_cache_policy(query->cache_policy);
+    }
+    else if (context->getSettingsRef().statistics_cache_policy != StatisticsCachePolicy::Default)
+    {
+        collector_settings.set_cache_policy(context->getSettingsRef().statistics_cache_policy);
+    }
+
+    // when enable_memory_catalog is true, we won't use cache
+    if (catalog->getSettingsRef().enable_memory_catalog)
+    {
+        if (collector_settings.cache_policy() != StatisticsCachePolicy::Default)
+            throw Exception("memory catalog don't support cache policy", ErrorCodes::BAD_ARGUMENTS);
+    }
 
     if (isSpecialFunction(query->table))
     {
-        executeSpecial();
-        return {};
+        return executeSpecial();
     }
     else if (query->kind == StatsQueryKind::COLUMN_STATS)
     {
@@ -485,11 +552,17 @@ BlockIO InterpreterShowStatsQuery::execute()
         // throw Exception("unimplemented", ErrorCodes::LOGICAL_ERROR);
         return executeColumn();
     }
-    else
+    else if (query->kind == StatsQueryKind::ALL_STATS)
     {
         catalog->checkHealth(/*is_write=*/false);
+        return executeAll();
+    }
+    else if (query->kind == StatsQueryKind::TABLE_STATS)
+    {
+        catalog->checkHealth(false);
         return executeTable();
     }
+    UNREACHABLE();
 }
 
 }

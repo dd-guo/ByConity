@@ -28,10 +28,10 @@
 namespace DB
 {
 
-void registerFunctionsBitmap(FunctionFactory & factory)
+REGISTER_FUNCTION(Bitmap)
 {
     factory.registerFunction<FunctionBitmapBuild>();
-    factory.registerFunction<FunctionArrayToBitmap>();
+    factory.registerFunction<ArrayToBitmapOverloadResolver>();
     factory.registerFunction<FunctionBitmapToArray>();
     factory.registerFunction<FunctionBitmapSubsetInRange>();
     factory.registerFunction<FunctionBitmapSubsetLimit>();

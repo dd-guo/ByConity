@@ -36,11 +36,11 @@
 /// DENY_ALLOCATIONS_IN_SCOPE in the inner scope. In Release builds these macros do nothing.
 #ifdef MEMORY_TRACKER_DEBUG_CHECKS
 #include <common/scope_guard.h>
-extern thread_local bool _memory_tracker_always_throw_logical_error_on_allocation;
+extern thread_local bool memory_tracker_always_throw_logical_error_on_allocation;
 #define ALLOCATIONS_IN_SCOPE_IMPL_CONCAT(n, val) \
-        bool _allocations_flag_prev_val##n = _memory_tracker_always_throw_logical_error_on_allocation; \
-        _memory_tracker_always_throw_logical_error_on_allocation = val; \
-        SCOPE_EXIT({ _memory_tracker_always_throw_logical_error_on_allocation = _allocations_flag_prev_val##n; })
+        bool _allocations_flag_prev_val##n = memory_tracker_always_throw_logical_error_on_allocation; \
+        memory_tracker_always_throw_logical_error_on_allocation = val; \
+        SCOPE_EXIT({ memory_tracker_always_throw_logical_error_on_allocation = _allocations_flag_prev_val##n; })
 #define ALLOCATIONS_IN_SCOPE_IMPL(n, val) ALLOCATIONS_IN_SCOPE_IMPL_CONCAT(n, val)
 #define DENY_ALLOCATIONS_IN_SCOPE ALLOCATIONS_IN_SCOPE_IMPL(__LINE__, true)
 #define ALLOW_ALLOCATIONS_IN_SCOPE ALLOCATIONS_IN_SCOPE_IMPL(__LINE__, false)
@@ -48,6 +48,11 @@ extern thread_local bool _memory_tracker_always_throw_logical_error_on_allocatio
 #define DENY_ALLOCATIONS_IN_SCOPE static_assert(true)
 #define ALLOW_ALLOCATIONS_IN_SCOPE static_assert(true)
 #endif
+
+namespace Poco
+{
+class Logger;
+}
 
 /** Tracks memory consumption.
   * It throws an exception if amount of consumed memory become greater than certain limit.
@@ -58,6 +63,7 @@ class MemoryTracker
 private:
     std::atomic<Int64> amount {0};
     std::atomic<Int64> peak {0};
+    std::atomic<Int64> soft_limit {0};
     std::atomic<Int64> hard_limit {0};
     std::atomic<Int64> profiler_limit {0};
 
@@ -72,6 +78,8 @@ private:
     /// Singly-linked list. All information will be passed to subsequent memory trackers also (it allows to implement trackers hierarchy).
     /// In terms of tree nodes it is the list of parents. Lifetime of these trackers should "include" lifetime of current tracker.
     std::atomic<MemoryTracker *> parent {};
+
+    Poco::Logger * log;
 
     /// You could specify custom metric to track memory usage.
     std::atomic<CurrentMetrics::Metric> metric = CurrentMetrics::end();
@@ -116,12 +124,35 @@ public:
         return amount.load(std::memory_order_relaxed);
     }
 
+    // Merges and mutations may pass memory ownership to other threads thus in the end of execution
+    // MemoryTracker for background task may have a non-zero counter.
+    // This method is intended to fix the counter inside of background_memory_tracker.
+    // NOTE: We can't use alloc/free methods to do it, because they also will change the value inside
+    // of total_memory_tracker.
+    void adjustOnBackgroundTaskEnd(const MemoryTracker * child)
+    {
+        auto background_memory_consumption = child->amount.load(std::memory_order_relaxed);
+        amount.fetch_sub(background_memory_consumption, std::memory_order_relaxed);
+
+        // Also fix CurrentMetrics::MergesMutationsMemoryTracking
+        auto metric_loaded = metric.load(std::memory_order_relaxed);
+        if (metric_loaded != CurrentMetrics::end())
+            CurrentMetrics::sub(metric_loaded, background_memory_consumption);
+    }
+
     Int64 getPeak() const
     {
         return peak.load(std::memory_order_relaxed);
     }
 
     void setHardLimit(Int64 value);
+
+    Int64 getSoftLimit() const
+    {
+        return soft_limit.load(std::memory_order_relaxed);
+    }
+
+    void setSoftLimit(Int64 value);
 
     Int64 getHardLimit() const
     {
@@ -244,3 +275,7 @@ public:
 };
 
 extern MemoryTracker total_memory_tracker;
+extern MemoryTracker background_memory_tracker;
+
+bool canEnqueueBackgroundTask();
+

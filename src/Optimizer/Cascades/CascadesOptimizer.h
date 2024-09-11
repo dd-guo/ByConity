@@ -20,10 +20,13 @@
 #include <Optimizer/Property/Property.h>
 #include <Optimizer/Rewriter/Rewriter.h>
 #include <Optimizer/Rule/Rule.h>
-#include <QueryPlan/PlanNode.h>
+#include <QueryPlan/CTEInfo.h>
 #include <QueryPlan/CTEVisitHelper.h>
+#include <QueryPlan/PlanNode.h>
+#include <QueryPlan/PlanNodeIdAllocator.h>
 
 #include <stack>
+#include <unordered_set>
 
 namespace DB
 {
@@ -40,17 +43,21 @@ using OptContextPtr = std::shared_ptr<OptimizationContext>;
 class CascadesOptimizer : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    explicit CascadesOptimizer(bool enable_cbo_ = true): enable_cbo(enable_cbo_) {}
 
     String name() const override { return "CascadesOptimizer"; }
-    static Property optimize(GroupId root, CascadesContext & context, const Property & required_prop);
+    static WinnerPtr optimize(GroupId root, CascadesContext & context, const Property & required_prop);
     static PlanNodePtr buildPlanNode(GroupId root, CascadesContext & context, const Property & required_prop);
+private:
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_cascades_optimizer; }
+    bool enable_cbo;
 };
 
 class CascadesContext
 {
 public:
-    explicit CascadesContext(ContextMutablePtr context_, CTEInfo & cte_info, size_t worker_size_, size_t max_join_size_);
+    explicit CascadesContext(ContextMutablePtr context_, CTEInfo & cte_info, size_t worker_size_, size_t max_join_size_, bool enable_cbo_);
 
     GroupExprPtr initMemo(const PlanNodePtr & plan_node);
 
@@ -61,7 +68,7 @@ public:
         GroupId target_group = UNDEFINED_GROUP);
     GroupExprPtr makeGroupExpression(const PlanNodePtr & plan_node, RuleType produce_rule = RuleType::UNDEFINED);
 
-    ContextMutablePtr getContext() const { return context; }
+    ContextMutablePtr & getContext() { return context; }
     TaskStack & getTaskStack() { return task_stack; }
     Memo & getMemo() { return memo; }
     size_t getWorkerSize() const { return worker_size; }
@@ -73,27 +80,18 @@ public:
     const std::vector<RulePtr> & getTransformationRules() const { return transformation_rules; }
     const std::vector<RulePtr> & getImplementationRules() const { return implementation_rules; }
 
-    String getInfo() const
-    {
-        std::stringstream ss;
+    void trace(const String & task_name, GroupId group_id, RuleType rule_type, UInt64 elapsed_ns);
 
-        ss << "Group: " << memo.getGroups().size() << '\n';
-
-        size_t total_logical_expr = 0;
-        size_t total_physical_expr = 0;
-        for (auto & group : memo.getGroups())
-        {
-            total_logical_expr += group->getLogicalExpressions().size();
-            total_physical_expr += group->getPhysicalExpressions().size();
-        }
-        ss << "Logical Expr: " << total_logical_expr << '\n';
-        ss << "Physical Expr: " << total_physical_expr << '\n';
-
-
-        return ss.str();
-    }
+    String getInfo() const;
 
     UInt64 getTaskExecutionTimeout() const { return task_execution_timeout; }
+
+    bool isEnablePruning() const { return enable_pruning; }
+    bool isEnableAutoCTE() const { return enable_auto_cte; }
+    bool isEnableTrace() const { return enable_trace; }
+    bool isEnableCbo() const { return enable_cbo; }
+
+    size_t getMaxJoinSize() const { return max_join_size; }
 
 private:
     ContextMutablePtr context;
@@ -104,24 +102,45 @@ private:
     std::vector<RulePtr> transformation_rules;
     std::vector<RulePtr> implementation_rules;
     size_t worker_size = 1;
-    size_t max_join_size;
     bool support_filter;
     UInt64 task_execution_timeout;
+    bool enable_pruning;
+    bool enable_auto_cte;
+    bool enable_trace;
+    bool enable_cbo;
+    size_t max_join_size;
+
+    struct Metric
+    {
+        UInt64 elapsed_ns;
+        UInt64 counts;
+    };
+    std::unordered_map<RuleType, std::unordered_map<String, Metric>> rule_trace;
+    
     Poco::Logger * log;
 };
 
 class OptimizationContext
 {
 public:
-    OptimizationContext(
-        CascadesContext & context_, const Property & required_prop_, double cost_upper_bound_ = std::numeric_limits<double>::max())
+    OptimizationContext(CascadesContext & context_, const Property & required_prop_, double cost_upper_bound_)
         : context(context_), required_prop(required_prop_), cost_upper_bound(cost_upper_bound_)
     {
+        if (!context.isEnablePruning())
+        {
+            cost_upper_bound = std::numeric_limits<double>::max();
+        }
     }
 
     const Property & getRequiredProp() const { return required_prop; }
     double getCostUpperBound() const { return cost_upper_bound; }
-    void setCostUpperBound(double cost_upper_bound_) { cost_upper_bound = cost_upper_bound_; }
+    void setCostUpperBound(double cost_upper_bound_)
+    {
+        if (context.isEnablePruning())
+        {
+            cost_upper_bound = cost_upper_bound_;
+        }
+    }
     void pushTask(const OptimizerTaskPtr & task) const { context.getTaskStack().push(task); }
 
     const std::vector<RulePtr> & getTransformationRules() const { return context.getTransformationRules(); }
@@ -145,13 +164,13 @@ private:
     double cost_upper_bound;
 };
 
-class WorkerSizeFinder : public PlanNodeVisitor<std::optional<size_t>, Void>
+class WorkerSizeFinder : public PlanNodeVisitor<std::optional<size_t>, const Context>
 {
 public:
     static size_t find(QueryPlan & query_plan, const Context & context);
-    std::optional<size_t> visitPlanNode(PlanNodeBase & node, Void & context) override;
-    std::optional<size_t> visitTableScanNode(TableScanNode & node, Void & context) override;
-    std::optional<size_t> visitCTERefNode(CTERefNode & node, Void & context) override;
+    std::optional<size_t> visitPlanNode(PlanNodeBase & node, const Context & context) override;
+    std::optional<size_t> visitTableScanNode(TableScanNode & node, const Context & context) override;
+    std::optional<size_t> visitCTERefNode(CTERefNode & node, const Context & context) override;
 
 private:
     explicit WorkerSizeFinder(CTEInfo & cte_info_) : cte_info(cte_info_) { }

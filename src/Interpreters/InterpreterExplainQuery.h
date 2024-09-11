@@ -24,6 +24,10 @@
 #include <Interpreters/IInterpreter.h>
 #include <Parsers/IAST_fwd.h>
 #include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTExplainQuery.h>
+#include <Interpreters/SelectQueryOptions.h>
+#include <Interpreters/ProcessorsProfileLog.h>
+#include <Interpreters/profile/ProfileLogHub.h>
 
 namespace DB
 {
@@ -39,9 +43,12 @@ public:
 
     Block getSampleBlock();
 
+    static void fillColumn(IColumn & column, const std::string & str);
+
 private:
     ASTPtr query;
     Poco::Logger * log;
+    SelectQueryOptions options;
 
     BlockInputStreamPtr executeImpl();
 
@@ -63,8 +70,30 @@ private:
 
     std::optional<String> getActivePartCondition(StoragePtr & storage);
 
-    void explainUsingOptimizer(const ASTPtr & ast, WriteBuffer & buffer, bool & single_line);
+    BlockInputStreamPtr explain();
+
+    BlockInputStreamPtr explainUsingOptimizer();
+
+    BlockInputStreamPtr explainMetaData();
+
+    void explainPlanWithOptimizer(const ASTExplainQuery & explain_ast, QueryPlan & plan, WriteBuffer & buffer, ContextMutablePtr & context_ptr, bool & single_line);
+
+    void explainDistributedWithOptimizer(const ASTExplainQuery & explain_ast, QueryPlan & plan, WriteBuffer & buffer, ContextMutablePtr & context_ptr);
+
+    BlockIO explainAnalyze();
+
+    void explainPipelineWithOptimizer(const ASTExplainQuery & explain_ast, QueryPlan & plan, WriteBuffer & buffer, ContextMutablePtr & context_ptr);
 };
 
+
+class ExplainConsumer: public ProfileElementConsumer<ProcessorProfileLogElement>
+{
+public:
+    explicit ExplainConsumer(std::string query_id): ProfileElementConsumer(query_id) {}
+    void consume(ProcessorProfileLogElement & element) override;
+
+    std::vector<ProcessorProfileLogElement> getStoreResult() const {return store_vector;}
+    std::vector<ProcessorProfileLogElement> store_vector;
+};
 
 }

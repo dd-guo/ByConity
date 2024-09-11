@@ -55,7 +55,7 @@ static std::optional<PlanNodePtr> tryPushJoinThroughLeftProjection(
     }
 
     // construct join
-    SymbolMapper symbol_mapper = SymbolMapper::symbolMapper(projection_mapping);
+    SymbolMapper symbol_mapper = SymbolMapper::simpleMapper(projection_mapping);
     auto mapped_join = symbol_mapper.map(*join_step);
 
     // construct post projection(assignments including symbols which are not join outputs will be pruned)
@@ -82,7 +82,7 @@ static std::optional<PlanNodePtr> tryPushJoinThroughLeftProjection(
         }
     }
     auto new_project_step
-        = std::make_shared<ProjectionStep>(join_step->getOutputStream(), assignments, name_to_type, project_step->isFinalProject());
+        = std::make_shared<ProjectionStep>(mapped_join->getOutputStream(), assignments, name_to_type, project_step->isFinalProject(), project_step->isIndexProject());
 
     return PlanNodeBase::createPlanNode(
         context.nextNodeId(), new_project_step, {PlanNodeBase::createPlanNode(context.nextNodeId(), mapped_join, {children, join_right_node})});
@@ -119,7 +119,7 @@ static std::optional<PlanNodePtr> tryPushJoinThroughRightProjection(
     }
 
     // construct join
-    SymbolMapper symbol_mapper = SymbolMapper::symbolMapper(projection_mapping);
+    SymbolMapper symbol_mapper = SymbolMapper::simpleMapper(projection_mapping);
     auto mapped_join = symbol_mapper.map(*join_step);
 
     // construct post projection(assignments including symbols which are not join outputs will be pruned)
@@ -146,7 +146,7 @@ static std::optional<PlanNodePtr> tryPushJoinThroughRightProjection(
         }
     }
     auto new_project_step
-        = std::make_shared<ProjectionStep>(join_step->getOutputStream(), assignments, name_to_type, project_step->isFinalProject());
+        = std::make_shared<ProjectionStep>(join_step->getOutputStream(), assignments, name_to_type, project_step->isFinalProject(), project_step->isIndexProject());
 
     return PlanNodeBase::createPlanNode(
         context.nextNodeId(), new_project_step, {PlanNodeBase::createPlanNode(context.nextNodeId(), mapped_join, {join_left_node, children})});
@@ -158,13 +158,14 @@ static bool isProjectionWithJoin(const PlanNodePtr & node)
         && node->getChildren()[0]->getStep()->getType() == IQueryPlanStep::Type::Join;
 }
 
-PatternPtr PullProjectionOnJoinThroughJoin::getPattern() const
+ConstRefPatternPtr PullProjectionOnJoinThroughJoin::getPattern() const
 {
-    return Patterns::join()->withAny(
+    static auto pattern = Patterns::join().withAny(
         Patterns::project()
             // identity projection will be inlined into join
-            ->matchingStep<ProjectionStep>([](const auto & step) { return !Utils::isIdentity(step.getAssignments()); })
-            ->withSingle(Patterns::join()));
+            .matchingStep<ProjectionStep>([](const auto & step) { return !Utils::isIdentity(step.getAssignments()); })
+            .withSingle(Patterns::join())).result();
+    return pattern;
 }
 
 TransformResult PullProjectionOnJoinThroughJoin::transformImpl(PlanNodePtr node, const Captures &, RuleContext & context)

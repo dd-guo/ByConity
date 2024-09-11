@@ -87,7 +87,7 @@ public:
 
     /// Query is resent to a replica, the query itself can be modified.
     std::atomic<bool> resent_query { false };
-
+    
     /// Read next block of data. Returns empty block if query is finished.
     Block read();
 
@@ -127,6 +127,8 @@ public:
     const Block & getHeader() const { return header; }
 
     const ExtendedProfileInfo & getExtendedProfileInfo() const { return extended_info; }
+
+    void setServerForwarding(bool server_forwarding = false) { is_server_forwarding = server_forwarding; }
 
 private:
     Block header;
@@ -201,6 +203,8 @@ private:
     /// This extended profile info is only for INSERT INFILE / INSERT SELECT, and metrics are sent from workers
     ExtendedProfileInfo extended_info;
 
+    bool is_server_forwarding {false};
+
     Poco::Logger * log = nullptr;
 
     /// Send all scalars to remote servers
@@ -233,8 +237,6 @@ private:
 
     /// Reads packet by packet
     Block readPackets();
-
-    void parseQueryWorkerMetrics(const QueryWorkerMetricElements & elements);
 
 };
 

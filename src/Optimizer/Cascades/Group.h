@@ -18,11 +18,13 @@
 #include <Core/Types.h>
 #include <Optimizer/CardinalityEstimate/PlanNodeStatistics.h>
 #include <Optimizer/Cascades/GroupExpression.h>
+#include <Optimizer/Property/Constants.h>
 #include <Optimizer/Property/Property.h>
+#include <Optimizer/Property/SymbolEquivalencesDeriver.h>
 #include <Optimizer/Rule/Transformation/JoinEnumOnGraph.h>
-#include <Optimizer/SymbolEquivalencesDeriver.h>
-
+#include <Optimizer/DataDependency/DataDependency.h>
 #include <memory>
+#include <string>
 
 namespace DB
 {
@@ -47,13 +49,17 @@ public:
     GroupId getId() const { return id; }
     bool isSimpleChildren() const { return simple_children; }
     bool isTableScan() const { return is_table_scan; }
-    bool isMagic() const { return is_magic; }
-    UInt32 getMaxTableScans() const { return max_table_scans; }
-
-    void setMagic(bool is_magic_) { is_magic = is_magic_; }
+    bool isJoinRoot() const { return is_join_root; }
+    UInt64 getMaxTableScans() const { return max_table_scans; }
+    UInt64 getMaxTableScanRows() const { return max_table_scan_rows; }
 
     void addExpression(const GroupExprPtr & expression, CascadesContext & context);
-    double getCostLowerBound() const { return cost_lower_bound; }
+    void makeRootJoinInfo(CascadesContext & context);
+    void makeRootJoinInfo(GroupExpression & expression, CascadesContext & context);
+
+    double getCostLowerBound(const Property & property) const;
+    void setCostLowerBound(const Property & property, double lower_bound);
+    bool hasOptimized(const Property & property) const;
 
     void deleteExpression(const GroupExprPtr & expression);
     void deleteAllExpression();
@@ -67,11 +73,12 @@ public:
      */
     WinnerPtr getBestExpression(const Property & property_set) const
     {
-        if (lowest_cost_expressions.contains(property_set))
+        if (auto it = lowest_cost_expressions.find(property_set); it != lowest_cost_expressions.end())
         {
-            return lowest_cost_expressions.at(property_set);
+            return it->second;
         }
-        throw Exception("Cascades can not build plan", ErrorCodes::PLAN_BUILD_ERROR);
+        throw Exception(
+            "Cascades can not build plan, Group " + std::to_string(id) + " " + property_set.toString(), ErrorCodes::PLAN_BUILD_ERROR);
     }
 
     bool hasWinner(const Property & property_set) const { return lowest_cost_expressions.contains(property_set); }
@@ -89,7 +96,21 @@ public:
 
     const std::vector<GroupExprPtr> & getLogicalExpressions() const { return logical_expressions; }
     const std::vector<GroupExprPtr> & getPhysicalExpressions() const { return physical_expressions; }
-    ConstQueryPlanStepPtr & getStep() const { return logical_expressions[0]->getStep(); }
+    const std::vector<GroupExprPtr> & getLogicalOtherwisePhysicalExpressions() const
+    {
+        if (!logical_expressions.empty())
+            return logical_expressions;
+        if (!physical_expressions.empty())
+            return physical_expressions;
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "cascades group must has at least one logical/physical expression!");
+    }
+
+    QueryPlanStepPtr & getStep() const
+    {
+        if (logical_expressions.empty())
+            return physical_expressions[0]->getStep();
+        return logical_expressions[0]->getStep();
+    }
     PlanNodePtr createLeafNode(ContextMutablePtr context) const;
 
     /**
@@ -114,9 +135,20 @@ public:
 
     const std::unordered_map<Property, WinnerPtr, PropertyHash> & getLowestCostExpressions() const { return lowest_cost_expressions; }
 
+    const std::optional<Constants> & getConstants() const
+    {
+        return constants;
+    }
+
+    const std::optional<DataDependency> & getDataDependency() const
+    {
+        return data_dependency;
+    }
+
     const SymbolEquivalencesPtr & getEquivalences() const { return equivalences; }
 
     const std::unordered_set<CTEId> & getCTESet() const { return cte_set; }
+    UInt32 getJoinRootId() const { return join_root_id; }
 private:
     GroupId id = UNDEFINED_GROUP;
 
@@ -124,7 +156,7 @@ private:
      * Mapping from property requirements to winner
      */
     std::unordered_map<Property, WinnerPtr, PropertyHash> lowest_cost_expressions;
-
+    
     /**
      * Vector of equivalent logical expressions
      */
@@ -138,7 +170,7 @@ private:
     /**
      * Cost Lower Bound
      */
-    double cost_lower_bound = -1;
+    std::unordered_map<Property, double, PropertyHash> cost_lower_bounds;
 
     /**
      * Whether equivalent logical expressions have been explored for this group
@@ -153,13 +185,17 @@ private:
 
     std::unordered_set<CTEId> cte_set;
 
-    UInt32 max_table_scans = 0;
+    UInt64 max_table_scans = 0;
+    UInt64 max_table_scan_rows = 0;
 
     SymbolEquivalencesPtr equivalences;
+    std::optional<Constants> constants;
+    std::optional<DataDependency> data_dependency;
 
     bool simple_children = true;
     bool is_table_scan = false;
-    bool is_magic = false;
+    bool is_join_root = false;
+    UInt32 join_root_id = 0;
 };
 
 }

@@ -48,14 +48,19 @@ void registerStorageView(StorageFactory & factory);
 void registerStorageMaterializedView(StorageFactory & factory);
 void registerStorageLiveView(StorageFactory & factory);
 void registerStorageGenerateRandom(StorageFactory & factory);
+void registerStorageDictCloud(StorageFactory & factory);
 
 #if USE_AWS_S3
 void registerStorageS3(StorageFactory & factory);
 void registerStorageCOS(StorageFactory & factory);
+void registerStorageCnchS3(StorageFactory & factory);
+void registerStorageCloudS3(StorageFactory & factory);
 #endif
 
 #if USE_HDFS
 void registerStorageHDFS(StorageFactory & factory);
+void registerStorageCnchHDFS(StorageFactory & factory);
+void registerStorageCloudHDFS(StorageFactory & factory);
 #endif
 
 void registerStorageODBC(StorageFactory & factory);
@@ -92,6 +97,11 @@ void registerStorageExternalDistributed(StorageFactory & factory);
 void registerStorageCnchHive(StorageFactory & factory);
 void registerStorageCloudHive(StorageFactory & factory);
 
+#if USE_JAVA_EXTENSIONS
+void registerStorageHudi(StorageFactory & factory);
+void registerStorageLas(StorageFactory & factory);
+#endif
+
 void registerStorages()
 {
     auto & factory = StorageFactory::instance();
@@ -114,14 +124,19 @@ void registerStorages()
     registerStorageMaterializedView(factory);
     registerStorageLiveView(factory);
     registerStorageGenerateRandom(factory);
+    registerStorageDictCloud(factory);
 
     #if USE_AWS_S3
     registerStorageS3(factory);
     registerStorageCOS(factory);
+    registerStorageCnchS3(factory);
+    registerStorageCloudS3(factory);
     #endif
 
     #if USE_HDFS
     registerStorageHDFS(factory);
+    registerStorageCnchHDFS(factory);
+    registerStorageCloudHDFS(factory);
     #endif
 
     registerStorageODBC(factory);
@@ -156,6 +171,11 @@ void registerStorages()
 
     #if USE_MYSQL || USE_LIBPQXX
     registerStorageExternalDistributed(factory);
+    #endif
+
+    #if USE_JAVA_EXTENSIONS
+    registerStorageHudi(factory);
+    registerStorageLas(factory);
     #endif
 }
 

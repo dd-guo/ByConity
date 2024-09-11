@@ -15,6 +15,7 @@
 
 #pragma once
 #include <QueryPlan/ITransformingStep.h>
+#include <Interpreters/ArrayJoinAction.h>
 
 namespace DB
 {
@@ -39,10 +40,15 @@ public:
 
     const ArrayJoinActionPtr & arrayJoin() const { return array_join; }
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
+    void toProto(Protos::ArrayJoinStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<ArrayJoinStep> fromProto(const Protos::ArrayJoinStep & proto, ContextPtr context);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
+    ArrayJoinActionPtr getArrayJoinAction() const { return array_join; }
     void setInputStreams(const DataStreams & input_streams_) override;
+
+    NameSet & getResultNameSet() const { return array_join->columns; }
+
+    bool isLeft() const { return array_join->is_left; }
 
 private:
     ArrayJoinActionPtr array_join;

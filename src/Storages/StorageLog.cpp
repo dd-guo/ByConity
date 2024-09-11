@@ -44,6 +44,7 @@
 
 #include <Interpreters/Context.h>
 #include <Parsers/ASTLiteral.h>
+#include "IO/ReadSettings.h"
 #include "StorageLogSettings.h"
 #include <Processors/Sources/SourceWithProgress.h>
 #include <Processors/Pipe.h>
@@ -113,7 +114,7 @@ private:
     struct Stream
     {
         Stream(const DiskPtr & disk, const String & data_path, size_t offset, size_t max_read_buffer_size_)
-            : plain(disk->readFile(data_path, {.buffer_size = std::min(max_read_buffer_size_, disk->getFileSize(data_path))}))
+            : plain(disk->readFile(data_path, ReadSettings().initializeReadSettings(std::min(max_read_buffer_size_, disk->getFileSize(data_path)))))
             , compressed(*plain)
         {
             if (offset)
@@ -429,7 +430,7 @@ void LogBlockOutputStream::writeData(const NameAndTypePair & name_and_type, cons
     settings.getter = createStreamGetter(name_and_type, written_streams);
 
     if (serialize_states.count(name) == 0)
-         serialization->serializeBinaryBulkStatePrefix(settings, serialize_states[name]);
+         serialization->serializeBinaryBulkStatePrefix(column, settings, serialize_states[name]);
 
     serialization->enumerateStreams([&] (const ISerialization::SubstreamPath & path)
     {
@@ -580,7 +581,7 @@ void StorageLog::loadMarks(std::chrono::seconds lock_timeout)
         for (auto & file : files_by_index)
             file->second.marks.reserve(marks_count);
 
-        std::unique_ptr<ReadBuffer> marks_rb = disk->readFile(marks_file_path, {.buffer_size = 32768});
+        std::unique_ptr<ReadBuffer> marks_rb = disk->readFile(marks_file_path, ReadSettings().initializeReadSettings(32768));
         while (!marks_rb->eof())
         {
             for (auto & file : files_by_index)
@@ -668,19 +669,20 @@ static std::chrono::seconds getLockTimeout(ContextPtr context)
 
 Pipe StorageLog::read(
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & /*query_info*/,
     ContextPtr context,
     QueryProcessingStage::Enum /*processed_stage*/,
     size_t max_block_size,
     unsigned num_streams)
 {
-    metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
+    storage_snapshot->check(column_names);
 
     auto lock_timeout = getLockTimeout(context);
     loadMarks(lock_timeout);
 
-    auto all_columns = metadata_snapshot->getColumns().getByNames(ColumnsDescription::All, column_names, true);
+    auto options = GetColumnsOptions(GetColumnsOptions::All).withSubcolumns();
+    auto all_columns = storage_snapshot->getColumnsByNames(options, column_names);
     all_columns = Nested::convertToSubcolumns(all_columns);
 
     std::shared_lock lock(rwlock, lock_timeout);
@@ -689,7 +691,7 @@ Pipe StorageLog::read(
 
     Pipes pipes;
 
-    const Marks & marks = getMarksWithRealRowCount(metadata_snapshot);
+    const Marks & marks = getMarksWithRealRowCount(storage_snapshot->metadata);
     size_t marks_size = marks.size();
 
     if (num_streams > marks_size)

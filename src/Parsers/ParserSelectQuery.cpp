@@ -31,6 +31,9 @@
 #include <Parsers/ParserSelectQuery.h>
 #include <Parsers/ParserTablesInSelectQuery.h>
 #include <Parsers/ParserWithElement.h>
+#include <Parsers/ParserHints.h>
+#include <Poco/Logger.h>
+#include <Parsers/formatAST.h>
 
 
 namespace DB
@@ -87,6 +90,7 @@ bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserExpressionWithOptionalAlias exp_elem(false, dt);
     ParserOrderByExpressionList order_list(dt);
     ParserGroupingSetsExpressionList grouping_sets_list(dt);
+    ParserHints query_hints;
 
     ParserToken open_bracket(TokenType::OpeningRoundBracket);
     ParserToken close_bracket(TokenType::ClosingRoundBracket);
@@ -126,6 +130,8 @@ bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         bool has_all = false;
         if (!s_select.ignore(pos, expected))
             return false;
+
+        query_hints.parse(pos, select_query->hints, expected);
 
         if (s_all.ignore(pos, expected))
             has_all = true;
@@ -179,8 +185,9 @@ bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     }
 
     /// FROM database.table or FROM table or FROM (subquery) or FROM tableFunction(...)
-    if (s_from.ignore(pos, expected))
-    {
+    /// MySQL compatibility for DUAL table -- ignore here
+    if (s_from.ignore(pos, expected) && !ParserKeyword("DUAL").ignore(pos, expected))
+    {    
         if (!ParserTablesInSelectQuery(dt).parse(pos, tables, expected))
             return false;
     }
@@ -208,6 +215,8 @@ bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             select_query->group_by_with_cube = true;
         else if (s_grouping_sets.ignore(pos, expected))
             select_query->group_by_with_grouping_sets = true;
+        else if (s_all.ignore(pos, expected))
+            select_query->group_by_all = true;
 
         if ((select_query->group_by_with_rollup || select_query->group_by_with_cube || select_query->group_by_with_grouping_sets) &&
             !open_bracket.ignore(pos, expected))
@@ -218,7 +227,7 @@ bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             if (!grouping_sets_list.parse(pos, group_expression_list, expected))
                 return false;
         }
-        else
+        else if (!select_query->group_by_all)
         {
             if (!exp_list.parse(pos, group_expression_list, expected))
                 return false;

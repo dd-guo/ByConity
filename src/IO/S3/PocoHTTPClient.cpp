@@ -1,3 +1,4 @@
+#include <Poco/Net/HTTPClientSession.h>
 #include <Common/config.h>
 
 #if USE_AWS_S3
@@ -17,6 +18,7 @@
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <common/logger_useful.h>
+#include <common/scope_guard.h>
 #include <re2/re2.h>
 
 #include <boost/algorithm/string.hpp>
@@ -35,6 +37,10 @@ namespace ProfileEvents
     extern const Event S3WriteRequestsErrors;
     extern const Event S3WriteRequestsThrottling;
     extern const Event S3WriteRequestsRedirects;
+
+    extern const Event PocoHTTPS3GetCount;
+    extern const Event PocoHTTPS3GetTime;
+    extern const Event PocoHTTPS3GetSessionTime;
 }
 
 namespace DB::ErrorCodes
@@ -49,10 +55,16 @@ namespace DB::S3
 PocoHTTPClientConfiguration::PocoHTTPClientConfiguration(
         const String & force_region_,
         const RemoteHostFilter & remote_host_filter_,
-        unsigned int s3_max_redirects_)
+        unsigned int s3_max_redirects_,
+        uint32_t http_keep_alive_timeout_ms_,
+        size_t http_connection_pool_size_,
+        bool wait_on_pool_size_limit_)
     : force_region(force_region_)
     , remote_host_filter(remote_host_filter_)
     , s3_max_redirects(s3_max_redirects_)
+    , http_keep_alive_timeout_ms(http_keep_alive_timeout_ms_)
+    , http_connection_pool_size(http_connection_pool_size_)
+    , wait_on_pool_size_limit(wait_on_pool_size_limit_)
 {
 }
 
@@ -88,14 +100,20 @@ void PocoHTTPClientConfiguration::updateSchemeAndRegion()
 
 
 PocoHTTPClient::PocoHTTPClient(const PocoHTTPClientConfiguration & clientConfiguration)
-    : per_request_configuration(clientConfiguration.perRequestConfiguration)
-    , timeouts(ConnectionTimeouts(
+    : per_request_configuration(clientConfiguration.per_request_configuration)
+      ,timeouts(ConnectionTimeouts(
           Poco::Timespan(clientConfiguration.connectTimeoutMs * 1000), /// connection timeout.
           Poco::Timespan(clientConfiguration.requestTimeoutMs * 1000), /// send timeout.
-          Poco::Timespan(clientConfiguration.requestTimeoutMs * 1000) /// receive timeout.
+          Poco::Timespan(clientConfiguration.requestTimeoutMs * 1000), /// receive timeout.
+          Poco::Timespan(clientConfiguration.enableTcpKeepAlive ? clientConfiguration.tcpKeepAliveIntervalMs * 1000 : 0),
+          Poco::Timespan(clientConfiguration.http_keep_alive_timeout_ms * 1000)
           ))
     , remote_host_filter(clientConfiguration.remote_host_filter)
     , s3_max_redirects(clientConfiguration.s3_max_redirects)
+    , extra_headers(clientConfiguration.extra_headers)
+    , http_connection_pool_size(clientConfiguration.http_connection_pool_size)
+    , wait_on_pool_size_limit(clientConfiguration.wait_on_pool_size_limit)
+    , slow_read_ms(clientConfiguration.slow_read_ms)
 {
 }
 
@@ -165,23 +183,46 @@ void PocoHTTPClient::makeRequestInternal(
         for (unsigned int attempt = 0; attempt <= s3_max_redirects; ++attempt)
         {
             Poco::URI target_uri(uri);
+            WriteBufferFromOwnString headers_ss;
 
-            /// Reverse proxy can replace host header with resolved ip address instead of host name.
-            /// This can lead to request signature difference on S3 side.
-            auto session = makeHTTPSession(target_uri, timeouts, false);
+            bool is_get_req = request.GetMethod() == Aws::Http::HttpMethod::HTTP_GET;
+            Stopwatch total_watch;
+            SCOPE_EXIT({
+                if (is_get_req) {
+                    auto time = total_watch.elapsedMicroseconds();
+                    ProfileEvents::increment(ProfileEvents::PocoHTTPS3GetCount);
+                    ProfileEvents::increment(ProfileEvents::PocoHTTPS3GetTime, total_watch.elapsedMicroseconds());
+                    if (slow_read_ms > 0 && time >= slow_read_ms * 1000)
+                        LOG_DEBUG(log, fmt::format("AWS S3 slow read({}ms): {}, time = {}ms, header = {}", slow_read_ms, uri, time/1000, headers_ss.str()));
+                }
+            });
+
+            HTTPSessionPtr volatile_session = nullptr;
+            PooledHTTPSessionPtr pooled_session;
+            Poco::Net::HTTPClientSession* session = nullptr;
 
             auto request_configuration = per_request_configuration(request);
 
-            if (!request_configuration.proxyHost.empty())
+            if (http_connection_pool_size == 0 || !request_configuration.proxy_host.empty())
             {
-                bool use_tunnel = request_configuration.proxyScheme == Aws::Http::Scheme::HTTP && target_uri.getScheme() == "https";
+                /// Reverse proxy can replace host header with resolved ip address instead of host name.
+                /// This can lead to request signature difference on S3 side.
+                volatile_session = makeHTTPSession(target_uri, timeouts, false);
+                session = volatile_session.get();
 
-                session->setProxy(
-                    request_configuration.proxyHost,
-                    request_configuration.proxyPort,
-                    Aws::Http::SchemeMapper::ToString(request_configuration.proxyScheme),
+                bool use_tunnel = request_configuration.proxy_scheme == Aws::Http::Scheme::HTTP && target_uri.getScheme() == "https";
+
+                volatile_session->setProxy(
+                    request_configuration.proxy_host,
+                    request_configuration.proxy_port,
+                    Aws::Http::SchemeMapper::ToString(request_configuration.proxy_scheme),
                     use_tunnel
                 );
+            }
+            else
+            {
+                pooled_session = makePooledHTTPSession(target_uri, timeouts, http_connection_pool_size, wait_on_pool_size_limit, false);
+                session = &(*pooled_session);
             }
 
             Poco::Net::HTTPRequest poco_request(Poco::Net::HTTPRequest::HTTP_1_1);
@@ -237,6 +278,8 @@ void PocoHTTPClient::makeRequestInternal(
 
             for (const auto & [header_name, header_value] : request.GetHeaders())
                 poco_request.set(header_name, header_value);
+            for (const auto & [header_name, header_value] : extra_headers)
+                poco_request.set(boost::algorithm::to_lower_copy(header_name), header_value);
 
             Poco::Net::HTTPResponse poco_response;
 
@@ -248,11 +291,10 @@ void PocoHTTPClient::makeRequestInternal(
             {
                 LOG_TRACE(log, "Writing request body.");
 
-                if (attempt > 0) /// rewind content body buffer.
-                {
-                    request.GetContentBody()->clear();
-                    request.GetContentBody()->seekg(0);
-                }
+                /// rewind content body buffer.
+                request.GetContentBody()->clear();
+                request.GetContentBody()->seekg(0);
+
                 auto size = Poco::StreamCopier::copyStream(*request.GetContentBody(), request_body_stream);
                 LOG_DEBUG(log, "Written {} bytes to request body", size);
             }
@@ -281,7 +323,6 @@ void PocoHTTPClient::makeRequestInternal(
             response->SetResponseCode(static_cast<Aws::Http::HttpResponseCode>(status_code));
             response->SetContentType(poco_response.getContentType());
 
-            WriteBufferFromOwnString headers_ss;
             for (const auto & [header_name, header_value] : poco_response)
             {
                 response->AddHeader(header_name, header_value);
@@ -298,7 +339,14 @@ void PocoHTTPClient::makeRequestInternal(
                 ProfileEvents::increment(select_metric(S3MetricType::Errors));
             }
 
-            response->SetResponseBody(response_body_stream, session);
+            if (volatile_session != nullptr)
+            {
+                response->SetResponseBody(response_body_stream, volatile_session);
+            }
+            else
+            {
+                response->SetResponseBody(response_body_stream, pooled_session);
+            }
 
             return;
         }

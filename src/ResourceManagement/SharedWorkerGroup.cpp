@@ -44,7 +44,7 @@ std::map<String, WorkerNodePtr> SharedWorkerGroup::getWorkers() const
     return getWorkersImpl(lock);
 }
 
-std::map<String, WorkerNodePtr> SharedWorkerGroup::getWorkersImpl(std::lock_guard<std::mutex> & /*lock*/) const
+std::map<String, WorkerNodePtr> SharedWorkerGroup::getWorkersImpl(std::lock_guard<bthread::RecursiveMutex> & /*lock*/) const
 {
     std::map<String, WorkerNodePtr> res;
     if (auto linked_grp_shared_ptr = tryGetLinkedGroup())
@@ -55,39 +55,36 @@ std::map<String, WorkerNodePtr> SharedWorkerGroup::getWorkersImpl(std::lock_guar
 WorkerGroupData SharedWorkerGroup::getData(bool with_metrics, bool only_running_state) const
 {
     WorkerGroupData data;
-    data.id = getID();
-    data.type = WorkerGroupType::Shared;
-    data.vw_uuid = getVWUUID();
-    data.vw_name = getVWName();
 
     {
         std::lock_guard lock(state_mutex);
 
         if (auto linked_group_ptr = tryGetLinkedGroup())
-            data.linked_id = linked_group_ptr->getID();
-        for (const auto & [_, worker] : getWorkersImpl(lock))
         {
-            if(!only_running_state || worker->state.load(std::memory_order_relaxed) == WorkerState::Running)
-                data.host_ports_vec.push_back(worker->host);
+            data = linked_group_ptr->getData(with_metrics, only_running_state);
+            data.linked_id = linked_group_ptr->getID();
+            data.linked_vw_name = linked_group_ptr->getVWName();
+
         }
     }
 
-    data.num_workers = data.host_ports_vec.size();
-
-    if (with_metrics)
-        data.metrics = getAggregatedMetrics();
-
+    data.id = getID();
+    data.type = type;
     data.is_auto_linked = isAutoLinked();
-    data.linked_vw_name = tryGetLinkedGroupVWName();
+    data.vw_uuid = getVWUUID();
+    /// Lock is acquired in `getVWName`.
+    data.vw_name = getVWName();
+    data.priority = priority; 
+
     return data;
 }
 
-WorkerGroupMetrics SharedWorkerGroup::getAggregatedMetrics() const
+WorkerGroupMetrics SharedWorkerGroup::getMetrics() const
 {
     std::lock_guard lock(state_mutex);
     WorkerGroupMetrics res;
     if (auto linked_grp_shared_ptr = tryGetLinkedGroup())
-        res = linked_grp_shared_ptr->getAggregatedMetrics();
+        res = linked_grp_shared_ptr->getMetrics();
     return res;
 }
 

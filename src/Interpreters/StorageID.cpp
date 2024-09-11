@@ -19,16 +19,17 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Interpreters/StorageID.h>
-#include <Interpreters/Context.h>
-#include <Parsers/ASTQueryWithTableAndOutput.h>
-#include <Parsers/ASTIdentifier.h>
-#include <Common/quoteString.h>
-#include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/DatabaseAndTableWithAlias.h>
-#include <Poco/Util/AbstractConfiguration.h>
+#include <Interpreters/StorageID.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTQueryWithTableAndOutput.h>
 #include <Storages/IStorage.h>
+#include <Poco/Util/AbstractConfiguration.h>
+#include <Common/quoteString.h>
+#include "Protos/RPCHelpers.h"
 
 namespace DB
 {
@@ -38,6 +39,13 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_DATABASE;
 }
+
+StorageID::StorageID(const QualifiedTableName & qualified_name)
+: StorageID(qualified_name.database, qualified_name.table) 
+{ 
+    assertNotEmpty();
+}
+
 
 StorageID::StorageID(const ASTQueryWithTableAndOutput & query)
 {
@@ -72,6 +80,7 @@ String StorageID::getTableName() const
     return table_name;
 }
 
+
 String StorageID::getDatabaseName() const
 {
     assertNotEmpty();
@@ -83,8 +92,18 @@ String StorageID::getDatabaseName() const
 String StorageID::getNameForLogs() const
 {
     assertNotEmpty();
-    return (database_name.empty() ? "" : backQuoteIfNeed(database_name) + ".") + backQuoteIfNeed(table_name)
-           + (hasUUID() ? " (" + toString(uuid) + ")" : "");
+    if (isDatabase())
+        return getDatabaseNameForLogs();
+    else
+        return (database_name.empty() ? "" : backQuoteIfNeed(database_name) + ".") + backQuoteIfNeed(table_name)
+            + (hasUUID() ? " (" + toString(uuid) + ")" : "");
+}
+
+String StorageID::getDatabaseNameForLogs() const
+{
+    if (database_name.empty())
+        throw Exception("Database name is empty", ErrorCodes::UNKNOWN_DATABASE);
+    return backQuoteIfNeed(database_name) + (hasUUID() ? " (UUID " + toString(uuid) + ")" : "");
 }
 
 bool StorageID::operator<(const StorageID & rhs) const
@@ -121,8 +140,7 @@ String StorageID::getFullNameNotQuoted() const
     return getDatabaseName() + "." + table_name;
 }
 
-StorageID StorageID::fromDictionaryConfig(const Poco::Util::AbstractConfiguration & config,
-                                          const String & config_prefix)
+StorageID StorageID::fromDictionaryConfig(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
 {
     StorageID res = StorageID::createEmpty();
     res.database_name = config.getString(config_prefix + ".database", "");
@@ -143,33 +161,42 @@ String StorageID::getInternalDictionaryName() const
     return database_name + "." + table_name;
 }
 
-void StorageID::serialize(WriteBuffer & buffer) const
+void StorageID::toProto(Protos::StorageID & proto) const
 {
-    writeBinary(database_name, buffer);
-    writeBinary(table_name, buffer);
-    writeBinary(uuid, buffer);
+    RPCHelpers::fillStorageID(*this, proto);
 }
 
-StorageID StorageID::deserialize(ReadBuffer & buffer, ContextPtr context)
+StorageID StorageID::tryFromProto(const Protos::StorageID & proto, ContextPtr context)
 {
-    String database_name;
-    readBinary(database_name, buffer);
-
-    String table_name;
-    readBinary(table_name, buffer);
-
-    UUID uuid;
-    readBinary(uuid, buffer);
-
-    if (table_name.empty() && uuid == UUIDHelpers::Nil)
-    {
-        return StorageID("_dummy", "_dummy", uuid);
+    try {
+        return fromProto(proto, context);
+    } catch (Exception &) {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+        return StorageID{};
     }
-    auto storage_id_recv = StorageID(database_name, table_name, uuid);
-    StoragePtr storage = DatabaseCatalog::instance().getTable({storage_id_recv.database_name, storage_id_recv.table_name}, context);
-    if (storage)
-        storage_id_recv = storage->getStorageID();
-    return storage_id_recv;
 }
 
+StorageID StorageID::fromProto(const Protos::StorageID & proto, ContextPtr context)
+{
+    auto storage_id = RPCHelpers::createStorageID(proto);
+
+    if (!storage_id)
+    {
+        return StorageID("_dummy", "_dummy", UUID{});
+    }
+
+    // patch
+    StoragePtr storage = DatabaseCatalog::instance().getTable(storage_id, context);
+    if (storage)
+    {
+        auto patched_storage_id = storage->getStorageID();
+
+        // set vw_name twice
+        if (proto.has_server_vw_name())
+            patched_storage_id.server_vw_name = proto.server_vw_name();
+        return patched_storage_id;
+    }
+
+    return storage_id;
+}
 }

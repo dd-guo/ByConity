@@ -167,10 +167,10 @@ INSTANTIATE_TEST_SUITE_P(TestExpressionInterpreter,
                                  // normal constant folding
                                  {"1 + 5 * 0.6 - 2", "2."},
                                  {"-1 + (1000000 - 1000000)", "cast(-1, 'Int64')"},
-                                 {"toDecimal32(3, 2) + toDecimal32(4.5, 4)", "'7.5000'"},
+                                 {"toDecimal32(3, 2) + toDecimal32(4.5, 4)", "'7.5'"},
                                  {"10 and (0 or not 1)", "0"},
                                  {"substring(concat('Hello, ', 'World!'), 3, 8)", "'llo, Wor'"},
-                                 {"lower(rpad('ABC', 7, '*')) = 'abc****'", "lower(rpad('ABC', 7, '*')) = 'abc****'"},
+                                 {"lower(rpad('ABC', 7, '*')) = 'abc****'", "1"},
                                  {"toTimeZone(toDateTime('2020-12-31 22:00:00', 'UTC'), 'Asia/Shanghai')", "cast(1609452000, 'DateTime(\\'Asia/Shanghai\\')')"},
                                  {"toYear(toDate('1994-01-01') + INTERVAL '1' YEAR)", "1995"},
                                  {"CAST(geohashDecode('ypzpgxczbzur').1, 'UInt32')", "cast(99, 'UInt32')"},
@@ -191,8 +191,8 @@ INSTANTIATE_TEST_SUITE_P(TestExpressionInterpreter,
                                  // lambda expression
                                  {"arrayMap(x -> (x + 2), [1, 2, 3])", "arrayMap(x -> (x + 2), [1, 2, 3])"},
                                  {"arrayMap(x -> (x + 2), unbound_int8_array)", "arrayMap(x -> (x + 2), unbound_int8_array)"},
-                                 {"arrayMap(x -> (x + 2), arrayConcat([1, 2], [3, 4]))", "arrayMap(x -> (x + 2), [1, 2, 3, 4])"},
-                                 {"length(arrayMap(x -> (x + 2), arrayConcat([1, 2], [3, 4]))) + (1 + 2)", "length(arrayMap(x -> (x + 2), [1, 2, 3, 4])) + cast(3, 'UInt16')"},
+                                 {"arrayMap(x -> (x + 2), arrayConcat([1, 2], [3, 4]))", "arrayMap(x -> (x + 2), arrayConcat([1, 2], [3, 4]))"},
+                                 {"length(arrayMap(x -> (x + 2), arrayConcat([1, 2], [3, 4]))) + (1 + 2)", "length(arrayMap(x -> (x + 2), arrayConcat([1, 2], [3, 4]))) + cast(3, 'UInt16')"},
 
                                  /* functions not evaluate */
                                  {"arrayJoin([1, 2, 3])", "arrayJoin([1, 2, 3])"},

@@ -42,9 +42,8 @@ public:
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
     {
-        return DataTypeTime(scale).createColumnConst(
-                input_rows_count,
-                time_value);
+        Decimal64 time(time_value);
+        return DataTypeTime(scale).createColumnConst(input_rows_count, time);
     }
 
 private:
@@ -138,10 +137,11 @@ public:
 
 }
 
-void registerFunctionCurrentTime(FunctionFactory & factory)
+REGISTER_FUNCTION(CurrentTime)
 {
     factory.registerFunction<CurrentTimeOverloadResolver>(FunctionFactory::CaseInsensitive);
     factory.registerFunction<CurrentTimeOverloadResolver>("LOCALTIME", FunctionFactory::CaseInsensitive);
+    factory.registerFunction<CurrentTimeOverloadResolver>("CURTIME", FunctionFactory::CaseInsensitive);
 }
 
 }

@@ -26,16 +26,34 @@
 
 namespace DB
 {
+
+class ExchangeTotalsSource;
+using ExchangeTotalsSourcePtr = std::shared_ptr<ExchangeTotalsSource>;
+class ExchangeExtremesSource;
+using ExchangeExtremesSourcePtr = std::shared_ptr<ExchangeExtremesSource>;
+
 /// Read chunk from ExchangeSink.
 class ExchangeSource : public SourceWithProgress
 {
 public:
-    ExchangeSource(Block header_, BroadcastReceiverPtr receiver_, ExchangeOptions options_);
-    ExchangeSource(Block header_, BroadcastReceiverPtr receiver_, ExchangeOptions options_, bool fetch_exception_from_scheduler_);
+    ExchangeSource(
+        Block header_,
+        BroadcastReceiverPtr receiver_,
+        ExchangeOptions options_,
+        ExchangeTotalsSourcePtr totals_source_ = nullptr,
+        ExchangeExtremesSourcePtr extremes_source_ = nullptr);
+    ExchangeSource(
+        Block header_,
+        BroadcastReceiverPtr receiver_,
+        ExchangeOptions options_,
+        bool fetch_exception_from_scheduler_,
+        ExchangeTotalsSourcePtr totals_source_ = nullptr,
+        ExchangeExtremesSourcePtr extremes_source_ = nullptr);
     ~ExchangeSource() override;
 
     IProcessor::Status prepare() override;
     String getName() const override;
+    String getClassName() const;
     BroadcastReceiverPtr & getReceiver() { return receiver; }
 
 protected:
@@ -45,10 +63,44 @@ protected:
 private:
     BroadcastReceiverPtr receiver;
     ExchangeOptions options;
-    bool fetch_exception_from_scheduler;
+    ExchangeTotalsSourcePtr totals_source;
+    ExchangeExtremesSourcePtr extremes_source;
     std::atomic<bool> was_query_canceled {false};
     std::atomic<bool> was_receiver_finished {false};
     Poco::Logger * logger;
+    void checkBroadcastStatus(const BroadcastStatus & status) const;
+};
+
+class ExchangeTotalsSource : public ISource
+{
+public:
+    explicit ExchangeTotalsSource(const Block& header);
+    ~ExchangeTotalsSource() override;
+
+    String getName() const override { return "ExchangeTotals"; }
+    void setTotals(Chunk chunk);
+
+protected:
+    Chunk generate() override;
+
+private:
+    Chunk totals;
+};
+
+class ExchangeExtremesSource : public ISource
+{
+public:
+    explicit ExchangeExtremesSource(const Block& header);
+    ~ExchangeExtremesSource() override;
+
+    String getName() const override { return "ExchangeExtremes"; }
+    void setExtremes(Chunk chunk);
+
+protected:
+    Chunk generate() override;
+
+private:
+    Chunk extremes;
 };
 
 }

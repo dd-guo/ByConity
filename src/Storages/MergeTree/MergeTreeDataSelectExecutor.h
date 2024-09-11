@@ -26,27 +26,15 @@
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/PartitionPruner.h>
-#include <Parsers/ASTSampleRatio.h>
-#include <boost/rational.hpp>   /// For calculations related to sampling coefficients.
 #include <QueryPlan/ReadFromMergeTree.h>
 
 namespace DB
 {
 
 class KeyCondition;
+struct IndexTimeWatcher;
 
 using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
-using RelativeSize = boost::rational<ASTSampleRatio::BigNum>;
-
-struct MergeTreeDataSelectSamplingData
-{
-    bool use_sampling = false;
-    bool read_nothing = false;
-    Float64 used_sample_factor = 1.0;
-    std::shared_ptr<ASTFunction> filter_function;
-    ActionsDAGPtr filter_expression;
-    RelativeSize relative_sample_size = 0;
-};
 
 /** Executes SELECT queries on data from the merge tree.
   */
@@ -61,7 +49,7 @@ public:
 
     QueryPlanPtr read(
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         const SelectQueryInfo & query_info,
         ContextPtr context,
         UInt64 max_block_size,
@@ -74,18 +62,18 @@ public:
         MergeTreeMetaBase::DataPartsVector parts,
         MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter,
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot_base,
-        const StorageMetadataPtr & metadata_snapshot,
+        const StorageSnapshotPtr & storage_snapshot,
         const SelectQueryInfo & query_info,
         ContextPtr context,
         UInt64 max_block_size,
         unsigned num_streams,
-        std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr) const;
+        std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read = nullptr,
+        MergeTreeDataSelectAnalysisResultPtr merge_tree_select_result_ptr = nullptr) const;
 
     /// Get an estimation for the number of marks we are going to read.
     /// Reads nothing. Secondary indexes are not used.
     /// This method is used to select best projection for table.
-    size_t estimateNumMarksToRead(
+    MergeTreeDataSelectAnalysisResultPtr estimateNumMarksToRead(
         MergeTreeMetaBase::DataPartsVector parts,
         const Names & column_names,
         const StorageMetadataPtr & metadata_snapshot_base,
@@ -114,6 +102,7 @@ private:
         const Settings & settings,
         Poco::Logger * log);
 
+    /// If filter_bitmap is nullptr, then we won't trying to generate read filter
     static MarkRanges filterMarksUsingIndex(
         MergeTreeIndexPtr index_helper,
         MergeTreeIndexConditionPtr condition,
@@ -123,7 +112,9 @@ private:
         const MergeTreeReaderSettings & reader_settings,
         size_t & total_granules,
         size_t & granules_dropped,
-        Poco::Logger * log);
+        roaring::Roaring * filter_bitmap,
+        Poco::Logger * log,
+        IndexTimeWatcher & index_time_watcher);
 
     struct PartFilterCounters
     {
@@ -182,7 +173,7 @@ public:
     static std::optional<std::unordered_set<String>> filterPartsByVirtualColumns(
         const MergeTreeMetaBase & data,
         const MergeTreeMetaBase::DataPartsVector & parts,
-        const ASTPtr & query,
+        const SelectQueryInfo & query_info,
         ContextPtr context);
 
     /// Filter parts using minmax index and partition key.
@@ -227,6 +218,14 @@ public:
         bool use_sampling,
         RelativeSize relative_sample_size);
 
+    static RangesInDataParts filterPartsByIntermediateResultCache(
+        const StorageID & storage_id,
+        const SelectQueryInfo & query_info,
+        const ContextPtr & context,
+        Poco::Logger * log,
+        RangesInDataParts & parts_with_ranges,
+        CacheHolderPtr & part_cache_holder);
+
     /// Create expression for sampling.
     /// Also, calculate _sample_factor if needed.
     /// Also, update key condition with selected sampling range.
@@ -241,7 +240,14 @@ public:
         bool sample_factor_column_queried,
         Poco::Logger * log);
 
-    static MarkRanges sampleByRange(const MergeTreeMetaBase::DataPartPtr& part, const MarkRanges & ranges, const RelativeSize & relative_sample_size, bool deterministic);
+    static MarkRanges sampleByRange(
+        const MergeTreeMetaBase::DataPartPtr & part,
+        const MarkRanges & ranges,
+        const RelativeSize & relative_sample_size,
+        bool deterministic,
+        bool uniform,
+        bool ensure_one_mark_in_part_when_sample_by_range);
+
     static MarkRanges sliceRange(const MarkRange & range, const UInt64 & sample_size);
 
     /// Check query limits: max_partitions_to_read, max_concurrent_queries.
@@ -250,6 +256,53 @@ public:
         const MergeTreeMetaBase & data,
         const RangesInDataParts & parts_with_ranges,
         const ContextPtr & context);
+};
+
+struct IndexTimeWatcher
+{
+    enum class Type
+    {
+        SEEK,
+        READ,
+        CLAC,
+    };
+
+    Stopwatch index_seek_watcher;
+    Stopwatch index_read_watcher;
+    Stopwatch index_calc_watcher;
+
+    size_t index_granule_seek_time;
+    size_t index_granule_read_time;
+    size_t index_condition_calc_time;
+
+    explicit IndexTimeWatcher(): index_granule_seek_time(0), index_granule_read_time(0), index_condition_calc_time(0) {}
+
+    void begin(Type type)
+    {
+        switch (type)
+        {
+            case Type::SEEK: index_seek_watcher.restart(); return;
+            case Type::READ: index_read_watcher.restart(); return;
+            case Type::CLAC: index_calc_watcher.restart(); return;
+        }
+    }
+
+    void elapsed(Type type)
+    {
+        switch (type)
+        {
+            case Type::SEEK: index_granule_seek_time += index_seek_watcher.elapsedMicroseconds(); return;
+            case Type::READ: index_granule_read_time += index_read_watcher.elapsedMicroseconds(); return;
+            case Type::CLAC: index_condition_calc_time += index_calc_watcher.elapsedMicroseconds(); return;
+        }
+    }
+
+    void watch(IndexTimeWatcher::Type type, std::function<void()> func) 
+    {
+        begin(type);
+        func();
+        elapsed(type);
+    }
 };
 
 }

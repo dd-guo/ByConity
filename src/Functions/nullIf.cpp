@@ -37,6 +37,7 @@ public:
     size_t getNumberOfArguments() const override { return 2; }
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -66,7 +67,7 @@ public:
 
 }
 
-void registerFunctionNullIf(FunctionFactory & factory)
+REGISTER_FUNCTION(NullIf)
 {
     factory.registerFunction<FunctionNullIf>(FunctionFactory::CaseInsensitive);
 }

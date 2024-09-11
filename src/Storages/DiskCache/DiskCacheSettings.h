@@ -15,17 +15,24 @@
 
 #pragma once
 
+#include <cstddef>
 #include <limits>
 #include <Poco/Util/AbstractConfiguration.h>
+
+#include <common/types.h>
 
 namespace DB
 {
 struct DiskCacheSettings
 {
-    static constexpr auto prefix = "disk_cache";
+    static constexpr auto root = "disk_cache_strategies";
     void loadFromConfig(const Poco::Util::AbstractConfiguration & conf, const std::string & disk_cache_name);
 
+    String disk_policy {"default"};
     size_t lru_max_size {std::numeric_limits<size_t>::max()};
+    size_t lru_max_nums {std::numeric_limits<size_t>::max()};
+    // max percent of disk total capacity
+    size_t lru_max_percent {80};
     // When queue size exceed random drop ratio, start drop disk cache task, range from 0 - 100
     size_t random_drop_threshold {50};
     // Cache mapping bucket size
@@ -42,17 +49,28 @@ struct DiskCacheSettings
     size_t cache_loader_per_disk {2};
     int cache_load_dispatcher_drill_down_level {1};
     size_t cache_set_rate_limit {0};
-};
-
-struct DiskCacheStrategySettings
-{
-    static constexpr auto prefix = "disk_cache_strategy";
-    void loadFromConfig(const Poco::Util::AbstractConfiguration & conf, const std::string & disk_cache_strategy_name);
+    size_t cache_set_throughput_limit {0};
 
     size_t segment_size {8192};
     size_t hits_to_cache {2};
     // Size of disk cache statistics bucket size
     size_t stats_bucket_size {10000};
+
+    // load previous folder cached data if it's not empty for compatible when data dir config is changed
+    std::string previous_disk_cache_dir{};
+    std::string latest_disk_cache_dir{"disk_cache_v1"};
+    UInt64 meta_cache_size_ratio{0};
+    UInt64 meta_cache_nums_ratio{50};
+
+    // config for cache stealing
+    UInt64 stealing_max_request_rate{0};
+    UInt64 stealing_connection_timeout_ms{10000};
+    UInt64 stealing_read_timeout_ms{20000};
+    UInt64 stealing_max_retry_times{3};
+    UInt64 stealing_retry_sleep_ms{100};
+    UInt64 stealing_max_queue_count{10000};
+
+    std::string toString() const;
 };
 
 }

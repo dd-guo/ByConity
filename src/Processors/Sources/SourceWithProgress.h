@@ -1,8 +1,9 @@
 #pragma once
-#include <Processors/ISource.h>
 #include <DataStreams/IBlockInputStream.h>
-#include <Common/Stopwatch.h>
 #include <DataStreams/StreamLocalLimits.h>
+#include <Processors/IProcessor.h>
+#include <Processors/ISource.h>
+#include <Common/Stopwatch.h>
 
 namespace DB
 {

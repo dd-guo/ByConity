@@ -13,16 +13,27 @@
  * limitations under the License.
  */
 
+#include <optional>
 #include <Optimizer/Utils.h>
 
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+#include <Analyzers/TypeAnalyzer.h>
+#include <DataTypes/getLeastSupertype.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/AggregateDescription.h>
 #include <Interpreters/Context.h>
+#include <Optimizer/ExpressionDeterminism.h>
 #include <Optimizer/ExpressionExtractor.h>
 #include <Optimizer/SymbolsExtractor.h>
-#include <Optimizer/ExpressionDeterminism.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/IAST.h>
+#include <Storages/StorageDistributed.h>
+#include <boost/math/special_functions/math_fwd.hpp>
+#include <common/logger_useful.h>
+#include "Parsers/IAST.h"
+
+extern const char * build_version;
 
 namespace DB
 {
@@ -95,15 +106,63 @@ bool isIdentity(const Assignments & assignments)
 
 bool isIdentity(const ProjectionStep & step)
 {
-    return !step.isFinalProject() && step.getDynamicFilters().empty() && Utils::isIdentity(step.getAssignments());
+    return !step.isFinalProject() && Utils::isIdentity(step.getAssignments());
 }
 
-std::unordered_map<String, String> computeIdentityTranslations(Assignments & assignments)
+bool isAlias(const Assignment & assignment)
+{
+    return assignment.second->getType() == ASTType::ASTIdentifier;
+}
+
+bool isAlias(const Assignments & assignments)
+{
+    return std::all_of(assignments.begin(), assignments.end(), [](const Assignment & assignment) { return isAlias(assignment); });
+}
+
+bool isIdentifierOrIdentifierCast(const ConstASTPtr & expression)
+{
+    if (const auto * function = expression->as<ASTFunction>())
+    {
+        return Poco::toLower(function->name) == "cast" && function->arguments->getChildren()[0]->getType() == ASTType::ASTIdentifier;
+    }
+    return expression->getType() == ASTType::ASTIdentifier;
+}
+
+ConstASTPtr tryUnwrapCast(const ConstASTPtr & expression, ContextMutablePtr context, const NamesAndTypes & names_and_types)
+{
+    if (const auto * function = expression->as<ASTFunction>();
+        function && Poco::toLower(function->name) == "cast" && function->arguments->getChildren().size() == 2)
+    {
+        auto & source_expression = function->arguments->getChildren()[0];
+        auto source_type = TypeAnalyzer::getType(source_expression, context, names_and_types);
+
+        const auto * target_type_name = function->arguments->getChildren()[1]->as<ASTLiteral>();
+        auto target_type = DataTypeFactory::instance().get(target_type_name->value.safeGet<String>());
+
+        auto super_type = tryGetLeastSupertype(DataTypes{source_type, target_type});
+        if (super_type != nullptr && super_type->equals(*target_type))
+        {
+            return source_expression;
+        }
+    }
+    return expression;
+}
+
+NameToNameMap extractIdentities(const ProjectionStep & project)
+{
+    NameToNameMap result;
+    for (const auto & assignment: project.getAssignments())
+        if (auto identifier = assignment.second->as<const ASTIdentifier>())
+            result.emplace(assignment.first, identifier->name());
+    return result;
+}
+
+std::unordered_map<String, String> computeIdentityTranslations(const Assignments & assignments)
 {
     std::unordered_map<String, String> output_to_input;
-    for (auto & assignment : assignments)
+    for (const auto & assignment : assignments)
     {
-        if (auto identifier = assignment.second->as<ASTIdentifier>())
+        if (const auto * identifier = assignment.second->as<ASTIdentifier>())
         {
             output_to_input[assignment.first] = identifier->name();
         }
@@ -116,15 +175,34 @@ ASTPtr extractAggregateToFunction(const AggregateDescription & aggregate_descrip
     const auto function = std::make_shared<ASTFunction>();
     function->name = aggregate_description.function->getName();
     function->arguments = std::make_shared<ASTExpressionList>();
-    function->parameters = std::make_shared<ASTExpressionList>();
     function->children.push_back(function->arguments);
     for (auto & argument : aggregate_description.argument_names)
         function->arguments->children.emplace_back(std::make_shared<ASTIdentifier>(argument));
-    for (auto & parameter : aggregate_description.parameters)
-        function->parameters->children.emplace_back(std::make_shared<ASTLiteral>(parameter));
+    if (!aggregate_description.parameters.empty())
+    {
+        function->parameters = std::make_shared<ASTExpressionList>();
+        for (auto & parameter : aggregate_description.parameters)
+            function->parameters->children.emplace_back(std::make_shared<ASTLiteral>(parameter));
+    }
     return function;
 }
 
+bool containsAggregateFunction(const ASTPtr & ast)
+{
+    if (auto function = ast->as<ASTFunction>())
+        if (AggregateFunctionFactory::instance().isAggregateFunctionName(function->name))
+            return true;
+    for (const auto & child : ast->children)
+        if (containsAggregateFunction(child))
+            return true;
+    return false;
+}
+
+
+bool canIgnoreNullsDirection(const DataTypePtr & type)
+{
+    return !type->isNullable() && type->getTypeId() != TypeIndex::Float32 && type->getTypeId() != TypeIndex::Float64;
+}
 
 bool checkFunctionName(const ASTFunction & function, const String & expect_name)
 {
@@ -204,5 +282,44 @@ bool canChangeOutputRows(const ProjectionStep & project, ContextPtr context)
     return canChangeOutputRows(project.getAssignments(), context);
 }
 
+static void extractNameToTypeImpl(PlanNodeBase * node, std::optional<NameToType> & res)
+{
+    if (node && res)
+    {
+        for (const auto & item : node->getCurrentDataStream().header)
+        {
+            const auto & name = item.name;
+            const auto & type = item.type;
+            if (auto it = res->find(name); it != res->end() && !it->second->equals(*type))
+            {
+                res = std::nullopt;
+                break;
+            }
+
+            res->emplace(name, type);
+        }
+    }
+
+    if (res)
+    {
+        for (auto & child : node->getChildren())
+            extractNameToTypeImpl(child.get(), res);
+    }
+}
+
+
+std::optional<NameToType> extractNameToType(const PlanNodeBase & node)
+{
+    std::optional<NameToType> res = NameToType{};
+    extractNameToTypeImpl(const_cast<PlanNodeBase *>(&node), res);
+    return res;
+}
+
+std::string getVersionFromSystem()
+{
+    if(build_version != nullptr && build_version[0] != '\0')
+        return std::string(build_version);
+    return "";
+}
 }
 }

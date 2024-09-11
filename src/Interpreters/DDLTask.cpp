@@ -28,10 +28,14 @@
 #include <IO/ReadBufferFromString.h>
 #include <Poco/Net/NetException.h>
 #include <common/logger_useful.h>
+#include "Interpreters/Context_fwd.h"
 #include <Parsers/ParserQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/ASTQueryWithOnCluster.h>
+#include <Parsers/ParserQuery.h>
 #include <Parsers/formatAST.h>
+#include <Parsers/parseQuery.h>
+#include <Parsers/queryToString.h>
 #include <Parsers/ASTQueryWithTableAndOutput.h>
 #include <Databases/DatabaseReplicated.h>
 
@@ -161,9 +165,16 @@ void DDLTaskBase::parseQueryFromEntry(ContextPtr context)
     const char * begin = entry.query.data();
     const char * end = begin + entry.query.size();
 
-    ParserQuery parser_query(end, ParserSettings::valueOf(context->getSettingsRef().dialect_type));
+    ParserQuery parser_query(end, ParserSettings::valueOf(context->getSettingsRef()));
     String description;
     query = parseQuery(parser_query, begin, end, description, 0, context->getSettingsRef().max_parser_depth);
+}
+
+void DDLTaskBase::formatRewrittenQuery(ContextPtr context)
+{
+    /// Convert rewritten AST back to string.
+    query_str = queryToString(*query);
+    query_for_logging = query->formatForLogging(context->getSettingsRef().log_queries_cut_to_length);
 }
 
 ContextMutablePtr DDLTaskBase::makeQueryContext(ContextPtr from_context, const ZooKeeperPtr & /*zookeeper*/)
@@ -374,6 +385,7 @@ void DatabaseReplicatedTask::parseQueryFromEntry(ContextPtr context)
         assert(ddl_query->database.empty());
         ddl_query->database = database->getDatabaseName();
     }
+    formatRewrittenQuery(context);
 }
 
 ContextMutablePtr DatabaseReplicatedTask::makeQueryContext(ContextPtr from_context, const ZooKeeperPtr & zookeeper)
@@ -429,9 +441,9 @@ void ZooKeeperMetadataTransaction::commit()
     state = COMMITTED;
 }
 
-ClusterPtr tryGetReplicatedDatabaseCluster(const String & cluster_name)
+ClusterPtr tryGetReplicatedDatabaseCluster(const String & cluster_name, ContextPtr context)
 {
-    if (const auto * replicated_db = dynamic_cast<const DatabaseReplicated *>(DatabaseCatalog::instance().tryGetDatabase(cluster_name).get()))
+    if (const auto * replicated_db = dynamic_cast<const DatabaseReplicated *>(DatabaseCatalog::instance().tryGetDatabase(cluster_name, context).get()))
         return replicated_db->getCluster();
     return {};
 }

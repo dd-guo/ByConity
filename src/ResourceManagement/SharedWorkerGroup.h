@@ -15,6 +15,7 @@
 
 #pragma once
 #include <ResourceManagement/IWorkerGroup.h>
+#include <ResourceManagement/WorkerGroupType.h>
 
 namespace DB::ResourceManagement
 {
@@ -24,17 +25,18 @@ class VirtualWarehouse;
 class SharedWorkerGroup : public IWorkerGroup
 {
 public:
-    SharedWorkerGroup(String id_, UUID vw_uuid_, String linked_id_, bool is_auto_linked_ = false)
-        : IWorkerGroup(WorkerGroupType::Shared, std::move(id_), vw_uuid_)
+    SharedWorkerGroup(WorkerGroupType type_, String id_, UUID vw_uuid_, String linked_id_, bool is_auto_linked_ = false, Int64 priority_ = 0)
+        : IWorkerGroup(type_, std::move(id_), vw_uuid_)
         , linked_id(std::move(linked_id_))
         , is_auto_linked(is_auto_linked_)
+        , priority(priority_)
     {
     }
 
     size_t getNumWorkers() const override;
     std::map<String, WorkerNodePtr> getWorkers() const override;
-    WorkerGroupData getData(bool with_metrics = false, bool only_running_state = true) const override;
-    WorkerGroupMetrics getAggregatedMetrics() const override;
+    WorkerGroupData getData(bool with_metrics, bool only_running_state) const override;
+    WorkerGroupMetrics getMetrics() const override;
 
     void registerNode(const WorkerNodePtr &) override;
     void removeNode(const String &) override;
@@ -62,12 +64,14 @@ public:
     WorkerGroupPtr tryGetLinkedGroup() const;
 
 private:
-    std::map<String, WorkerNodePtr> getWorkersImpl(std::lock_guard<std::mutex> & lock) const;
+    std::map<String, WorkerNodePtr> getWorkersImpl(std::lock_guard<bthread::RecursiveMutex> & lock) const;
 
     const String linked_id;
     WorkerGroupWeakPtr linked_group;
 
     bool is_auto_linked;
+
+    Int64 priority {0};
 };
 
 using SharedWorkerGroupPtr = std::shared_ptr<SharedWorkerGroup>;

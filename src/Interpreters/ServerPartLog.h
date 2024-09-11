@@ -14,6 +14,8 @@
  */
 
 #pragma once
+
+#include <Catalog/DataModelPartWrapper_fwd.h>
 #include <Interpreters/SystemLog.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
 
@@ -32,7 +34,7 @@ struct ServerPartLogElement
 
     Type event_type = INSERT_PART;
     time_t event_time = 0;
-    UInt64 txn_id;
+    UInt64 txn_id = 0;
 
     String database_name;
     String table_name;
@@ -40,17 +42,33 @@ struct ServerPartLogElement
 
     String part_name;
     String partition_id;
+    // unique identifier for parts stored in object storage (S3)
+    // empty for other storage (HDFS)
+    String part_id;
+    // whether the part is in staging area or not
+    UInt8 is_staged_part = false;
     UInt64 rows = 0;
     UInt64 bytes = 0;
+    // commit time of the txn adding the part
+    UInt64 commit_ts = 0;
+    // commit time of the txn removing the part
+    // e.g, if part_a is covered by tombstone part_b, then end_ts(part_a) == commit_ts(part_b)
+    // only REMOVE_PART will set this field
+    UInt64 end_ts = 0;
+    // source parts for MERGE_PARTS and MUTATE_PART
+    // note that if a task mutates several parts in one txn, the source parts here is not
+    // the input part for each new part, but all the source parts for the txn
     Strings source_part_names;
-    UInt8 is_staged_part = false;
+
+    UInt64 duration_ms = 0;
+    UInt64 peak_memory_usage = 0;
 
     UInt8 error = 0;
     String exception;
 
     static std::string name() { return "ServerPartLog"; }
     static NamesAndTypesList getNamesAndTypes();
-    static NamesAndAliases getNamesAndAliases() { return {}; }
+    static NamesAndAliases getNamesAndAliases();
     void appendToBlock(MutableColumns & columns) const;
 };
 
@@ -58,7 +76,26 @@ class ServerPartLog : public SystemLog<ServerPartLogElement>
 {
     using SystemLog<ServerPartLogElement>::SystemLog;
 public:
-    static bool addNewParts(const ContextPtr & local_context, ServerPartLogElement::Type type, const MutableMergeTreeDataPartsCNCHVector & parts, UInt64 txn_id, UInt8 error);
+
+    static bool addNewParts(
+        const ContextPtr & local_context,
+        StorageID storage_id,
+        ServerPartLogElement::Type type,
+        const MutableMergeTreeDataPartsCNCHVector & parts,
+        const MutableMergeTreeDataPartsCNCHVector & staged_parts,
+        UInt64 txn_id,
+        UInt8 error,
+        const Strings & source_part_names = {},
+        UInt64 duration_ns = 0,
+        UInt64 peak_memory_usage = 0);
+
+    static bool addRemoveParts(
+        const ContextPtr & local_context,
+        StorageID storage_id,
+        const ServerDataPartsVector & parts,
+        bool is_staged);
+
+    void prepareTable() override;
 };
 
 }

@@ -24,6 +24,7 @@
 #include <IO/ReadBufferFromFileDecorator.h>
 #include <IO/WriteBufferFromFileDecorator.h>
 #include <Common/quoteString.h>
+#include "IO/ReadSettings.h"
 #include <condition_variable>
 
 namespace DB
@@ -41,7 +42,7 @@ public:
     {
         try
         {
-            CompletionAwareWriteBuffer::finalize();
+            finalize();
         }
         catch (...)
         {
@@ -49,13 +50,10 @@ public:
         }
     }
 
-    void finalize() override
+protected:
+    void finalizeImpl() override
     {
-        if (finalized)
-            return;
-
-        WriteBufferFromFileDecorator::finalize();
-
+        WriteBufferFromFileDecorator::finalizeImpl();
         completion_callback();
     }
 
@@ -152,7 +150,7 @@ DiskCacheWrapper::readFile(
                 auto tmp_path = path + ".tmp";
                 {
                     auto src_buffer = DiskDecorator::readFile(path, settings);
-                    auto dst_buffer = cache_disk->writeFile(tmp_path, {.buffer_size = settings.buffer_size, .mode = WriteMode::Rewrite});
+                    auto dst_buffer = cache_disk->writeFile(tmp_path, {.buffer_size = settings.local_fs_buffer_size, .mode = WriteMode::Rewrite});
                     copyData(*src_buffer, *dst_buffer);
                 }
                 cache_disk->moveFile(tmp_path, path);
@@ -197,7 +195,7 @@ DiskCacheWrapper::writeFile(const String & path, const WriteSettings& settings)
         [this, path, settings]()
         {
             /// Copy file from cache to actual disk when cached buffer is finalized.
-            auto src_buffer = cache_disk->readFile(path, {.buffer_size = settings.buffer_size});
+            auto src_buffer = cache_disk->readFile(path, ReadSettings().initializeReadSettings(settings.buffer_size));
             auto dst_buffer = DiskDecorator::writeFile(path, settings);
             copyData(*src_buffer, *dst_buffer);
             dst_buffer->finalize();

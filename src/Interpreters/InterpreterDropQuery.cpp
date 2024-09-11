@@ -19,28 +19,24 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <Databases/DatabaseReplicated.h>
 #include <Databases/IDatabase.h>
+#include <ExternalCatalog/IExternalCatalogMgr.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/executeDDLQueryOnCluster.h>
-#include <Interpreters/InterpreterDropQuery.h>
 #include <Interpreters/ExternalDictionariesLoader.h>
+#include <Interpreters/InterpreterDropQuery.h>
 #include <Interpreters/QueryLog.h>
-#include <Access/AccessRightsElement.h>
+#include <Interpreters/executeDDLQueryOnCluster.h>
 #include <Parsers/ASTDropQuery.h>
 #include <Storages/IStorage.h>
+#include <Transaction/ICnchTransaction.h>
+#include <Transaction/IntentLock.h>
 #include <Common/escapeForFileName.h>
 #include <Common/quoteString.h>
 #include <Common/typeid_cast.h>
-#include <Transaction/IntentLock.h>
-#include <Transaction/ICnchTransaction.h>
-#include <Databases/DatabaseReplicated.h>
 
 #if !defined(ARCADIA_BUILD)
 #    include "config_core.h"
-#endif
-
-#if USE_MYSQL
-#   include <Databases/MySQL/DatabaseMaterializeMySQL.h>
 #endif
 
 #if USE_LIBPQXX
@@ -55,6 +51,8 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int SYNTAX_ERROR;
     extern const int UNKNOWN_TABLE;
+    extern const int UNKNOWN_CATALOG;
+    extern const int UNKNOWN_CNCH_SNAPSHOT;
     extern const int NOT_IMPLEMENTED;
     extern const int INCORRECT_QUERY;
     extern const int SUPPORT_IS_DISABLED;
@@ -62,9 +60,9 @@ namespace ErrorCodes
 }
 
 
-static DatabasePtr tryGetDatabase(const String & database_name, bool if_exists)
+static DatabasePtr tryGetDatabase(const String & database_name, bool if_exists, ContextPtr local_context)
 {
-    return if_exists ? DatabaseCatalog::instance().tryGetDatabase(database_name) : DatabaseCatalog::instance().getDatabase(database_name);
+    return if_exists ? DatabaseCatalog::instance().tryGetDatabase(database_name, local_context) : DatabaseCatalog::instance().getDatabase(database_name, local_context);
 }
 
 
@@ -81,8 +79,11 @@ BlockIO InterpreterDropQuery::execute()
 
     if (getContext()->getSettingsRef().database_atomic_wait_for_drop_and_detach_synchronously)
         drop.no_delay = true;
-
-    if (!drop.table.empty())
+    if (drop.table.empty() && drop.database.empty() && !drop.catalog.empty())
+        return executeToCatalog(drop);
+    else if (drop.is_snapshot)
+        return executeToSnapshot(drop);
+    else if (!drop.table.empty())
         return executeToTable(drop);
     else if (!drop.database.empty())
         return executeToDatabase(drop);
@@ -100,6 +101,50 @@ void InterpreterDropQuery::waitForTableToBeActuallyDroppedOrDetached(const ASTDr
         DatabaseCatalog::instance().waitTableFinallyDropped(uuid_to_wait);
     else if (query.kind == ASTDropQuery::Kind::Detach)
         db->waitDetachedTableNotInUse(uuid_to_wait);
+}
+
+BlockIO InterpreterDropQuery::executeToCatalog(ASTDropQuery & query)
+{
+    const std::string & catalog_name = query.catalog;
+    bool exist = ExternalCatalog::Mgr::instance().isCatalogExist(catalog_name);
+    if (!exist)
+    {
+        if (!query.if_exists)
+        {
+            throw Exception("Externcal catalog" + backQuoteIfNeed(catalog_name) + "doesn't exist ", ErrorCodes::UNKNOWN_CATALOG);
+        }
+        else
+        {
+            return {};
+        }
+    }
+    ExternalCatalog::Mgr::instance().dropExternalCatalog(catalog_name);
+    return {};
+}
+
+BlockIO InterpreterDropQuery::executeToSnapshot(ASTDropQuery & query)
+{
+    auto current_context = getContext();
+    if (query.database.empty())
+        query.database = current_context->getCurrentDatabase();
+
+    /// TODO: check access
+
+    DatabasePtr database = DatabaseCatalog::instance().getDatabase(query.database, current_context);
+    if (!database->supportSnapshot())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Database '{}' doesn't support snapshot", query.database);
+
+    /// TODO: need intent lock?
+
+    if (!database->tryGetSnapshot(query.table))
+    {
+        if (!query.if_exists)
+            throw Exception(ErrorCodes::UNKNOWN_CNCH_SNAPSHOT, "No such snapshot: {}", query.table);
+        return {};
+    }
+    /// TODO: in the future, need to check whether there're active txns using the snapshot
+    database->dropSnapshot(current_context, query.table);
+    return {};
 }
 
 BlockIO InterpreterDropQuery::executeToTable(ASTDropQuery & query)
@@ -334,7 +379,7 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
     auto ddl_guard = DatabaseCatalog::instance().getDDLGuard(database_name, "");
     IntentLockPtr db_lock;
 
-    database = tryGetDatabase(database_name, query.if_exists);
+    database = tryGetDatabase(database_name, query.if_exists, getContext());
 
     if (database)
     {
@@ -358,10 +403,6 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
             if (query.kind == ASTDropQuery::Kind::Detach && query.permanently)
                 throw Exception("DETACH PERMANENTLY is not implemented for databases", ErrorCodes::NOT_IMPLEMENTED);
 
-#if USE_MYSQL
-            if (database->getEngineName() == "MaterializeMySQL")
-                stopDatabaseSynchronization(database);
-#endif
             if (auto * replicated = typeid_cast<DatabaseReplicated *>(database.get()))
                 replicated->stopReplication();
 #if USE_LIBPQXX
@@ -382,11 +423,14 @@ BlockIO InterpreterDropQuery::executeToDatabaseImpl(const ASTDropQuery & query, 
                 /// see DatabaseMaterializeMySQL<>::getTablesIterator()
                 for (auto iterator = database->getTablesIterator(getContext()); iterator->isValid(); iterator->next())
                 {
-                    iterator->table()->flush();
+                    if (auto table = iterator->table())
+                        table->flush();
                 }
 
                 for (auto iterator = database->getTablesIterator(getContext()); iterator->isValid(); iterator->next())
                 {
+                    if (!iterator->table())
+                        continue;
                     DatabasePtr db;
                     UUID table_to_wait = UUIDHelpers::Nil;
                     query_for_table.table = iterator->name();

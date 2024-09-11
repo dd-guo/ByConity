@@ -11,6 +11,8 @@
 #include <Common/typeid_cast.h>
 #include <Common/UTF8Helpers.h>
 
+#include <DataTypes/EnumValues.h>
+
 #include "IArraySource.h"
 #include "IValueSource.h"
 #include "Slices.h"
@@ -39,7 +41,7 @@ template <typename ArraySink> struct NullableArraySink;
 template <typename T>
 struct NumericArraySource : public ArraySourceImpl<NumericArraySource<T>>
 {
-    using ColVecType = std::conditional_t<IsDecimalNumber<T>, ColumnDecimal<T>, ColumnVector<T>>;
+    using ColVecType = ColumnVectorOrDecimal<T>;
     using Slice = NumericArraySlice<T>;
     using Column = ColumnArray;
 
@@ -58,8 +60,8 @@ struct NumericArraySource : public ArraySourceImpl<NumericArraySource<T>>
     }
 
     explicit NumericArraySource(const ColumnArray & arr)
-            : column(typeid_cast<const ColVecType &>(arr.getData()))
-            , elements(typeid_cast<const ColVecType &>(arr.getData()).getData()), offsets(arr.getOffsets())
+        : column(typeid_cast<const ColVecType &>(arr.getData()))
+        , elements(typeid_cast<const ColVecType &>(arr.getData()).getData()), offsets(arr.getOffsets())
     {
     }
 
@@ -140,18 +142,9 @@ struct NumericArraySource : public ArraySourceImpl<NumericArraySource<T>>
 
 
 /// The methods can be virtual or not depending on the template parameter. See IStringSource.
-#if !defined(__clang__)
-#   pragma GCC diagnostic push
-#   pragma GCC diagnostic ignored "-Wsuggest-override"
-#elif __clang_major__ >= 11
-#   pragma GCC diagnostic push
-#   ifdef HAS_SUGGEST_OVERRIDE
-#       pragma GCC diagnostic ignored "-Wsuggest-override"
-#   endif
-#   ifdef HAS_SUGGEST_DESTRUCTOR_OVERRIDE
-#       pragma GCC diagnostic ignored "-Wsuggest-destructor-override"
-#   endif
-#endif
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsuggest-override"
+#pragma GCC diagnostic ignored "-Wsuggest-destructor-override"
 
 template <typename Base>
 struct ConstSource : public Base
@@ -165,17 +158,22 @@ struct ConstSource : public Base
     size_t row_num = 0;
 
     explicit ConstSource(const ColumnConst & col_)
-            : Base(static_cast<const typename Base::Column &>(col_.getDataColumn())), total_rows(col_.size())
+        : Base(static_cast<const typename Base::Column &>(col_.getDataColumn()))
+        , total_rows(col_.size())
     {
     }
 
     template <typename ColumnType>
-    ConstSource(const ColumnType & col_, size_t total_rows_) : Base(col_), total_rows(total_rows_)
+    ConstSource(const ColumnType & col_, size_t total_rows_)
+        : Base(col_)
+        , total_rows(total_rows_)
     {
     }
 
     template <typename ColumnType>
-    ConstSource(const ColumnType & col_, const NullMap & null_map_, size_t total_rows_) : Base(col_, null_map_), total_rows(total_rows_)
+    ConstSource(const ColumnType & col_, const NullMap & null_map_, size_t total_rows_)
+        : Base(col_, null_map_)
+        , total_rows(total_rows_)
     {
     }
 
@@ -184,22 +182,24 @@ struct ConstSource : public Base
 
     virtual void accept(ArraySourceVisitor & visitor) // override
     {
-        if constexpr (std::is_base_of<IArraySource, Base>::value)
+        if constexpr (std::is_base_of_v<IArraySource, Base>)
             visitor.visit(*this);
         else
-            throw Exception(
-                    "accept(ArraySourceVisitor &) is not implemented for " + demangle(typeid(ConstSource<Base>).name())
-                    + " because " + demangle(typeid(Base).name()) + " is not derived from IArraySource", ErrorCodes::NOT_IMPLEMENTED);
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                            "accept(ArraySourceVisitor &) is not implemented for {} because {} "
+                            "is not derived from IArraySource",
+                            demangle(typeid(ConstSource<Base>).name()), demangle(typeid(Base).name()));
     }
 
     virtual void accept(ValueSourceVisitor & visitor) // override
     {
-        if constexpr (std::is_base_of<IValueSource, Base>::value)
+        if constexpr (std::is_base_of_v<IValueSource, Base>)
             visitor.visit(*this);
         else
-            throw Exception(
-                    "accept(ValueSourceVisitor &) is not implemented for " + demangle(typeid(ConstSource<Base>).name())
-                    + " because " + demangle(typeid(Base).name()) + " is not derived from IValueSource", ErrorCodes::NOT_IMPLEMENTED);
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                            "accept(ValueSourceVisitor &) is not implemented for {} because {} "
+                            "is not derived from IValueSource",
+                            demangle(typeid(ConstSource<Base>).name()), demangle(typeid(Base).name()));
     }
 
     void next()
@@ -233,9 +233,7 @@ struct ConstSource : public Base
     }
 };
 
-#if !defined(__clang__) || __clang_major__ >= 11
-#   pragma GCC diagnostic pop
-#endif
+#pragma GCC diagnostic pop
 
 struct StringSource
 {
@@ -251,7 +249,8 @@ struct StringSource
     ColumnString::Offset prev_offset = 0;
 
     explicit StringSource(const ColumnString & col)
-            : elements(col.getChars()), offsets(col.getOffsets())
+        : elements(col.getChars())
+        , offsets(col.getOffsets())
     {
     }
 
@@ -279,6 +278,11 @@ struct StringSource
     size_t getElementSize() const
     {
         return offsets[row_num] - prev_offset - 1;
+    }
+
+    size_t getColumnSize() const
+    {
+        return offsets.size();
     }
 
     Slice getWhole() const
@@ -319,8 +323,98 @@ struct StringSource
     }
 };
 
+/// Treats Enum values as Strings, modeled after StringSource
+template <typename EnumDataType>
+struct EnumSource
+{
+    using Column = typename EnumDataType::ColumnType;
+    using Slice = NumericArraySlice<UInt8>;
 
-/// Differs to StringSource by having 'offest' and 'length' in code points instead of bytes in getSlice* methods.
+    using SinkType = StringSink;
+
+    const typename Column::Container & data;
+    const EnumDataType & data_type;
+
+    size_t row_num = 0;
+
+    EnumSource(const Column & col, const EnumDataType & data_type_)
+        : data(col.getData())
+        , data_type(data_type_)
+    {
+    }
+
+    void next()
+    {
+        ++row_num;
+    }
+
+    bool isEnd() const
+    {
+        return row_num == data.size();
+    }
+
+    size_t rowNum() const
+    {
+        return row_num;
+    }
+
+    size_t getSizeForReserve() const
+    {
+        return data.size();
+    }
+
+    size_t getElementSize() const
+    {
+        std::string_view name = data_type.getNameForValue(data[row_num]).toView();
+        return name.size();
+    }
+
+    size_t getColumnSize() const
+    {
+        return data.size();
+    }
+
+    Slice getWhole() const
+    {
+        std::string_view name = data_type.getNameForValue(data[row_num]).toView();
+        return {reinterpret_cast<const UInt8 *>(name.data()), name.size()};
+    }
+
+    Slice getSliceFromLeft(size_t offset) const
+    {
+        std::string_view name = data_type.getNameForValue(data[row_num]).toView();
+        if (offset >= name.size())
+            return {reinterpret_cast<const UInt8 *>(name.data()), 0};
+        return {reinterpret_cast<const UInt8 *>(name.data()) + offset, name.size() - offset};
+    }
+
+    Slice getSliceFromLeft(size_t offset, size_t length) const
+    {
+        std::string_view name = data_type.getNameForValue(data[row_num]).toView();
+        if (offset >= name.size())
+            return {reinterpret_cast<const UInt8 *>(name.data()), 0};
+        return {reinterpret_cast<const UInt8 *>(name.data()) + offset, std::min(length, name.size() - offset)};
+    }
+
+    Slice getSliceFromRight(size_t offset) const
+    {
+        std::string_view name = data_type.getNameForValue(data[row_num]).toView();
+        if (offset > name.size())
+            return {reinterpret_cast<const UInt8 *>(name.data()), name.size()};
+        return {reinterpret_cast<const UInt8 *>(name.data()) + name.size() - offset, offset};
+    }
+
+    Slice getSliceFromRight(size_t offset, size_t length) const
+    {
+        std::string_view name = data_type.getNameForValue(data[row_num]).toView();
+        if (offset > name.size())
+            return {reinterpret_cast<const UInt8 *>(name.data()), length + name.size() > offset ? std::min(name.size(), length + name.size() - offset) : 0};
+        return {reinterpret_cast<const UInt8 *>(name.data()) + name.size() - offset, std::min(length, offset)};
+    }
+};
+
+
+/// Differs to StringSource by having 'offset' and 'length' in code points instead of bytes in getSlice* methods.
 /** NOTE: The behaviour of substring and substringUTF8 is inconsistent when negative offset is greater than string size:
   * substring:
   *      hello
@@ -351,6 +445,11 @@ struct UTF8StringSource : public StringSource
             UTF8::syncBackward(pos, begin);
         }
         return pos;
+    }
+
+    size_t getElementSize() const
+    {
+        return UTF8::countCodePoints(&elements[prev_offset], StringSource::getElementSize());
     }
 
     Slice getSliceFromLeft(size_t offset) const
@@ -417,13 +516,15 @@ struct FixedStringSource
     const UInt8 * end;
     size_t string_size;
     size_t row_num = 0;
+    size_t column_size = 0;
 
     explicit FixedStringSource(const ColumnFixedString & col)
-            : string_size(col.getN())
+        : string_size(col.getN())
     {
         const auto & chars = col.getChars();
         pos = chars.data();
         end = pos + chars.size();
+        column_size = col.size();
     }
 
     void next()
@@ -450,6 +551,11 @@ struct FixedStringSource
     size_t getElementSize() const
     {
         return string_size;
+    }
+
+    size_t getColumnSize() const
+    {
+        return column_size;
     }
 
     Slice getWhole() const
@@ -522,7 +628,7 @@ inline std::unique_ptr<IStringSource> createDynamicStringSource(const IColumn & 
         return std::make_unique<DynamicStringSource<ConstSource<StringSource>>>(col);
     if (checkColumnConst<ColumnFixedString>(&col))
         return std::make_unique<DynamicStringSource<ConstSource<FixedStringSource>>>(col);
-    throw Exception("Unexpected type of string column: " + col.getName(), ErrorCodes::ILLEGAL_COLUMN);
+    throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unexpected type of string column: {}", col.getName());
 }
 
 using StringSources = std::vector<std::unique_ptr<IStringSource>>;
@@ -547,7 +653,8 @@ struct GenericArraySource : public ArraySourceImpl<GenericArraySource>
     }
 
     explicit GenericArraySource(const ColumnArray & arr)
-            : elements(arr.getData()), offsets(arr.getOffsets())
+        : elements(arr.getData())
+        , offsets(arr.getOffsets())
     {
     }
 
@@ -708,7 +815,7 @@ template <typename T>
 struct NumericValueSource : ValueSourceImpl<NumericValueSource<T>>
 {
     using Slice = NumericValueSlice<T>;
-    using Column = std::conditional_t<IsDecimalNumber<T>, ColumnDecimal<T>, ColumnVector<T>>;
+    using Column = ColumnVectorOrDecimal<T>;
 
     using SinkType = NumericArraySink<T>;
 
@@ -807,7 +914,10 @@ struct NullableValueSource : public ValueSource
     const NullMap & null_map;
 
     template <typename Column>
-    explicit NullableValueSource(const Column & col, const NullMap & null_map_) : ValueSource(col), null_map(null_map_) {}
+    NullableValueSource(const Column & col, const NullMap & null_map_)
+        : ValueSource(col)
+        , null_map(null_map_)
+    {}
 
     void accept(ValueSourceVisitor & visitor) override { visitor.visit(*this); }
 

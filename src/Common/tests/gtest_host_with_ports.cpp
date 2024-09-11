@@ -77,29 +77,21 @@ TEST(HostWithPortsUtils, HostWithPortsGetAddress)
     EXPECT_EQ(hp0.getRPCAddress(), "[::1]:9000");
     EXPECT_EQ(hp0.getTCPAddress(), "[::1]:9001");
     EXPECT_EQ(hp0.getHTTPAddress(), "[::1]:9002");
-    EXPECT_EQ(hp0.getExchangeAddress(), "[::1]:9003");
-    EXPECT_EQ(hp0.getExchangeStatusAddress(), "[::1]:9004");
 
     HostWithPorts hp1 {"[::1]", rpc_port, tcp_port, http_port, exchange_port, exchange_status_port, ""};
     EXPECT_EQ(hp1.getRPCAddress(), "[::1]:9000");
     EXPECT_EQ(hp1.getTCPAddress(), "[::1]:9001");
     EXPECT_EQ(hp1.getHTTPAddress(), "[::1]:9002");
-    EXPECT_EQ(hp1.getExchangeAddress(), "[::1]:9003");
-    EXPECT_EQ(hp1.getExchangeStatusAddress(), "[::1]:9004");
 
     HostWithPorts hp2 {"127.0.0.1", rpc_port, tcp_port, http_port, exchange_port, exchange_status_port, ""};
     EXPECT_EQ(hp2.getRPCAddress(), "127.0.0.1:9000");
     EXPECT_EQ(hp2.getTCPAddress(), "127.0.0.1:9001");
     EXPECT_EQ(hp2.getHTTPAddress(), "127.0.0.1:9002");
-    EXPECT_EQ(hp2.getExchangeAddress(), "127.0.0.1:9003");
-    EXPECT_EQ(hp2.getExchangeStatusAddress(), "127.0.0.1:9004");
 
     HostWithPorts hp3 {"www.google.com", rpc_port, tcp_port, http_port, exchange_port, exchange_status_port, ""};
     EXPECT_EQ(hp3.getRPCAddress(), "www.google.com:9000");
     EXPECT_EQ(hp3.getTCPAddress(), "www.google.com:9001");
     EXPECT_EQ(hp3.getHTTPAddress(), "www.google.com:9002");
-    EXPECT_EQ(hp3.getExchangeAddress(), "www.google.com:9003");
-    EXPECT_EQ(hp3.getExchangeStatusAddress(), "www.google.com:9004");
 }
 
 TEST(HostWithPortsUtils, createHostPortString)
@@ -137,6 +129,57 @@ TEST(HostWithPortsUtils, HostWithPortHash)
 
     HostWithPorts hp4 {"10.1.1.1", rpc_port, tcp_port, http_port, exchange_port, exchange_status_port, ""};
     EXPECT_EQ(hasher(hp4), hasher(hp4));
+}
+
+TEST(HostWithPortsUtils, truncateNetworkInterfaceIfHas)
+{
+    {
+        const std::string host{"1:aaaa:1:1::1111%eno1"};
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected{"1:aaaa:1:1::1111"};
+        EXPECT_EQ(expected, truncated_host);
+    }
+
+    {
+        const std::string host{"1:aaaa:1:1::1111"};
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected{"1:aaaa:1:1::1111"};
+        EXPECT_EQ(expected, truncated_host);
+    }
+
+    {
+        const std::string host{"10.1.1.1%eno1"};
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected{"10.1.1.1"};
+        EXPECT_EQ(expected, truncated_host);
+    }
+
+    {
+        const std::string host{"10.1.1.1"};
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected{"10.1.1.1"};
+        EXPECT_EQ(expected, truncated_host);
+    }
+
+    {
+        const std::string host{"google"};
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected{"google"};
+        EXPECT_EQ(expected, truncated_host);
+    }
+
+    {
+        const std::string host{"www.google.com"};
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected{"www.google.com"};
+        EXPECT_EQ(expected, truncated_host);
+    }
+    {
+        const std::string host;
+        const std::string truncated_host = truncateNetworkInterfaceIfHas(host);
+        const std::string expected;
+        EXPECT_EQ(expected, truncated_host);
+    }
 }
 
 } // end anonymous namespace

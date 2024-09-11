@@ -15,6 +15,7 @@
 
 #pragma once
 #include <QueryPlan/ITransformingStep.h>
+#include <Parsers/IAST_fwd.h>
 
 namespace DB
 {
@@ -37,9 +38,27 @@ public:
             double auto_include_threshold_,
             bool final_);
 
+    TotalsHavingStep(
+            const DataStream & input_stream_,
+            bool overflow_row_,
+            const ConstASTPtr & having_filter_,
+            TotalsMode totals_mode_,
+            double auto_include_threshold_,
+            bool final_);
+
     String getName() const override { return "TotalsHaving"; }
 
     Type getType() const override { return Type::TotalsHaving; }
+
+    bool isOverflowRow() const { return overflow_row; }
+    String getFilterColumnName() const { return filter_column_name; }
+    TotalsMode getTotalsMode() const { return totals_mode; }
+    double getAutoIncludeThreshols() const { return auto_include_threshold; }
+    bool isFinal() const { return final; }
+    const ConstASTPtr & getHavingFilter() const
+    {
+        return having_filter;
+    }
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings & settings) override;
 
@@ -48,14 +67,17 @@ public:
 
     const ActionsDAGPtr & getActions() const { return actions_dag; }
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
+
+    void toProto(Protos::TotalsHavingStep & proto, bool for_hash_equals = false) const;
+
+    static std::shared_ptr<TotalsHavingStep> fromProto(const Protos::TotalsHavingStep & proto, ContextPtr);
 
 private:
     bool overflow_row;
     ActionsDAGPtr actions_dag;
+    ConstASTPtr having_filter;
     String filter_column_name;
     TotalsMode totals_mode;
     double auto_include_threshold;

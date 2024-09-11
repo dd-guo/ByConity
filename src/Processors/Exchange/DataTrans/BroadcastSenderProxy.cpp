@@ -25,9 +25,9 @@
 #include <Processors/Chunk.h>
 #include <Processors/Exchange/DataTrans/BroadcastSenderProxy.h>
 #include <Processors/Exchange/DataTrans/BroadcastSenderProxyRegistry.h>
-#include <Processors/Exchange/DataTrans/DataTransKey.h>
 #include <Processors/Exchange/DataTrans/DataTrans_fwd.h>
 #include <Processors/Exchange/DataTrans/Local/LocalChannelOptions.h>
+#include <Processors/Exchange/ExchangeDataKey.h>
 #include <Poco/Logger.h>
 #include <Common/Exception.h>
 #include <common/logger_useful.h>
@@ -42,8 +42,8 @@ namespace ErrorCodes
     extern const int EXCHANGE_DATA_TRANS_EXCEPTION;
 }
 
-BroadcastSenderProxy::BroadcastSenderProxy(DataTransKeyPtr data_key_)
-    : data_key(std::move(data_key_)), wait_timeout_ms(5000), logger(&Poco::Logger::get("BroadcastSenderProxy"))
+BroadcastSenderProxy::BroadcastSenderProxy(ExchangeDataKeyPtr data_key_, SenderProxyOptions options)
+    : data_key(std::move(data_key_)), wait_timeout_ms(options.wait_timeout_ms), logger(&Poco::Logger::get("BroadcastSenderProxy"))
 {
 }
 
@@ -60,7 +60,7 @@ BroadcastSenderProxy::~BroadcastSenderProxy()
 }
 
 
-BroadcastStatus BroadcastSenderProxy::send(Chunk chunk)
+BroadcastStatus BroadcastSenderProxy::sendImpl(Chunk chunk)
 {
     if (!has_real_sender.load(std::memory_order_acquire))
         waitBecomeRealSender(wait_timeout_ms);
@@ -77,11 +77,15 @@ BroadcastStatus BroadcastSenderProxy::finish(BroadcastStatusCode status_code, St
         if (status_code > BroadcastStatusCode::RUNNING)
         {
             std::lock_guard lock(mutex);
-            // Wakeup all pending call for waitBecomeRealSender and waitAccept
-            closed = true;
-            wait_accept.notify_all();
-            wait_become_real.notify_all();
-            return BroadcastStatus(BroadcastStatusCode::SEND_NOT_READY, false, "Sender not ready");
+            if (!real_sender)
+            {
+                // Wakeup all pending call for waitBecomeRealSender and waitAccept
+                closed = true;
+                wait_accept.notify_all();
+                wait_become_real.notify_all();
+                LOG_ERROR(logger, "Proxy {} does not contain a real sender", *data_key);
+                return BroadcastStatus(BroadcastStatusCode::SEND_NOT_READY, false, "Sender not ready");
+            }
         }
 
         waitBecomeRealSender(wait_timeout_ms);
@@ -100,7 +104,7 @@ void BroadcastSenderProxy::merge(IBroadcastSender && sender)
     else
     {
         if (!other->has_real_sender)
-            throw Exception("Can't merge proxy has no real sender " + data_key->dump(), ErrorCodes::LOGICAL_ERROR);
+            throw Exception("Can't merge proxy has no real sender " + data_key->toString(), ErrorCodes::LOGICAL_ERROR);
 
         real_sender->merge(std::move(*other->real_sender));
         other->has_real_sender.store(false, std::memory_order_release);
@@ -114,7 +118,7 @@ void BroadcastSenderProxy::merge(IBroadcastSender && sender)
 String BroadcastSenderProxy::getName() const
 {
     String prefix = "[Proxy]";
-    return real_sender ? prefix + real_sender->getName() : prefix + data_key->dump();
+    return real_sender ? prefix + real_sender->getName() : prefix + data_key->toString();
 }
 
 void BroadcastSenderProxy::waitAccept(UInt32 timeout_ms)
@@ -126,33 +130,37 @@ void BroadcastSenderProxy::waitAccept(UInt32 timeout_ms)
     if (!wait_accept.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] {
             return this->header.operator bool() || closed;
         }))
-        throw Exception("Wait accept timeout for " + data_key->dump(), ErrorCodes::TIMEOUT_EXCEEDED);
+        throw Exception("Wait accept timeout for " + data_key->toString(), ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
     else if (closed)
-        throw Exception("Interrput accept for " + data_key->dump(), ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
+        throw Exception("Interrput accept for " + data_key->toString(), ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
 }
 
 void BroadcastSenderProxy::accept(ContextPtr context_, Block header_)
 {
     std::unique_lock lock(mutex);
     if (header || context)
-        throw Exception("Can't call accept twice for {} " + data_key->dump(), ErrorCodes::LOGICAL_ERROR);
+        throw Exception("Can't call accept twice for {} " + data_key->toString(), ErrorCodes::LOGICAL_ERROR);
     context = std::move(context_);
     header = std::move(header_);
-    wait_timeout_ms = context->getSettingsRef().exchange_timeout_ms / 2;
+    wait_timeout_ms = context->getSettingsRef().exchange_wait_accept_max_timeout_ms + 
+                      context->getSettingsRef().wait_runtime_filter_timeout + 3000; // 3000 is send planSegment timeout
     wait_accept.notify_all();
 }
 
 void BroadcastSenderProxy::becomeRealSender(BroadcastSenderPtr sender)
 {
     std::lock_guard lock(mutex);
+    if (closed)
+        throw Exception(
+            ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION, "becomeRealSender failed, BroadcastSenderProxy {} already closed", *data_key);
     if (real_sender)
     {
         if (real_sender != sender)
-            throw Exception("Can't set set real sender twice for " + data_key->dump(), ErrorCodes::LOGICAL_ERROR);
+            throw Exception("Can't set set real sender twice for " + data_key->toString(), ErrorCodes::LOGICAL_ERROR);
         return;
     }
 
-    LOG_DEBUG(logger, "Proxy become real sender: {}", sender->getName());
+    LOG_TRACE(logger, "Proxy become real sender: {}", sender->getName());
     real_sender = std::move(sender);
     has_real_sender.store(true, std::memory_order_release);
     wait_become_real.notify_all();
@@ -165,9 +173,9 @@ void BroadcastSenderProxy::waitBecomeRealSender(UInt32 timeout_ms)
         return;
     if (!wait_become_real.wait_for(
             lock, std::chrono::milliseconds(timeout_ms), [this] { return this->real_sender.operator bool() || closed; }))
-        throw Exception("Wait become real sender timeout for " + data_key->dump(), ErrorCodes::TIMEOUT_EXCEEDED);
+        throw Exception("Wait become real sender timeout for " + data_key->toString(), ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
     else if (closed)
-        throw Exception("Interrput accept for " + data_key->dump(), ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
+        throw Exception("Interrput waitBecomeRealSender for " + data_key->toString(), ErrorCodes::EXCHANGE_DATA_TRANS_EXCEPTION);
 }
 
 BroadcastSenderType BroadcastSenderProxy::getType()
@@ -189,7 +197,7 @@ Block BroadcastSenderProxy::getHeader() const
     return header;
 }
 
-DataTransKeyPtr BroadcastSenderProxy::getDataKey() const
+ExchangeDataKeyPtr BroadcastSenderProxy::getDataKey() const
 {
     return data_key;
 }

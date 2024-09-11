@@ -17,20 +17,15 @@
 #include <Core/Types.h>
 #include <Common/SipHash.h>
 #include <Common/ThreadPool.h>
+#include <Interpreters/Context_fwd.h>
 
-#include <memory>
-#include <vector>
-#include <string>
-#include <deque>
 #include <mutex>
-#include <unordered_map>
 
 
 namespace DB
 {
 
-class Context;
-using ContextMutablePtr = std::shared_ptr<Context>;
+class CnchWorkerResource;
 
 template<typename NamedSession>
 class NamedSessionsImpl
@@ -45,8 +40,9 @@ public:
     std::shared_ptr<NamedSession> acquireSession(
         const Key & session_id,
         ContextPtr context,
-        std::chrono::steady_clock::duration timeout,
-        bool throw_if_not_found);
+        size_t timeout,
+        bool throw_if_not_found,
+        bool return_null_if_not_found = false);
 
     void releaseSession(NamedSession & session)
     {
@@ -54,16 +50,13 @@ public:
         scheduleCloseSession(session, lock);
     }
 
-private:
+    std::vector<std::pair<Key, std::shared_ptr<CnchWorkerResource>>> getAllWorkerResources() const;
 
-    /// TODO it's very complicated. Make simple std::map with time_t or boost::multi_index.
+private:
     using Container = std::unordered_map<Key, std::shared_ptr<NamedSession>, SessionKeyHash>;
-    using CloseTimes = std::deque<std::vector<Key>>;
+    using CloseTimes = std::multimap<size_t, Key>;
     Container sessions;
     CloseTimes close_times;
-    std::chrono::steady_clock::duration close_interval = std::chrono::seconds(1);
-    std::chrono::steady_clock::time_point close_cycle_time = std::chrono::steady_clock::now();
-    UInt64 close_cycle = 0;
 
     void scheduleCloseSession(NamedSession & session, std::unique_lock<std::mutex> &);
 
@@ -72,7 +65,7 @@ private:
     /// Close sessions, that has been expired. Returns how long to wait for next session to be expired, if no new sessions will be added.
     std::chrono::steady_clock::duration closeSessions(std::unique_lock<std::mutex> & lock);
 
-    std::mutex mutex;
+    mutable std::mutex mutex;
     std::condition_variable cond;
     std::atomic<bool> quit{false};
     ThreadFromGlobalPool thread{&NamedSessionsImpl::cleanThread, this};
@@ -90,13 +83,15 @@ struct NamedSession
     /// User name and session identifier. Named sessions are local to users.
     using NamedSessionKey = std::pair<String, String>;
     NamedSessionKey key;
-    UInt64 close_cycle = 0;
     ContextMutablePtr context;
-    std::chrono::steady_clock::duration timeout;
+    size_t timeout;
+    size_t close_time{0};
     NamedSessionsImpl<NamedSession> & parent;
 
-    NamedSession(NamedSessionKey key_, ContextPtr context_, std::chrono::steady_clock::duration timeout_, NamedSessions & parent_);
+    NamedSession(NamedSessionKey key_, ContextPtr context_, size_t timeout_, NamedSessions & parent_);
     void release();
+
+    String getID() const { return key.first + "-" + key.second; }
 
     class SessionKeyHash
     {
@@ -117,13 +112,15 @@ struct NamedCnchSession
     using SessionKeyHash = std::hash<NamedSessionKey>;
 
     NamedSessionKey key;
-    UInt64 close_cycle = 0;
     ContextMutablePtr context;
-    std::chrono::steady_clock::duration timeout;
+    size_t timeout;
+    size_t close_time{0};
     NamedSessionsImpl<NamedCnchSession> & parent;
 
-    NamedCnchSession(NamedSessionKey key_, ContextPtr context_, std::chrono::steady_clock::duration timeout_, NamedCnchSessions & parent_);
+    NamedCnchSession(NamedSessionKey key_, ContextPtr context_, size_t timeout_, NamedCnchSessions & parent_);
     void release();
+
+    String getID() const { return std::to_string(key); }
 };
 
 }

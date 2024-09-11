@@ -57,7 +57,7 @@ public:
     using Job = std::function<void()>;
 
     /// Maximum number of threads is based on the number of physical cores.
-    ThreadPoolImpl(DB::CpuSetPtr cpu_set_ = nullptr);
+    explicit ThreadPoolImpl(DB::CpuSetPtr cpu_set_ = nullptr);
 
     /// Size is constant. Up to num_threads are created on demand and then run until shutdown.
     explicit ThreadPoolImpl(size_t max_threads_, DB::CpuSetPtr cpu_set_ = nullptr);
@@ -103,8 +103,11 @@ public:
     void setQueueSize(size_t value);
     size_t getMaxThreads() const;
     size_t getMaxQueueSize() const;
-
+    void finalize();
+        
 private:
+    friend class DiskCacheTest;
+
     mutable std::mutex mutex;
     std::condition_variable job_finished;
     std::condition_variable new_job_or_shutdown;
@@ -115,6 +118,7 @@ private:
 
     size_t scheduled_jobs = 0;
     bool shutdown = false;
+    bool threads_remove_themselves = true;
     const bool shutdown_on_exception = true;
 
     struct JobWithPriority
@@ -142,8 +146,6 @@ private:
     ReturnType scheduleImpl(Job job, int priority, std::optional<uint64_t> wait_microseconds);
 
     void worker(typename std::list<Thread>::iterator thread_it);
-
-    void finalize();
 };
 
 
@@ -186,14 +188,13 @@ public:
 class ThreadFromGlobalPool
 {
 public:
-    ThreadFromGlobalPool() {}
+    ThreadFromGlobalPool() = default;
 
     template <typename Function, typename... Args>
     explicit ThreadFromGlobalPool(Function && func, Args &&... args)
         : state(std::make_shared<Poco::Event>()),
         tid(std::make_shared<size_t>(0)),
-        cv(std::make_shared<std::condition_variable>()),
-        mutex()
+        cv(std::make_shared<std::condition_variable>())
     {
         /// NOTE: If this will throw an exception, the destructor won't be called.
         getThreadPool().scheduleOrThrow([

@@ -19,6 +19,7 @@
 #include <Common/formatIPv6.h>
 #include <Common/filesystemHelpers.h>
 #include <Common/HostWithPorts.h>
+#include <Common/ProfileEvents.h>
 #include <Poco/URI.h>
 #include <Poco/Path.h>
 #include <ServiceDiscovery/ServiceDiscoveryFactory.h>
@@ -29,6 +30,15 @@
 #include <common/logger_useful.h>
 #include <common/scope_guard.h>
 #include "HDFSFileSystem.h"
+
+namespace ProfileEvents
+{
+    extern const int HdfsRequestErrors;
+    extern const int HdfsExists;
+    extern const int HdfsList;
+    extern const int HdfsRename;
+}
+
 namespace DB
 {
 
@@ -280,7 +290,7 @@ void HDFSFileSystem::reconnect() const
 
 void HDFSFileSystem::reconnectIfNecessary() const
 {
-    if (io_error_num_to_reconnect == 0 || (io_error_num != 0 && io_error_num % io_error_num_to_reconnect == 0))
+    if (io_error_num && (io_error_num_to_reconnect == 0 || io_error_num % io_error_num_to_reconnect == 0))
     {
         reconnect();
         io_error_num = 0;
@@ -486,6 +496,7 @@ bool HDFSFileSystem::setSize(const std::string& path, uint64_t size)
 
 bool HDFSFileSystem::exists(const std::string& path) const
 {
+    ProfileEvents::increment(ProfileEvents::HdfsExists);
     HDFSFSPtr fs_copy = getFS();
     String normalized_path = normalizePath(path);
     int ret = hdfsExists(fs_copy.get(), normalized_path.c_str());
@@ -533,8 +544,9 @@ ssize_t HDFSFileSystem::getCapacity() const
 }
 
 void HDFSFileSystem::list(const std::string& path,
-    std::vector<std::string>& filenames) const
+    std::vector<std::string>& filenames, std::vector<size_t> & sizes) const
 {
+    ProfileEvents::increment(ProfileEvents::HdfsList);
     HDFSFSPtr fs_copy = getFS();
     int num = 0;
     String normalized_path = normalizePath(path);
@@ -548,6 +560,7 @@ void HDFSFileSystem::list(const std::string& path,
     {
         Poco::Path filename(files[i].mName);
         filenames.push_back(filename.getFileName());
+        sizes.push_back(files[i].mSize);
     }
     hdfsFreeFileInfo(files, num);
 }
@@ -570,6 +583,7 @@ int64_t HDFSFileSystem::getLastModifiedInSeconds(
 bool HDFSFileSystem::renameTo(const std::string& path,
     const std::string& rpath) const
 {
+    ProfileEvents::increment(ProfileEvents::HdfsRename);
     HDFSFSPtr fs_copy = getFS();
     String normalized_path = normalizePath(path);
     String normalized_rpath = normalizePath(rpath);
@@ -638,6 +652,7 @@ String HDFSFileSystem::normalizePath(const String &path)
 
 void HDFSFileSystem::handleError(const String & func) const
 {
+    ProfileEvents::increment(ProfileEvents::HdfsRequestErrors);
     if (errno == EIO)
     {
         ++io_error_num;
@@ -792,13 +807,13 @@ HDFSConnectionParams::HDFSConnectionParams()
 HDFSConnectionParams::HDFSConnectionParams(HDFSConnectionType t, const String & hdfs_user_, const String & hdfs_service_)
     : conn_type(t), hdfs_user(hdfs_user_), hdfs_service(hdfs_service_), addrs()
 {
-    lookupOnNeed();
+    // lookupOnNeed();
 }
 
 HDFSConnectionParams::HDFSConnectionParams(HDFSConnectionType t, const String & hdfs_user_, const std::vector<IpWithPort>& addrs_ )
     : conn_type(t), hdfs_user(hdfs_user_), hdfs_service(""), addrs(addrs_)
 {
-    lookupOnNeed();
+    // lookupOnNeed();
 }
 
 HDFSConnectionParams HDFSConnectionParams::parseHdfsFromConfig(
@@ -837,7 +852,7 @@ HDFSConnectionParams HDFSConnectionParams::parseHdfsFromConfig(
     {
         connect_params = HDFSConnectionParams(CONN_HA, hdfs_user, config.getString(hdfs_ha_key));
     }
-    else if (config.has(hdfs_nnproxy_key))
+    else
     {
         // hdfs_nnproxy could refer to both cfs and nnproxy.
         String hdfs_nnproxy = config.getString(hdfs_nnproxy_key, "nnproxy");
@@ -855,10 +870,6 @@ HDFSConnectionParams HDFSConnectionParams::parseHdfsFromConfig(
             // this is a nnproxy.
             connect_params = HDFSConnectionParams(CONN_NNPROXY, hdfs_user, hdfs_nnproxy);
         }
-    }
-    else
-    {
-        connect_params = HDFSConnectionParams();
     }
 
     connect_params.krb5_params = HDFSKrb5Params::parseKrb5FromConfig(config, config_prefix);
@@ -888,23 +899,49 @@ HDFSConnectionParams HDFSConnectionParams::parseFromMisusedNNProxyStr(String hdf
 
 void HDFSConnectionParams::lookupOnNeed()
 {
+    // if (conn_type != CONN_NNPROXY)
+    //     return;
+
+    // HostWithPortsVec nnproxys = lookupNNProxy(hdfs_service);
+    // assert(nnproxys.size() > 0);
+    // for (auto it : nnproxys)
+    // {
+    //     addrs.emplace_back(it.getHost(), it.tcp_port);
+    // }
+    // // ensure the nnproxy picked is not the same as the broken one.
+    // nnproxy_index = brokenNNs.findOneGoodNN(nnproxys);
+    inited = true;
+}
+
+std::vector<HDFSConnectionParams::IpWithPort> HDFSConnectionParams::lookupAndShuffle() const
+{
+    std::vector<IpWithPort> ret;
     if (conn_type != CONN_NNPROXY)
-        return;
+        return ret;
 
     HostWithPortsVec nnproxys = lookupNNProxy(hdfs_service);
     assert(nnproxys.size() > 0);
+    shuffleAddrs(nnproxys);
     for (auto it : nnproxys)
     {
-        addrs.emplace_back(it.getHost(), it.tcp_port);
+        ret.emplace_back(it.host, it.tcp_port);
     }
-    // ensure the nnproxy picked is not the same as the broken one.
-    nnproxy_index = brokenNNs.findOneGoodNN(nnproxys);
-    inited = true;
+    return ret;
+}
+
+void HDFSConnectionParams::shuffleAddrs(HostWithPortsVec & shuffle_addrs) const
+{
+    if (shuffle_addrs.size() < 2)
+        return;
+
+    static thread_local std::random_device shuffle_rd{};
+    auto dist = std::mt19937{shuffle_rd()};
+    std::shuffle(shuffle_addrs.begin(),shuffle_addrs.end(), dist);
 }
 
 void HDFSConnectionParams::setNNProxyBroken()
 {
-    if( conn_type != CONN_NNPROXY || !inited) {
+    if (conn_type != CONN_NNPROXY || !inited) {
         return;
     }
     brokenNNs.insert(addrs[nnproxy_index].first);
@@ -916,6 +953,7 @@ Poco::URI HDFSConnectionParams::formatPath(const String & path) const
     switch (conn_type)
     {
         case CONN_NNPROXY: {
+            auto addrs_from_nnproxy = lookupAndShuffle();
             uri.setScheme("hdfs");
             if (use_nnproxy_ha)
             {
@@ -923,8 +961,8 @@ Poco::URI HDFSConnectionParams::formatPath(const String & path) const
             }
             else
             {
-                uri.setHost(addrs[nnproxy_index].first);
-                uri.setPort(addrs[nnproxy_index].second);
+                uri.setHost(addrs_from_nnproxy[0].first);
+                uri.setPort(addrs_from_nnproxy[0].second);
             }
             return uri;
         }
@@ -986,25 +1024,21 @@ HDFSBuilderPtr HDFSConnectionParams::createBuilder(const Poco::URI & uri) const
             setHdfsDirectConfig(builder, hdfs_user, "hdfs://" + normalizedHost, uri.getPort());
             return builder;
         }
-        else if (uri.getScheme() == "hdfs")
-        {
-            setHdfsHaConfig(builder, normalizedHost, hdfs_user, std::vector<std::pair<String, int>>());
-            return builder;
-        }
     }
 
     // construt from other configs.
     switch (conn_type)
     {
         case CONN_NNPROXY: {
+            auto addrs_from_nnproxy = lookupAndShuffle();
             if (use_nnproxy_ha)
             {
-                setHdfsHaConfig(builder, hdfs_service, hdfs_user, addrs);
+                setHdfsHaConfig(builder, hdfs_service, hdfs_user, addrs_from_nnproxy);
                 return builder;
             }
             else
             {
-                IpWithPort targetNode = addrs[nnproxy_index];
+                IpWithPort targetNode = addrs_from_nnproxy[0];
                 setHdfsDirectConfig(builder, hdfs_user, "hdfs://" + std::get<0>(safeNormalizeHost(targetNode.first)), targetNode.second);
                 return builder;
             }
@@ -1184,7 +1218,8 @@ void setLastModified(const std::string& path, const Poco::Timestamp& ts)
 
 void list(const std::string& path, std::vector<std::string>& files)
 {
-    getDefaultHdfsFileSystem()->list(path, files);
+    std::vector<size_t> sizes;
+    getDefaultHdfsFileSystem()->list(path, files, sizes);
 }
 
 bool isFile(const std::string& path)
@@ -1215,10 +1250,6 @@ void setWritable(const std::string& path)
 void setSize(const std::string& path, uint64_t size)
 {
     getDefaultHdfsFileSystem()->setSize(path, size);
-}
-
-DirectoryIterator::DirectoryIterator()
-{
 }
 
 DirectoryIterator::DirectoryIterator(const std::string& dir_path_): dir_path(joinPaths({dir_path_}, true))

@@ -29,6 +29,7 @@
 #include <Parsers/ASTRenameQuery.h>
 #include <Storages/IStorage.h>
 #include <Transaction/ICnchTransaction.h>
+#include "Common/tests/gtest_global_context.h"
 #include <Common/typeid_cast.h>
 
 
@@ -39,6 +40,7 @@ namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
     extern const int CNCH_TRANSACTION_NOT_INITIALIZED;
+    extern const int LOGICAL_ERROR;
 }
 
 InterpreterRenameQuery::InterpreterRenameQuery(const ASTPtr & query_ptr_, ContextPtr context_)
@@ -50,11 +52,12 @@ InterpreterRenameQuery::InterpreterRenameQuery(const ASTPtr & query_ptr_, Contex
 BlockIO InterpreterRenameQuery::execute()
 {
     const auto & rename = query_ptr->as<const ASTRenameQuery &>();
+    auto access_type = rename.database ? RenameType::RenameDatabase : RenameType::RenameTable;
 
     if (!rename.cluster.empty())
-        return executeDDLQueryOnCluster(query_ptr, getContext(), getRequiredAccess());
+        return executeDDLQueryOnCluster(query_ptr, getContext(), getRequiredAccess(access_type));
 
-    getContext()->checkAccess(getRequiredAccess());
+    getContext()->checkAccess(getRequiredAccess(access_type));
 
     String path = getContext()->getPath();
     String current_database = getContext()->getCurrentDatabase();
@@ -102,7 +105,7 @@ BlockIO InterpreterRenameQuery::executeToTables(const ASTRenameQuery & rename, c
         if (!rename.exchange)
             database_catalog.assertTableDoesntExist(StorageID(elem.to_database_name, elem.to_table_name), getContext());
 
-        DatabasePtr database = database_catalog.getDatabase(elem.from_database_name);
+        DatabasePtr database = database_catalog.getDatabase(elem.from_database_name, getContext());
         if (typeid_cast<DatabaseReplicated *>(database.get())
             && !getContext()->getClientInfo().is_replicated_database_internal)
         {
@@ -121,7 +124,7 @@ BlockIO InterpreterRenameQuery::executeToTables(const ASTRenameQuery & rename, c
             database->renameTable(
                 getContext(),
                 elem.from_table_name,
-                *database_catalog.getDatabase(elem.to_database_name),
+                *database_catalog.getDatabase(elem.to_database_name, getContext()),
                 elem.to_table_name,
                 rename.exchange,
                 rename.dictionary);
@@ -145,7 +148,7 @@ BlockIO InterpreterRenameQuery::executeToDatabase(const ASTRenameQuery &, const 
     IntentLockPtr old_db_lock;
     IntentLockPtr new_db_lock;
 
-    auto db = catalog.getDatabase(old_name);
+    auto db = catalog.getDatabase(old_name, getContext());
     if (db->getEngineName().starts_with("Cnch"))
     {
         auto txn = getContext()->getCurrentTransaction();
@@ -155,23 +158,35 @@ BlockIO InterpreterRenameQuery::executeToDatabase(const ASTRenameQuery &, const 
         new_db_lock = txn->createIntentLock(IntentLock::DB_LOCK_PREFIX, new_name);
         std::lock(*old_db_lock, *new_db_lock);
     }
-    catalog.assertDatabaseDoesntExist(new_name);
+    catalog.assertDatabaseDoesntExist(new_name, getContext());
     db->renameDatabase(getContext(), new_name);
     return {};
 }
 
-AccessRightsElements InterpreterRenameQuery::getRequiredAccess() const
+AccessRightsElements InterpreterRenameQuery::getRequiredAccess(InterpreterRenameQuery::RenameType type) const
 {
     AccessRightsElements required_access;
     const auto & rename = query_ptr->as<const ASTRenameQuery &>();
     for (const auto & elem : rename.elements)
     {
-        required_access.emplace_back(AccessType::SELECT | AccessType::DROP_TABLE, elem.from.database, elem.from.table);
-        required_access.emplace_back(AccessType::CREATE_TABLE | AccessType::INSERT, elem.to.database, elem.to.table);
-        if (rename.exchange)
+        if (type == RenameType::RenameTable)
         {
-            required_access.emplace_back(AccessType::CREATE_TABLE | AccessType::INSERT, elem.from.database, elem.from.table);
-            required_access.emplace_back(AccessType::SELECT | AccessType::DROP_TABLE, elem.to.database, elem.to.table);
+            required_access.emplace_back(AccessType::SELECT | AccessType::DROP_TABLE, elem.from.database, elem.from.table);
+            required_access.emplace_back(AccessType::CREATE_TABLE | AccessType::INSERT, elem.to.database, elem.to.table);
+            if (rename.exchange)
+            {
+                required_access.emplace_back(AccessType::CREATE_TABLE | AccessType::INSERT, elem.from.database, elem.from.table);
+                required_access.emplace_back(AccessType::SELECT | AccessType::DROP_TABLE, elem.to.database, elem.to.table);
+            }
+        }
+        else if (type == RenameType::RenameDatabase)
+        {
+            required_access.emplace_back(AccessType::SELECT | AccessType::DROP_DATABASE, elem.from.database);
+            required_access.emplace_back(AccessType::CREATE_DATABASE | AccessType::INSERT, elem.to.database);
+        }
+        else
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown type of rename query");
         }
     }
     return required_access;

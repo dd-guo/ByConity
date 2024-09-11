@@ -14,31 +14,51 @@
  */
 
 #pragma once
-#include <QueryPlan/ITransformingStep.h>
 #include <Core/SortDescription.h>
 #include <DataStreams/SizeLimits.h>
 #include <Disks/IVolume.h>
+#include <Interpreters/prepared_statement.h>
+#include <QueryPlan/ITransformingStep.h>
 
 namespace DB
 {
-
 /// Sorts stream of data. See MergeSortingTransform.
 class SortingStep : public ITransformingStep
 {
 public:
-    explicit SortingStep(
-            const DataStream & input_stream,
-            const SortDescription & description_,
-            UInt64 limit_,
-            bool partial_);
+    ENUM_WITH_PROTO_CONVERTER(
+        Stage, // enum name
+        Protos::SortingStep::Stage, // proto enum message
+        (FULL),
+        (MERGE),
+        (PARTIAL),
+        (PARTIAL_NO_MERGE)
+    );
+
+    explicit SortingStep(const DataStream & input_stream, SortDescription description_, SizeOrVariable limit_, Stage stage_, SortDescription prefix_description_ = {}, bool enable_adaptive_spill_ = false);
 
     String getName() const override { return "Sorting"; }
 
     Type getType() const override { return Type::Sorting; }
-    const SortDescription & getSortDescription() const { return description; }
-    UInt64 getLimit() const { return limit; }
-    bool isPartial() const { return partial; }
+    const SortDescription & getSortDescription() const { return result_description; }
+    const SortDescription & getPrefixDescription() const { return prefix_description; }
+    void setPrefixDescription(const SortDescription & prefix_description_) { prefix_description = prefix_description_; }
+    Stage getStage() const { return stage; }
+    void setStage(Stage stage_) { stage = stage_; }
 
+    const SizeOrVariable & getLimit() const
+    {
+        return limit;
+    }
+    UInt64 getLimitValue() const
+    {
+        return std::get<UInt64>(limit);
+    }
+
+    bool hasPreparedParam() const
+    {
+        return std::holds_alternative<String>(limit);
+    }
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
     void describeActions(JSONBuilder::JSONMap & map) const override;
@@ -47,15 +67,19 @@ public:
     /// Add limit or change it to lower value.
     void updateLimit(size_t limit_);
 
-    void serialize(WriteBuffer &) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer &, ContextPtr context_ = nullptr);
+    void toProto(Protos::SortingStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<SortingStep> fromProto(const Protos::SortingStep & proto, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 
+    void prepare(const PreparedStatementContext & prepared_context) override;
+
 private:
-    SortDescription description;
-    UInt64 limit;
-    bool partial;
+    const SortDescription result_description;
+    SizeOrVariable limit;
+    Stage stage;
+    SortDescription prefix_description;
+    bool enable_adaptive_spill = false;
 };
 
 }

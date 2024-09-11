@@ -54,7 +54,12 @@ ExternalProject_Get_property(datasketches_proj INSTALL_DIR)
 set(datasketches_INSTALL_DIR ${INSTALL_DIR})
 message("Source dir of datasketches_proj = ${datasketches_INSTALL_DIR}")
 add_library(datasketches_lib INTERFACE)
-target_include_directories(datasketches_lib
+target_include_directories(datasketches_lib SYSTEM
                             INTERFACE ${datasketches_INSTALL_DIR}/include)
+
+target_compile_options (datasketches_lib
+        INTERFACE
+        -Wno-error
+        )
 add_dependencies(datasketches_lib datasketches_proj)
 set(USE_DATASKETCHES 1)

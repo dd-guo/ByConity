@@ -30,7 +30,9 @@
 #include <Statistics/DataSketchesHelper.h>
 #include <Statistics/SerdeUtils.h>
 #include <Statistics/StatsNdvBucketsResultImpl.h>
+#include <Statistics/StringHash.h>
 #include <Statistics/serde_extend.hpp>
+#include <Statistics/CollectorSettings.h>
 
 namespace DB::Statistics
 {
@@ -72,7 +74,7 @@ namespace impl
 
     // algorithm to generate bucket bounds from kll_sketch
     template <typename T>
-    std::vector<T> generateBoundsFromKll(const datasketches::kll_sketch<T> & kll)
+    std::vector<T> generateBoundsFromKll(const datasketches::kll_sketch<T> & kll, UInt64 histogram_bucket_size)
     {
         // dump internal data from kll_sketch
         std::vector<T> internal_bounds;
@@ -85,10 +87,9 @@ namespace impl
         std::sort(internal_bounds.begin(), internal_bounds.end());
         internal_bounds = trimBucketBounds(internal_bounds);
 
-        // 350 ~= 248 + 50 * 2
-        if (internal_bounds.size() < 350)
+        if (internal_bounds.size() < histogram_bucket_size)
         {
-            if (internal_bounds.size() < 125)
+            if (internal_bounds.size() <= histogram_bucket_size / 2)
             {
                 // construct top K like bounds
                 // i.e. [1, 1, 3, 3, 5, 5, ...]
@@ -108,9 +109,12 @@ namespace impl
         }
         else
         {
-            // normally
-            // just use get_quantiles api
-            auto quantiles = kll.get_quantiles(350);
+            // quantiles API will return split points on [0.0, 1/(size -1), 2/(size -1),..., 1.0] 
+            // to get equal-height bucket, we need to add 1 more split point
+            auto quantiles = kll.get_quantiles(histogram_bucket_size + 1, false);
+            // rewrite min/max to the accurate one
+            quantiles[0] = kll.get_min_item();
+            quantiles[histogram_bucket_size] = kll.get_max_item(); 
             return trimBucketBounds(quantiles);
         }
     }
@@ -130,10 +134,11 @@ public:
         // enable only when T is string
         // using sfinae
         static_assert(is_string);
-        return CityHash_v1_0_2::CityHash64(str.data(), str.size());
+        return Statistics::stringHash64(str);
     }
 
-    StatsKllSketchImpl() = default;
+    // default value of logK of kll_sketch is 1600
+    explicit StatsKllSketchImpl(UInt64 logK = DEFAULT_KLL_SKETCH_LOG_K) : data(logK) { }
 
     String serialize() const override;
     void deserialize(std::string_view blob) override;
@@ -156,20 +161,20 @@ public:
 
     bool isEmpty() const override { return data.is_empty(); }
 
-    T get_min_value() { return data.get_min_value(); }
-    T get_max_value() { return data.get_max_value(); }
+    T getMinItem() { return data.get_min_item(); }
+    T getMaxItem() { return data.get_max_item(); }
 
-    std::shared_ptr<BucketBounds> getBucketBounds() const override;
+    std::shared_ptr<BucketBounds> getBucketBounds(UInt64 bucket_size) const override;
 
     int64_t getCount() const override { return data.get_n(); }
 
     // assuming ndv==count for each bucket
     // generate ndvBucketsResultImpl
-    std::shared_ptr<StatsNdvBucketsResultImpl<T>> generateNdvBucketsResultImpl(double total_ndv) const;
+    std::shared_ptr<StatsNdvBucketsResultImpl<T>> generateNdvBucketsResultImpl(double total_ndv, UInt64 histogram_bucket_size) const;
 
-    std::shared_ptr<StatsNdvBucketsResult> generateNdvBucketsResult(double total_ndv) const override
+    std::shared_ptr<StatsNdvBucketsResult> generateNdvBucketsResult(double total_ndv, UInt64 histogram_bucket_size) const override
     {
-        return generateNdvBucketsResultImpl(total_ndv);
+        return generateNdvBucketsResultImpl(total_ndv, histogram_bucket_size);
     }
 
 protected:
@@ -182,7 +187,7 @@ protected:
         }
         else
         {
-            return Statistics::toDouble(data.get_min_value());
+            return Statistics::toDouble(data.get_min_item());
         }
     }
     std::optional<double> maxAsDouble() const override
@@ -193,7 +198,7 @@ protected:
         }
         else
         {
-            return Statistics::toDouble(data.get_max_value());
+            return Statistics::toDouble(data.get_max_item());
         }
     }
 
@@ -202,10 +207,10 @@ private:
 };
 
 template <typename T>
-inline std::shared_ptr<BucketBounds> StatsKllSketchImpl<T>::getBucketBounds() const
+inline std::shared_ptr<BucketBounds> StatsKllSketchImpl<T>::getBucketBounds(UInt64 histogram_bucket_size) const
 {
     auto bounds = std::make_shared<BucketBoundsImpl<T>>();
-    auto vec = impl::generateBoundsFromKll(data);
+    auto vec = impl::generateBoundsFromKll(data, histogram_bucket_size);
     bounds->setBounds(std::move(vec));
     return bounds;
 }
@@ -253,9 +258,9 @@ namespace impl
 
 // return null when ndv < 2
 template <typename T>
-std::shared_ptr<StatsNdvBucketsResultImpl<T>> StatsKllSketchImpl<T>::generateNdvBucketsResultImpl(double total_ndv) const
+std::shared_ptr<StatsNdvBucketsResultImpl<T>> StatsKllSketchImpl<T>::generateNdvBucketsResultImpl(double total_ndv, UInt64 histogram_bucket_size) const
 {
-    auto bounds = impl::generateBoundsFromKll(data);
+    auto bounds = impl::generateBoundsFromKll(data, histogram_bucket_size);
     auto output_bounds = bounds;
 
     auto row_count = data.get_n();

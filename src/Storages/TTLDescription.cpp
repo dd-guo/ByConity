@@ -12,6 +12,8 @@
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTAssignment.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ExpressionListParsers.h>
+#include <Parsers/parseQuery.h>
 #include <Storages/ColumnsDescription.h>
 #include <Interpreters/Context.h>
 
@@ -19,6 +21,7 @@
 
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeNullable.h>
 
 
 namespace DB
@@ -56,7 +59,44 @@ TTLAggregateDescription & TTLAggregateDescription::operator=(const TTLAggregateD
 namespace
 {
 
-void checkTTLExpression(const ExpressionActionsPtr & ttl_expression, const String & result_column_name)
+// For compatibility. To convert ttl expression such as "`toDate(p_date)` + toIntervalDay(x)" to "toDate(p_date) + toIntervalDay(x)"
+void normalizeTTLExpression(ASTPtr & ttl_ast, const ColumnsDescription & columns)
+{
+    Names column_names = columns.getNamesOfPhysical();
+    NameSet column_set{column_names.begin(), column_names.end()};
+
+    std::function<void(ASTPtr &)> replace_unexpected_indentifier = [&column_set, &replace_unexpected_indentifier](ASTPtr & ast)
+    {
+        if (!ast)
+            return;
+
+        if (ASTFunction * func = ast->as<ASTFunction>())
+        {
+            for (auto & child : func->arguments->children)
+                replace_unexpected_indentifier(child);
+        }
+        else if (ASTIdentifier * identifier = ast->as<ASTIdentifier>())
+        {
+            String name = identifier->getColumnName();
+            if (!column_set.count(name))
+            {
+                ParserExpression parser;
+                ASTPtr parse_res= parseQuery(parser, name, 0, 0);
+                if (parse_res->as<ASTFunction>())
+                    ast = parse_res;
+            }
+        }
+        else
+        {
+            for (auto & child : ast->children)
+                replace_unexpected_indentifier(child);
+        }
+    };
+
+    replace_unexpected_indentifier(ttl_ast);
+}
+
+void checkTTLExpression(const ExpressionActionsPtr & ttl_expression, const String & result_column_name, bool allow_nullable_type = false)
 {
     for (const auto & action : ttl_expression->getActions())
     {
@@ -74,13 +114,35 @@ void checkTTLExpression(const ExpressionActionsPtr & ttl_expression, const Strin
 
     const auto & result_column = ttl_expression->getSampleBlock().getByName(result_column_name);
 
-    if (!typeid_cast<const DataTypeDateTime *>(result_column.type.get())
-        && !typeid_cast<const DataTypeDate *>(result_column.type.get()))
+    const auto * result_type = result_column.type.get();
+
+    if (result_type->isNullable())
     {
-        throw Exception(
-            "TTL expression result column should have DateTime or Date type, but has " + result_column.type->getName(),
-            ErrorCodes::BAD_TTL_EXPRESSION);
+        if (!allow_nullable_type)
+        {
+            throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+                "TTL expression result type is {} but allow_nullable_key is false.", result_type->getName());
+        }
+
+        auto nested_type = static_cast<const DataTypeNullable *>(result_type)->getNestedType();
+        if (!typeid_cast<const DataTypeDateTime *>(nested_type.get())
+            && !typeid_cast<const DataTypeDate *>(nested_type.get()))
+        {
+            throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+                "TTL expression result column should have Nullable(DateTime) or Nullable(Date) type, but has " + result_type->getName());
+        }
     }
+    else
+    {
+        if (!typeid_cast<const DataTypeDateTime *>(result_column.type.get())
+            && !typeid_cast<const DataTypeDate *>(result_column.type.get()))
+        {
+            throw Exception(
+                "TTL expression result column should have DateTime or Date type, but has " + result_column.type->getName(),
+                ErrorCodes::BAD_TTL_EXPRESSION);
+        }
+    }
+
 }
 
 class FindAggregateFunctionData
@@ -93,7 +155,7 @@ public:
     {
         /// Do not throw if found aggregate function inside another aggregate function,
         /// because it will be checked, while creating expressions.
-        if (AggregateFunctionFactory::instance().isAggregateFunctionName(func.name))
+        if (AggregateUtils::isAggregateFunction(func))
             has_aggregate_function = true;
     }
 };
@@ -163,7 +225,8 @@ TTLDescription TTLDescription::getTTLFromAST(
     const ASTPtr & definition_ast,
     const ColumnsDescription & columns,
     ContextPtr context,
-    const KeyDescription & primary_key)
+    const KeyDescription & primary_key,
+    bool allow_nullable_type)
 {
     TTLDescription result;
     const auto * ttl_element = definition_ast->as<ASTTTLElement>();
@@ -174,6 +237,7 @@ TTLDescription TTLDescription::getTTLFromAST(
     else /// It's columns TTL without any additions, just copy it
         result.expression_ast = definition_ast->clone();
 
+    normalizeTTLExpression(result.expression_ast, columns);
     auto ttl_ast = result.expression_ast->clone();
     auto syntax_analyzer_result = TreeRewriter(context).analyze(ttl_ast, columns.getAllPhysical());
     result.expression = ExpressionAnalyzer(ttl_ast, syntax_analyzer_result, context).getActions(false);
@@ -190,7 +254,7 @@ TTLDescription TTLDescription::getTTLFromAST(
         result.destination_name = ttl_element->destination_name;
         result.mode = ttl_element->mode;
 
-        if (ttl_element->mode == TTLMode::DELETE)
+        if (ttl_element->mode == TTLMode::DELETE || ttl_element->mode == TTLMode::MOVE)
         {
             if (ASTPtr where_expr_ast = ttl_element->where())
             {
@@ -293,10 +357,63 @@ TTLDescription TTLDescription::getTTLFromAST(
         }
     }
 
-    checkTTLExpression(result.expression, result.result_column);
+    checkTTLExpression(result.expression, result.result_column, allow_nullable_type);
     return result;
 }
 
+void TTLDescription::tryRewriteTTLWithPartitionKey(TTLDescription & ttl_description, const ColumnsDescription & columns, const KeyDescription & partition_key, const KeyDescription & primary_key, ContextPtr context)
+{
+    /// no need to rewrite if partition columns is empty
+    if (partition_key.column_names.empty())
+        return;
+
+    bool has_rewritten = false;
+    std::function<void(ASTPtr &,const NameSet &)> replace_func_with_partition_column = [&replace_func_with_partition_column, &has_rewritten](ASTPtr & definition_ast, const NameSet & partition_columns)
+    {
+        if (!definition_ast)
+            return;
+
+        if (ASTFunction * func = definition_ast->as<ASTFunction>())
+        {
+            String column_name = func->getColumnName();
+            if (partition_columns.count(column_name))
+            {
+                auto identifier = std::make_shared<ASTIdentifier>(column_name);
+                definition_ast = identifier;
+                has_rewritten = true;
+            }
+            else
+            {
+                for (auto & child : func->arguments->children)
+                    replace_func_with_partition_column(child, partition_columns);
+            }
+        }
+        else
+        {
+            for (auto & child : definition_ast->children)
+                replace_func_with_partition_column(child, partition_columns);
+        }
+    };
+
+    NameSet partition_names;
+    for (auto column_name : partition_key.column_names)
+        partition_names.insert(column_name);
+
+    replace_func_with_partition_column(ttl_description.expression_ast, partition_names);
+
+    if (!has_rewritten)
+        return;
+
+    ColumnsDescription full_columns = ColumnsDescription(partition_key.sample_block.getNamesAndTypesList());
+    for (auto it=columns.begin(); it!=columns.end(); it++)
+    {
+        if (!full_columns.has(it->name))
+            full_columns.add(*it);
+    }
+
+    /// update the ttl_description based on new definition AST.
+    ttl_description = getTTLFromAST(ttl_description.expression_ast, full_columns, context, primary_key);
+}
 
 TTLTableDescription::TTLTableDescription(const TTLTableDescription & other)
  : definition_ast(other.definition_ast ? other.definition_ast->clone() : nullptr)
@@ -331,7 +448,8 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
     const ASTPtr & definition_ast,
     const ColumnsDescription & columns,
     ContextPtr context,
-    const KeyDescription & primary_key)
+    const KeyDescription & primary_key,
+    bool allow_nullable_type)
 {
     TTLTableDescription result;
     if (!definition_ast)
@@ -342,7 +460,7 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
     bool have_unconditional_delete_ttl = false;
     for (const auto & ttl_element_ptr : definition_ast->children)
     {
-        auto ttl = TTLDescription::getTTLFromAST(ttl_element_ptr, columns, context, primary_key);
+        auto ttl = TTLDescription::getTTLFromAST(ttl_element_ptr, columns, context, primary_key, allow_nullable_type);
         if (ttl.mode == TTLMode::DELETE)
         {
             if (!ttl.where_expression)

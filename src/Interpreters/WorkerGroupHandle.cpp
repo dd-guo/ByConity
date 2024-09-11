@@ -13,13 +13,19 @@
  * limitations under the License.
  */
 
+#include <cstddef>
 #include <Interpreters/WorkerGroupHandle.h>
 
 #include <ResourceManagement/CommonData.h>
+#include "Common/Exception.h"
+#include "Common/HostWithPorts.h"
+#include "common/getFQDNOrHostName.h"
+#include <Common/Configurations.h>
 #include <Common/parseAddress.h>
 #include <Interpreters/Context.h>
 #include <IO/ConnectionTimeouts.h>
 #include <CloudServices/CnchWorkerClientPools.h>
+#include <fmt/core.h>
 #include <common/logger_useful.h>
 
 namespace DB
@@ -32,17 +38,27 @@ namespace ErrorCodes
     extern const int RESOURCE_MANAGER_NO_AVAILABLE_WORKER;
 }
 
-std::unique_ptr<DB::ConsistentHashRing> WorkerGroupHandleImpl::buildRing(const ShardsInfo & shards_info, const ContextPtr global_context)
+WorkerGroupHandle WorkerGroupHandleImpl::mockWorkerGroupHandle(const String & worker_id_prefix_, UInt64 worker_number_, const ContextPtr & context_)
 {
-    UInt32 num_replicas = global_context->getConfigRef().getInt("consistent_hash_ring.num_replicas", 16);
-    UInt32 num_probes = global_context->getConfigRef().getInt("consistent_hash_ring.num_probes", 21);
-    double load_factor = global_context->getConfigRef().getDouble("consistent_hash_ring.load_factor", 1.15);
-    std::unique_ptr<DB::ConsistentHashRing> ret = std::make_unique<DB::ConsistentHashRing>(num_replicas, num_probes, load_factor);
-    std::for_each(shards_info.begin(), shards_info.end(), [&](const ShardInfo & info)
+    HostWithPortsVec hosts_vec;
+    for (size_t i=0; i<worker_number_; i++)
     {
-        ret->insert(info.worker_id);
-    });
-    return ret;
+        String worker_id = worker_id_prefix_ + toString(i);
+        HostWithPorts mock_host;
+        mock_host.id = std::move(worker_id);
+        hosts_vec.emplace_back(std::move(mock_host));
+    }
+
+    return std::make_shared<WorkerGroupHandleImpl>("", WorkerGroupHandleSource::RM, "", hosts_vec, context_);
+}
+
+void WorkerGroupHandleImpl::buildRing()
+{
+    UInt32 num_replicas = getContext()->getConfigRef().getInt("consistent_hash_ring.num_replicas", 16);
+    UInt32 num_probes = getContext()->getConfigRef().getInt("consistent_hash_ring.num_probes", 21);
+    double load_factor = getContext()->getConfigRef().getDouble("consistent_hash_ring.load_factor", 1.15);
+    ring = std::make_unique<DB::ConsistentHashRing>(num_replicas, num_probes, load_factor);
+    std::for_each(shards_info.begin(), shards_info.end(), [&](const ShardInfo & info) { ring->insert(info.worker_id); });
 }
 
 WorkerGroupHandleImpl::WorkerGroupHandleImpl(
@@ -58,6 +74,7 @@ WorkerGroupHandleImpl::WorkerGroupHandleImpl(
     , vw_name(std::move(vw_name_))
     , hosts(std::move(hosts_))
     , metrics(metrics_)
+    , worker_num(hosts.size())
 {
     auto current_context = getContext();
 
@@ -92,30 +109,25 @@ WorkerGroupHandleImpl::WorkerGroupHandleImpl(
             default_database, user_password.first, user_password.second,
             /*cluster_*/"",/*cluster_secret_*/"",
             "server", address.compression, address.secure, 1,
-            host.exchange_port, host.exchange_status_port, host.rpc_port);
+            host.exchange_port, host.exchange_status_port, host.rpc_port, host.id);
 
         info.pool = std::make_shared<ConnectionPoolWithFailover>(
             ConnectionPoolPtrs{pool}, settings.load_balancing, settings.connections_with_failover_max_tries);
         info.per_replica_pools = {std::move(pool)};
 
         shards_info.emplace_back(std::move(info));
-
-        worker_clients.emplace_back(current_context->getCnchWorkerClientPools().getWorker(host));
     }
-
-    /// if not jump consistent hash, build ring
-    if (current_context->getPartAllocationAlgo() != Context::PartAllocator::JUMP_CONSISTENT_HASH)
-    {
-        ring = buildRing(this->shards_info, current_context);
-        LOG_DEBUG(&Poco::Logger::get("WorkerGroupHandleImpl"), "Success built ring with {} nodes\n", ring->size());
-
-    }
+    
+    buildRing();
+    LOG_DEBUG(&Poco::Logger::get("WorkerGroupHandleImpl"), "Success built ring with {} nodes\n", ring->size());
 }
 
 WorkerGroupHandleImpl::WorkerGroupHandleImpl(const WorkerGroupData & data, const ContextPtr & context_)
     : WorkerGroupHandleImpl(data.id, WorkerGroupHandleSource::RM, data.vw_name, data.host_ports_vec, context_, data.metrics)
 {
     type = data.type;
+    worker_num = data.num_workers;
+    priority = data.priority;
 }
 
 WorkerGroupHandleImpl::WorkerGroupHandleImpl(const WorkerGroupHandleImpl & from, [[maybe_unused]] const std::vector<size_t> & indices)
@@ -125,49 +137,109 @@ WorkerGroupHandleImpl::WorkerGroupHandleImpl(const WorkerGroupHandleImpl & from,
     if (!current_context)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Context expired!");
 
-    // TODO(zuochuang.zema) MERGE worker client pool
     for (size_t index : indices)
     {
         hosts.emplace_back(from.getHostWithPortsVec().at(index));
         shards_info.emplace_back(from.getShardsInfo().at(index));
-        worker_clients.emplace_back(current_context->getCnchWorkerClientPools().getWorker(hosts.back()));
     }
 
-    // TODO(zuochuang.zema) MERGE hash
-    if (current_context->getPartAllocationAlgo() != Context::PartAllocator::JUMP_CONSISTENT_HASH)
+    buildRing();
+
+    worker_num = from.workerNum();
+}
+
+static std::unordered_set<UInt64> getBusyWorkerIndexes(double ratio, const WorkerGroupMetrics & metrics)
+{
+    if (metrics.worker_metrics_vec.empty())
+        return {};
+    auto size = metrics.worker_metrics_vec.size();
+
+    /// Mapping from #task to worker index list.
+    std::map<UInt64, std::unordered_set<UInt64>> order_by_tasks;
+    double avg = 0;
+    for (size_t i = 0; i < size; ++i)
     {
-        ring = buildRing(this->shards_info, current_context);
+        const auto & worker_metrics = metrics.worker_metrics_vec[i];
+        auto num_tasks = worker_metrics.numTasks();
+        order_by_tasks[num_tasks].insert(i);
+        avg += num_tasks;
     }
+
+    if (order_by_tasks.size() <= 1)
+        return {};
+
+    avg /= size;
+
+    std::unordered_set<UInt64> res;
+    for (auto it = order_by_tasks.rbegin(); it != order_by_tasks.rend(); ++it)
+    {
+        if (it->first >= ratio * avg)
+            res.insert(it->second.begin(), it->second.end());
+        else
+            break;
+    }
+    return res;
 }
 
-CnchWorkerClientPtr WorkerGroupHandleImpl::getWorkerClientByHash(const String & key) const
+CnchWorkerClientPtr WorkerGroupHandleImpl::getWorkerClient(bool skip_busy_worker) const
 {
-    if (worker_clients.empty())
-        throw Exception("No available worker for " + id, ErrorCodes::RESOURCE_MANAGER_NO_AVAILABLE_WORKER);
-    UInt64 index = std::hash<String>{}(key) % worker_clients.size();
-    return worker_clients[index];
-}
-
-CnchWorkerClientPtr WorkerGroupHandleImpl::getWorkerClient() const
-{
-    if (worker_clients.empty())
-        throw Exception("No available worker for " + id, ErrorCodes::RESOURCE_MANAGER_NO_AVAILABLE_WORKER);
-    if (worker_clients.size() == 1)
-        return worker_clients[0];
-
     std::uniform_int_distribution dist;
-    auto index = dist(thread_local_rng) % worker_clients.size();
-    return worker_clients[index];
+    size_t sequence = dist(thread_local_rng);
+    return getWorkerClient(sequence, skip_busy_worker).second;
+}
+
+std::pair<UInt64, CnchWorkerClientPtr> WorkerGroupHandleImpl::getWorkerClient(UInt64 sequence, bool skip_busy_worker) const
+{
+    if (hosts.empty())
+        throw Exception("No available worker for " + id, ErrorCodes::RESOURCE_MANAGER_NO_AVAILABLE_WORKER);
+
+    auto size = hosts.size();
+    if (size == 1)
+        return {0, doGetWorkerClient(hosts[0])};
+
+    auto start_index = sequence % size;
+    if (!skip_busy_worker)
+        return {start_index, doGetWorkerClient(hosts[start_index])};
+
+    auto ratio = getContext()->getRootConfig().vw_ratio_of_busy_worker.value;
+    auto busy_worker_indexes = getBusyWorkerIndexes(ratio, getMetrics());
+    for (size_t i = 0; i < size; ++i)
+    {
+        start_index %= size;
+        if (busy_worker_indexes.contains(start_index))
+        {
+            start_index++;
+            continue;
+        }
+        return {start_index, doGetWorkerClient(hosts[start_index])};
+    }
+    start_index %= size;
+    return {start_index, doGetWorkerClient(hosts[start_index])};
 }
 
 CnchWorkerClientPtr WorkerGroupHandleImpl::getWorkerClient(const HostWithPorts & host_ports) const
 {
-    if (auto index = indexOf(host_ports))
+    if (indexOf(host_ports).has_value())
     {
-        return worker_clients.at(index.value());
+        return doGetWorkerClient(host_ports);
     }
 
     throw Exception("Can't get WorkerClient for host_ports: " + host_ports.toDebugString(), ErrorCodes::NO_SUCH_SERVICE);
+}
+
+std::vector<CnchWorkerClientPtr> WorkerGroupHandleImpl::getWorkerClients() const
+{
+    std::vector<CnchWorkerClientPtr> res;
+    res.reserve(hosts.size());
+    for (const auto & host : hosts)
+        res.emplace_back(doGetWorkerClient(host));
+    return res;
+}
+
+CnchWorkerClientPtr WorkerGroupHandleImpl::doGetWorkerClient(const HostWithPorts & host_ports) const
+{
+    /// Get a cached client, or create a new one when cache miss or client is unhealthy.
+    return getContext()->getCnchWorkerClientPools().getWorker(host_ports);
 }
 
 bool WorkerGroupHandleImpl::isSame(const WorkerGroupData & data) const
@@ -227,6 +299,16 @@ std::vector<std::pair<String, UInt16>> WorkerGroupHandleImpl::getReadWorkers() c
         res.emplace_back(conn->getHost(), conn->getPort());
     }
     return res;
+}
+
+std::unordered_map<String, HostWithPorts> WorkerGroupHandleImpl::getIdHostPortsMap() const
+{
+    std::unordered_map<String, HostWithPorts> id_hosts;
+    for (const auto & host : hosts)
+    {
+        id_hosts.emplace(host.id, host);
+    }
+    return id_hosts;
 }
 
 }

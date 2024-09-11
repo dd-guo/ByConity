@@ -16,6 +16,7 @@
 #pragma once
 #include <Core/ColumnNumbers.h>
 #include <Functions/IFunction.h>
+#include <Processors/Chunk.h>
 #include <Processors/Exchange/DataTrans/DataTrans_fwd.h>
 #include <Processors/Exchange/ExchangeBufferedSender.h>
 #include <Processors/Exchange/ExchangeOptions.h>
@@ -32,25 +33,38 @@ namespace DB
 class SinglePartitionExchangeSink : public IExchangeSink
 {
 public:
-    explicit SinglePartitionExchangeSink(Block header_,
-    BroadcastSenderPtr sender_,
-    size_t partition_id_,
-    ExchangeOptions options_);
-    String getName() const override { return "SinglePartitionExchangeSink"; }
+    explicit SinglePartitionExchangeSink(Block header_, 
+        BroadcastSenderPtr sender_,
+        size_t partition_id_,
+        ExchangeOptions options_,
+        const String &name_);
+    String getName() const override { return name; }
     void onCancel() override;
     virtual ~SinglePartitionExchangeSink() override = default;
+
+    static String generateName(size_t exchange_id)
+    {
+        return fmt::format("SinglePartitionExchangeSink[{}]", exchange_id);
+    }
+
+    static String generateNameForTest()
+    {
+        return fmt::format("SinglePartitionExchangeSink[{}]", -1);
+    }
 
 protected:
     void consume(Chunk) override;
     void onFinish() override;
 
 private:
+    String name;
     const Block & header;
     BroadcastSenderPtr sender;
     size_t partition_id;
     size_t column_num;
     ExchangeOptions options;
     ExchangeBufferedSender buffered_sender;
+    ChunkInfoPtr current_chunk_info;
     Poco::Logger * logger;
 };
 

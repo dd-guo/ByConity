@@ -48,6 +48,10 @@ struct ASTWindowDefinition : public IAST
 
     ASTPtr clone() const override;
 
+    void toLowerCase() override { boost::to_lower(parent_window_name); }
+
+    void toUpperCase() override { boost::to_upper(parent_window_name); }
+
     String getID(char delimiter) const override;
 
     ASTType getType() const override { return ASTType::ASTWindowDefinition; }
@@ -55,6 +59,10 @@ struct ASTWindowDefinition : public IAST
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 
     std::string getDefaultWindowName() const;
+
+    void serialize(WriteBuffer & buf) const override;
+    void deserializeImpl(ReadBuffer & buf) override;
+    static ASTPtr deserialize(ReadBuffer & buf);
 };
 
 struct ASTWindowListElement : public IAST
@@ -68,9 +76,15 @@ struct ASTWindowListElement : public IAST
 
     ASTPtr clone() const override;
 
+    void toLowerCase() override { boost::to_lower(name); }
+
     String getID(char delimiter) const override;
 
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+
+    void serialize(WriteBuffer & buf) const override;
+    void deserializeImpl(ReadBuffer & buf) override;
+    static ASTPtr deserialize(ReadBuffer & buf);
 };
 
 }

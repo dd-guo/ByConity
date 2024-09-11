@@ -55,7 +55,7 @@ struct OverlappedRange
 /**
  * A bucket in an histogram. We use double type for lower/higher bound for simplicity.
  */
-class Bucket : public std::enable_shared_from_this<Bucket>
+class Bucket
 {
 private:
     // lower bound of bucket
@@ -226,9 +226,6 @@ public:
     //		overlay the diagonal.
     //------------------------------------------------------------------------
     OverlappedRange makeBucketIntersect(const Bucket & bucket) const;
-
-    // return copy of bucket
-    Bucket makeBucketCopy() const;
 
     //		Merges with another bucket. Returns merged bucket that should be part
     //		of the output. It also returns what is leftover from the merge.

@@ -31,9 +31,13 @@ public:
     void serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
     void deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
 
-    void enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const override;
-
+    void enumerateStreams(
+        EnumerateStreamsSettings & settings,
+        const StreamCallback & callback,
+        const SubstreamData & data) const override;
+    
     void serializeBinaryBulkStatePrefix(
+        const IColumn & column,
         SerializeBinaryBulkSettings & settings,
         SerializeBinaryBulkStatePtr & state) const override;
 
@@ -52,7 +56,7 @@ public:
         SerializeBinaryBulkSettings & settings,
         SerializeBinaryBulkStatePtr & state) const override;
 
-    void deserializeBinaryBulkWithMultipleStreams(
+    size_t deserializeBinaryBulkWithMultipleStreams(
         ColumnPtr & column,
         size_t limit,
         DeserializeBinaryBulkSettings & settings,
@@ -64,7 +68,7 @@ private:
     void serializeTextImpl(const IColumn & column, size_t row_num, WriteBuffer & ostr, KeyWriter && key_writer, ValueWriter && value_writer) const;
 
     template <typename Reader>
-    void deserializeTextImpl(IColumn & column, ReadBuffer & istr, Reader && reader) const;
+    void deserializeTextImpl(IColumn & column, ReadBuffer & istr, Reader && reader, const FormatSettings & settings) const;
 };
 
 }

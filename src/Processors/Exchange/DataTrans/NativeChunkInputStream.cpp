@@ -16,10 +16,10 @@
 #include "NativeChunkInputStream.h"
 
 #include <DataTypes/DataTypeFactory.h>
-#include <DataTypes/DataTypeLowCardinality.h>
 #include <IO/ReadHelpers.h>
 #include <Processors/Transforms/AggregatingTransform.h>
 #include <Common/typeid_cast.h>
+#include <Processors/Chunk.h>
 
 namespace DB
 {
@@ -78,6 +78,18 @@ Chunk NativeChunkInputStream::readImpl()
             chunk_info->read(istr);
             res.setChunkInfo(chunk_info);
         }
+        else if (chunk_info_type == static_cast<UInt8>(ChunkInfo::Type::Totals))
+        {
+            auto chunk_info = std::make_shared<ChunkInfoTotals>();
+            chunk_info->read(istr);
+            res.setChunkInfo(chunk_info);
+        }
+        else if (chunk_info_type == static_cast<UInt8>(ChunkInfo::Type::Extremes))
+        {
+            auto chunk_info = std::make_shared<ChunkInfoExtremes>();
+            chunk_info->read(istr);
+            res.setChunkInfo(chunk_info);
+        }
     }
     /// Dimensions
     size_t col_num = 0;
@@ -85,6 +97,7 @@ Chunk NativeChunkInputStream::readImpl()
 
     readVarUInt(col_num, istr);
     readVarUInt(row_num, istr);
+    chassert(header.columns() == col_num);
 
     Columns columns;
     for (size_t i = 0; i < col_num; ++i)

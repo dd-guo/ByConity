@@ -32,6 +32,10 @@ namespace Catalog
 
 class MetastoreFDBImpl : public IMetaStore
 {
+// Limitations of FDB (in bytes)
+#define MAX_FDB_KV_SIZE 100000  //Hard limit.Keys cannot exceed 10,000 bytes in size. Values cannot exceed 100,000 bytes in size
+#define MAX_FDB_TRANSACTION_SIZE 10000000
+
 public:
     struct FDBIterator: public IMetaStore::Iterator
     {
@@ -78,11 +82,17 @@ public:
 
     bool batchWrite(const BatchCommitRequest & req, BatchCommitResponse & response) override;
 
-    void drop(const String &, const String & expected = {}) override;
+    void drop(const String &, const UInt64 & expected = 0) override;
+
+    void drop(const String &, const String & expected_value) override;
 
     IteratorPtr getAll() override;
 
-    IteratorPtr getByPrefix(const String &, const size_t & limit = 0, uint32_t scan_batch_size = DEFAULT_SCAN_BATCH_COUNT) override;
+    IteratorPtr getByPrefix(
+        const String &,
+        const size_t & limit = 0,
+        uint32_t scan_batch_size = DEFAULT_SCAN_BATCH_COUNT,
+        const String & start_key = "") override;
 
     IteratorPtr getByRange(const String & range_start, const String & range_end, const bool include_start, const bool include_end) override;
 
@@ -90,8 +100,15 @@ public:
 
     void close() override {}
 
-private:
     static void check_fdb_op(const fdb_error_t & error_t);
+
+    // leave some margin
+    uint32_t getMaxBatchSize() final { return MAX_FDB_TRANSACTION_SIZE - 1000; }
+
+    // leave some margin
+    uint32_t getMaxKVSize() final { return MAX_FDB_KV_SIZE - 200; }
+
+private:
     /// convert metastore specific error code to Clickhouse error code for processing convenience in upper layer.
     static int toCommonErrorCode(const fdb_error_t & error_t);
 

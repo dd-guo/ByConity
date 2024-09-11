@@ -24,11 +24,16 @@
 #include <Storages/IStorage.h>
 #include <Transaction/TxnTimestamp.h>
 #include <Common/ErrorCodes.h>
-#include "Storages/IStorage_fwd.h"
+#include <Storages/IStorage_fwd.h>
 #include <Interpreters/Context_fwd.h>
 
 namespace DB
 {
+
+namespace Protos
+{
+    class DataModelTable;
+}
 
 namespace ErrorCodes
 {
@@ -43,12 +48,11 @@ namespace ErrorCodes
    It doesn't make sense to detach / attach a database when metadata is stored in a centralized
    kv storage.
  */
-
-
 class DatabaseCnch : public IDatabase, protected WithContext
 {
 public:
     DatabaseCnch(const String & name, UUID uuid, ContextPtr context);
+    DatabaseCnch(const String & name, UUID uuid, const String & logger, ContextPtr context);
 
     String getEngineName() const override { return "Cnch"; }
     UUID getUUID() const override { return db_uuid; }
@@ -62,7 +66,7 @@ public:
     void detachTablePermanently(ContextPtr local_context, const String & name) override;
     /// No need to be empty when drop cnch database. Catalog is responsible for deleting tables under current db.
     bool shouldBeEmptyOnDetach() const override { return false; }
-    void renameDatabase(ContextPtr local_cotnext, const String & new_name) override;
+    void renameDatabase(ContextPtr local_context, const String & new_name) override;
     void renameTable(
         ContextPtr context,
         const String & table_name,
@@ -74,23 +78,33 @@ public:
     void drop(ContextPtr context) override;
     bool isTableExist(const String & name, ContextPtr local_context) const override;
     StoragePtr tryGetTable(const String & name, ContextPtr local_context) const override;
+    StoragePtr tryGetTable(const String & name, ContextPtr local_context, bool ignore_status) const override;
     DatabaseTablesIteratorPtr getTablesIterator(ContextPtr local_context, const FilterByNameFunction & filter_by_table_name) override;
+    /// used to optimize visiting of system.tables
+    DatabaseTablesIteratorPtr getTablesIteratorWithCommonSnapshot(ContextPtr local_context, const std::vector<Protos::DataModelTable> & snapshot);
+    DatabaseTablesIteratorPtr getTablesIteratorLightweight(ContextPtr local_context, const FilterByNameFunction & filter_by_table_name = {});
     bool empty() const override;
     void shutdown() override {}
     void createEntryInCnchCatalog(ContextPtr local_context) const;
+
+    bool supportSnapshot() const override { return db_uuid != UUIDHelpers::Nil; }
+    void dropSnapshot(ContextPtr local_context, const String & snapshot_name) override;
+    SnapshotPtr tryGetSnapshot(const String & snapshot_name) const override;
+    Snapshots getAllSnapshots() const override;
+    Snapshots getAllSnapshotsForStorage(UUID storage_uuid) const override;
 
     TxnTimestamp commit_time;
 protected:
     ASTPtr getCreateTableQueryImpl(const String & name, ContextPtr local_context, bool throw_on_error) const override;
     StoragePtr tryGetTableImpl(const String & name, ContextPtr local_context) const;
 
+    Poco::Logger * log;
 private:
     const UUID db_uuid;
     /// local storage cache, mapping from name->storage, mainly for select query
     /// Work under an assumptions that database was re-created for each query
     mutable std::unordered_map<String, StoragePtr> cache;
     mutable std::shared_mutex cache_mutex;
-    Poco::Logger * log;
 };
 
 using CnchDBPtr = std::shared_ptr<DatabaseCnch>;

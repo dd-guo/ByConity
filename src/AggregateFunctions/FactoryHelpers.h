@@ -33,6 +33,18 @@ inline void assertBinary(const std::string & name, const DataTypes & argument_ty
         throw Exception("Aggregate function " + name + " requires two arguments", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 }
 
+inline void assertTernary(const std::string & name, const DataTypes & argument_types)
+{
+    if (argument_types.size() != 3)
+        throw Exception("function " + name + " require three arguments", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+}
+
+inline void assertQuaternary(const std::string & name, const DataTypes & argument_types)
+{
+    if (argument_types.size() != 4)
+        throw Exception("function " + name + " require four arguments", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+}
+
 template<std::size_t maximal_arity>
 inline void assertArityAtMost(const std::string & name, const DataTypes & argument_types)
 {

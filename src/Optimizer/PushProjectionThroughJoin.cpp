@@ -30,7 +30,7 @@ std::optional<PlanNodePtr> PushProjectionThroughJoin::pushProjectionThroughJoin(
     auto & step = *project.getStep();
 
     bool all_deterministic = true;
-    auto assignments = step.getAssignments();
+    const auto & assignments = step.getAssignments();
     const NameToType & name_to_type = step.getNameToType();
     for (auto & assigment : assignments)
     {
@@ -212,6 +212,8 @@ std::optional<PlanNodePtr> PushProjectionThroughJoin::pushProjectionThroughJoin(
         DataStream{.header = step.getOutputStream().header},
         join_step.getKind(),
         join_step.getStrictness(),
+        join_step.getMaxStreams(),
+        join_step.getKeepLeftReadInOrder(),
         join_step.getLeftKeys(),
         join_step.getRightKeys(),
         join_step.getFilter(),
@@ -219,7 +221,12 @@ std::optional<PlanNodePtr> PushProjectionThroughJoin::pushProjectionThroughJoin(
         join_step.getRequireRightKeys(),
         join_step.getAsofInequality(),
         join_step.getDistributionType(),
-        join_step.isMagic());
+        join_step.getJoinAlgorithm(),
+        join_step.isMagic(),
+        join_step.isOrdered(),
+        join_step.isSimpleReordered(),
+        join_step.getRuntimeFilterBuilders(),
+        join_step.getHints());
     PlanNodePtr new_join_node = std::make_shared<JoinNode>(
         context->nextNodeId(), std::move(new_join_step), PlanNodes{left_expression_step_inline, right_expression_step_inline});
 
@@ -233,7 +240,7 @@ PlanNodePtr PushProjectionThroughJoin::inlineProjections(PlanNodePtr parent_proj
     {
         return parent_projection;
     }
-    auto result = InlineProjections::inlineProjections(parent_projection, child, context);
+    auto result = InlineProjections::inlineProjections(parent_projection, child, context, false);
     if (result.has_value())
     {
         return inlineProjections(result.value(), context);

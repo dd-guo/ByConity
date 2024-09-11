@@ -35,6 +35,9 @@
 #include <Core/ColumnsWithTypeAndName.h>
 
 #include <Common/StringUtils/StringUtils.h>
+#include "Interpreters/ExpressionAnalyzer.h"
+#include "Interpreters/TreeRewriter.h"
+#include "Parsers/ASTFunction.h"
 
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeHelper.h>
@@ -62,6 +65,8 @@ TableJoin::TableJoin(const Settings & settings, VolumePtr tmp_volume_)
     , max_files_to_merge(settings.join_on_disk_max_files_to_merge)
     , temporary_files_codec(settings.temporary_files_codec)
     , allow_extended_conversion(settings.allow_extended_type_conversion)
+    , runtime_filter_bloom_build_threshold(settings.runtime_filter_bloom_build_threshold)
+    , runtime_filter_in_build_threshold(settings.runtime_filter_in_build_threshold)
     , tmp_volume(tmp_volume_)
 {
 }
@@ -80,28 +85,52 @@ void TableJoin::resetCollected()
     right_type_map.clear();
     left_converting_actions = nullptr;
     right_converting_actions = nullptr;
+    key_ids_null_safe.clear();
 }
 
-void TableJoin::addUsingKey(const ASTPtr & ast)
+void TableJoin::addUsingKey(const ASTPtr & ast, bool null_safe)
 {
     key_names_left.push_back(ast->getColumnName());
     key_names_right.push_back(ast->getAliasOrColumnName());
 
     key_asts_left.push_back(ast);
     key_asts_right.push_back(ast);
+    key_ids_null_safe.push_back(null_safe);
 
     auto & right_key = key_names_right.back();
     if (renames.count(right_key))
         right_key = renames[right_key];
 }
 
-void TableJoin::addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast)
+void TableJoin::addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool null_safe)
 {
     key_names_left.push_back(left_table_ast->getColumnName());
     key_names_right.push_back(right_table_ast->getAliasOrColumnName());
 
     key_asts_left.push_back(left_table_ast);
     key_asts_right.push_back(right_table_ast);
+    key_ids_null_safe.push_back(null_safe);
+}
+
+void TableJoin::addInequalConditions(const ASTs & inequal_conditions, const NamesAndTypesList & columns_for_join, ContextPtr context)
+{
+    if (inequal_conditions.empty())
+        return;
+
+    ASTPtr mixed_inequal_condition = inequal_conditions[0];
+    for (size_t i = 1; i < inequal_conditions.size(); ++i)
+    {
+        mixed_inequal_condition = makeASTFunction("and", mixed_inequal_condition, inequal_conditions[i]);
+    }
+
+    /**
+    * generate actions for inequal conditions that used for filtering rows in join.
+    */
+    inequal_column_name = mixed_inequal_condition->getColumnName();
+    auto syntax_result = TreeRewriter(context).analyze(mixed_inequal_condition, columns_for_join);
+    inequal_condition_actions = ExpressionAnalyzer(mixed_inequal_condition, syntax_result, context).getActions(false);
+    LOG_DEBUG(&Poco::Logger::get("TableJoin"), fmt::format("addInequalConditions: mixed_inequal_condition: {}", 
+        queryToString(mixed_inequal_condition)));
 }
 
 /// @return how many times right key appears in ON section.
@@ -117,7 +146,8 @@ size_t TableJoin::rightKeyInclusion(const String & name) const
     return count;
 }
 
-void TableJoin::deduplicateAndQualifyColumnNames(const NameSet & left_table_columns, const String & right_table_prefix)
+void TableJoin::deduplicateAndQualifyColumnNames(
+    const NameSet & left_table_columns, const String & right_table_prefix, bool check_identifier_begin_valid)
 {
     NameSet joined_columns;
     NamesAndTypesList dedup_columns;
@@ -134,7 +164,7 @@ void TableJoin::deduplicateAndQualifyColumnNames(const NameSet & left_table_colu
 
         /// Also qualify unusual column names - that does not look like identifiers.
 
-        if (left_table_columns.count(column.name) || !isValidIdentifierBegin(column.name.at(0)))
+        if (left_table_columns.count(column.name) || (check_identifier_begin_valid && (!isValidIdentifierBegin(column.name.at(0)))))
             inserted.name = right_table_prefix + column.name;
 
         original_names[inserted.name] = column.name;
@@ -143,6 +173,12 @@ void TableJoin::deduplicateAndQualifyColumnNames(const NameSet & left_table_colu
     }
 
     columns_from_joined_table.swap(dedup_columns);
+}
+
+void TableJoin::setInequalCondition(ExpressionActionsPtr inequal_condition_actions_, String inequal_column_name_)
+{
+    inequal_condition_actions = inequal_condition_actions_; 
+    inequal_column_name = inequal_column_name_; 
 }
 
 NamesWithAliases TableJoin::getNamesWithAliases(const NameSet & required_columns) const
@@ -333,6 +369,27 @@ bool TableJoin::allowMergeJoin() const
     return all_join || special_left;
 }
 
+bool TableJoin::allowParallelHashJoin() const
+{
+    if (dictionary_reader || join_algorithm != JoinAlgorithm::PARALLEL_HASH)
+        return false;
+    if (table_join.kind == ASTTableJoin::Kind::Cross)
+        return false;
+    if (isSpecialStorage() || !oneDisjunct())
+        return false;
+    return true;
+}
+
+bool TableJoin::forceNullableRight() const
+{
+    return (join_use_nulls && isLeftOrFull(table_join.kind));
+}
+
+bool TableJoin::forceNullableLeft() const
+{
+    return join_use_nulls && isRightOrFull(table_join.kind);
+}
+
 bool TableJoin::needStreamWithNonJoinedRows() const
 {
     if (strictness() == ASTTableJoin::Strictness::Asof ||
@@ -436,7 +493,7 @@ bool TableJoin::inferJoinKeyCommonType(const NamesAndTypesList & left, const Nam
         DataTypePtr supertype;
         try
         {
-            supertype = DB::getLeastSupertype({ltype->second, rtype->second}, allow_extended_conversion);
+            supertype = DB::getLeastSupertype(DataTypes{ltype->second, rtype->second}, allow_extended_conversion);
         }
         catch (DB::Exception & ex)
         {
@@ -501,150 +558,6 @@ String TableJoin::renamedRightColumnName(const String & name) const
     if (const auto it = renames.find(name); it != renames.end())
         return it->second;
     return name;
-}
-
-void TableJoin::serialize(WriteBuffer & buf) const
-{
-    select_query->serialize(buf);
-
-    writeBinary(key_names_left, buf);
-    writeBinary(key_names_right, buf);
-
-    serializeASTs(key_asts_left, buf);
-    serializeASTs(key_asts_right, buf);
-    serializeAST(table_join, buf);
-
-    serializeEnum(asof_inequality, buf);
-
-    columns_from_joined_table.serialize(buf);
-    columns_added_by_join.serialize(buf);
-
-    writeBinary(left_type_map.size(), buf);
-    for (auto & item : left_type_map)
-    {
-        writeBinary(item.first, buf);
-        serializeDataType(item.second, buf);
-    }
-
-    writeBinary(right_type_map.size(), buf);
-    for (auto & item : right_type_map)
-    {
-        writeBinary(item.first, buf);
-        serializeDataType(item.second, buf);
-    }
-
-    if (left_converting_actions)
-    {
-        writeBinary(true, buf);
-        left_converting_actions->serialize(buf);
-    }
-    else
-        writeBinary(false, buf);
-
-    if (right_converting_actions)
-    {
-        writeBinary(true, buf);
-        right_converting_actions->serialize(buf);
-    }
-    else
-        writeBinary(false, buf);
-
-    writeBinary(original_names.size(), buf);
-    for (auto & item : original_names)
-    {
-        writeBinary(item.first, buf);
-        writeBinary(item.second, buf);
-    }
-
-    writeBinary(renames.size(), buf);
-    for (auto & item : renames)
-    {
-        writeBinary(item.first, buf);
-        writeBinary(item.second, buf);
-    }
-}
-
-void TableJoin::deserializeImpl(ReadBuffer & buf, ContextPtr context)
-{
-    readBinary(key_names_left, buf);
-    readBinary(key_names_right, buf);
-
-    key_asts_left = deserializeASTs(buf);
-    key_asts_right = deserializeASTs(buf);
-    auto table_join_ptr = deserializeAST(buf);
-    table_join = *(table_join_ptr->as<ASTTableJoin>());
-
-    deserializeEnum(asof_inequality, buf);
-
-    columns_from_joined_table.deserialize(buf);
-    columns_added_by_join.deserialize(buf);
-
-    size_t left_size;
-    readBinary(left_size, buf);
-    for (size_t i = 0; i < left_size; ++i)
-    {
-        String name;
-        readBinary(name, buf);
-        auto type = deserializeDataType(buf);
-        left_type_map[name] = type;
-    }
-
-    size_t right_size;
-    readBinary(right_size, buf);
-    for (size_t i = 0; i < right_size; ++i)
-    {
-        String name;
-        readBinary(name, buf);
-        auto type = deserializeDataType(buf);
-        right_type_map[name] = type;
-    }
-
-    bool has_left_converting_actions;
-    readBinary(has_left_converting_actions, buf);
-    if (has_left_converting_actions)
-        left_converting_actions = ActionsDAG::deserialize(buf, context);
-
-    bool has_right_converting_actions;
-    readBinary(has_right_converting_actions, buf);
-    if (has_right_converting_actions)
-        right_converting_actions = ActionsDAG::deserialize(buf, context);
-
-    size_t original_names_size;
-    readBinary(original_names_size, buf);
-    for (size_t i = 0; i < original_names_size; ++i)
-    {
-        String key;
-        String value;
-        readBinary(key, buf);
-        readBinary(value, buf);
-        original_names[key] = value;
-    }
-
-    size_t renames_size;
-    readBinary(renames_size, buf);
-    for (size_t i = 0; i < renames_size; ++i)
-    {
-        String key;
-        String value;
-        readBinary(key, buf);
-        readBinary(value, buf);
-        renames[key] = value;
-    }
-}
-
-std::shared_ptr<TableJoin> TableJoin::deserialize(ReadBuffer & buf, ContextPtr context)
-{
-    ASTPtr select_query = ASTSelectQuery::deserialize(buf);
-    if (const auto * query = select_query->as<ASTSelectQuery>())
-    {
-        JoinedTables joined_tables(context, *query);
-        joined_tables.resolveTables();
-        auto table_join = joined_tables.makeTableJoin(*query);
-        table_join->setSelectQuery(select_query);
-        table_join->deserializeImpl(buf, context);
-        return table_join;
-    }
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "deserializeTableJoin needs ASTSelectQuery");
 }
 
 }

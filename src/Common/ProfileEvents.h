@@ -1,9 +1,13 @@
 #pragma once
 
-#include <Common/VariableContext.h>
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 #include <stddef.h>
+#include <Core/Types.h>
+#include <Common/LabelledMetrics.h>
+#include <Common/VariableContext.h>
+#include <metric_helper.h>
 
 /** Implements global counters for various events happening in the application
   *  - for high level profiling.
@@ -33,10 +37,10 @@ namespace ProfileEvents
         VariableContext level = VariableContext::Thread;
 
         /// By default, any instance have to increment global counters
-        Counters(VariableContext level_ = VariableContext::Thread, Counters * parent_ = &global_counters);
+        Counters(VariableContext level = VariableContext::Thread, Counters * parent = &global_counters);
 
         /// Global level static initializer
-        Counters(Counter * allocated_counters) noexcept
+        Counters(Counter * allocated_counters)
             : counters(allocated_counters), parent(nullptr), level(VariableContext::Global) {}
 
         Counter & operator[] (Event event)
@@ -59,8 +63,27 @@ namespace ProfileEvents
             } while (current != nullptr);
         }
 
+        uint64_t getIOReadTime(bool use_async_read) const;
+
+        struct Snapshot
+        {
+            Snapshot();
+
+            const Count & operator[] (Event event) const
+            {
+                return counters_holder[event];
+            }
+
+            uint64_t getIOReadTime(bool use_async_read) const;
+
+        private:
+            std::unique_ptr<Count[]> counters_holder;
+
+            friend class Counters;
+        };
+
         /// Every single value is fetched atomically, but not all values as a whole.
-        Counters getPartiallyAtomicSnapshot() const;
+        Snapshot getPartiallyAtomicSnapshot() const;
 
         /// Reset all counters to zero and reset parent.
         void reset();
@@ -83,11 +106,14 @@ namespace ProfileEvents
         static const Event num_counters;
     };
 
-    /// Increment a counter for event. Thread-safe.
-    void increment(Event event, Count amount = 1);
+    /// Increment a counter for event. Thread-safe
+    void increment(Event event, Count amount = 1, Metrics::MetricType type = Metrics::None, LabelledMetrics::MetricLabels labels = {}, time_t ts = {});
 
     /// Get name of event by identifier. Returns statically allocated string.
     const char * getName(Event event);
+
+    /// Get name of metric by identifier in snake_case. Returns statically allocated string.
+    const DB::String getSnakeName(Event event);
 
     /// Get description of event by identifier. Returns statically allocated string.
     const char * getDocumentation(Event event);

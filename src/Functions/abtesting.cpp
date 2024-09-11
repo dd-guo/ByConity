@@ -180,6 +180,7 @@ public:
 
     bool isDeterministic() const override { return false; }
     bool isDeterministicInScopeOfQuery() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 5; }
 
@@ -291,24 +292,10 @@ public:
     }
 };
 
-void registerFunctionBayesAB(FunctionFactory & factory)
+REGISTER_FUNCTION(BayesAB)
 {
     factory.registerFunction<FunctionBayesAB>();
 }
 
 }
-
-#else
-
-namespace DB
-{
-
-class FunctionFactory;
-
-void registerFunctionBayesAB(FunctionFactory & /* factory */)
-{
-}
-
-}
-
 #endif

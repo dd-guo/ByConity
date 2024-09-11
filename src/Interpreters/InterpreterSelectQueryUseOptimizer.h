@@ -14,35 +14,98 @@
  */
 
 #pragma once
+#include <Interpreters/DistributedStages/PlanSegmentSplitter.h>
 #include <Interpreters/IInterpreter.h>
+#include <Interpreters/QueryLog.h>
 #include <Interpreters/SelectQueryOptions.h>
+#include <Interpreters/prepared_statement.h>
+#include <QueryPlan/CTEVisitHelper.h>
 #include <QueryPlan/PlanVisitor.h>
 #include <Interpreters/DistributedStages/PlanSegmentSplitter.h>
 #include <Interpreters/QueryLog.h>
+#include <QueryPlan/QueryPlan.h>
+#include <Poco/Logger.h>
+#include <Common/Stopwatch.h>
+#include "Parsers/IAST_fwd.h"
+
+namespace Poco
+{
+class Logger;
+}
 
 namespace DB
 {
+struct Analysis;
+using AnalysisPtr = std::shared_ptr<Analysis>;
+struct QueryCacheContext;
+
 class InterpreterSelectQueryUseOptimizer : public IInterpreter
 {
 public:
-    InterpreterSelectQueryUseOptimizer(const ASTPtr & query_ptr_, ContextMutablePtr & context_, const SelectQueryOptions & options_)
-        : query_ptr(query_ptr_), context(context_), options(options_)
+    InterpreterSelectQueryUseOptimizer(const ASTPtr & query_ptr_, ContextMutablePtr context_, const SelectQueryOptions & options_)
+        : InterpreterSelectQueryUseOptimizer(query_ptr_, nullptr, {}, context_, options_)
     {
     }
 
-    QueryPlanPtr buildQueryPlan();
+    InterpreterSelectQueryUseOptimizer(
+        PlanNodePtr sub_plan_ptr_, CTEInfo cte_info_, ContextMutablePtr context_, const SelectQueryOptions & options_)
+        : InterpreterSelectQueryUseOptimizer(nullptr, std::move(sub_plan_ptr_), std::move(cte_info_), context_, options_)
+    {
+    }
+
+    InterpreterSelectQueryUseOptimizer(
+        const ASTPtr & query_ptr_,
+        PlanNodePtr sub_plan_ptr_,
+        CTEInfo cte_info_,
+        ContextMutablePtr & context_,
+        const SelectQueryOptions & options_);
+
+    QueryPlanPtr getQueryPlan(bool skip_optimize = false);
+    void buildQueryPlan(QueryPlanPtr & query_plan, AnalysisPtr & analysis, bool skip_optimize = false);
+    std::pair<PlanSegmentTreePtr, std::set<StorageID>> getPlanSegment();
+    QueryPlanPtr getPlanFromCache(UInt128 query_hash);
+    bool addPlanToCache(UInt128 query_hash, QueryPlanPtr & plan, AnalysisPtr analysis);
+    static void setPlanSegmentInfoForExplainAnalyze(PlanSegmentTreePtr & plan_segment_tree);
+    BlockIO readFromQueryCache(ContextPtr local_context, QueryCacheContext & can_use_query_cache);
 
     BlockIO execute() override;
 
     void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr &, ContextPtr) const override
     {
         elem.query_kind = "Select";
+        elem.segment_profiles = segment_profiles;
     }
+
+    static void resetFinalSampleSize(PlanSegmentTreePtr & plan_segment_tree);
+
+    static void fillContextQueryAccessInfo(ContextPtr context, AnalysisPtr & analysis);
+
+    static void fillQueryPlan(ContextPtr context, QueryPlan & query_plan);
+
+    Block getSampleBlock();
+
+    static void setUnsupportedSettings(ContextMutablePtr & context);
+
+    std::optional<std::set<StorageID>> getUsedStorageIds();
+    BlockIO executeCreatePreparedStatementQuery();
+    bool isCreatePreparedStatement();
+
+    ASTPtr & getQuery() { return query_ptr; }
 
 private:
     ASTPtr query_ptr;
+    PlanNodePtr sub_plan_ptr;
+    CTEInfo cte_info;
     ContextMutablePtr context;
     SelectQueryOptions options;
+    Poco::Logger * log;
+    bool interpret_sub_query;
+    PlanSegmentTreePtr plan_segment_tree_ptr;
+
+    std::shared_ptr<std::vector<String>> segment_profiles;
+
+    Block block;
+    PreparedParameterBindings auto_prepared_params;
 };
 
 /**
@@ -69,8 +132,20 @@ struct ClusterInfoContext
 class ClusterInfoFinder : public PlanNodeVisitor<std::optional<PlanSegmentContext>, ClusterInfoContext>
 {
 public:
-    static PlanSegmentContext find(PlanNodePtr & node, ClusterInfoContext & cluster_info_context);
+    static PlanSegmentContext find(QueryPlan & plan, ClusterInfoContext & cluster_info_context);
+    explicit ClusterInfoFinder(CTEInfo & cte_info_) : cte_helper(cte_info_) { }
     std::optional<PlanSegmentContext> visitPlanNode(PlanNodeBase & node, ClusterInfoContext & cluster_info_context) override;
     std::optional<PlanSegmentContext> visitTableScanNode(TableScanNode & node, ClusterInfoContext & cluster_info_context) override;
+    std::optional<PlanSegmentContext> visitTableWriteNode(TableWriteNode & node, ClusterInfoContext & cluster_info_context) override;
+    std::optional<PlanSegmentContext> visitCTERefNode(CTERefNode & node, ClusterInfoContext & cluster_info_context) override;
+private:
+    SimpleCTEVisitHelper<std::optional<PlanSegmentContext>> cte_helper;
+};
+
+class ExplainAnalyzeVisitor : public NodeVisitor<void, PlanSegmentTree::Nodes>
+{
+public:
+    void visitExplainAnalyzeNode(QueryPlan::Node * node, PlanSegmentTree::Nodes &) override;
+    void visitNode(QueryPlan::Node * node, PlanSegmentTree::Nodes &) override;
 };
 }

@@ -16,8 +16,10 @@
 #include <Core/Types.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
+#include <MergeTreeCommon/CnchStorageCommon.h>
 #include <Storages/IStorage_fwd.h>
 #include <Databases/IDatabase.h>
+#include <Storages/ColumnsDescription.h>
 
 #include <unordered_map>
 #include <unordered_set>
@@ -28,20 +30,48 @@ namespace DB
 {
 
 class CnchWorkerServiceImpl;
+class CloudTablesBlockSource;
 
 class CnchWorkerResource
 {
 public:
-    void executeCreateQuery(ContextMutablePtr context, const String & create_query, bool skip_if_exists = false);
+    void executeCreateQuery(ContextMutablePtr context, const String & create_query, bool skip_if_exists = false, const ColumnsDescription & object_columns = {});
+
+    void executeCacheableCreateQuery(
+        ContextMutablePtr context,
+        const StorageID & cnch_storage_id,
+        const String & definition,
+        const String & local_table_name,
+        WorkerEngineType engine_type,
+        const String & underlying_dictionary_tables,
+        const ColumnsDescription & object_columns);
+
     StoragePtr getTable(const StorageID & table_id) const;
     DatabasePtr getDatabase(const String & database_name) const;
     bool isCnchTableInWorker(const StorageID & table_id) const;
 
+    ~CnchWorkerResource()
+    {
+        clearResource();
+    }
+
     void clearResource();
 
-    friend class CnchWorkerServiceImpl;
+    auto getTables() const
+    {
+        auto lock = std::lock_guard(mutex);
+        return cloud_tables;
+    }
+
+    auto getCreateTime() const
+    {
+        return create_time;
+    }
 
 private:
+    friend class CnchWorkerServiceImpl;
+    friend class CloudTablesBlockSource;
+
     auto getLock() const { return std::lock_guard(mutex); }
 
     using DatabaseAndTableName = std::pair<String, String>;
@@ -56,14 +86,21 @@ private:
         }
     };
 
+    using TablesMap = std::unordered_map<DatabaseAndTableName, StoragePtr, DatabaseAndTableNameHash>;
+    using TablesSet = std::unordered_set<DatabaseAndTableName, DatabaseAndTableNameHash>;
+
     mutable std::mutex mutex;
 
-    std::unordered_map<DatabaseAndTableName, StoragePtr, DatabaseAndTableNameHash> cloud_tables;
+    TablesMap cloud_tables;
     std::unordered_map<String, DatabasePtr> memory_databases;
 
+    void insertCloudTable(DatabaseAndTableName key, const StoragePtr & storage, ContextPtr context, bool throw_if_exists);
+
     /// for offloading query
-    std::unordered_set<DatabaseAndTableName, DatabaseAndTableNameHash> cnch_tables;
+    TablesSet cnch_tables;
     std::map<UUID, String> worker_table_names;
+
+    time_t create_time{time(nullptr)};
 };
 
 }

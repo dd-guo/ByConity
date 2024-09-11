@@ -20,7 +20,6 @@
  */
 
 #include <TableFunctions/ITableFunction.h>
-#include <Interpreters/Context.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageTableFunction.h>
 #include <Access/AccessFlags.h>
@@ -35,11 +34,23 @@ namespace ProfileEvents
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
 StoragePtr ITableFunction::execute(const ASTPtr & ast_function, ContextPtr context, const std::string & table_name,
                                    ColumnsDescription cached_columns) const
 {
+    if (isPreviledgedFunction() && context->shouldBlockPrivilegedOperations())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Tenant cannot execute this function {} for security reason.", getName());
+
     ProfileEvents::increment(ProfileEvents::TableFunctionExecute);
-    context->checkAccess(AccessType::CREATE_TEMPORARY_TABLE | StorageFactory::instance().getSourceAccessType(getStorageTypeName()));
+    AccessFlags required_access =  StorageFactory::instance().getSourceAccessType(getStorageTypeName());
+    String function_name = getName();
+    if ((function_name != "null") && (function_name != "view") && (function_name != "viewIfPermitted"))
+        required_access |= AccessType::CREATE_TEMPORARY_TABLE;
+    context->checkAccess(required_access);
 
     if (cached_columns.empty())
         return executeImpl(ast_function, context, table_name, std::move(cached_columns));

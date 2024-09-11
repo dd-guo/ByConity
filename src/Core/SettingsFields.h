@@ -29,7 +29,7 @@
 #include <boost/range/adaptor/map.hpp>
 #include <chrono>
 #include <unordered_map>
-#include <set>
+#include <unordered_set>
 #include <string_view>
 
 
@@ -166,6 +166,7 @@ using SettingFieldMilliseconds = SettingFieldTimespan<SettingFieldTimespanUnit::
 struct SettingFieldString
 {
     String value;
+    using Type = String;
     bool changed = false;
 
     explicit SettingFieldString(const std::string_view & str = {}) : value(str) {}
@@ -256,6 +257,7 @@ template <typename EnumT, typename Traits>
 struct SettingFieldEnum
 {
     using EnumType = EnumT;
+    using Type = EnumT; // for reflection
 
     EnumType value;
     bool changed = false;
@@ -479,7 +481,7 @@ struct SettingFieldCustom
 
 struct SettingFieldMultiRegexString
 {
-    std::set<String> value;
+    std::unordered_set<String> value;
     bool changed = false;
 
     explicit SettingFieldMultiRegexString(const Field & f = {}) : value(parseStringToRegexSet(f.safeGet<const String &>())) { }
@@ -492,7 +494,7 @@ struct SettingFieldMultiRegexString
     void writeBinary(WriteBuffer & out) const;
     void readBinary(ReadBuffer & in);
 
-    std::set<String> parseStringToRegexSet(String x);
+    std::unordered_set<String> parseStringToRegexSet(String x);
 };
 
 }

@@ -46,16 +46,19 @@ public:
     /// Useful if we already have a DDL lock
     bool no_ddl_lock{false};
 
-    /// We dropping dictionary, so print correct word
     bool is_dictionary{false};
-
-    /// Same as above
+    bool is_snapshot{false};
     bool is_view{false};
 
     bool no_delay{false};
 
     // We detach the object permanently, so it will not be reattached back during server restart.
     bool permanently{false};
+
+    /// TRUNCATE TABLE t [PARTITION WHERE predicate]
+    ASTPtr partition_predicate;
+    /// TRUNCATE TABLE t [PARTITION [ID] p]
+    ASTPtr partition;
 
     /** Get the text that identifies this element. */
     String getID(char) const override;

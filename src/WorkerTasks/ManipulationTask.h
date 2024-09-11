@@ -29,7 +29,7 @@
 namespace DB
 {
 
-class ManipulationTask : public WithContext, private boost::noncopyable
+class ManipulationTask: private boost::noncopyable
 {
 public:
     ManipulationTask(ManipulationTaskParams params, ContextPtr context_);
@@ -39,7 +39,24 @@ public:
 
     void execute();
 
-    virtual bool isCancelled() { return getManipulationListElement()->is_cancelled.load(std::memory_order_relaxed); }
+    bool isCancelled(UInt64 timeout = 0)
+    {
+        if (getManipulationListElement()->is_cancelled.load(std::memory_order_relaxed))
+            return true;
+
+        if (!timeout)
+            return false;
+
+        if (static_cast<UInt64>(time(nullptr) - getManipulationListElement()->last_touch_time.load(std::memory_order_relaxed)) > timeout)
+        {
+            LOG_TRACE(&Poco::Logger::get("ManipulationTask"),
+                      "Set is_cancelled for task {} as no heartbeat from server.", getManipulationListElement()->task_id);
+            setCancelled();
+            return true;
+        }
+        return false;
+    }
+
     virtual void setCancelled() { getManipulationListElement()->is_cancelled.store(true, std::memory_order_relaxed); }
 
     void setManipulationEntry();
@@ -48,15 +65,23 @@ public:
 
     auto & getParams() { return params; }
 
+    StoragePtr getStorage() const { return params.storage; }
+
+    auto getTaskID() const { return params.task_id; }
+
+    ContextPtr getContext() const { return context; }
+
 protected:
     ManipulationTaskParams params;
 
     std::unique_ptr<ManipulationListEntry> manipulation_entry;
+
+    /// ManipulationTask should hold context by itself, because of ManipulationTask is executed in BackgroundPool
+    ContextPtr context;
 };
 
 using ManipulationTaskPtr = std::shared_ptr<ManipulationTask>;
 
-/// Async
-void executeManipulationTask(ManipulationTaskParams params, ContextPtr context);
+void executeManipulationTask(ManipulationTaskPtr task, MergeTreeMutableDataPartsVector all_parts);
 
 }

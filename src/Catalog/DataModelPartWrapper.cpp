@@ -14,6 +14,7 @@
  */
 
 #include <Catalog/DataModelPartWrapper.h>
+#include <Interpreters/CnchSystemLog.h>
 #include <Protos/DataModelHelpers.h>
 #include "Storages/MergeTree/DeleteBitmapCache.h"
 
@@ -28,6 +29,11 @@ namespace ErrorCodes
 }
 
 DataModelPartWrapper::DataModelPartWrapper() = default;
+
+Int64 getBucketNumberOrInvalid(Int64 bucket_number, bool valid)
+{
+    return valid ? bucket_number : kInvalidBucketNumber;
+}
 
 UInt64 ServerDataPart::getCommitTime() const
 {
@@ -49,6 +55,21 @@ UInt64 ServerDataPart::getColumnsCommitTime() const
 UInt64 ServerDataPart::getMutationCommitTime() const
 {
     return part_model().has_mutation_commit_time() ? part_model().mutation_commit_time() : 0;
+}
+
+UInt64 ServerDataPart::getEndTime() const
+{
+    return part_model_wrapper->part_model->has_end_time() ? part_model_wrapper->part_model->end_time() : 0;
+}
+
+UInt64 ServerDataPart::getLastModificationTime() const
+{
+    return part_model().has_last_modification_time() ? part_model().last_modification_time() : 0;
+}
+
+void ServerDataPart::setEndTime(UInt64 end_time) const
+{
+    const_cast<ServerDataPart *>(this)->part_model_wrapper->part_model->set_end_time(end_time);
 }
 
 bool ServerDataPart::containsExactly(const ServerDataPart & other) const
@@ -89,7 +110,7 @@ void ServerDataPart::serializePartitionAndMinMaxIndex(const MergeTreeMetaBase & 
     if (unlikely(storage.format_version < MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING))
         throw Exception("MergeTree data format is too old", ErrorCodes::FORMAT_VERSION_TOO_OLD);
 
-    part_model_wrapper->partition.store(storage, buf);
+    part_model_wrapper->partition->store(storage, buf);
     if (!isEmpty())
     {
         if (!minmax_idx() || !minmax_idx()->initialized)
@@ -101,7 +122,7 @@ void ServerDataPart::serializePartitionAndMinMaxIndex(const MergeTreeMetaBase & 
     /// Skip partition_id check if this is a deleted part
     if (!deleted())
     {
-        String calculated_partition_id = part_model_wrapper->partition.getID(storage);
+        String calculated_partition_id = part_model_wrapper->partition->getID(storage);
         if (calculated_partition_id != info().partition_id)
             throw Exception(
                 "While loading part " + name() + ": calculated partition ID: " + calculated_partition_id
@@ -127,6 +148,12 @@ void ServerDataPart::serializeDeleteBitmapMetas([[maybe_unused]] const MergeTree
 }
 
 UInt64 ServerDataPart::rowsCount() const { return part_model_wrapper->part_model->rows_count(); }
+UInt64 ServerDataPart::marksCount() const { return part_model_wrapper->part_model->marks_count(); }
+UInt64 ServerDataPart::rowExistsCount() const
+{
+    return part_model_wrapper->part_model->has_row_exists_count() ? part_model_wrapper->part_model->row_exists_count() : rowsCount();
+}
+
 bool ServerDataPart::isEmpty() const { return !isPartial() && part_model_wrapper->part_model->rows_count() == 0; }
 UInt64 ServerDataPart::size() const { return part_model_wrapper->part_model->size();}
 bool ServerDataPart::isPartial() const { return part_model_wrapper->info->hint_mutation; }
@@ -135,8 +162,23 @@ bool ServerDataPart::deleted() const { return part_model_wrapper->part_model->de
 const Protos::DataModelPart & ServerDataPart::part_model() const { return *part_model_wrapper->part_model; }
 const MergeTreePartInfo & ServerDataPart::info() const { return *part_model_wrapper->info; }
 const String & ServerDataPart::name() const { return part_model_wrapper->name; }
-const MergeTreePartition & ServerDataPart::partition() const { return part_model_wrapper->partition; }
+const MergeTreePartition & ServerDataPart::partition() const { return *(part_model_wrapper->partition); }
 const std::shared_ptr<IMergeTreeDataPart::MinMaxIndex> & ServerDataPart::minmax_idx() const { return part_model_wrapper->minmax_idx; }
+
+UUID ServerDataPart::get_uuid() const
+{
+    return part_model().has_part_id() ? RPCHelpers::createUUID(part_model().part_id()) : UUIDHelpers::Nil;
+}
+
+UInt64 ServerDataPart::txnID() const
+{
+    return part_model_wrapper->txnID();
+}
+
+bool ServerDataPart::hasStagingTxnID() const
+{
+    return part_model().has_staging_txn_id();
+}
 
 MutableMergeTreeDataPartCNCHPtr ServerDataPart::toCNCHDataPart(
     const MergeTreeMetaBase & storage,
@@ -144,6 +186,10 @@ MutableMergeTreeDataPartCNCHPtr ServerDataPart::toCNCHDataPart(
     const std::optional<std::string> & relative_path) const
 {
     auto res = createPartFromModel(storage, part_model(), /*id_full_paths,*/ relative_path);
+
+    /// Here we need to use the commit time of the server part to set the commit time, otherwise the commit time detected from the transaction may be lost which will affect the visibility.
+    if (getCommitTime() != IMergeTreeDataPart::NOT_INITIALIZED_COMMIT_TIME)
+        res->commit_time = getCommitTime();
 
     if (prev_part)
         res->setPreviousPart(prev_part->toCNCHDataPart(storage, /*id_full_paths,*/ relative_path));
@@ -154,6 +200,37 @@ MutableMergeTreeDataPartCNCHPtr ServerDataPart::toCNCHDataPart(
 void ServerDataPart::setVirtualPartSize(const UInt64 & vp_size) const { virtual_part_size = vp_size; }
 
 UInt64 ServerDataPart::getVirtualPartSize() const { return virtual_part_size; }
+
+UInt64 ServerDataPart::deletedRowsCount(const MergeTreeMetaBase & storage, bool ignore_error) const
+{
+    UInt64 res = 0;
+    /// For unique table, deletedRowsCount is calculated from delete_bitmap.
+    if (storage.getInMemoryMetadataPtr()->hasUniqueKey())
+    {
+        if (delete_bitmap_metas.empty())
+        {
+            if (ignore_error)
+            {
+                LOG_DEBUG(storage.getLogger(), "Delete bitmap meta for part {} is empty whose engine is unique table, it's a bug!", name());
+                return 0;
+            }
+            else
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Delete bitmap meta for part {} is empty whose engine is unique table, it's a bug!", name());
+
+        }
+
+        for (const auto & delete_bitmap_meta: delete_bitmap_metas)
+            res += delete_bitmap_meta->cardinality();
+    }
+    /// For normal table, deletedRowsCount is calculated from _row_exists column which result is already materialized in part meta.
+    else
+    {
+        res = rowsCount() - rowExistsCount();
+    }
+
+    LOG_TRACE(storage.getLogger(), "Deleted rows of part {} is {}", name(), res);
+    return res;
+}
 
 const ImmutableDeleteBitmapPtr & ServerDataPart::getDeleteBitmap(const MergeTreeMetaBase & storage, bool is_unique_new_part) const
 {
@@ -174,9 +251,11 @@ const ImmutableDeleteBitmapPtr & ServerDataPart::getDeleteBitmap(const MergeTree
                 return delete_bitmap;
             throw Exception("No metadata for delete bitmap of part " + name(), ErrorCodes::LOGICAL_ERROR);
         }
+
         Stopwatch watch;
         auto cache = storage.getContext()->getDeleteBitmapCache();
-        String cache_key = DeleteBitmapCache::buildKey(storage.getStorageUUID(), info().partition_id, info().min_block, info().max_block);
+        /// TODO (zuochuang.zema): how to get the value of _row_exists.
+        String cache_key = DeleteBitmapCache::buildKey(storage.getStorageUUID(), info().partition_id, info().min_block, info().max_block, 0);
         ImmutableDeleteBitmapPtr cached_bitmap;
         UInt64 cached_version = 0; /// 0 is an invalid value and acts as a sentinel
         bool hit_cache = cache->lookup(cache_key, cached_version, cached_bitmap);
@@ -218,8 +297,15 @@ const ImmutableDeleteBitmapPtr & ServerDataPart::getDeleteBitmap(const MergeTree
                     }
                     else
                     {
+                        if (auto unique_table_log = storage.getContext()->getCloudUniqueTableLog())
+                        {
+                            auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, storage.getCnchStorageID());
+                            current_log.metric = ErrorCodes::LOGICAL_ERROR;
+                            current_log.event_msg = "Part " + name() + " doesn't contain delete bitmap meta at " + toString(cached_version) + ", request bitmap meta at " + toString(meta->commit_time());
+                            unique_table_log->add(current_log);
+                        }
                         throw Exception(
-                            "Part " + name() + " doesn't contain delete bitmap meta at " + toString(cached_version),
+                            "Part " + name() + " doesn't contain delete bitmap meta at " + toString(cached_version) + ", request bitmap meta at " + toString(meta->commit_time()),
                             ErrorCodes::LOGICAL_ERROR);
                     }
                 }
@@ -234,6 +320,7 @@ const ImmutableDeleteBitmapPtr & ServerDataPart::getDeleteBitmap(const MergeTree
             {
                 cache->insert(cache_key, target_version, delete_bitmap);
             }
+
             LOG_DEBUG(
                 storage.getLogger(),
                 "Loaded delete bitmap at commit_time {} of {} in {} ms, bitmap cardinality: {}, it was generated in txn_id: {}",

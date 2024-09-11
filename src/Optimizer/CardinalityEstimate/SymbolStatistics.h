@@ -28,11 +28,11 @@ class SymbolStatistics;
 using SymbolStatisticsPtr = std::shared_ptr<SymbolStatistics>;
 
 // export symbols
-using Statistics::OverlappedRange;
-using Statistics::OverlappedRanges;
 using Statistics::Bucket;
 using Statistics::Buckets;
 using Statistics::Histogram;
+using Statistics::OverlappedRange;
+using Statistics::OverlappedRanges;
 
 namespace Statistics
 {
@@ -66,10 +66,10 @@ public:
 
     SymbolStatisticsPtr copy() const
     {
-        return std::make_shared<SymbolStatistics>(ndv, min, max, null_counts, avg_len, histogram, type, db_table_column, unknown);
+        return std::make_shared<SymbolStatistics>(ndv, min, max, null_counts, avg_len, histogram.copy(), type, db_table_column, unknown);
     }
 
-    SymbolStatistics & operator+(const SymbolStatistics & other)
+    SymbolStatistics & operator+=(const SymbolStatistics & other)
     {
         ndv += other.ndv;
         min = min < other.min ? min : other.min;
@@ -94,12 +94,20 @@ public:
     size_t getOutputSizeInBytes();
 
     void setNdv(UInt64 ndv_) { ndv = ndv_; }
-    void setType(const DataTypePtr & type_) { type = type_; }
+    void setMax(Float64 max_) { max = max_; }
+    void setType(const DataTypePtr & type_)
+    {
+        type = type_;
+        normalize();
+    }
     void setDbTableColumn(String db_table_column_) { db_table_column = db_table_column_; }
 
-    bool isNullable() const { return type->isNullable(); }
+    bool isNullable() const { return isNullableOrLowCardinalityNullable(type); }
     bool isNumber() const;
     bool isString() const;
+
+    void normalize();
+
 
     bool isImplicitConvertableFromString();
 
@@ -138,15 +146,15 @@ public:
     SymbolStatisticsPtr createNot(SymbolStatisticsPtr & origin);
 
     // adjust other symbols statistics while they don't participation in filter/join/aggregate.
-    SymbolStatisticsPtr applySelectivity(double selectivity);
-    SymbolStatisticsPtr applySelectivity(double rowcount_selectivity, double ndv_selectivity);
+    SymbolStatisticsPtr applySelectivity(double selectivity) const;
+    SymbolStatisticsPtr applySelectivity(double rowcount_selectivity, double ndv_selectivity) const;
 
     void emplaceBackBucket(Bucket bucket) { histogram.emplaceBackBucket(std::move(bucket)); }
 
     Poco::JSON::Object::Ptr toJson() const;
 
 private:
-    // number of distinct values
+        // number of distinct values
     UInt64 ndv;
 
     // minimum value

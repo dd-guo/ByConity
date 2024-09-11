@@ -19,6 +19,7 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
+#include <Interpreters/StorageID.h>
 #include <Parsers/ParserSystemQuery.h>
 #include <Parsers/ASTSystemQuery.h>
 #include <Parsers/CommonParsers.h>
@@ -104,6 +105,14 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
     if (!found)
         return false;
 
+    // Parse integer
+    auto parse_uint = [](IParser::Pos & pos_, Expected & expected_, UInt64 & res_)
+    {
+        ASTPtr ast;
+        if (!ParserUnsignedInteger().parse(pos_, ast, expected_)) return false;
+        res_ = safeGet<UInt64>(ast->as<ASTLiteral>()->value);
+        return true;
+    };
     ParserPartition parser_partition;
     switch (res->type)
     {
@@ -159,6 +168,7 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                     ASTPtr database;
                     if (!database_parser.parse(pos, database, expected))
                         return false;
+                    tryRewriteCnchDatabaseName(database, pos.getContext());
                     tryGetIdentifierNameInto(database, res->database);
                 }
                 else if (ParserKeyword{"TABLE"}.ignore(pos, expected))
@@ -184,6 +194,7 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             break;
         }
 
+        case Type::RECALCULATE_METRICS:
         case Type::RESTART_REPLICA:
         case Type::SYNC_REPLICA:
             if (!parseDatabaseAndTableName(pos, expected, res->database, res->table))
@@ -249,10 +260,21 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             break;
         }
 
+        case Type::GC:
+        {
+            if (!parseDatabaseAndTableName(pos, expected, res->database, res->table))
+                return false;
+            if (ParserKeyword{"PARTITION"}.ignore(pos, expected) && !parser_partition.parse(pos, res->partition, expected))
+                return false;
+            break;
+        }
+
         case Type::START_GC:
         case Type::STOP_GC:
         case Type::FORCE_GC:
+        case Type::DROP_CNCH_META_CACHE:
         case Type::DROP_CNCH_PART_CACHE:
+        case Type::DROP_CNCH_DELETE_BITMAP_CACHE:
         case Type::STOP_TTL_MERGES:
         case Type::START_TTL_MERGES:
         case Type::STOP_MOVES:
@@ -265,14 +287,20 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
         case Type::START_REPLICATION_QUEUES:
         case Type::START_CONSUME:
         case Type::STOP_CONSUME:
+        case Type::DROP_CONSUME:
         case Type::RESTART_CONSUME:
+        case Type::RESYNC_MATERIALIZEDMYSQL_TABLE:
         case Type::DROP_CHECKSUMS_CACHE:
         case Type::SYNC_DEDUP_WORKER:
+        case Type::SYNC_REPAIR_TASK:
         case Type::START_DEDUP_WORKER:
         case Type::STOP_DEDUP_WORKER:
+        case Type::START_CLUSTER:
+        case Type::STOP_CLUSTER:
         case Type::FLUSH_CNCH_LOG:
         case Type::STOP_CNCH_LOG:
         case Type::RESUME_CNCH_LOG:
+        case Type::MANIFEST_CHECKPOINT:
             parseDatabaseAndTableName(pos, expected, res->database, res->table);
             break;
 
@@ -337,14 +365,124 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             break;
         }
 
+        case Type::DEDUP_WITH_HIGH_PRIORITY:
+        {
+            if (!parseDatabaseAndTableName(pos, expected, res->database, res->table))
+                return false;
+            if (!ParserKeyword{"PARTITION"}.ignore(pos, expected))
+                return false;
+            if (!parser_partition.parse(pos, res->partition, expected))
+                return false;
+            break;
+        }
+
         case Type::DEDUP:
         {
             if (!parseDatabaseAndTableName(pos, expected, res->database, res->table))
                 return false;
             if (ParserKeyword{"PARTITION"}.ignore(pos, expected) && !parser_partition.parse(pos, res->partition, expected))
                 return false;
+            if (ParserKeyword{"BUCKET"}.ignore(pos, expected))
+            {
+                ASTPtr ast;
+                if (!ParserUnsignedInteger().parse(pos, ast, expected))
+                    return false;
+                res->specify_bucket = true;
+                res->bucket_number = safeGet<UInt64>(ast->as<ASTLiteral>()->value);
+            }
             if (!ParserKeyword{"FOR REPAIR"}.ignore(pos, expected))
                 return false;
+            break;
+        }
+
+        case Type::RESET_CONSUME_OFFSET:
+        {
+            if (!parseIdentifierOrStringLiteral(pos, expected, res->string_data))
+                return false;
+            break;
+        }
+
+        case Type::CLEAN_TRASH_TABLE:
+        {
+            ASTPtr table;
+            ParserCompoundIdentifier name_p(true);
+            if (!name_p.parse(pos, table, expected))
+                return false;
+            auto table_id = table->as<ASTTableIdentifier>()->getTableId();
+            res->database = table_id.database_name;
+            res->table = table_id.table_name;
+            res->table_uuid = table_id.uuid;
+            break;
+        }
+
+        case Type::CLEAN_TRANSACTION:
+        {
+            if (!parse_uint(pos, expected, res->txn_id))
+                return false;
+            break;
+        }
+
+        case Type::START_MATERIALIZEDMYSQL:
+        case Type::STOP_MATERIALIZEDMYSQL:
+        {
+            if (!parseIdentifierOrStringLiteral(pos, expected, res->database))
+                return false;
+            break;
+        }
+
+        case Type::LOCK_MEMORY_LOCK:
+        {
+            parseDatabaseAndTableName(pos, expected, res->database, res->table);
+            if (ParserKeyword{"PARTITION"}.ignore(pos, expected) && !parser_partition.parse(pos, res->partition, expected))
+                return false;
+
+            ASTPtr seconds;
+            if (!(ParserKeyword{"FOR"}.ignore(pos, expected)
+                && ParserUnsignedInteger().parse(pos, seconds, expected)
+                && ParserKeyword{"SECOND"}.ignore(pos, expected)))   /// SECOND, not SECONDS to be consistent with INTERVAL parsing in SQL
+            {
+                return false;
+            }
+
+            res->seconds = seconds->as<ASTLiteral>()->value.get<UInt64>();
+
+            if (ParserKeyword{"DOMAIN"}.ignore(pos, expected))
+                res->string_data = "DOMAIN";
+
+            break;
+        }
+
+        case Type::START_VIEW:
+        case Type::STOP_VIEW:
+        case Type::DROP_VIEW_META:
+            if (!parseDatabaseAndTableName(pos, expected, res->database, res->table))
+                return false;
+            break;
+
+        case Type::RELEASE_MEMORY_LOCK:
+        {
+            if (ParserKeyword{"OF"}.ignore(pos, expected))
+            {
+                if (!ParserKeyword{"TXN"}.ignore(pos, expected))
+                    return false;
+                if (!parse_uint(pos, expected, res->txn_id))
+                    return false;
+                res->specify_txn = true;
+            }
+            else
+                parseDatabaseAndTableName(pos, expected, res->database, res->table);
+            break;
+        }
+
+        case Type::DROP_SCHEMA_CACHE:
+        {
+            if (ParserKeyword{"FOR"}.ignore(pos, expected))
+            {
+                if (ParserKeyword{"S3"}.ignore(pos, expected))
+                    res->schema_cache_storage = "S3";
+                else
+                    return false;
+            }
             break;
         }
 

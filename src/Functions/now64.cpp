@@ -89,6 +89,7 @@ public:
 
     bool isDeterministic() const override { return false; }
     bool isDeterministicInScopeOfQuery() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
 private:
     Field time_value;
@@ -151,7 +152,7 @@ public:
 
 }
 
-void registerFunctionNow64(FunctionFactory & factory)
+REGISTER_FUNCTION(Now64)
 {
     factory.registerFunction<Now64OverloadResolver>(FunctionFactory::CaseInsensitive);
 }

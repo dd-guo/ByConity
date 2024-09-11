@@ -20,17 +20,21 @@
 #include "common/logger_useful.h"
 #include <Common/Exception.h>
 // #include <Transaction/CnchExplicitTransaction.h>
-#include "Disks/IDisk.h"
+#include <Disks/IDisk.h>
+#include <Disks/DiskByteS3.h>
 #include <MergeTreeCommon/CnchStorageCommon.h>
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
+#include <Storages/MergeTree/S3ObjectMetadata.h>
+#include <Storages/MergeTree/S3PartsAttachMeta.h>
 #include <Interpreters/Context.h>
 #include <cppkafka/cppkafka.h>
+
 
 namespace DB
 {
 namespace ErrorCodes
 {
-    // extern const int BAD_CAST;
+    extern const int BAD_CAST;
     extern const int BAD_TYPE_OF_FIELD;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
@@ -102,6 +106,12 @@ const char * txnInitiatorToString(CnchTransactionInitiator initiator)
 
         case CnchTransactionInitiator::Txn:
             return "Txn";
+
+        case CnchTransactionInitiator::MvRefresh:
+            return "MvRefresh";
+
+        case CnchTransactionInitiator::MergeSelect:
+            return "MergeSelect";
     }
 
     throw Exception("Bad type of Transaction Initiator", ErrorCodes::BAD_TYPE_OF_FIELD);
@@ -128,14 +138,31 @@ void UndoResource::clean(Catalog::Catalog & , [[maybe_unused]]MergeTreeMetaBase 
         throw Exception("Disk " + diskName() + " not found. This should only happens in testing or unstable environment. If this exception is on production, there's a bug", ErrorCodes::LOGICAL_ERROR);
     }
 
-    if (type() == UndoResourceType::Part || type() == UndoResourceType::DeleteBitmap || type() == UndoResourceType::StagedPart)
+    if (type() == UndoResourceType::Part || type() == UndoResourceType::DeleteBitmap || type() == UndoResourceType::StagedPart
+        || type() == UndoResourceType::S3DetachDeleteBitmap || type() == UndoResourceType::S3AttachDeleteBitmap)
     {
-        const auto & resource_relative_path = placeholders(1);
+        const auto & resource_relative_path = type() == UndoResourceType::S3AttachDeleteBitmap ? placeholders(4) : placeholders(1);
         String rel_path = storage->getRelativeDataPath(IStorage::StorageLocation::MAIN) + resource_relative_path;
         if (disk->exists(rel_path))
         {
-            LOG_DEBUG(log, "Will remove undo path {}", disk->getPath() + rel_path);
-            disk->removeRecursive(rel_path);
+            if ((type() == UndoResourceType::Part || type() == UndoResourceType::StagedPart)
+                && disk->getType() == DiskType::Type::ByteS3)
+            {
+                if (auto s3_disk = std::dynamic_pointer_cast<DiskByteS3>(disk); s3_disk != nullptr)
+                {
+                    S3PartsLazyCleaner cleaner(s3_disk->getS3Util(), s3_disk->getPath(),
+                        S3ObjectMetadata::PartGeneratorID(S3ObjectMetadata::PartGeneratorID::TRANSACTION, std::to_string(txn_id)), 1);
+
+                    cleaner.push(resource_relative_path);
+
+                    cleaner.finalize();
+                }
+            }
+            else
+            {
+                LOG_DEBUG(log, "Will remove Disk {} undo path {}" , disk->getPath(), rel_path);
+                disk->removeRecursive(rel_path);
+            }
         }
     }
     else if (type() == UndoResourceType::FileSystem)
@@ -152,9 +179,59 @@ void UndoResource::clean(Catalog::Catalog & , [[maybe_unused]]MergeTreeMetaBase 
             disk->moveDirectory(dst_path, src_path);
         }
     }
+    else if (type() == UndoResourceType::KVFSLockKey)
+    {
+        LOG_TRACE(log, "Nothing to clean in vfs for undo resource:" + toDebugString());
+    }
     else
     {
-        LOG_DEBUG(log, "Undefined clean method.");
+        LOG_DEBUG(log, "Undefined clean method for undo resource: " + toDebugString());
+    }
+}
+
+void UndoResource::commit(const Context & context) const
+{
+    auto catalog = context.getCnchCatalog();
+
+    if (type() == UndoResourceType::S3AttachDeleteBitmap)
+    {
+        const String & from_tbl_uuid = placeholders(0);
+        const String & former_bitmap_meta = placeholders(2);
+
+        StoragePtr table = catalog->tryGetTableByUUID(context, from_tbl_uuid, TxnTimestamp::maxTS(), true);
+        if (!table)
+            return;
+
+        auto * storage = dynamic_cast<MergeTreeMetaBase *>(table.get());
+        if (!storage)
+            throw Exception("Table is not of MergeTree class", ErrorCodes::BAD_CAST);
+
+        DiskPtr disk;
+        if (diskName().empty())
+        {
+            // For cnch, this storage policy should only contains one disk
+            disk = storage->getStoragePolicy(IStorage::StorageLocation::MAIN)->getAnyDisk();
+        }
+        else
+        {
+            disk = storage->getStoragePolicy(IStorage::StorageLocation::MAIN)->getDiskByName(diskName());
+        }
+
+        /// This can happen in testing environment when disk name may change time to time
+        if (!disk)
+        {
+            throw Exception("Disk " + diskName() + " not found. This should only happens in testing or unstable environment. If this exception is on production, there's a bug", ErrorCodes::LOGICAL_ERROR);
+        }
+
+        DataModelDeleteBitmapPtr model_ptr = std::make_shared<Protos::DataModelDeleteBitmap>();
+        model_ptr->ParseFromString(former_bitmap_meta);
+        const auto & relative_path = DeleteBitmapMeta::deleteBitmapFileRelativePath(*model_ptr);
+        String rel_path = storage->getRelativeDataPath(IStorage::StorageLocation::MAIN) + relative_path;
+        if (disk->exists(rel_path))
+        {
+            LOG_DEBUG(log, "Will remove Disk {} undo path {}", disk->getPath(), rel_path);
+            disk->removeRecursive(rel_path);
+        }
     }
 }
 
@@ -163,7 +240,7 @@ UndoResourceNames integrateResources(const UndoResources & resources)
     UndoResourceNames result;
     for (const auto & resource : resources)
     {
-        if (resource.type() == UndoResourceType::Part)
+        if (resource.type() == UndoResourceType::Part || resource.type() == UndoResourceType::S3VolatilePart)
         {
             result.parts.insert(resource.placeholders(0));
         }
@@ -179,13 +256,30 @@ UndoResourceNames integrateResources(const UndoResources & resources)
         {
             /// try to get part name from dst path
             String dst_path = resource.placeholders(1);
-            if (dst_path.empty() && dst_path.back() == '/')
+            if (!dst_path.empty() && dst_path.back() == '/')
                 dst_path.pop_back();
             String part_name = dst_path.substr(dst_path.find_last_of('/') + 1);
-            if (MergeTreePartInfo::tryParsePartName(part_name, nullptr, MERGE_TREE_CHCH_DATA_STORAGTE_VERSION))
+            MergeTreePartInfo part_info;
+            if (MergeTreePartInfo::tryParsePartName(part_name, &part_info, MERGE_TREE_CHCH_DATA_STORAGTE_VERSION)
+                && part_info.mutation == static_cast<Int64>(resource.txn_id))
             {
+                /// Here we need to check the part mutation match with the transaction id as well, because we also record
+                /// intermediate moves. If this undo buffer is for an intermediate move, part_name can be the name of old
+                /// parts (before attach).
                 result.parts.insert(part_name);
             }
+        }
+        else if (resource.type() == UndoResourceType::KVFSLockKey)
+        {
+            result.kvfs_lock_keys.insert(resource.placeholders(0));
+        }
+        else if (resource.type() == UndoResourceType::S3AttachPart
+            || resource.type() == UndoResourceType::S3DetachPart
+            || resource.type() == UndoResourceType::S3DetachStagedPart
+            || resource.type() == UndoResourceType::S3AttachMeta
+            || resource.type() == UndoResourceType::S3DetachDeleteBitmap
+            || resource.type() == UndoResourceType::S3AttachDeleteBitmap)
+        {
         }
         else
             throw Exception("Unknown undo resource type " + toString(static_cast<int>(resource.type())), ErrorCodes::LOGICAL_ERROR);

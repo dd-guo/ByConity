@@ -49,6 +49,38 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+static ConsulAddrType consul_addr_type;
+
+String addrTypeString(ConsulAddrType type)
+{
+    switch (type)
+    {
+        case ConsulAddrType::IPV4:
+            return "IPV4";
+        case ConsulAddrType::IPV6:
+            return "IPV6";
+        case ConsulAddrType::DUAL:
+            return "DUAL";
+        default:
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown ConsulAddrType {}", type);
+    }
+}
+
+bool checkConsulResults(const ServiceDiscoveryConsul::Endpoints & endpoints)
+{
+    if (endpoints.empty())
+        return false;
+    if (consul_addr_type != ConsulAddrType::IPV4)
+    {
+        for (const auto & endpoint : endpoints)
+        {
+            if (endpoint.host.find("::") == std::string::npos)
+                return false;
+        }
+    }
+    return true;
+}
+
 ServiceDiscoveryConsul::ServiceDiscoveryConsul(const Poco::Util::AbstractConfiguration & config)
 {
     /// initialize cluster variable
@@ -59,7 +91,8 @@ ServiceDiscoveryConsul::ServiceDiscoveryConsul(const Poco::Util::AbstractConfigu
         cache_disabled = config.getBool("service_discovery.disable_cache");
     if (config.hasProperty("service_discovery.cache_timeout"))
         cache_timeout = config.getUInt("service_discovery.cache_timeout");
-
+    if (config.hasProperty("service_discovery.check_result"))
+        check_result = config.getBool("service_discovery.check_result");
 }
 
 HostWithPortsVec ServiceDiscoveryConsul::lookup(const String & psm_name, ComponentType type, const String & vw_name)
@@ -98,13 +131,13 @@ IServiceDiscovery::WorkerGroupMap ServiceDiscoveryConsul::lookupWorkerGroupsInVW
         if (ep.tags.count("hostname"))
             host_with_ports.id = ep.tags.at("hostname");
         if (ep.tags.count("PORT1"))
+        {
             host_with_ports.rpc_port = parse<UInt16>(ep.tags.at("PORT1"));
+            host_with_ports.exchange_port = host_with_ports.rpc_port;
+            host_with_ports.exchange_status_port = host_with_ports.rpc_port;
+        }
         if (ep.tags.count("PORT2"))
             host_with_ports.http_port = parse<UInt16>(ep.tags.at("PORT2"));
-        if (ep.tags.count("PORT5"))
-            host_with_ports.exchange_port = parse<UInt16>(ep.tags.at("PORT5"));
-        if (ep.tags.count("PORT6"))
-            host_with_ports.exchange_status_port = parse<UInt16>(ep.tags.at("PORT6"));
 
         group.push_back(std::move(host_with_ports));
     }
@@ -135,6 +168,18 @@ ServiceDiscoveryConsul::Endpoints ServiceDiscoveryConsul::fetchEndpointsFromCach
     try
     {
         Endpoints res = fetchEndpointsFromUpstream(psm_name, vw_name);
+        if (check_result && !checkConsulResults(res))
+        {
+            LOG_WARNING(
+                log,
+                "Failed to get valid results by addr type {}: size = {}, first = {}, return old cache results: size = {}, first = {}",
+                addrTypeString(consul_addr_type),
+                res.size(),
+                res.empty() ? "empty" : res.begin()->host,
+                cache_res.endpoints.size(),
+                cache_res.endpoints.empty() ? "empty" : cache_res.endpoints.begin()->host);
+            return cache_res.endpoints;
+        }
         SDCacheValue<Endpoint> new_value {res, time(nullptr)};
 
         // update cache
@@ -165,13 +210,13 @@ HostWithPortsVec ServiceDiscoveryConsul::formatResult(const Endpoints & eps, Com
             if (e.tags.count("hostname"))
                 host_with_ports.id = e.tags.at("hostname");
             if (e.tags.count("PORT1"))
+            {
                 host_with_ports.rpc_port = parse<UInt16>(e.tags.at("PORT1"));
+                host_with_ports.exchange_port = host_with_ports.rpc_port;
+                host_with_ports.exchange_status_port = host_with_ports.rpc_port;
+            }
             if (e.tags.count("PORT2"))
                 host_with_ports.http_port = parse<UInt16>(e.tags.at("PORT2"));
-            if (e.tags.count("PORT5"))
-                host_with_ports.exchange_port = parse<UInt16>(e.tags.at("PORT5"));
-            if (e.tags.count("PORT6"))
-                host_with_ports.exchange_status_port = parse<UInt16>(e.tags.at("PORT6"));
 
             result.push_back(std::move(host_with_ports));
         }

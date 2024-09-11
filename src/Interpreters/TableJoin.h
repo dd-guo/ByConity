@@ -24,14 +24,18 @@
 #include <Core/Names.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/SettingsEnums.h>
-#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Interpreters/IJoin.h>
-#include <Interpreters/join_common.h>
+#include <Interpreters/RuntimeFilter/RuntimeFilterBuilder.h>
+#include <Interpreters/RuntimeFilter/RuntimeFilterConsumer.h>
 #include <Interpreters/asof.h>
+#include <Interpreters/join_common.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
+
 #include <DataStreams/IBlockStream_fwd.h>
 #include <DataStreams/SizeLimits.h>
 #include <DataTypes/getLeastSupertype.h>
 #include <Storages/IStorage_fwd.h>
+#include "Interpreters/ExpressionActions.h"
 
 #include <utility>
 #include <memory>
@@ -53,6 +57,8 @@ struct Settings;
 
 class IVolume;
 using VolumePtr = std::shared_ptr<IVolume>;
+
+class RuntimeFilterConsumer;
 
 class TableJoin
 {
@@ -79,7 +85,7 @@ private:
     const SizeLimits size_limits;
     const size_t default_max_bytes = 0;
     const bool join_use_nulls = false;
-    const size_t max_joined_block_rows = 0;
+    size_t max_joined_block_rows = 0;
     JoinAlgorithm join_algorithm = JoinAlgorithm::AUTO;
     const bool partial_merge_join_optimizations = false;
     const size_t partial_merge_join_rows_in_right_blocks = 0;
@@ -87,6 +93,9 @@ private:
     const size_t max_files_to_merge = 0;
     const String temporary_files_codec = "LZ4";
     const bool allow_extended_conversion = false;
+    const size_t runtime_filter_bloom_build_threshold = 1024000;
+    const size_t runtime_filter_in_build_threshold = 1024;
+    std::shared_ptr<RuntimeFilterConsumer> runtimeFilterConsumer = nullptr;
 
     Names key_names_left;
     Names key_names_right; /// Duplicating names are qualified.
@@ -94,6 +103,8 @@ private:
     ASTs key_asts_left;
     ASTs key_asts_right;
     ASTTableJoin table_join;
+    ExpressionActionsPtr inequal_condition_actions;
+    String inequal_column_name;
 
     ASOF::Inequality asof_inequality = ASOF::Inequality::GreaterOrEquals;
 
@@ -119,6 +130,9 @@ private:
 
     // Used to generate TableJoin during serialization
     ASTPtr select_query;
+
+    // Collect null safe comparison columns
+    std::vector<bool> key_ids_null_safe;
 
     Names requiredJoinedNames() const;
 
@@ -162,16 +176,19 @@ public:
     bool preferMergeJoin() const { return join_algorithm == JoinAlgorithm::PREFER_PARTIAL_MERGE; }
     bool forceMergeJoin() const { return join_algorithm == JoinAlgorithm::PARTIAL_MERGE; }
     bool forceNestedLoopJoin() const { return join_algorithm == JoinAlgorithm::NESTED_LOOP_JOIN; }
+    bool forceGraceHashJoin() const { return join_algorithm == JoinAlgorithm::GRACE_HASH; }
+    bool allowParallelHashJoin() const;
     bool forceHashJoin() const
     {
         /// HashJoin always used for DictJoin
-        return dictionary_reader || join_algorithm == JoinAlgorithm::HASH;
+        return dictionary_reader || join_algorithm == JoinAlgorithm::HASH || join_algorithm == JoinAlgorithm::PARALLEL_HASH;
     }
 
-    bool forceNullableRight() const { return join_use_nulls && isLeftOrFull(table_join.kind); }
-    bool forceNullableLeft() const { return join_use_nulls && isRightOrFull(table_join.kind); }
+    bool forceNullableRight() const;
+    bool forceNullableLeft() const;
     size_t defaultMaxBytes() const { return default_max_bytes; }
-    size_t maxJoinedBlockRows() const { return max_joined_block_rows; }
+    size_t & maxJoinedBlockRows() { return max_joined_block_rows; }
+    void setMaxJoinedBlockRows(size_t new_val) { max_joined_block_rows = new_val; }
     size_t maxRowsInRightBlock() const { return partial_merge_join_rows_in_right_blocks; }
     size_t maxBytesInLeftBuffer() const { return partial_merge_join_left_table_buffer_bytes; }
     size_t maxFilesToMerge() const { return max_files_to_merge; }
@@ -180,17 +197,23 @@ public:
     bool needStreamWithNonJoinedRows() const;
 
     void resetCollected();
-    void addUsingKey(const ASTPtr & ast);
-    void addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast);
+    void addUsingKey(const ASTPtr & ast, bool null_safe);
+    void addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast, bool null_safe);
+    void addInequalConditions(const ASTs & inequal_conditions, const NamesAndTypesList & columns_for_join, ContextPtr context);
 
     bool hasUsing() const { return table_join.using_expression_list != nullptr; }
     bool hasOn() const { return table_join.on_expression != nullptr; }
     ASTPtr getOnExpression(){ return table_join.on_expression != nullptr ? table_join.on_expression : table_join.on_expression; }
+    ExpressionActionsPtr getInequalCondition() const { return inequal_condition_actions; }
+
+    void setInequalCondition(ExpressionActionsPtr inequal_condition_actions_, String inequal_column_name_);
+    String getInequalColumnName() const { return inequal_column_name;}
 
     NamesWithAliases getNamesWithAliases(const NameSet & required_columns) const;
     NamesWithAliases getRequiredColumns(const Block & sample, const Names & action_required_columns) const;
 
-    void deduplicateAndQualifyColumnNames(const NameSet & left_table_columns, const String & right_table_prefix);
+    void deduplicateAndQualifyColumnNames(
+        const NameSet & left_table_columns, const String & right_table_prefix, bool check_identifier_begin_valid = true);
     size_t rightKeyInclusion(const String & name) const;
     NameSet requiredRightKeys() const;
 
@@ -223,6 +246,7 @@ public:
 
     const Names & keyNamesLeft() const { return key_names_left; }
     const Names & keyNamesRight() const { return key_names_right; }
+    const std::vector<bool> *keyIdsNullSafe() const { return key_ids_null_safe.empty() ? nullptr : &key_ids_null_safe; }
     const NamesAndTypesList & columnsFromJoinedTable() const { return columns_from_joined_table; }
     void setColumnsFromJoinedTable(const NamesAndTypesList & columns) { columns_from_joined_table = columns; }
     Names columnsAddedByJoin() const
@@ -236,6 +260,11 @@ public:
     /// StorageJoin overrides key names (cause of different names qualification)
     void setRightKeys(const Names & keys) { key_names_right = keys; }
 
+    bool isSpecialStorage() const {return !!joined_storage; }
+    // The communary introduced support for "The 'OR' operator in 'ON' section for join",
+    // but in our scenario, there only one disjunct at a time yet
+    bool oneDisjunct() const { return true; }
+
     /// Split key and other columns by keys name list
     void splitAdditionalColumns(const Block & sample_block, Block & block_keys, Block & block_others) const;
     Block getRequiredRightKeys(const Block & right_table_keys, std::vector<String> & keys_sources) const;
@@ -245,6 +274,12 @@ public:
     void serialize(WriteBuffer & buf) const;
     void deserializeImpl(ReadBuffer & buf, ContextPtr context);
     static std::shared_ptr<TableJoin> deserialize(ReadBuffer & buf, ContextPtr context);
+
+    std::shared_ptr<RuntimeFilterConsumer> getRuntimeFilterConsumer() const { return runtimeFilterConsumer; }
+    size_t getBloomBuildThreshold() const { return runtime_filter_bloom_build_threshold;}
+    size_t getInBuildThreshold() const { return runtime_filter_in_build_threshold;}
+
+    void setRuntimeFilterConsumer(const std::shared_ptr<RuntimeFilterConsumer> &filterConsumer) { runtimeFilterConsumer = filterConsumer; }
 };
 
 }

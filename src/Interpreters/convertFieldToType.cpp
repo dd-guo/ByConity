@@ -27,7 +27,6 @@
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeMap.h>
-#include <DataTypes/DataTypeByteMap.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypeString.h>
@@ -44,8 +43,9 @@
 #include <Core/AccurateComparison.h>
 #include <Common/typeid_cast.h>
 #include <Common/NaNUtils.h>
+#include <Common/FieldVisitorToString.h>
 
-#include <common/DateLUT.h>
+#include <Common/DateLUT.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
 
 
@@ -200,6 +200,22 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
     {
         return static_cast<const DataTypeDateTime &>(type).getTimeZone().fromDayNum(DayNum(src.get<Int32>()));
     }
+    else if (which_type.isDateTime64() && which_from_type.isDate())
+    {
+        const auto & date_time64_type = static_cast<const DataTypeDateTime64 &>(type);
+        const auto value = date_time64_type.getTimeZone().fromDayNum(DayNum(src.get<UInt16>()));
+        return DecimalField(
+            DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(value, 0, date_time64_type.getScaleMultiplier()),
+            date_time64_type.getScale());
+    }
+    else if (which_type.isDateTime64() && which_from_type.isDate32())
+    {
+        const auto & date_time64_type = static_cast<const DataTypeDateTime64 &>(type);
+        const auto value = date_time64_type.getTimeZone().fromDayNum(ExtendedDayNum(static_cast<Int32>(src.get<Int32>())));
+        return DecimalField(
+            DecimalUtils::decimalFromComponentsWithMultiplier<DateTime64>(value, 0, date_time64_type.getScaleMultiplier()),
+            date_time64_type.getScale());
+    }
     else if (type.isValueRepresentedByNumber() && src.getType() != Field::Types::String)
     {
         if (which_type.isUInt8()) return convertNumericType<UInt8>(src, type);
@@ -245,6 +261,25 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
             return src;
         }
 
+        if (which_type.isTime() && src.getType() == Field::Types::Decimal64)
+        {
+            return src;
+        }
+
+        /// For toDate('xxx') in 1::Int64, we CAST `src` to UInt64, which may
+        /// produce wrong result in some special cases.
+        if (which_type.isDate() && src.getType() == Field::Types::Int64)
+        {
+            return convertNumericType<UInt64>(src, type);
+        }
+
+        /// For toDate32('xxx') in 1, we CAST `src` to Int64. Also, it may
+        /// produce wrong result in some special cases.
+        if (which_type.isDate32() && src.getType() == Field::Types::UInt64)
+        {
+            return convertNumericType<Int64>(src, type);
+        }
+
         if (which_type.isDateTime64()
             && (which_from_type.isNativeInt() || which_from_type.isNativeUInt() || which_from_type.isDateOrDate32() || which_from_type.isDateTime() || which_from_type.isDateTime64()))
         {
@@ -252,11 +287,30 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
             const auto decimal_value = DecimalUtils::decimalFromComponents<DateTime64>(src.reinterpret<Int64>(), 0, scale);
             return Field(DecimalField<DateTime64>(decimal_value, scale));
         }
+        else if (which_type.isIPv4() && src.getType() == Field::Types::IPv4)
+        {
+            /// Already in needed type.
+            return src;
+        }
     }
     else if (which_type.isUUID() && src.getType() == Field::Types::UUID)
     {
         /// Already in needed type.
         return src;
+    }
+    else if (which_type.isIPv6())
+    {
+        /// Already in needed type.
+        if (src.getType() == Field::Types::IPv6)
+            return src;
+        /// Treat FixedString(16) as a binary representation of IPv6
+        if (which_from_type.isFixedString() && assert_cast<const DataTypeFixedString *>(from_type_hint)->getN() == IPV6_BINARY_LENGTH)
+        {
+            const auto col = type.createColumn();
+            ReadBufferFromString in_buffer(src.get<String>());
+            type.getDefaultSerialization()->deserializeBinary(*col, in_buffer);
+            return (*col)[0];
+        }
     }
     else if (which_type.isStringOrFixedString())
     {
@@ -275,6 +329,8 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
             }
             return src;
         }
+
+        return applyVisitor(FieldVisitorToString(), src);
     }
     else if (const DataTypeArray * type_array = typeid_cast<const DataTypeArray *>(&type))
     {
@@ -343,70 +399,29 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
     }
     else if (const DataTypeMap * type_map = typeid_cast<const DataTypeMap *>(&type))
     {
-        if (src.getType() == Field::Types::Map)
+        const auto & key_type = *type_map->getKeyType();
+        const auto & value_type = *type_map->getValueType();
+
+        const auto & map = src.get<Map>();
+        size_t map_size = map.size();
+
+        Map res(map_size);
+
+        bool have_unconvertible_element = false;
+        for (size_t i = 0; i < map_size; ++i)
         {
-            const auto & key_type = *type_map->getKeyType();
-            const auto & value_type = *type_map->getValueType();
+            const auto & key = map[i].first;
+            const auto & value = map[i].second;
 
-            const auto & map = src.get<Map>();
-            size_t map_size = map.size();
+            res[i] = {convertFieldToType(key, key_type), convertFieldToType(value, value_type)};
+            if (res[i].first.isNull() && !key_type.isNullable())
+                have_unconvertible_element = true;
 
-            Map res(map_size);
-
-            bool have_unconvertible_element = false;
-
-            for (size_t i = 0; i < map_size; ++i)
-            {
-                const auto & map_entry = map[i].get<Tuple>();
-
-                const auto & key = map_entry[0];
-                const auto & value = map_entry[1];
-
-                Tuple updated_entry(2);
-
-                updated_entry[0] = convertFieldToType(key, key_type);
-
-                if (updated_entry[0].isNull() && !key_type.isNullable())
-                    have_unconvertible_element = true;
-
-                updated_entry[1] = convertFieldToType(value, value_type);
-                if (updated_entry[1].isNull() && !value_type.isNullable())
-                    have_unconvertible_element = true;
-
-                res[i] = updated_entry;
-            }
-
-            return have_unconvertible_element ? Field(Null()) : Field(res);
+            if (res[i].second.isNull() && !value_type.isNullable())
+                have_unconvertible_element = true;
         }
-    }
-    else if (const DataTypeByteMap * byte_type_map = typeid_cast<const DataTypeByteMap *>(&type))
-    {
-        if (src.getType() == Field::Types::ByteMap)
-        {
-            const auto & key_type = *byte_type_map->getKeyType();
-            const auto & value_type = *byte_type_map->getValueType();
 
-            const auto & map = src.get<ByteMap>();
-            size_t map_size = map.size();
-
-            ByteMap res(map_size);
-
-            bool have_unconvertible_element = false;
-            for (size_t i = 0; i < map_size; ++i)
-            {
-                const auto & key = map[i].first;
-                const auto & value = map[i].second;
-
-                res[i] = {convertFieldToType(key, key_type), convertFieldToType(value, value_type)};
-                if (res[i].first.isNull() && !key_type.isNullable())
-                    have_unconvertible_element = true;
-
-                if (res[i].second.isNull() && !value_type.isNullable())
-                    have_unconvertible_element = true;
-            }
-
-            return have_unconvertible_element ? Field(Null()) : Field(res);
-        }
+        return have_unconvertible_element ? Field(Null()) : Field(res);
     }
     else if (const DataTypeAggregateFunction * agg_func_type = typeid_cast<const DataTypeAggregateFunction *>(&type))
     {
@@ -424,6 +439,48 @@ Field convertFieldToTypeImpl(const Field & src, const IDataType & type, const ID
     {
         if (src.getType() == Field::Types::BitMap64)
             return src;
+    }
+    else if (isObject(type))
+    {
+        if (src.getType() == Field::Types::Object)
+            return src;  /// Already in needed type.
+
+        const auto * from_type_tuple = typeid_cast<const DataTypeTuple *>(from_type_hint);
+        if (src.getType() == Field::Types::Tuple && from_type_tuple && from_type_tuple->haveExplicitNames())
+        {
+            const auto & names = from_type_tuple->getElementNames();
+            const auto & tuple = src.get<const Tuple &>();
+
+            if (names.size() != tuple.size())
+                throw Exception(ErrorCodes::TYPE_MISMATCH,
+                    "Bad size of tuple in IN or VALUES section (while converting to Object). Expected size: {}, actual size: {}",
+                        names.size(), tuple.size());
+
+            Object object;
+            for (size_t i = 0; i < names.size(); ++i)
+                object[names[i]] = tuple[i];
+
+            return object;
+        }
+
+        if (src.getType() == Field::Types::Map)
+        {
+            Object object;
+            const auto & map = src.get<const Map &>();
+            for (const auto & i : map)
+            {
+                const auto & key = i.first;
+                const auto & value = i.second;
+
+                if (key.getType() != Field::Types::String)
+                    throw Exception(ErrorCodes::TYPE_MISMATCH,
+                        "Cannot convert from Map with key of type {} to Object", key.getTypeName());
+
+                object[key.get<const String &>()] = value;
+            }
+
+            return object;
+        }
     }
 
     /// Conversion from string by parsing.

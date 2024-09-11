@@ -20,20 +20,29 @@
  */
 
 #include <Storages/HDFS/HDFSCommon.h>
-#include <Poco/URI.h>
 #include <boost/algorithm/string/replace.hpp>
+#include <Poco/URI.h>
 
 #if USE_HDFS
-#include <Common/ShellCommand.h>
-#include <Common/Exception.h>
-#include <Common/formatIPv6.h>
-#include <random>
-#include <IO/WriteBufferFromString.h>
-#include <IO/Operators.h>
-#include <common/logger_useful.h>
-#include <ServiceDiscovery/ServiceDiscoveryFactory.h>
-#include <ServiceDiscovery/ServiceDiscoveryConsul.h>
+#    include <random>
+#    include <IO/Operators.h>
+#    include <IO/WriteBufferFromString.h>
+#    include <ServiceDiscovery/ServiceDiscoveryConsul.h>
+#    include <ServiceDiscovery/ServiceDiscoveryFactory.h>
+#    include <Common/Exception.h>
+#    include <Common/ShellCommand.h>
+#    include <Common/formatIPv6.h>
+#    include <common/logger_useful.h>
+#    include <Common/ElapsedTimeProfileEventIncrement.h>
+#    include <Common/ProfileEvents.h>
 
+
+
+namespace ProfileEvents
+{
+    extern const int HdfsConnect;
+    extern const int HdfsConnectMicroseconds;
+}
 
 namespace DB
 {
@@ -45,10 +54,11 @@ namespace ErrorCodes
     extern const int NO_ELEMENTS_IN_CONFIG;
 }
 
+TTLBrokenNameNodes brokenNNs{};
+
 const String HDFSBuilderWrapper::CONFIG_PREFIX = "hdfs";
 
-void HDFSBuilderWrapper::loadFromConfig(const Poco::Util::AbstractConfiguration & config,
-    const String & config_path, bool isUser)
+void HDFSBuilderWrapper::loadFromConfig(const Poco::Util::AbstractConfiguration & config, const String & config_path, bool isUser)
 {
     Poco::Util::AbstractConfiguration::Keys keys;
 
@@ -69,9 +79,9 @@ void HDFSBuilderWrapper::loadFromConfig(const Poco::Util::AbstractConfiguration 
             need_kinit = true;
             hadoop_kerberos_principal = config.getString(key_path);
 
-// #if USE_INTERNAL_HDFS3_LIBRARY
-//             hdfsBuilderSetPrincipal(hdfs_builder, hadoop_kerberos_principal.c_str());
-// #endif
+            // #if USE_INTERNAL_HDFS3_LIBRARY
+            //             hdfsBuilderSetPrincipal(hdfs_builder, hadoop_kerberos_principal.c_str());
+            // #endif
 
             continue;
         }
@@ -85,8 +95,8 @@ void HDFSBuilderWrapper::loadFromConfig(const Poco::Util::AbstractConfiguration 
         {
             if (isUser)
             {
-                throw Exception("hadoop.security.kerberos.ticket.cache.path cannot be set per user",
-                    ErrorCodes::EXCESSIVE_ELEMENT_IN_CONFIG);
+                throw Exception(
+                    "hadoop.security.kerberos.ticket.cache.path cannot be set per user", ErrorCodes::EXCESSIVE_ELEMENT_IN_CONFIG);
             }
 
             hadoop_security_kerberos_ticket_cache_path = config.getString(key_path);
@@ -95,32 +105,29 @@ void HDFSBuilderWrapper::loadFromConfig(const Poco::Util::AbstractConfiguration 
 
         key_name = boost::replace_all_copy(key, "_", ".");
 
-        const auto & [k,v] = keep(key_name, config.getString(key_path));
+        const auto & [k, v] = keep(key_name, config.getString(key_path));
         hdfsBuilderConfSetStr(get(), k.c_str(), v.c_str());
     }
 }
 
 String HDFSBuilderWrapper::getKinitCmd()
 {
-
     if (hadoop_kerberos_keytab.empty() || hadoop_kerberos_principal.empty())
     {
-        throw Exception("Not enough parameters to run kinit",
-            ErrorCodes::NO_ELEMENTS_IN_CONFIG);
+        throw Exception("Not enough parameters to run kinit", ErrorCodes::NO_ELEMENTS_IN_CONFIG);
     }
 
     WriteBufferFromOwnString ss;
 
-    String cache_name =  hadoop_security_kerberos_ticket_cache_path.empty() ?
-        String() :
-        (String(" -c \"") + hadoop_security_kerberos_ticket_cache_path + "\"");
+    String cache_name = hadoop_security_kerberos_ticket_cache_path.empty()
+        ? String()
+        : (String(" -c \"") + hadoop_security_kerberos_ticket_cache_path + "\"");
 
     // command to run looks like
     // kinit -R -t /keytab_dir/clickhouse.keytab -k somebody@TEST.CLICKHOUSE.TECH || ..
-    ss << hadoop_kerberos_kinit_command << cache_name <<
-        " -R -t \"" << hadoop_kerberos_keytab << "\" -k " << hadoop_kerberos_principal <<
-        "|| " << hadoop_kerberos_kinit_command << cache_name << " -t \"" <<
-        hadoop_kerberos_keytab << "\" -k " << hadoop_kerberos_principal;
+    ss << hadoop_kerberos_kinit_command << cache_name << " -R -t \"" << hadoop_kerberos_keytab << "\" -k " << hadoop_kerberos_principal
+       << "|| " << hadoop_kerberos_kinit_command << cache_name << " -t \"" << hadoop_kerberos_keytab << "\" -k "
+       << hadoop_kerberos_principal;
     return ss.str();
 }
 
@@ -141,7 +148,6 @@ void HDFSBuilderWrapper::runKinit()
 
 HDFSBuilderWrapper createHDFSBuilder(const String & uri_str, const Poco::Util::AbstractConfiguration & config)
 {
-
     HDFSConnectionParams hdfs_params = HDFSConnectionParams::parseHdfsFromConfig(config);
     const Poco::URI uri(uri_str);
     // const auto & host = uri.getHost();
@@ -152,9 +158,8 @@ HDFSBuilderWrapper createHDFSBuilder(const String & uri_str, const Poco::Util::A
 
     HDFSBuilderWrapper builder(hdfs_params.createBuilder(uri));
     if (builder.get() == nullptr)
-        throw Exception("Unable to create builder to connect to HDFS: " +
-            uri.toString() + " " + String(hdfsGetLastError()),
-            ErrorCodes::NETWORK_ERROR);
+        throw Exception(
+            "Unable to create builder to connect to HDFS: " + uri.toString() + " " + String(hdfsGetLastError()), ErrorCodes::NETWORK_ERROR);
 
     // hdfsBuilderConfSetStr(builder.get(), "input.read.timeout", "60000"); // 1 min
     // hdfsBuilderConfSetStr(builder.get(), "input.write.timeout", "60000"); // 1 min
@@ -190,12 +195,11 @@ HDFSBuilderWrapper createHDFSBuilder(const String & uri_str, const Poco::Util::A
         String user_config_prefix = HDFSBuilderWrapper::CONFIG_PREFIX + "_" + user;
         if (config.has(user_config_prefix))
         {
-#if USE_INTERNAL_HDFS3_LIBRARY
+#    if USE_INTERNAL_HDFS3_LIBRARY
             builder.loadFromConfig(config, user_config_prefix, true);
-#else
-            throw Exception("Multi user HDFS configuration required internal libhdfs3",
-                ErrorCodes::EXCESSIVE_ELEMENT_IN_CONFIG);
-#endif
+#    else
+            throw Exception("Multi user HDFS configuration required internal libhdfs3", ErrorCodes::EXCESSIVE_ELEMENT_IN_CONFIG);
+#    endif
         }
     }
 
@@ -211,10 +215,12 @@ std::mutex HDFSBuilderWrapper::kinit_mtx;
 
 HDFSFSPtr createHDFSFS(hdfsBuilder * builder)
 {
+    ProfileEvents::increment(ProfileEvents::HdfsConnect);
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::HdfsConnectMicroseconds);
+
     HDFSFSPtr fs(hdfsBuilderConnect(builder), detail::HDFSFsDeleter());
     if (fs == nullptr)
-        throw Exception("Unable to connect to HDFS: " + String(hdfsGetLastError()),
-            ErrorCodes::NETWORK_ERROR);
+        throw Exception("Unable to connect to HDFS: " + String(hdfsGetLastError()), ErrorCodes::NETWORK_ERROR);
 
     return fs;
 }
@@ -241,7 +247,8 @@ std::pair<std::string, size_t> getNameNodeNNProxy(const std::string & nnproxy)
         std::sample(nnproxys.begin(), nnproxys.end(), std::back_inserter(sample), 1, std::mt19937{std::random_device{}()});
         if (!sample.empty() && num_retry-- > 0)
         {
-            if (brokenNNs.isBrokenNN(sample[0].getHost())) continue;
+            if (brokenNNs.isBrokenNN(sample[0].getHost()))
+                continue;
         }
         break;
     }
@@ -274,7 +281,8 @@ HDFSBuilderPtr createHDFSBuilder(const Poco::URI & uri, const std::string hdfs_u
 
     HDFSBuilderPtr builder(hdfsNewBuilder());
     if (builder == nullptr)
-        throw Exception("Unable to create builder to connect to HDFS: " + uri.toString() + " " + std::string(hdfsGetLastError()),
+        throw Exception(
+            "Unable to create builder to connect to HDFS: " + uri.toString() + " " + std::string(hdfsGetLastError()),
             ErrorCodes::NETWORK_ERROR);
     hdfsBuilderConfSetStr(builder.get(), "input.read.timeout", "60000"); // 1 min
     hdfsBuilderConfSetStr(builder.get(), "input.write.timeout", "60000"); // 1 min
@@ -298,8 +306,12 @@ String getNameNodeCluster(const String & hdfs_url)
     auto pos2 = hdfs_url.find('/', pos1);
     return hdfs_url.substr(pos1, pos2 - pos1);
 }
-HDFSConnectionParams hdfsParamsFromUrl(const Poco::URI & uri)
+
+std::optional<HDFSConnectionParams> hdfsParamsFromUrl(const Poco::URI & uri)
 {
+    if (uri.getPort() == 0)
+        return {};
+
     /// ignore password
     String user_info = uri.getUserInfo();
     user_info = user_info.substr(0, user_info.find(':'));

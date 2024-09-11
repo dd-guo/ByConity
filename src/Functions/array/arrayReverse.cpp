@@ -31,6 +31,8 @@ public:
     size_t getNumberOfArguments() const override { return 1; }
     bool useDefaultImplementationForConstants() const override { return true; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
@@ -89,6 +91,10 @@ ColumnPtr FunctionArrayReverse::executeImpl(const ColumnsWithTypeAndName & argum
         || executeString(*src_inner_col, offsets, *res_inner_col)
         || executeFixedString(*src_inner_col, offsets, *res_inner_col)
         || executeGeneric(*src_inner_col, offsets, *res_inner_col);
+
+    // res_data is an empty clone of src_data
+    // typeid_cast on both should behave similarly
+    chassert(bool(src_nullable_col) == bool(res_nullable_col));
 
     if (src_nullable_col)
         if (!executeNumber<UInt8>(src_nullable_col->getNullMapColumn(), offsets, res_nullable_col->getNullMapColumn()))
@@ -245,7 +251,7 @@ bool FunctionArrayReverse::executeString(const IColumn & src_data, const ColumnA
 }
 
 
-void registerFunctionArrayReverse(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayReverse)
 {
     factory.registerFunction<FunctionArrayReverse>();
 }

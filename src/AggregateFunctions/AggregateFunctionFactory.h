@@ -2,6 +2,7 @@
 
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Common/IFactoryWithAliases.h>
+#include <Parsers/ASTFunction.h>
 
 
 #include <functional>
@@ -85,7 +86,8 @@ private:
         const DataTypes & argument_types,
         const Array & parameters,
         AggregateFunctionProperties & out_properties,
-        bool has_null_arguments) const;
+        bool has_null_arguments,
+        bool handle_null_itself = false) const;
 
     std::optional<AggregateFunctionProperties> tryGetPropertiesImpl(const String & name) const;
 
@@ -102,6 +104,14 @@ private:
 
     String getFactoryName() const override { return "AggregateFunctionFactory"; }
 
+};
+
+struct AggregateUtils
+{
+    static bool isAggregateFunction(const ASTFunction & node)
+    {
+        return AggregateFunctionFactory::instance().isAggregateFunctionName(node.name);
+    }
 };
 
 }

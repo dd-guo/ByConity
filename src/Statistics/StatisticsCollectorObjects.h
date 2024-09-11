@@ -15,7 +15,7 @@
 
 #pragma once
 #include <Statistics/StatsColumnBasic.h>
-#include <Statistics/StatsCpcSketch.h>
+#include <Statistics/StatsHllSketch.h>
 #include <Statistics/StatsKllSketch.h>
 #include <Statistics/StatsNdvBuckets.h>
 #include <Statistics/StatsTableBasic.h>
@@ -29,7 +29,6 @@ namespace StatisticsImpl
     public:
         std::shared_ptr<StatsTableBasic> basic;
 
-    public:
         // TODO: use reflection to eliminate this manual code
         StatsCollection writeToCollection() const
         {
@@ -52,10 +51,10 @@ namespace StatisticsImpl
     {
     public:
         std::shared_ptr<StatsNdvBucketsResult> ndv_buckets_result;
-        // basic contains ndv and histogram bounds, a.k.a. cpc/kll sketch
+        // basic contains ndv and histogram bounds, a.k.a. hll/kll sketch
         std::shared_ptr<StatsColumnBasic> basic;
 
-    public:
+
         // TODO: use reflection to eliminate this manual code
         StatsCollection writeToCollection() const
         {

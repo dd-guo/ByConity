@@ -38,6 +38,10 @@ private:
     BlockIO executeToTable(ASTDropQuery & query);
     BlockIO executeToTableImpl(ASTDropQuery & query, DatabasePtr & db, UUID & uuid_to_wait);
 
+    BlockIO executeToSnapshot(ASTDropQuery & query);
+
+    BlockIO executeToCatalog(ASTDropQuery & query);
+
     static void waitForTableToBeActuallyDroppedOrDetached(const ASTDropQuery & query, const DatabasePtr & db, const UUID & uuid_to_wait);
 
     BlockIO executeToDictionary(const String & database_name, const String & dictionary_name, ASTDropQuery::Kind kind, bool if_exists, bool is_temporary, bool no_ddl_lock);

@@ -16,6 +16,7 @@
 #pragma once
 
 #include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ExpressionListParsers.h>
 
 
 namespace DB
@@ -30,25 +31,25 @@ public:
 
     ASTPtr clone() const override;
 
-    enum class Operator
-    {
-        UNKNOWN,
-        INTERSECT_ALL,
-        INTERSECT_DISTINCT,
-        EXCEPT_ALL,
-        EXCEPT_DISTINCT
-    };
+    ENUM_WITH_PROTO_CONVERTER(
+        Operator, // enum name
+        Protos::IntersectExceptOperator, // proto enum message
+        (UNKNOWN, 0),
+        (EXCEPT_ALL, 1),
+        (EXCEPT_DISTINCT, 2),
+        (INTERSECT_ALL, 3),
+        (INTERSECT_DISTINCT, 4));
 
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 
     ASTs getListOfSelects() const;
 
-    /// Final operator after applying visitor.
-    Operator final_operator = Operator::UNKNOWN;
-
     void serialize(WriteBuffer & buf) const override;
     void deserializeImpl(ReadBuffer & buf) override;
     static ASTPtr deserialize(ReadBuffer & buf);
+    static const char * fromOperator(Operator op);
+    /// Final operator after applying visitor.
+    Operator final_operator = Operator::UNKNOWN;
 };
 
 }

@@ -23,37 +23,27 @@ namespace
 
         friend bool operator<(const ProtoElement & left, const ProtoElement & right)
         {
-            static constexpr auto compare_name = [](const boost::container::small_vector<std::string_view, 3> & left_name,
-                                                    const boost::container::small_vector<std::string_view, 3> & right_name,
-                                                    size_t i)
+            /// Compare components alphabetically.
+            size_t min_size = std::min(left.full_name.size(), right.full_name.size());
+            for (size_t i = 0; i != min_size; ++i)
             {
-                if (i < left_name.size())
-                {
-                    if (i < right_name.size())
-                        return left_name[i].compare(right_name[i]);
-                    else
-                        return 1; /// left_name is longer => left_name > right_name
-                }
-                else if (i < right_name.size())
-                    return 1; /// right_name is longer => left < right
-                else
-                    return 0; /// left_name == right_name
-            };
+                int cmp = left.full_name[i].compare(right.full_name[i]);
+                if (cmp != 0)
+                    return cmp < 0;
+            }
 
-            if (int cmp = compare_name(left.full_name, right.full_name, 0))
-                return cmp < 0;
+            /// Names with less number of components first.
+            if (left.full_name.size() != right.full_name.size())
+                return left.full_name.size() < right.full_name.size();
 
-            if (int cmp = compare_name(left.full_name, right.full_name, 1))
-                return cmp < 0;
-
+            /// Grants before partial revokes.
             if (left.is_partial_revoke != right.is_partial_revoke)
-                return right.is_partial_revoke;
+                return right.is_partial_revoke; /// if left is grant, right is partial revoke, we assume left < right
 
+            /// Grants with grant option after other grants.
+            /// Revoke grant option after normal revokes.
             if (left.grant_option != right.grant_option)
-                return right.grant_option;
-
-            if (int cmp = compare_name(left.full_name, right.full_name, 2))
-                return cmp < 0;
+                return right.grant_option; /// if left is without grant option, and right is with grant option, we assume left < right
 
             return (left.access_flags < right.access_flags);
         }
@@ -202,6 +192,7 @@ namespace
     };
 
 
+    /* must be synced with the Level definition in ContextAccess.cpp */
     enum Level
     {
         GLOBAL_LEVEL,
@@ -223,8 +214,11 @@ namespace
     }
 }
 
+template <bool Enable>
+concept Permission = Enable;
 
-struct AccessRights::Node
+template<bool IsSensitive>
+struct AccessRightsBase<IsSensitive>::Node
 {
 public:
     std::shared_ptr<const String> node_name;
@@ -254,58 +248,84 @@ public:
         return *this;
     }
 
-    void grant(const AccessFlags & flags_)
+    void grant(const AccessFlags & flags_, int lvl)
     {
         AccessFlags flags_to_add = flags_ & getAllGrantableFlags();
-        addGrantsRec(flags_to_add);
+        addGrantsRec(flags_to_add, lvl);
         optimizeTree();
     }
 
     template <typename ... Args>
-    void grant(const AccessFlags & flags_, const std::string_view & name, const Args &... subnames)
+    void grant(const AccessFlags & flags_, int lvl, const std::string_view & name, const Args &... subnames)
     {
         auto & child = getChild(name);
-        child.grant(flags_, subnames...);
+        child.grant(flags_, lvl, subnames...);
         eraseChildIfPossible(child);
         calculateMinMaxFlags();
     }
 
     template <typename StringT>
-    void grant(const AccessFlags & flags_, const std::vector<StringT> & names)
+    void grant(const AccessFlags & flags_, int lvl, const std::vector<StringT> & names)
     {
         for (const auto & name : names)
         {
             auto & child = getChild(name);
-            child.grant(flags_);
+            child.grant(flags_, lvl);
             eraseChildIfPossible(child);
         }
         calculateMinMaxFlags();
     }
 
+    template <bool if_exists>
     void revoke(const AccessFlags & flags_)
     {
         removeGrantsRec(flags_);
         optimizeTree();
     }
 
-    template <typename... Args>
+    template <bool if_exists, typename... Args>
     void revoke(const AccessFlags & flags_, const std::string_view & name, const Args &... subnames)
     {
-        auto & child = getChild(name);
+        if constexpr (if_exists)
+        {
+            auto * child = tryGetChild(name);
 
-        child.revoke(flags_, subnames...);
-        eraseChildIfPossible(child);
+            if (!child)
+                return;
+
+            child->template revoke<if_exists>(flags_, subnames...);
+            eraseChildIfPossible(*child);
+        }
+        else
+        {
+            auto & child = getChild(name);
+
+            child.template revoke<if_exists>(flags_, subnames...);
+            eraseChildIfPossible(child);
+        }
         calculateMinMaxFlags();
     }
 
-    template <typename StringT>
+    template <bool if_exists, typename StringT>
     void revoke(const AccessFlags & flags_, const std::vector<StringT> & names)
     {
         for (const auto & name : names)
         {
-            auto & child = getChild(name);
-            child.revoke(flags_);
-            eraseChildIfPossible(child);
+            if constexpr (if_exists)
+            {
+                auto * child = tryGetChild(name);
+                if (!child)
+                    continue;
+
+                child->template revoke<if_exists>(flags_);
+                eraseChildIfPossible(*child);
+            }
+            else
+            {
+                auto & child = getChild(name);
+                child.template revoke<if_exists>(flags_);
+                eraseChildIfPossible(child);
+            }
         }
         calculateMinMaxFlags();
     }
@@ -316,7 +336,7 @@ public:
     }
 
     template <typename... Args>
-    bool isGranted(const AccessFlags & flags_, const std::string_view & name, const Args &... subnames) const
+    bool isGranted(const AccessFlags & flags_, const std::string_view & name, const Args &... subnames) const requires (!Permission<IsSensitive>)
     {
         AccessFlags flags_to_check = flags_ - min_flags_with_children;
         if (!flags_to_check)
@@ -332,7 +352,7 @@ public:
     }
 
     template <typename StringT>
-    bool isGranted(const AccessFlags & flags_, const std::vector<StringT> & names) const
+    bool isGranted(const AccessFlags & flags_, const std::vector<StringT> & names) const requires (!Permission<IsSensitive>)
     {
         AccessFlags flags_to_check = flags_ - min_flags_with_children;
         if (!flags_to_check)
@@ -354,6 +374,62 @@ public:
                     return false;
             }
         }
+        return true;
+    }
+
+    bool isGranted(int sensitive_level, const AccessFlags & flags_) const requires Permission<IsSensitive>
+    {
+        /* sensitive resource is not granted */
+        if (level < sensitive_level)
+            return false;
+
+        return isGranted(flags_);
+    }
+
+    template <typename... Args>
+    bool isGranted(int sensitive_level, const AccessFlags & flags_, const std::string_view & name, const Args &... subnames) const requires Permission<IsSensitive>
+    {
+        AccessFlags flags_to_check = flags_ - min_flags_with_children;
+        if (!max_flags_with_children.contains(flags_to_check))
+            return false;
+
+        const Node * child = tryGetChild(name);
+        if (child)
+            return child->isGranted(sensitive_level, flags_to_check, subnames...);
+
+        /* sensitive resource is not granted */
+        if (level < sensitive_level)
+            return false;
+
+        return flags.contains(flags_to_check);
+    }
+
+    template <typename StringT>
+    bool isGranted(int sensitive_level, const AccessFlags & flags_, const std::unordered_set<StringT> & names) const requires Permission<IsSensitive>
+    {
+        AccessFlags flags_to_check = flags_ - min_flags_with_children;
+        if (!max_flags_with_children.contains(flags_to_check))
+            return false;
+
+        for (const auto & name : names)
+        {
+            const Node * child = tryGetChild(name);
+            if (child)
+            {
+                if (!child->isGranted(sensitive_level, flags_to_check, name))
+                    return false;
+            }
+            else
+            {
+                /* sensitive resource is not granted */
+                if (level < sensitive_level)
+                    return false;
+
+                if (!flags.contains(flags_to_check))
+                    return false;
+            }
+        }
+
         return true;
     }
 
@@ -398,21 +474,21 @@ public:
         return res;
     }
 
-    void modifyFlags(const ModifyFlagsFunction & function, bool & flags_added, bool & flags_removed)
+    void modifyFlags(const ModifyFlagsFunction & function, bool grant_option, bool & flags_added, bool & flags_removed)
     {
         flags_added = false;
         flags_removed = false;
-        modifyFlagsRec(function, flags_added, flags_removed);
+        modifyFlagsRec(function, grant_option, flags_added, flags_removed);
         if (flags_added || flags_removed)
             optimizeTree();
     }
 
     void logTree(Poco::Logger * log, const String & title) const
     {
-        LOG_TRACE(log, "Tree({}): level={}, name={}, flags={}, min_flags={}, max_flags={}, num_children={}",
+        LOG_TRACE(log, "Tree({}): level={}, name={}, flags={}, min_flags={}, max_flags={}, num_children={}, is_sensitive={}",
             title, level, node_name ? *node_name : "NULL", flags.toString(),
             min_flags_with_children.toString(), max_flags_with_children.toString(),
-            (children ? children->size() : 0));
+            (children ? children->size() : 0), IsSensitive);
 
         if (children)
         {
@@ -460,13 +536,22 @@ private:
             children = nullptr;
     }
 
-    bool canEraseChild(const Node & child) const
+    bool canEraseChild([[maybe_unused]] const Node & child) const
     {
-        return ((flags & child.getAllGrantableFlags()) == child.flags) && !child.children;
+        if constexpr (IsSensitive)
+            return false;
+        else
+            return ((flags & child.getAllGrantableFlags()) == child.flags) && !child.children;
     }
 
-    void addGrantsRec(const AccessFlags & flags_)
+    void addGrantsRec(const AccessFlags & flags_, int lvl)
     {
+        if constexpr (IsSensitive)
+        {
+            if (level > lvl)
+                return;
+        }
+
         if (auto flags_to_add = flags_ & getAllGrantableFlags())
         {
             flags |= flags_to_add;
@@ -475,7 +560,7 @@ private:
                 for (auto it = children->begin(); it != children->end();)
                 {
                     auto & child = it->second;
-                    child.addGrantsRec(flags_to_add);
+                    child.addGrantsRec(flags_to_add, lvl);
                     if (canEraseChild(child))
                         it = children->erase(it);
                     else
@@ -515,7 +600,7 @@ private:
         auto flags = node.flags;
         auto parent_fl = parent_flags & node.getAllGrantableFlags();
         auto revokes = parent_fl - flags;
-        auto grants = flags - parent_fl;
+        auto grants = IsSensitive ? flags : flags - parent_fl;
 
         if (revokes)
             res.push_back(ProtoElement{revokes, full_name, false, true});
@@ -534,6 +619,7 @@ private:
         }
     }
 
+    // TODO: modify grant flags here as well
     static void getElementsRec(
         ProtoElements & res,
         const boost::container::small_vector<std::string_view, 3> & full_name,
@@ -549,8 +635,8 @@ private:
         auto flags_go = node_go ? node_go->flags : parent_fl_go;
         auto revokes = parent_fl - flags;
         auto revokes_go = parent_fl_go - flags_go - revokes;
-        auto grants_go = flags_go - parent_fl_go;
-        auto grants = flags - parent_fl - grants_go;
+        auto grants_go = IsSensitive ? flags_go : flags_go - parent_fl_go;
+        auto grants = IsSensitive ? flags - grants_go : flags - parent_fl - grants_go;
 
         if (revokes)
             res.push_back(ProtoElement{revokes, full_name, false, true});
@@ -655,7 +741,7 @@ private:
             for (auto & [lhs_childname, lhs_child] : *children)
             {
                 if (!rhs.tryGetChild(lhs_childname))
-                    lhs_child.flags |= rhs.flags & lhs_child.getAllGrantableFlags();
+                    lhs_child.addGrantsRec(rhs.flags, COLUMN_LEVEL);
             }
         }
     }
@@ -673,17 +759,17 @@ private:
             for (auto & [lhs_childname, lhs_child] : *children)
             {
                 if (!rhs.tryGetChild(lhs_childname))
-                    lhs_child.flags &= rhs.flags;
+                    lhs_child.removeGrantsRec(~rhs.flags);
             }
         }
     }
 
     template <typename ... ParentNames>
-    void modifyFlagsRec(const ModifyFlagsFunction & function, bool & flags_added, bool & flags_removed, const ParentNames & ... parent_names)
+    void modifyFlagsRec(const ModifyFlagsFunction & function, bool grant_option, bool & flags_added, bool & flags_removed, const ParentNames & ... parent_names)
     {
-        auto invoke = [&function](const AccessFlags & flags_, const AccessFlags & min_flags_with_children_, const AccessFlags & max_flags_with_children_, std::string_view database_ = {}, std::string_view table_ = {}, std::string_view column_ = {}) -> AccessFlags
+        auto invoke = [function, grant_option](const AccessFlags & flags_, const AccessFlags & min_flags_with_children_, const AccessFlags & max_flags_with_children_, std::string_view database_ = {}, std::string_view table_ = {}, std::string_view column_ = {}) -> AccessFlags
         {
-            return function(flags_, min_flags_with_children_, max_flags_with_children_, database_, table_, column_);
+            return function(flags_, min_flags_with_children_, max_flags_with_children_, database_, table_, column_, grant_option);
         };
 
         if constexpr (sizeof...(ParentNames) < 3)
@@ -693,7 +779,7 @@ private:
                 for (auto & child : *children | boost::adaptors::map_values)
                 {
                     const String & child_name = *child.node_name;
-                    child.modifyFlagsRec(function, flags_added, flags_removed, parent_names..., child_name);
+                    child.modifyFlagsRec(function, grant_option, flags_added, flags_removed, parent_names..., child_name);
                 }
             }
         }
@@ -713,20 +799,25 @@ private:
     }
 };
 
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive>::AccessRightsBase() = default;
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive>::~AccessRightsBase() = default;
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive>::AccessRightsBase(AccessRightsBase && src) noexcept = default;
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive> & AccessRightsBase<IsSensitive>::operator =(AccessRightsBase && src) noexcept = default;
 
-AccessRights::AccessRights() = default;
-AccessRights::~AccessRights() = default;
-AccessRights::AccessRights(AccessRights && src) = default;
-AccessRights & AccessRights::operator =(AccessRights && src) = default;
 
-
-AccessRights::AccessRights(const AccessRights & src)
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive>::AccessRightsBase(const AccessRightsBase & src)
 {
     *this = src;
 }
 
 
-AccessRights & AccessRights::operator =(const AccessRights & src)
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive> & AccessRightsBase<IsSensitive>::operator =(const AccessRightsBase & src)
 {
     if (src.root)
         root = std::make_unique<Node>(*src.root);
@@ -740,33 +831,37 @@ AccessRights & AccessRights::operator =(const AccessRights & src)
 }
 
 
-AccessRights::AccessRights(const AccessFlags & access)
+template <bool IsSensitive>
+AccessRightsBase<IsSensitive>::AccessRightsBase(const AccessFlags & access)
 {
     grant(access);
 }
 
 
-bool AccessRights::isEmpty() const
+template <bool IsSensitive>
+bool AccessRightsBase<IsSensitive>::isEmpty() const
 {
     return !root && !root_with_grant_option;
 }
 
 
-void AccessRights::clear()
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::clear()
 {
     root = nullptr;
     root_with_grant_option = nullptr;
 }
 
 
+template <bool IsSensitive>
 template <bool with_grant_option, typename... Args>
-void AccessRights::grantImpl(const AccessFlags & flags, const Args &... args)
+void AccessRightsBase<IsSensitive>::grantImpl(const AccessFlags & flags, int lvl, const Args &... args)
 {
     auto helper = [&](std::unique_ptr<Node> & root_node)
     {
         if (!root_node)
             root_node = std::make_unique<Node>();
-        root_node->grant(flags, args...);
+        root_node->grant(flags, lvl, args...);
         if (!root_node->flags && !root_node->children)
             root_node = nullptr;
     };
@@ -776,23 +871,25 @@ void AccessRights::grantImpl(const AccessFlags & flags, const Args &... args)
         helper(root_with_grant_option);
 }
 
+template <bool IsSensitive>
 template <bool with_grant_option>
-void AccessRights::grantImplHelper(const AccessRightsElement & element)
+void AccessRightsBase<IsSensitive>::grantImplHelper(const AccessRightsElement & element)
 {
     assert(!element.is_partial_revoke);
     assert(!element.grant_option || with_grant_option);
     if (element.any_database)
-        grantImpl<with_grant_option>(element.access_flags);
+        grantImpl<with_grant_option>(element.access_flags, GLOBAL_LEVEL);
     else if (element.any_table)
-        grantImpl<with_grant_option>(element.access_flags, element.database);
+        grantImpl<with_grant_option>(element.access_flags, DATABASE_LEVEL, element.database);
     else if (element.any_column)
-        grantImpl<with_grant_option>(element.access_flags, element.database, element.table);
+        grantImpl<with_grant_option>(element.access_flags, TABLE_LEVEL, element.database, element.table);
     else
-        grantImpl<with_grant_option>(element.access_flags, element.database, element.table, element.columns);
+        grantImpl<with_grant_option>(element.access_flags, COLUMN_LEVEL, element.database, element.table, element.columns);
 }
 
+template <bool IsSensitive>
 template <bool with_grant_option>
-void AccessRights::grantImpl(const AccessRightsElement & element)
+void AccessRightsBase<IsSensitive>::grantImpl(const AccessRightsElement & element)
 {
     if (element.is_partial_revoke)
         throw Exception("A partial revoke should be revoked, not granted", ErrorCodes::BAD_ARGUMENTS);
@@ -809,40 +906,66 @@ void AccessRights::grantImpl(const AccessRightsElement & element)
     }
 }
 
+template <bool IsSensitive>
 template <bool with_grant_option>
-void AccessRights::grantImpl(const AccessRightsElements & elements)
+void AccessRightsBase<IsSensitive>::grantImpl(const AccessRightsElements & elements)
 {
     for (const auto & element : elements)
+    {
+        if constexpr (IsSensitive)
+        {
+            if (element.any_database)
+                continue;
+        }
+
         grantImpl<with_grant_option>(element);
+    }
 }
 
-void AccessRights::grant(const AccessFlags & flags) { grantImpl<false>(flags); }
-void AccessRights::grant(const AccessFlags & flags, const std::string_view & database) { grantImpl<false>(flags, database); }
-void AccessRights::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { grantImpl<false>(flags, database, table); }
-void AccessRights::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { grantImpl<false>(flags, database, table, column); }
-void AccessRights::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { grantImpl<false>(flags, database, table, columns); }
-void AccessRights::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { grantImpl<false>(flags, database, table, columns); }
-void AccessRights::grant(const AccessRightsElement & element) { grantImpl<false>(element); }
-void AccessRights::grant(const AccessRightsElements & elements) { grantImpl<false>(elements); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessFlags & flags) { grantImpl<false>(flags, GLOBAL_LEVEL); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessFlags & flags, const std::string_view & database) { grantImpl<false>(flags, DATABASE_LEVEL, database); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { grantImpl<false>(flags, TABLE_LEVEL, database, table); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { grantImpl<false>(flags, COLUMN_LEVEL, database, table, column); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { grantImpl<false>(flags, COLUMN_LEVEL, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { grantImpl<false>(flags, COLUMN_LEVEL, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessRightsElement & element) { grantImpl<false>(element); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grant(const AccessRightsElements & elements) { grantImpl<false>(elements); }
 
-void AccessRights::grantWithGrantOption(const AccessFlags & flags) { grantImpl<true>(flags); }
-void AccessRights::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database) { grantImpl<true>(flags, database); }
-void AccessRights::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { grantImpl<true>(flags, database, table); }
-void AccessRights::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { grantImpl<true>(flags, database, table, column); }
-void AccessRights::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { grantImpl<true>(flags, database, table, columns); }
-void AccessRights::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { grantImpl<true>(flags, database, table, columns); }
-void AccessRights::grantWithGrantOption(const AccessRightsElement & element) { grantImpl<true>(element); }
-void AccessRights::grantWithGrantOption(const AccessRightsElements & elements) { grantImpl<true>(elements); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessFlags & flags) { grantImpl<true>(flags, GLOBAL_LEVEL); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database) { grantImpl<true>(flags, DATABASE_LEVEL, database); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { grantImpl<true>(flags, TABLE_LEVEL, database, table); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { grantImpl<true>(flags, COLUMN_LEVEL, database, table, column); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { grantImpl<true>(flags, COLUMN_LEVEL, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { grantImpl<true>(flags, COLUMN_LEVEL, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessRightsElement & element) { grantImpl<true>(element); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::grantWithGrantOption(const AccessRightsElements & elements) { grantImpl<true>(elements); }
 
 
-template <bool grant_option, typename... Args>
-void AccessRights::revokeImpl(const AccessFlags & flags, const Args &... args)
+template <bool IsSensitive>
+template <bool grant_option, bool if_exists, typename... Args>
+void AccessRightsBase<IsSensitive>::revokeImpl(const AccessFlags & flags, const Args &... args)
 {
     auto helper = [&](std::unique_ptr<Node> & root_node)
     {
         if (!root_node)
             return;
-        root_node->revoke(flags, args...);
+        root_node->template revoke<if_exists>(flags, args...);
         if (!root_node->flags && !root_node->children)
             root_node = nullptr;
     };
@@ -852,63 +975,100 @@ void AccessRights::revokeImpl(const AccessFlags & flags, const Args &... args)
         helper(root);
 }
 
-template <bool grant_option>
-void AccessRights::revokeImplHelper(const AccessRightsElement & element)
+template <bool IsSensitive>
+template <bool grant_option, bool if_exists>
+void AccessRightsBase<IsSensitive>::revokeImplHelper(const AccessRightsElement & element)
 {
     assert(!element.grant_option || grant_option);
     if (element.any_database)
-        revokeImpl<grant_option>(element.access_flags);
+        revokeImpl<grant_option, if_exists>(element.access_flags);
     else if (element.any_table)
-        revokeImpl<grant_option>(element.access_flags, element.database);
+        revokeImpl<grant_option, if_exists>(element.access_flags, element.database);
     else if (element.any_column)
-        revokeImpl<grant_option>(element.access_flags, element.database, element.table);
+        revokeImpl<grant_option, if_exists>(element.access_flags, element.database, element.table);
     else
-        revokeImpl<grant_option>(element.access_flags, element.database, element.table, element.columns);
+        revokeImpl<grant_option, if_exists>(element.access_flags, element.database, element.table, element.columns);
 }
 
-template <bool grant_option>
-void AccessRights::revokeImpl(const AccessRightsElement & element)
+template <bool IsSensitive>
+template <bool grant_option, bool is_exists>
+void AccessRightsBase<IsSensitive>::revokeImpl(const AccessRightsElement & element)
 {
     if constexpr (grant_option)
     {
-        revokeImplHelper<true>(element);
+        revokeImplHelper<true, is_exists>(element);
     }
     else
     {
         if (element.grant_option)
-            revokeImplHelper<true>(element);
+            revokeImplHelper<true, is_exists>(element);
         else
-            revokeImplHelper<false>(element);
+            revokeImplHelper<false, is_exists>(element);
     }
 }
 
-template <bool grant_option>
-void AccessRights::revokeImpl(const AccessRightsElements & elements)
+template <bool IsSensitive>
+template <bool grant_option, bool is_exists>
+void AccessRightsBase<IsSensitive>::revokeImpl(const AccessRightsElements & elements)
 {
     for (const auto & element : elements)
-        revokeImpl<grant_option>(element);
+        revokeImpl<grant_option, is_exists>(element);
 }
 
-void AccessRights::revoke(const AccessFlags & flags) { revokeImpl<false>(flags); }
-void AccessRights::revoke(const AccessFlags & flags, const std::string_view & database) { revokeImpl<false>(flags, database); }
-void AccessRights::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { revokeImpl<false>(flags, database, table); }
-void AccessRights::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { revokeImpl<false>(flags, database, table, column); }
-void AccessRights::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { revokeImpl<false>(flags, database, table, columns); }
-void AccessRights::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { revokeImpl<false>(flags, database, table, columns); }
-void AccessRights::revoke(const AccessRightsElement & element) { revokeImpl<false>(element); }
-void AccessRights::revoke(const AccessRightsElements & elements) { revokeImpl<false>(elements); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessFlags & flags) { revokeImpl<false, false>(flags); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessFlags & flags, const std::string_view & database) { revokeImpl<false, false>(flags, database); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { revokeImpl<false, false>(flags, database, table); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { revokeImpl<false, false>(flags, database, table, column); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { revokeImpl<false, false>(flags, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { revokeImpl<false, false>(flags, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessRightsElement & element) { revokeImpl<false, false>(element); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revoke(const AccessRightsElements & elements) { revokeImpl<false, false>(elements); }
 
-void AccessRights::revokeGrantOption(const AccessFlags & flags) { revokeImpl<true>(flags); }
-void AccessRights::revokeGrantOption(const AccessFlags & flags, const std::string_view & database) { revokeImpl<true>(flags, database); }
-void AccessRights::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { revokeImpl<true>(flags, database, table); }
-void AccessRights::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { revokeImpl<true>(flags, database, table, column); }
-void AccessRights::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { revokeImpl<true>(flags, database, table, columns); }
-void AccessRights::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { revokeImpl<true>(flags, database, table, columns); }
-void AccessRights::revokeGrantOption(const AccessRightsElement & element) { revokeImpl<true>(element); }
-void AccessRights::revokeGrantOption(const AccessRightsElements & elements) { revokeImpl<true>(elements); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessFlags & flags) { revokeImpl<false, true>(flags); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessFlags & flags, const std::string_view & database) { revokeImpl<false, true>(flags, database); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { revokeImpl<false, true>(flags, database, table); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { revokeImpl<false, true>(flags, database, table, column); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { revokeImpl<false, true>(flags, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { revokeImpl<false, true>(flags, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessRightsElement & element) { revokeImpl<false, true>(element); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::tryRevoke(const AccessRightsElements & elements) { revokeImpl<false, true>(elements); }
+
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessFlags & flags) { revokeImpl<true, false>(flags); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessFlags & flags, const std::string_view & database) { revokeImpl<true, false>(flags, database); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table) { revokeImpl<true, false>(flags, database, table); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) { revokeImpl<true, false>(flags, database, table, column); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) { revokeImpl<true, false>(flags, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) { revokeImpl<true, false>(flags, database, table, columns); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessRightsElement & element) { revokeImpl<true, false>(element); }
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::revokeGrantOption(const AccessRightsElements & elements) { revokeImpl<true, false>(elements); }
 
 
-AccessRightsElements AccessRights::getElements() const
+template <bool IsSensitive>
+AccessRightsElements AccessRightsBase<IsSensitive>::getElements() const
 {
 #if 0
     logTree();
@@ -921,11 +1081,11 @@ AccessRightsElements AccessRights::getElements() const
 }
 
 
-String AccessRights::toString() const
+template <bool IsSensitive>
+String AccessRightsBase<IsSensitive>::toString() const
 {
     return getElements().toString();
 }
-
 
 template <bool grant_option, typename... Args>
 bool AccessRights::isGrantedImpl(const AccessFlags & flags, const Args &... args) const
@@ -934,6 +1094,7 @@ bool AccessRights::isGrantedImpl(const AccessFlags & flags, const Args &... args
     {
         if (!root_node)
             return flags.isEmpty();
+
         return root_node->isGranted(flags, args...);
     };
     if constexpr (grant_option)
@@ -1000,21 +1161,18 @@ bool AccessRights::hasGrantOption(const AccessRightsElement & element) const { r
 bool AccessRights::hasGrantOption(const AccessRightsElements & elements) const { return isGrantedImpl<true>(elements); }
 
 
-bool operator ==(const AccessRights & left, const AccessRights & right)
+template <bool IsSensitive>
+bool AccessRightsBase<IsSensitive>::sameNode(const std::unique_ptr<Node> & left_node, const std::unique_ptr<Node> & right_node)
 {
-    auto helper = [](const std::unique_ptr<AccessRights::Node> & left_node, const std::unique_ptr<AccessRights::Node> & right_node)
-    {
-        if (!left_node)
-            return !right_node;
-        if (!right_node)
-            return false;
-        return *left_node == *right_node;
-    };
-    return helper(left.root, right.root) && helper(left.root_with_grant_option, right.root_with_grant_option);
+    if (!left_node)
+        return !right_node;
+    if (!right_node)
+        return false;
+    return *left_node == *right_node;
 }
 
-
-void AccessRights::makeUnion(const AccessRights & other)
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::makeUnion(const AccessRightsBase<IsSensitive> & other)
 {
     auto helper = [](std::unique_ptr<Node> & root_node, const std::unique_ptr<Node> & other_root_node)
     {
@@ -1036,50 +1194,47 @@ void AccessRights::makeUnion(const AccessRights & other)
 }
 
 
-void AccessRights::makeIntersection(const AccessRights & other)
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::makeIntersection(const AccessRightsBase<IsSensitive> & other)
 {
     auto helper = [](std::unique_ptr<Node> & root_node, const std::unique_ptr<Node> & other_root_node)
     {
         if (!root_node)
+            return;
+        if (!other_root_node)
         {
-            if (other_root_node)
-                root_node = std::make_unique<Node>(*other_root_node);
+            root_node = nullptr;
             return;
         }
-        if (other_root_node)
-        {
-            root_node->makeIntersection(*other_root_node);
-            if (!root_node->flags && !root_node->children)
-                root_node = nullptr;
-        }
+        root_node->makeIntersection(*other_root_node);
+        if (!root_node->flags && !root_node->children)
+            root_node = nullptr;
     };
     helper(root, other.root);
     helper(root_with_grant_option, other.root_with_grant_option);
 }
 
 
-void AccessRights::modifyFlags(const ModifyFlagsFunction & function)
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::modifyFlags(const ModifyFlagsFunction & function)
 {
     if (!root)
         return;
+
     bool flags_added, flags_removed;
-    root->modifyFlags(function, flags_added, flags_removed);
+    root->modifyFlags(function, false, flags_added, flags_removed);
     if (flags_removed && root_with_grant_option)
         root_with_grant_option->makeIntersection(*root);
-}
 
-
-void AccessRights::modifyFlagsWithGrantOption(const ModifyFlagsFunction & function)
-{
-    if (!root_with_grant_option)
-        return;
-    bool flags_added, flags_removed;
-    root_with_grant_option->modifyFlags(function, flags_added, flags_removed);
-    if (flags_added)
+    if (root_with_grant_option)
     {
-        if (!root)
-            root = std::make_unique<Node>();
-        root->makeUnion(*root_with_grant_option);
+        root_with_grant_option->modifyFlags(function, true, flags_added, flags_removed);
+        if (flags_added)
+        {
+            if (!root)
+                root = std::make_unique<Node>();
+            root->makeUnion(*root_with_grant_option);
+        }
     }
 }
 
@@ -1092,7 +1247,8 @@ AccessRights AccessRights::getFullAccess()
 }
 
 
-void AccessRights::logTree() const
+template <bool IsSensitive>
+void AccessRightsBase<IsSensitive>::logTree() const
 {
     auto * log = &Poco::Logger::get("AccessRights");
     if (root)
@@ -1104,4 +1260,70 @@ void AccessRights::logTree() const
     else
         LOG_TRACE(log, "Tree: NULL");
 }
+
+template <bool grant_option, typename... Args>
+bool SensitiveAccessRights::isGrantedImpl(int sensitive_level, const AccessFlags & flags, const Args &... args) const
+{
+    auto helper = [&](const std::unique_ptr<Node> & root_node) -> bool
+    {
+        if (!root_node)
+            return flags.isEmpty();
+
+        return root_node->isGranted(sensitive_level, flags, args...);
+    };
+    if constexpr (grant_option)
+        return helper(root_with_grant_option);
+    else
+        return helper(root);
+}
+
+template <bool grant_option>
+bool SensitiveAccessRights::isGrantedImplHelper(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessRightsElement & element) const
+{
+    assert(!element.grant_option || grant_option);
+    if (element.any_database)
+        return isGrantedImpl<grant_option>(sensitive_level, element.access_flags);
+    else if (element.any_table)
+        return isGrantedImpl<grant_option>(sensitive_level, element.access_flags, element.database);
+    else if (element.any_column)
+        return isGrantedImpl<grant_option>(sensitive_level, element.access_flags, element.database, element.table);
+    else
+        return isGrantedImpl<grant_option>(sensitive_level, element.access_flags, element.database, element.table, sensitive_columns);
+}
+
+template <bool grant_option>
+bool SensitiveAccessRights::isGrantedImpl(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessRightsElement & element) const
+{
+    if constexpr (grant_option)
+    {
+        return isGrantedImplHelper<true>(sensitive_level, sensitive_columns, element);
+    }
+    else
+    {
+        if (element.grant_option)
+            return isGrantedImplHelper<true>(sensitive_level, sensitive_columns, element);
+        else
+            return isGrantedImplHelper<false>(sensitive_level, sensitive_columns, element);
+    }
+}
+
+template <bool grant_option>
+bool SensitiveAccessRights::isGrantedImpl(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessRightsElements & elements) const
+{
+    for (const auto & element : elements)
+        if (!isGrantedImpl<grant_option>(sensitive_level, sensitive_columns, element))
+            return false;
+    return true;
+}
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> &, const AccessFlags & flags) const { return isGrantedImpl<false>(sensitive_level, flags); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> &, const AccessFlags & flags, const std::string_view & database) const { return isGrantedImpl<false>(sensitive_level, flags, database); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> &, const AccessFlags & flags, const std::string_view & database, const std::string_view & table) const { return isGrantedImpl<false>(sensitive_level, flags, database, table); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> &, const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::string_view & column) const { return isGrantedImpl<false>(sensitive_level, flags, database, table, column); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> &) const { return isGrantedImpl<false>(sensitive_level, flags, database, table, sensitive_columns); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings &) const { return isGrantedImpl<false>(sensitive_level, flags, database, table, sensitive_columns); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessRightsElement & element) const { return isGrantedImpl<false>(sensitive_level, sensitive_columns, element); }
+bool SensitiveAccessRights::isGranted(int sensitive_level, const std::unordered_set<std::string_view> & sensitive_columns, const AccessRightsElements & elements) const { return isGrantedImpl<false>(sensitive_level, sensitive_columns, elements); }
+
+template class AccessRightsBase<true>;
+template class AccessRightsBase<false>;
 }

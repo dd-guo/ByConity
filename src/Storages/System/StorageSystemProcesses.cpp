@@ -23,10 +23,11 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeMap.h>
-#include <DataTypes/DataTypeByteMap.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <Interpreters/ProcessList.h>
 #include <Storages/System/StorageSystemProcesses.h>
+#include <Parsers/formatTenantDatabaseName.h>
 #include <Interpreters/Context.h>
 #include <Core/Settings.h>
 #include <Interpreters/ProfileEventsExt.h>
@@ -84,13 +85,8 @@ NamesAndTypesList StorageSystemProcesses::getNamesAndTypes()
 
         {"thread_ids", std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt64>())},
 
-#ifdef USE_COMMUNITY_MAP
         {"ProfileEvents", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
         {"Settings", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>())},
-#else
-        {"ProfileEvents", std::make_shared<DataTypeByteMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
-        {"Settings", std::make_shared<DataTypeByteMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeString>())},
-#endif
 
         {"current_database", std::make_shared<DataTypeString>()},
     };
@@ -110,19 +106,27 @@ NamesAndAliases StorageSystemProcesses::getNamesAndAliases()
 void StorageSystemProcesses::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
 {
     ProcessList::Info info = context->getProcessList().getInfo(true, true, true);
+    auto tenant_id = getCurrentTenantId();
+    if (!context->is_tenant_user())
+        tenant_id.resize(0);
 
     for (const auto & process : info)
     {
+        if (!tenant_id.empty() && !isTenantMatchedEntityName(process.client_info.initial_user, tenant_id))
+        {
+            continue;
+        }
+    
         size_t i = 0;
 
         res_columns[i++]->insert(process.client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY);
 
-        res_columns[i++]->insert(process.client_info.current_user);
+        res_columns[i++]->insert(getOriginalEntityName(process.client_info.current_user, tenant_id));
         res_columns[i++]->insert(process.client_info.current_query_id);
         res_columns[i++]->insertData(IPv6ToBinary(process.client_info.current_address.host()).data(), 16);
         res_columns[i++]->insert(process.client_info.current_address.port());
 
-        res_columns[i++]->insert(process.client_info.initial_user);
+        res_columns[i++]->insert(getOriginalEntityName(process.client_info.initial_user, tenant_id));
         res_columns[i++]->insert(process.client_info.initial_query_id);
         res_columns[i++]->insertData(IPv6ToBinary(process.client_info.initial_address.host()).data(), 16);
         res_columns[i++]->insert(process.client_info.initial_address.port());
@@ -185,7 +189,7 @@ void StorageSystemProcesses::fillData(MutableColumns & res_columns, ContextPtr c
             }
         }
 
-        res_columns[i++]->insert(process.current_database);
+        res_columns[i++]->insert(getOriginalEntityName(process.current_database, tenant_id));
     }
 }
 

@@ -21,49 +21,53 @@
 
 #include "LocalServer.h"
 
-#include <Poco/Util/XMLConfiguration.h>
-#include <Poco/Util/HelpFormatter.h>
-#include <Poco/Util/OptionCallback.h>
-#include <Poco/String.h>
-#include <Poco/Logger.h>
-#include <Poco/NullChannel.h>
-#include <Databases/DatabaseMemory.h>
-#include <Storages/System/attachSystemTables.h>
-#include <Interpreters/ProcessList.h>
-#include <Interpreters/executeQuery.h>
-#include <Interpreters/loadMetadata.h>
-#include <Interpreters/DatabaseCatalog.h>
-#include <Common/Exception.h>
-#include <Common/Macros.h>
-#include <Common/Config/ConfigProcessor.h>
-#include <Common/escapeForFileName.h>
-#include <Common/ClickHouseRevision.h>
-#include <Common/ThreadStatus.h>
-#include <Common/UnicodeBar.h>
-#include <Common/config_version.h>
-#include <Common/quoteString.h>
-#include <IO/ReadBufferFromFile.h>
-#include <IO/ReadBufferFromString.h>
-#include <IO/WriteBufferFromFileDescriptor.h>
-#include <IO/UseSSL.h>
-#include <IO/ReadHelpers.h>
-#include <Parsers/parseQuery.h>
-#include <Parsers/IAST.h>
-#include <common/ErrorHandlers.h>
-#include <Common/StatusFile.h>
-#include <Functions/registerFunctions.h>
+#include <filesystem>
 #include <AggregateFunctions/registerAggregateFunctions.h>
-#include <TableFunctions/registerTableFunctions.h>
-#include <Storages/registerStorages.h>
+#include <Databases/DatabaseMemory.h>
 #include <Dictionaries/registerDictionaries.h>
 #include <Disks/registerDisks.h>
 #include <Formats/registerFormats.h>
-#include <boost/program_options/options_description.hpp>
+#include <Functions/registerFunctions.h>
+#include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/UseSSL.h>
+#include <IO/WriteBufferFromFileDescriptor.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Storages/System/attachSystemTables.h>
+#include <Storages/System/attachInformationSchemaTables.h>
+#include <Storages/System/attachMySQLTables.h>
+#include <Interpreters/ProcessList.h>
+#include <Interpreters/executeQuery.h>
+#include <Interpreters/loadMetadata.h>
+#include <Parsers/IAST.h>
+#include <Parsers/parseQuery.h>
+#include <Storages/System/attachSystemTables.h>
+#include <Storages/registerStorages.h>
+#include <TableFunctions/registerTableFunctions.h>
 #include <boost/program_options.hpp>
-#include <common/argsToConfig.h>
+#include <boost/program_options/options_description.hpp>
+#include <Poco/Logger.h>
+#include <Poco/NullChannel.h>
+#include <Poco/String.h>
+#include <Poco/Util/HelpFormatter.h>
+#include <Poco/Util/OptionCallback.h>
+#include <Poco/Util/XMLConfiguration.h>
+#include <Common/ClickHouseRevision.h>
+#include <Common/Config/ConfigProcessor.h>
+#include <Common/Exception.h>
+#include <Common/Macros.h>
+#include <Common/StatusFile.h>
 #include <Common/TerminalSize.h>
+#include <Common/ThreadStatus.h>
+#include <Common/UnicodeBar.h>
+#include <Common/config_version.h>
+#include <Common/escapeForFileName.h>
+#include <Common/getNumberOfPhysicalCPUCores.h>
+#include <Common/quoteString.h>
 #include <Common/randomSeed.h>
-#include <filesystem>
+#include <common/ErrorHandlers.h>
+#include <common/argsToConfig.h>
 
 namespace fs = std::filesystem;
 
@@ -198,19 +202,17 @@ void LocalServer::tryInitPath()
 }
 
 
-static void attachSystemTables(ContextPtr context)
+static DatabasePtr createMemoryDatabaseIfNotExists(ContextPtr context, const String & database_name)
 {
-    DatabasePtr system_database = DatabaseCatalog::instance().tryGetDatabase(DatabaseCatalog::SYSTEM_DATABASE);
+    DatabasePtr system_database = DatabaseCatalog::instance().tryGetDatabase(database_name, context);
     if (!system_database)
     {
         /// TODO: add attachTableDelayed into DatabaseMemory to speedup loading
-        system_database = std::make_shared<DatabaseMemory>(DatabaseCatalog::SYSTEM_DATABASE, context);
-        DatabaseCatalog::instance().attachDatabase(DatabaseCatalog::SYSTEM_DATABASE, system_database);
+        system_database = std::make_shared<DatabaseMemory>(database_name, context);
+        DatabaseCatalog::instance().attachDatabase(database_name, system_database);
     }
-
-    attachSystemTablesLocal(*system_database);
+    return system_database;
 }
-
 
 int LocalServer::main(const std::vector<std::string> & /*args*/)
 try
@@ -267,6 +269,18 @@ try
 
     setupUsers();
 
+    do
+    {
+        unsigned cores = getNumberOfPhysicalCPUCores() * 2;
+
+        if (cores < 4)
+            break;
+
+        int res = bthread_setconcurrency(cores);
+        if (res)
+            LOG_ERROR(log, "Error when calling bthread_setconcurrency. Error number {}.", res);
+    } while (false);
+
     /// Limit on total number of concurrently executing queries.
     /// There is no need for concurrent queries, override max_concurrent_queries.
     global_context->getProcessList().setMaxSize(0);
@@ -282,15 +296,14 @@ try
     if (mark_cache_size)
         global_context->setMarkCache(mark_cache_size);
 
-    /// Size of cache for query. It is not necessary.
-    size_t query_cache_size = config().getUInt64("query_cache_size", 1000000);
-    if (query_cache_size)
-        global_context->setQueryCache(query_cache_size);
-
     /// A cache for mmapped files.
     size_t mmap_cache_size = config().getUInt64("mmap_cache_size", 1000);   /// The choice of default is arbitrary.
     if (mmap_cache_size)
         global_context->setMMappedFileCache(mmap_cache_size);
+
+    size_t footer_cache_size = config().getUInt64("footer_cache_size", 3221225472);
+    if (footer_cache_size)
+        global_context->setFooterCache(footer_cache_size);
 
     /// Load global settings from default_profile and system_profile.
     global_context->setDefaultProfiles(config());
@@ -326,14 +339,22 @@ try
         fs::create_directories(fs::path(path) / "data/");
         fs::create_directories(fs::path(path) / "metadata/");
         loadMetadataSystem(global_context);
-        attachSystemTables(global_context);
+        attachSystemTablesLocal(*createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::SYSTEM_DATABASE));
+        attachInformationSchema(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::INFORMATION_SCHEMA));
+        attachInformationSchema(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::INFORMATION_SCHEMA_UPPERCASE));
+        attachMySQL(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::MYSQL));
+        attachMySQL(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::MYSQL_UPPERCASE));
         loadMetadata(global_context);
         DatabaseCatalog::instance().loadDatabases();
         LOG_DEBUG(log, "Loaded metadata.");
     }
     else if (!config().has("no-system-tables"))
     {
-        attachSystemTables(global_context);
+        attachSystemTablesLocal(*createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::SYSTEM_DATABASE));
+        attachInformationSchema(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::INFORMATION_SCHEMA));
+        attachInformationSchema(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::INFORMATION_SCHEMA_UPPERCASE));
+        attachMySQL(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::MYSQL));
+        attachMySQL(global_context, *createMemoryDatabaseIfNotExists(global_context, DatabaseCatalog::MYSQL_UPPERCASE));
     }
 
     processQueries();
@@ -405,7 +426,8 @@ void LocalServer::processQueries()
     const auto & settings = global_context->getSettingsRef();
 
     std::vector<String> queries;
-    auto parse_res = splitMultipartQuery(queries_str, queries, settings.max_query_size, settings.max_parser_depth, ParserSettings::valueOf(settings.dialect_type));
+    auto parse_res
+        = splitMultipartQuery(queries_str, queries, settings.max_query_size, settings.max_parser_depth, ParserSettings::valueOf(settings));
 
     if (!parse_res.second)
         throw Exception("Cannot parse and execute the following part of query: " + String(parse_res.first), ErrorCodes::SYNTAX_ERROR);
@@ -545,7 +567,7 @@ void LocalServer::cleanup()
 
 static void showClientVersion()
 {
-    std::cout << DBMS_NAME << " client version " << VERSION_STRING << VERSION_OFFICIAL << "." << '\n';
+    std::cout << VERSION_NAME << " client version " << VERSION_STRING << VERSION_OFFICIAL << "." << '\n';
 }
 
 static std::string getHelpHeader()

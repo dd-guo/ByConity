@@ -5,7 +5,9 @@
 #cmakedefine01 USE_RE2_ST
 #cmakedefine01 USE_SSL
 #cmakedefine01 USE_HDFS
+#cmakedefine01 USE_HIVE
 #cmakedefine01 USE_INTERNAL_HDFS3_LIBRARY
+#cmakedefine01 USE_HIVE
 #cmakedefine01 USE_AWS_S3
 #cmakedefine01 USE_BROTLI
 #cmakedefine01 USE_UNWIND
@@ -21,3 +23,15 @@
 #cmakedefine01 USE_BREAKPAD
 #cmakedefine01 BYTEJOURNAL_AVAILABLE
 #cmakedefine01 USE_KRB5
+#cmakedefine01 USE_JEMALLOC
+#cmakedefine01 USE_BZIP2
+#cmakedefine01 USE_LASFS
+#cmakedefine01 USE_SIMDJSON
+#cmakedefine01 USE_RAPIDJSON
+#cmakedefine01 USE_JAVA_EXTENSIONS
+#cmakedefine01 USE_TSQUERY
+#cmakedefine01 USE_SIMDJSON
+#cmakedefine01 USE_RAPIDJSON
+#cmakedefine01 USE_NLP
+#cmakedefine01 USE_HUALLOC
+#cmakedefine01 USE_LIBURING

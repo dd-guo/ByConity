@@ -41,14 +41,17 @@
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeUUID.h>
+#include <DataTypes/DataTypeIPv4andIPv6.h>
 
 #include <QueryPlan/PlanSerDerHelper.h>
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 
-#include <IO/WriteHelpers.h>
-#include <IO/ReadHelpers.h>
 #include <Core/Field.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
+#include <Protos/EnumMacros.h>
+#include <Protos/plan_node_utils.pb.h>
 
 
 namespace DB
@@ -96,6 +99,10 @@ DataTypePtr createBaseDataTypeFromTypeIndex(TypeIndex index)
             return std::make_shared<DataTypeString>();
         case TypeIndex::UUID:
             return std::make_shared<DataTypeUUID>();
+        case TypeIndex::IPv4:
+            return std::make_shared<DataTypeIPv4>();
+        case TypeIndex::IPv6:
+            return std::make_shared<DataTypeIPv6>();
         case TypeIndex::Set:
             return std::make_shared<DataTypeSet>();
         case TypeIndex::BitMap64:
@@ -105,7 +112,7 @@ DataTypePtr createBaseDataTypeFromTypeIndex(TypeIndex index)
     }
 }
 
-DataTypePtr deserializeDataTypeV1V1(ReadBuffer & buf)
+DataTypePtr deserializeDataTypeV1(ReadBuffer & buf)
 {
     DESERIALIZE_ENUM(TypeIndex, index, buf)
     switch (index)
@@ -167,7 +174,7 @@ DataTypePtr deserializeDataTypeV1V1(ReadBuffer & buf)
             return createDecimal<DataTypeDecimal>(precision, scale);
         }
         case TypeIndex::Array: {
-            auto nest_type = deserializeDataTypeV1V1(buf);
+            auto nest_type = deserializeDataTypeV1(buf);
             return std::make_shared<DataTypeArray>(nest_type);
         }
         case TypeIndex::Tuple: {
@@ -177,7 +184,7 @@ DataTypePtr deserializeDataTypeV1V1(ReadBuffer & buf)
             Strings names;
             for (size_t i = 0; i < size; ++i)
             {
-                types.emplace_back(deserializeDataTypeV1V1(buf));
+                types.emplace_back(deserializeDataTypeV1(buf));
             }
             for (size_t i = 0; i < size; ++i)
             {
@@ -200,16 +207,16 @@ DataTypePtr deserializeDataTypeV1V1(ReadBuffer & buf)
             return std::make_shared<DataTypeInterval>(kind);
         }
         case TypeIndex::Nullable: {
-            auto nest_type = deserializeDataTypeV1V1(buf);
+            auto nest_type = deserializeDataTypeV1(buf);
             return std::make_shared<DataTypeNullable>(nest_type);
         }
         case TypeIndex::LowCardinality: {
-            auto dict_type = deserializeDataTypeV1V1(buf);
+            auto dict_type = deserializeDataTypeV1(buf);
             return std::make_shared<DataTypeLowCardinality>(dict_type);
         }
         case TypeIndex::Map: {
-            auto key_type = deserializeDataTypeV1V1(buf);
-            auto value_type = deserializeDataTypeV1V1(buf);
+            auto key_type = deserializeDataTypeV1(buf);
+            auto value_type = deserializeDataTypeV1(buf);
             return std::make_shared<DataTypeMap>(key_type, value_type);
         }
         case TypeIndex::Function: {
@@ -218,9 +225,9 @@ DataTypePtr deserializeDataTypeV1V1(ReadBuffer & buf)
             DataTypes args;
             for (size_t i = 0; i < size; ++i)
             {
-                args.emplace_back(deserializeDataTypeV1V1(buf));
+                args.emplace_back(deserializeDataTypeV1(buf));
             }
-            DataTypePtr result_type = deserializeDataTypeV1V1(buf);
+            DataTypePtr result_type = deserializeDataTypeV1(buf);
             return std::make_shared<DataTypeFunction>(args, result_type);
         }
         case TypeIndex::AggregateFunction: {
@@ -232,7 +239,7 @@ DataTypePtr deserializeDataTypeV1V1(ReadBuffer & buf)
             DataTypes type_args;
             for (size_t i = 0; i < size; ++i)
             {
-                type_args.emplace_back(deserializeDataTypeV1V1(buf));
+                type_args.emplace_back(deserializeDataTypeV1(buf));
             }
             Array params;
             readVarUInt(size, buf);
@@ -384,6 +391,17 @@ DataTypePtr deserializeDataType(ReadBuffer & buf)
     return data_type_factory.get(type_name);
 }
 
+void serializeDataTypeToProto(const DataTypePtr & data_type, Protos::DataType & proto)
+{
+    proto.set_type_name(data_type->getName());
+}
+
+DataTypePtr deserializeDataTypeFromProto(const Protos::DataType & proto)
+{
+    const DataTypeFactory & data_type_factory = DataTypeFactory::instance();
+    return data_type_factory.get(proto.type_name());
+}
+
 void serializeDataTypes(const DataTypes & data_types, WriteBuffer & buf)
 {
     writeBinary(data_types.size(), buf);
@@ -398,7 +416,6 @@ DataTypes deserializeDataTypes(ReadBuffer & buf)
     DataTypes types;
     for (size_t index = 0; index < size; ++index)
     {
-        index++;
         types.emplace_back(deserializeDataType(buf));
     }
     return types;

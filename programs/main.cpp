@@ -35,6 +35,7 @@
 #include <utility> /// pair
 
 #if !defined(ARCADIA_BUILD)
+#    include "config_core.h"
 #    include "config_tools.h"
 #endif
 
@@ -45,6 +46,15 @@
 #include <common/phdr_cache.h>
 #include <common/scope_guard.h>
 
+#if USE_JEMALLOC
+#include <unistd.h>
+
+namespace DB::ErrorCodes
+{
+    extern const int PROF_NOT_SET;
+    extern const int STD_EXCEPTION;
+}
+#endif
 
 /// Universal executable for various clickhouse applications
 #if ENABLE_CLICKHOUSE_SERVER
@@ -85,6 +95,12 @@ int mainEntryClickHouseKeeperConverter(int argc, char ** argv);
 #endif
 #if ENABLE_CLICKHOUSE_PART_TOOLKIT
 int mainEntryClickhousePartToolkit(int argc, char ** argv);
+int mainEntryClickhousePartMerger(int argc, char ** argv);
+int mainEntryClickhouseS3RenameTool(int argc, char ** argv);
+int mainEntryClickhouseS3MetaSanitizer(int argc, char ** argv);
+#endif
+#if ENABLE_CLICKHOUSE_DUMPER
+int mainEntryClickHouseDumper(int argc, char ** argv);
 #endif
 #if ENABLE_CLICKHOUSE_META_INSPECTOR
 int mainEntryClickhouseMetaInspector(int argc, char ** argv);
@@ -104,6 +120,9 @@ int mainEntryClickHouseResourceManager(int argc, char ** argv);
 #endif
 #if ENABLE_CLICKHOUSE_TSO_SERVER
 int mainEntryClickHouseTSOServer(int argc, char ** argv);
+#endif
+#if ENABLE_CLICKHOUSE_STORAGE_TOOLS
+int mainEntryStorageTools(int argc, char ** argv);
 #endif
 
 int mainEntryClickHouseHashBinary(int, char **)
@@ -165,6 +184,12 @@ std::pair<const char *, MainFunc> clickhouse_applications[] =
     {"part-toolkit", mainEntryClickhousePartToolkit},
     {"part-writer", mainEntryClickhousePartToolkit},
     {"part-converter", mainEntryClickhousePartToolkit},
+    {"part-merger", mainEntryClickhousePartMerger},
+    {"s3-rename", mainEntryClickhouseS3RenameTool},
+    {"s3-meta-sanitizer", mainEntryClickhouseS3MetaSanitizer},
+#endif
+#if ENABLE_CLICKHOUSE_DUMPER
+    {"dumper", mainEntryClickHouseDumper},
 #endif
 #if ENABLE_CLICKHOUSE_META_INSPECTOR
     {"meta-inspector", mainEntryClickhouseMetaInspector},
@@ -188,6 +213,10 @@ std::pair<const char *, MainFunc> clickhouse_applications[] =
 #if ENABLE_CLICKHOUSE_TSO_SERVER
     {"tso-server", mainEntryClickHouseTSOServer},
     {"tso_server", mainEntryClickHouseTSOServer},
+#endif
+#if ENABLE_CLICKHOUSE_STORAGE_TOOLS
+    {"storage-tools", mainEntryStorageTools},
+    {"storage_tools", mainEntryStorageTools},
 #endif
 };
 
@@ -383,6 +412,22 @@ struct Checker
 
 }
 
+#if USE_JEMALLOC
+/* Since the jemalloc read MALLOC_CONF only during program start,
+ * set env when running does not work.
+ * So leverage `execv` to replace the running image with the new MALLOC_CONF env
+ */
+static int generalExevc(char ** argv_)
+{
+    if (execvp(argv_[0], argv_) < 0)
+    {
+        std::cerr << "execv failed, error code: " << errno << ", " << strerror(errno) << std::endl;
+        return DB::ErrorCodes::STD_EXCEPTION;
+    }
+    return 0;
+}
+#endif
+
 
 /// This allows to implement assert to forbid initialization of a class in static constructors.
 /// Usage:
@@ -420,5 +465,14 @@ int main(int argc_, char ** argv_)
         }
     }
 
-    return main_func(static_cast<int>(argv.size()), argv.data());
+    int code = main_func(static_cast<int>(argv.size()), argv.data());
+
+#if USE_JEMALLOC
+    if (code == DB::ErrorCodes::PROF_NOT_SET)
+    {
+        code = generalExevc(argv_);
+    }
+#endif
+
+    return code;
 }

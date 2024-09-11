@@ -27,6 +27,7 @@
 #include <iostream>
 #include <cassert>
 
+#include <Common/MemoryTracker.h>
 #include <Common/Exception.h>
 #include <IO/BufferBase.h>
 
@@ -36,6 +37,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int NOT_IMPLEMENTED;
     extern const int CANNOT_WRITE_AFTER_END_OF_BUFFER;
 }
 
@@ -121,10 +123,48 @@ public:
         next();
     }
 
+    /// This method may be called before finalize() to tell there would not be any more data written.
+    /// Used does not have to call it, implementation should check it itself if needed.
+    ///
+    /// The idea is similar to prefetch. In case if all data is written, we can flush the buffer
+    /// and start sending data asynchronously. It may improve writing performance in case you have
+    /// multiple files to finalize. Mainly, for blob storage, finalization has high latency,
+    /// and calling preFinalize in a loop may parallelize it.
+    virtual void preFinalize() { next(); }
+
+    virtual WriteBuffer * inplaceReconstruct([[maybe_unused]] const String & out_path, [[maybe_unused]] std::unique_ptr<WriteBuffer> nested)
+    {
+        throw Exception("Corresponding write buffer doesn't implement inplaceReconstruct().", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    /// Write the last data.
     virtual void finalize()
+    {
+        if (finalized)
+            return;
+
+        MemoryTracker::LockExceptionInThread lock(VariableContext::Global);
+        try
+        {
+            finalizeImpl();
+            finalized = true;
+        }
+        catch (...)
+        {
+            pos = working_buffer.begin();
+            finalized = true;
+            throw;
+        }
+    }
+
+protected:
+
+    virtual void finalizeImpl()
     {
         next();
     }
+
+    bool finalized = false;
 
 private:
     /** Write the data in the buffer (from the beginning of the buffer to the current position).

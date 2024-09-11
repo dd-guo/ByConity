@@ -17,6 +17,7 @@
 #include <Catalog/MetastoreByteKVImpl.h>
 #include <Catalog/CatalogUtils.h>
 #include <iostream>
+#include <client.h>
 #include <common/defines.h>
 
 namespace DB
@@ -26,6 +27,7 @@ namespace ErrorCodes
 {
     extern const int METASTORE_OPERATION_ERROR;
     extern const int METASTORE_COMMIT_CAS_FAILURE;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace Catalog
@@ -33,9 +35,30 @@ namespace Catalog
 
 using namespace bytekv::sdk;
 
-MetastoreByteKVImpl::MetastoreByteKVImpl(const String & service_name_, const String & cluster_name_,
-                                         const String & name_space_, const String & table_name_)
-    : IMetaStore(), service_name(service_name_), cluster_name(cluster_name_), name_space(name_space_), table_name(table_name_)
+using Job = std::function<Errorcode()>;
+Errorcode retryWhenHostIsDown(const Job & job)
+{
+    auto code = job();
+    /// Retry for one time if it is due to host-is-down. Wait for the ByteKV sdk's fix to remove this logic.
+    if (code == Errorcode::HOST_IS_DOWN)
+        code = job();
+    return code;
+}
+
+MetastoreByteKVImpl::MetastoreByteKVImpl(
+    const String & discovery_type_,
+    const String & service_name_,
+    const UInt64 service_port_,
+    const String & cluster_name_,
+    const String & name_space_,
+    const String & table_name_)
+    : IMetaStore()
+    , discovery_type(discovery_type_)
+    , service_name(service_name_)
+    , service_port(service_port_)
+    , cluster_name(cluster_name_)
+    , name_space(name_space_)
+    , table_name(table_name_)
 {
     init();
 }
@@ -43,7 +66,9 @@ MetastoreByteKVImpl::MetastoreByteKVImpl(const String & service_name_, const Str
 void MetastoreByteKVImpl::init()
 {
     auto code = ByteKVClientBuilder()
+        .setServiceDiscoveryType(discovery_type)
         .setServiceName(service_name)
+        .setServicePort(service_port)
         .setClusterName(cluster_name)
         .setNameSpace(name_space)
         .setConnectionTimeoutMS(3000)
@@ -61,7 +86,7 @@ void MetastoreByteKVImpl::put(const String & key, const String & value, bool if_
     put_req.key =  key;
     put_req.value = value;
     put_req.if_not_exists = if_not_exists;
-    auto code = client->Put(put_req, &put_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Put(put_req, &put_resp); });
     assertStatus(OperationType::PUT, code, {Errorcode::OK});
 }
 
@@ -69,7 +94,7 @@ void MetastoreByteKVImpl::putTTL(const String & key, const String & value, UInt6
 {
     PutRequest put_req{this->table_name, key, value, ttl};
     PutResponse put_resp;
-    auto code = client->Put(put_req, &put_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Put(put_req, &put_resp); });
     assertStatus(OperationType::PUT, code, {Errorcode::OK});
 }
 
@@ -82,7 +107,7 @@ std::pair<bool, String> MetastoreByteKVImpl::putCAS(const String & key, const St
     put_req.key =  key;
     put_req.value = value;
     put_req.expected_value = &expected_value;
-    auto code = client->Put(put_req, &put_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Put(put_req, &put_resp); });
 
     assertStatus(OperationType::PUT, code, {Errorcode::OK, Errorcode::CAS_FAILED});
 
@@ -98,7 +123,7 @@ uint64_t MetastoreByteKVImpl::get(const String & key, String & value)
     GetResponse get_resp;
     get_req.table = this->table_name;
     get_req.key = key;
-    auto code = client->Get(get_req, &get_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Get(get_req, &get_resp); });
     assertStatus(OperationType::GET, code, {Errorcode::OK, Errorcode::KEY_NOT_FOUND});
     value = std::move(get_resp.value);
     return get_resp.version;
@@ -107,34 +132,52 @@ uint64_t MetastoreByteKVImpl::get(const String & key, String & value)
 std::vector<std::pair<String, UInt64>> MetastoreByteKVImpl::multiGet(const std::vector<String> & keys)
 {
     std::vector<std::pair<String, UInt64>> res;
-    MultiGetRequest mg_req;
-    mg_req.gets_.resize(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i)
-    {
-        mg_req.gets_[i].table = this->table_name;
-        mg_req.gets_[i].key = keys[i];
-    }
+    res.reserve(keys.size());
 
-    MultiGetResponse mg_resp;
-    auto code = client->MultiGet(mg_req, &mg_resp);
-    assertStatus(OperationType::MULTIGET, code, {Errorcode::OK});
-    for (auto ele : mg_resp.results)
+    auto multi_get_batch = [&] (size_t start_idx, size_t end_idx) {
+        MultiGetRequest mg_req;
+        size_t req_size = end_idx - start_idx;
+        mg_req.gets_.resize(req_size);
+        for (size_t i = 0; i < req_size; ++i)
+        {
+            mg_req.gets_[i].table = this->table_name;
+            mg_req.gets_[i].key = keys[start_idx + i];
+        }
+
+        MultiGetResponse mg_resp;
+        auto code = retryWhenHostIsDown([&]() { return client->MultiGet(mg_req, &mg_resp); });
+        assertStatus(OperationType::MULTIGET, code, {Errorcode::OK});
+        if (req_size != mg_resp.results.size())
+            throw Exception("Wrong response size in multiGet. ", ErrorCodes::METASTORE_OPERATION_ERROR);
+
+        for (size_t i = 0; i < mg_resp.results.size(); i++)
+        {
+            const auto & ele = mg_resp.results[i];
+            if (ele.first == Errorcode::OK)
+                res.emplace_back(std::move(ele.second.value), ele.second.version);
+            else if (ele.first == Errorcode::KEY_NOT_FOUND)
+                res.emplace_back("", 0);
+            else
+                throw Exception("Encounter bytekv error: " + String(ErrorString(ele.first)) + " while get record with key : " + keys[i], ele.first);
+        }
+    };
+
+    for (size_t i = 0; i < keys.size(); i += DEFAULT_MULTI_GET_BATCH_COUNT)
     {
-        if (ele.first == Errorcode::OK)
-            res.emplace_back(std::move(ele.second.value), ele.second.version);
-        else
-            res.emplace_back("", 0);
+        multi_get_batch(i, std::min(i + DEFAULT_MULTI_GET_BATCH_COUNT, keys.size()));
     }
 
     return res;
 }
 
-bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommitResponse response)
+bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommitResponse & response)
 {
     bytekv::sdk::WriteBatchRequest wb_req;
     bytekv::sdk::WriteBatchResponse wb_resp;
     std::vector<Slice> expected_values;
     expected_values.reserve(req.puts.size());
+
+    wb_req.write_timeout_ms = req.commit_timeout_ms;
 
     for (auto & single_put : req.puts)
     {
@@ -143,6 +186,7 @@ bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommit
         put_req.key = Slice(single_put.key);
         put_req.value = Slice(single_put.value);
         put_req.if_not_exists = single_put.if_not_exists;
+        put_req.ttl = single_put.ttl;
 
         if (single_put.expected_value)
         {
@@ -157,8 +201,8 @@ bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommit
     {
         DeleteRequest del_req;
         del_req.table = this->table_name;
-        del_req.key = Slice(delete_key);
-        // del_req.expected_version = expected_version;
+        del_req.key = Slice(delete_key.key);
+        del_req.expected_version = delete_key.expected_version;
         wb_req.AddDelete(del_req);
     }
 
@@ -181,7 +225,7 @@ bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommit
 
     if (req.with_cas)
     {
-        auto code = client->WriteBatch(wb_req, &wb_resp);
+        auto code = retryWhenHostIsDown([&]() { return client->WriteBatch(wb_req, &wb_resp); });
 
         if (code == Errorcode::CAS_FAILED)
             collect_conflict_info();
@@ -196,7 +240,7 @@ bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommit
     }
     else
     {
-        auto code = client->MultiWrite(wb_req, &wb_resp);
+        auto code = retryWhenHostIsDown([&]() { return client->MultiWrite(wb_req, &wb_resp); });
         assertStatus(OperationType::MULTIWRITE, code, {Errorcode::OK});
         /// return code is OK cannot ensure all KV records be inserted successfully in MultiWrite, still need check the response.
         collect_conflict_info();
@@ -205,7 +249,6 @@ bool MetastoreByteKVImpl::batchWrite(const BatchCommitRequest & req, BatchCommit
     return response.puts.size() == 0;
 }
 
-
 void MetastoreByteKVImpl::drop(const String & key, const UInt64 & expected_version)
 {
     DeleteRequest del_req;
@@ -213,8 +256,13 @@ void MetastoreByteKVImpl::drop(const String & key, const UInt64 & expected_versi
     del_req.table = this->table_name;
     del_req.key = key;
     del_req.expected_version = expected_version;
-    auto code = client->Delete(del_req, &del_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Delete(del_req, &del_resp); });
     assertStatus(OperationType::DELETE, code, {Errorcode::OK});
+}
+
+void MetastoreByteKVImpl::drop([[maybe_unused]] const String & key, [[maybe_unused]] const String & expected_value)
+{
+    throw Exception("drop by expected value is not supported in bytekv catalog api", Errorcode::NOT_IMPLEMENTED);
 }
 
 MetastoreByteKVImpl::IteratorPtr MetastoreByteKVImpl::getAll()
@@ -222,18 +270,25 @@ MetastoreByteKVImpl::IteratorPtr MetastoreByteKVImpl::getAll()
     return getByPrefix("");
 }
 
-MetastoreByteKVImpl::IteratorPtr MetastoreByteKVImpl::getByPrefix(const String & partition_id, const size_t & limit, uint32_t scan_batch_size)
+MetastoreByteKVImpl::IteratorPtr MetastoreByteKVImpl::getByPrefix(const String & partition_id, const size_t & limit, uint32_t scan_batch_size, const String & start_key)
 {
     ScanRequest scan_req;
     scan_req.scan_batch_count = scan_batch_size;
     scan_req.limit = limit;
     scan_req.table = table_name;
-    scan_req.start_key = partition_id;
+    if (likely(start_key.empty()))
+    {
+        scan_req.start_key = partition_id;
+    }
+    else
+    {
+        scan_req.start_key = start_key;
+    }
     String end_key = getNextKey(partition_id);
     scan_req.end_key = end_key;
     ScanResponse scan_resp;
 
-    auto code = client->Scan(scan_req, &scan_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Scan(scan_req, &scan_resp); });
     assertStatus(OperationType::SCAN, code, {Errorcode::OK});
 
     return std::make_shared<ByteKVIterator>(scan_resp.iterator);
@@ -252,7 +307,7 @@ MetastoreByteKVImpl::IteratorPtr MetastoreByteKVImpl::getByRange(const String & 
     scan_req.start_key = start_key;
     scan_req.end_key = end_key;
 
-    auto code = client->Scan(scan_req, &scan_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Scan(scan_req, &scan_resp); });
     assertStatus(OperationType::SCAN, code, {Errorcode::OK});
 
     return std::make_shared<ByteKVIterator>(scan_resp.iterator);
@@ -272,7 +327,7 @@ void MetastoreByteKVImpl::clean(const String & prefix)
         }
 
         WriteBatchResponse wb_resp;
-        auto code = client->WriteBatch(wb_req, &wb_resp);
+        auto code = retryWhenHostIsDown([&]() { return client->WriteBatch(wb_req, &wb_resp); });
         assertStatus(OperationType::CLEAN, code, {Errorcode::OK});
     };
 
@@ -304,7 +359,7 @@ void MetastoreByteKVImpl::cleanAll()
     scan_req.start_key = "";
     ScanResponse scan_resp;
 
-    auto code = client->Scan(scan_req, &scan_resp);
+    auto code = retryWhenHostIsDown([&]() { return client->Scan(scan_req, &scan_resp); });
     assertStatus(OperationType::SCAN, code, {Errorcode::OK});
 
     IteratorPtr  it= std::make_shared<ByteKVIterator>(scan_resp.iterator);
@@ -321,7 +376,7 @@ void MetastoreByteKVImpl::cleanAll()
         }
 
         WriteBatchResponse wb_resp;
-        code = client->WriteBatch(wb_req, &wb_resp);
+        code = retryWhenHostIsDown([&]() { return client->WriteBatch(wb_req, &wb_resp); });
         assertStatus(OperationType::CLEAN, code, {Errorcode::OK});
     };
 

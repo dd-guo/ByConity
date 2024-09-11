@@ -13,17 +13,14 @@
  * limitations under the License.
  */
 
+#include <Optimizer/Property/Property.h>
 #include <QueryPlan/ExchangeStep.h>
 
 
 namespace DB
 {
-
-
 ExchangeStep::ExchangeStep(DataStreams input_streams_, const ExchangeMode & mode_, Partitioning schema_, bool keep_order_)
-    : exchange_type(mode_)
-    , schema(std::move(schema_))
-    , keep_order(keep_order_)
+    : exchange_type(mode_), schema(std::move(schema_)), keep_order(keep_order_)
 {
     setInputStreams(input_streams_);
 }
@@ -50,14 +47,30 @@ QueryPipelinePtr ExchangeStep::updatePipeline(QueryPipelines pipelines, const Bu
     return std::move(pipelines[0]);
 }
 
-void ExchangeStep::serialize(WriteBuffer &) const
+std::shared_ptr<ExchangeStep> ExchangeStep::fromProto(const Protos::ExchangeStep & proto, ContextPtr)
 {
-    throw Exception("ExchangeStep should be rewritten into RemoteExchangeSourceStep", ErrorCodes::NOT_IMPLEMENTED);
+    DataStreams input_streams;
+    for (const auto & proto_element : proto.input_streams())
+    {
+        DataStream element;
+        element.fillFromProto(proto_element);
+        input_streams.emplace_back(std::move(element));
+    }
+    auto exchange_type = ExchangeModeConverter::fromProto(proto.exchange_type());
+    auto schema = Partitioning::fromProto(proto.schema());
+    auto keep_order = proto.keep_order();
+    auto step = std::make_shared<ExchangeStep>(input_streams, exchange_type, schema, keep_order);
+
+    return step;
 }
 
-QueryPlanStepPtr ExchangeStep::deserialize(ReadBuffer &, ContextPtr &)
+void ExchangeStep::toProto(Protos::ExchangeStep & proto, bool) const
 {
-    throw Exception("ExchangeStep should be rewritten into RemoteExchangeSourceStep", ErrorCodes::NOT_IMPLEMENTED);
+    for (const auto & element : input_streams)
+        element.toProto(*proto.add_input_streams());
+    proto.set_exchange_type(ExchangeModeConverter::toProto(exchange_type));
+    schema.toProto(*proto.mutable_schema());
+    proto.set_keep_order(keep_order);
 }
 
 std::shared_ptr<IQueryPlanStep> ExchangeStep::copy(ContextPtr) const

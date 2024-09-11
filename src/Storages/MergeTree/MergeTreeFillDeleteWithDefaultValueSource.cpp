@@ -13,9 +13,11 @@
  * limitations under the License.
  */
 
+#include <limits>
 #include <Storages/MergeTree/MergeTreeFillDeleteWithDefaultValueSource.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
 #include <Interpreters/Context.h>
+#include "Core/Defines.h"
 
 namespace DB
 {
@@ -38,7 +40,6 @@ MergeTreeFillDeleteWithDefaultValueSource::MergeTreeFillDeleteWithDefaultValueSo
     , data_part(std::move(data_part_))
     , delete_bitmap(std::move(delete_bitmap_))
     , columns_to_read(std::move(columns_to_read_))
-    , continue_reading(false)
     , mark_cache(storage.getContext()->getMarkCache())
 {
     {
@@ -55,19 +56,21 @@ MergeTreeFillDeleteWithDefaultValueSource::MergeTreeFillDeleteWithDefaultValueSo
     addTotalRowsApprox(data_part->rows_count);
 
     /// Add columns because we don't want to read empty blocks
-    injectRequiredColumns(storage, metadata_snapshot, data_part, columns_to_read);
-    NamesAndTypesList columns_for_reader = metadata_snapshot->getColumns().getByNames(ColumnsDescription::AllPhysical, columns_to_read, false);
+    injectRequiredColumns(storage, metadata_snapshot, data_part, columns_to_read, "");
+    NamesAndTypesList columns_for_reader = metadata_snapshot->getColumns().getByNames(GetColumnsOptions::AllPhysical, columns_to_read);
 
     MergeTreeReaderSettings reader_settings =
     {
-        .min_bytes_to_use_direct_io = std::numeric_limits<size_t>::max(), // disable direct io
-        .max_read_buffer_size = DBMS_DEFAULT_BUFFER_SIZE,
+        .read_settings = ReadSettings {
+            .aio_threshold = std::numeric_limits<size_t>::max(), // disable direct io
+        },
         .save_marks_in_cache = false
     };
 
     reader = data_part->getReader(columns_for_reader, metadata_snapshot,
         MarkRanges{MarkRange(0, data_part->getMarksCount())},
-        /* uncompressed_cache = */ nullptr, mark_cache.get(), reader_settings);
+        /* uncompressed_cache = */ nullptr, mark_cache.get(), reader_settings,
+        nullptr, {}, {}, [&](const Progress& value) { progress(value); });
 }
 
 Chunk MergeTreeFillDeleteWithDefaultValueSource::generate()
@@ -89,7 +92,6 @@ try
         {
             current_row += rows_to_read;
             current_mark++;
-            continue_reading = false;
 
             for (auto & col : header)
                 res_columns.push_back(col.type->createColumnConstWithDefaultValue(rows_to_read)->convertToFullColumnIfConst());
@@ -99,8 +101,9 @@ try
 
             const auto & sample = reader->getColumns();
             Columns columns(sample.size());
-            size_t rows_read = reader->readRows(current_mark, continue_reading, rows_to_read, columns);
-            continue_reading = true;
+            size_t rows_read = reader->readRows(current_mark,
+                current_row - data_part->index_granularity.getMarkStartingRow(current_mark),
+                rows_to_read, data_part->getMarksCount(), nullptr, columns);
 
             if (rows_read != rows_to_read)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Expect {} rows read from mark {} in part {}, got {}",

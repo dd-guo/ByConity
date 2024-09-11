@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <set>
 
+#include <boost/algorithm/string/case_conv.hpp>
 
 class SipHash;
 
@@ -51,9 +52,11 @@ class ReadBuffer;
 
 #define APPLY_AST_TYPES(M) \
     M(ASTAlterQuery) \
+    M(ASTDeleteQuery) \
     M(ASTAlterCommand) \
     M(ASTAssignment) \
     M(ASTAsterisk) \
+    M(ASTAlterDiskCacheQuery) \
     M(ASTCheckQuery) \
     M(ASTColumnDeclaration) \
     M(ASTColumnsMatcher) \
@@ -61,6 +64,9 @@ class ReadBuffer;
     M(ASTColumnsExceptTransformer) \
     M(ASTColumnsReplaceTransformer) \
     M(ASTConstraintDeclaration) \
+    M(ASTForeignKeyDeclaration) \
+    M(ASTUniqueNotEnforcedDeclaration) \
+    M(ASTDataType) \
     M(ASTStorage) \
     M(ASTColumns) \
     M(ASTCreateQuery) \
@@ -108,6 +114,7 @@ class ReadBuffer;
     M(ASTSelectQuery) \
     M(ASTSelectWithUnionQuery) \
     M(ASTSetQuery) \
+    M(ASTSetSensitiveQuery) \
     M(ASTSetRoleQuery) \
     M(ASTSettingsProfileElement) \
     M(ASTSettingsProfileElements) \
@@ -125,6 +132,7 @@ class ReadBuffer;
     M(ASTTablesInSelectQuery) \
     M(ASTTTLElement) \
     M(ASTUseQuery) \
+    M(ASTSwitchQuery) \
     M(ASTUserNameWithHost) \
     M(ASTUserNamesWithHost) \
     M(ASTWatchQuery) \
@@ -134,14 +142,29 @@ class ReadBuffer;
     M(ASTCreateStatsQuery) \
     M(ASTDropStatsQuery) \
     M(ASTShowStatsQuery) \
+    M(ASTAutoStatsQuery) \
+    M(ASTCreateBinding) \
+    M(ASTShowBindings) \
+    M(ASTDropBinding) \
+    M(ASTAdviseQuery) \
     M(ASTSelectIntersectExceptQuery) \
     M(ASTWindowListElement) \
     M(ASTTEALimit) \
-    M(ASTDumpInfoQuery) \
+    M(ASTDumpQuery) \
     M(ASTReproduceQuery) \
     M(ASTPartToolKit) \
     M(ASTQuantifiedComparison) \
-    M(ASTTableColumnReference)
+    M(ASTTableColumnReference) \
+    M(ASTUpdateQuery) \
+    M(ASTPreparedParameter) \
+    M(ASTCreatePreparedStatementQuery) \
+    M(ASTExecutePreparedStatementQuery) \
+    M(ASTShowPreparedStatementQuery) \
+    M(ASTDropPreparedStatementQuery) \
+    M(ASTBitEngineConstraintDeclaration) \
+    M(ASTStorageAnalyticalMySQL) \
+    M(ASTCreateQueryAnalyticalMySQL) \
+    M(ASTClusterByElement)
 #define ENUM_TYPE(ITEM) ITEM,
 
 enum class ASTType : UInt8
@@ -151,12 +174,50 @@ enum class ASTType : UInt8
 
 #undef ENUM_TYPE
 
+using StringPair = std::pair<String, String>;
+using StringPairs = std::vector<StringPair>;
+
+class SqlHint
+{
+private:
+    String name;
+
+    // one of below fields is non-empty
+    Strings options;
+    StringPairs kv_options;
+
+public:
+    explicit SqlHint(String name_): name(std::move(name_)) {}
+    SqlHint(String name_, Strings options_): name(std::move(name_)), options(std::move(options_)) {}
+    SqlHint(String name_, StringPairs kv_options_): name(std::move(name_)), kv_options(std::move(kv_options_)) {}
+
+    void setKvOption(String & key, String & value) {kv_options.emplace_back(StringPair{key, value});}
+    void setOption(const String & option) {options.emplace_back(option);}
+    String getName() const {return name;}
+    StringPairs getKvOptions() const {return kv_options;}
+    Strings getOptions() const {return options;}
+    void serialize(WriteBuffer & buf) const;
+    static SqlHint deserialize(ReadBuffer & buf);
+};
+
+class SqlHints : public std::vector<SqlHint>
+{
+public:
+    using std::vector<SqlHint>::vector;
+
+    void serialize(WriteBuffer & buf) const;
+    void deserialize(ReadBuffer & buf);
+};
+
+// using SqlHints = std::vector<SqlHint>;
+
 /** Element of the syntax tree (hereinafter - directed acyclic graph with elements of semantics)
   */
 class IAST : public std::enable_shared_from_this<IAST>, public TypePromotion<IAST>
 {
 public:
     ASTs children;
+    SqlHints hints;
 
     virtual ~IAST() = default;
     IAST() = default;
@@ -211,6 +272,10 @@ public:
 
     void dumpTree(WriteBuffer & ostr, size_t indent = 0) const;
     std::string dumpTree(size_t indent = 0) const;
+
+    virtual void toLowerCase() {}
+
+    virtual void toUpperCase() {}
 
     /** Check the depth of the tree.
       * If max_depth is specified and the depth is greater - throw an exception.
@@ -326,6 +391,8 @@ public:
         bool always_quote_identifiers = false;
         bool without_alias = false;
         IdentifierQuotingStyle identifier_quoting_style = IdentifierQuotingStyle::Backticks;
+        DialectType dialect_type = DialectType::CLICKHOUSE;
+        bool show_secrets = true; /// Show secret parts of the AST (e.g. passwords, encryption keys).
 
         // Newline or whitespace.
         char nl_or_ws;
@@ -382,10 +449,16 @@ public:
     }
 
     // A simple way to add some user-readable context to an error message.
-    std::string formatForErrorMessage() const;
-    template <typename AstArray>
-    static std::string formatForErrorMessage(const AstArray & array);
+    String formatWithHiddenSecrets(size_t max_length = 0,
+                                   bool one_line = true,  
+                                   bool no_alias = false,
+                                   DialectType dialect = DialectType::CLICKHOUSE) const;
+    String formatForLogging(size_t max_length = 0) const { return formatWithHiddenSecrets(max_length, true); }
+    String formatForErrorMessage() const { return formatWithHiddenSecrets(0, true); }
+    String formatForErrorMessageWithoutAlias() const { return formatWithHiddenSecrets(0, true, true); }
 
+    /// If an AST has secret parts then formatForLogging() will replace them with the placeholder '[HIDDEN]'.
+    virtual bool hasSecretParts() const { return childrenHaveSecretParts(); }
     void cloneChildren();
 
     virtual void serialize(WriteBuffer &) const { throw Exception("Not implement serialize of " + getID(), ErrorCodes::NOT_IMPLEMENTED); }
@@ -402,24 +475,11 @@ public:
     static const char * hilite_substitution;
     static const char * hilite_none;
 
+protected:
+    bool childrenHaveSecretParts() const;
+
 private:
     size_t checkDepthImpl(size_t max_depth, size_t level) const;
 };
-
-template <typename AstArray>
-std::string IAST::formatForErrorMessage(const AstArray & array)
-{
-    WriteBufferFromOwnString buf;
-    for (size_t i = 0; i < array.size(); ++i)
-    {
-        if (i > 0)
-        {
-            const char * delim = ", ";
-            buf.write(delim, strlen(delim));
-        }
-        array[i]->format(IAST::FormatSettings(buf, true /* one line */));
-    }
-    return buf.str();
-}
 
 }

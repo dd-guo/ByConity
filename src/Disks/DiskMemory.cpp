@@ -57,6 +57,8 @@ public:
 
     String name() const override { return iter->filename(); }
 
+    size_t size() const override { return 0; }
+
 private:
     std::vector<fs::path> dir_file_paths;
     std::vector<fs::path>::iterator iter;
@@ -168,19 +170,19 @@ ReservationPtr DiskMemory::reserve(UInt64 /*bytes*/)
     throw Exception("Method reserve is not implemented for memory disks", ErrorCodes::NOT_IMPLEMENTED);
 }
 
-UInt64 DiskMemory::getTotalSpace() const
+DiskStats DiskMemory::getTotalSpace(bool) const
 {
-    return 0;
+    return {};
 }
 
-UInt64 DiskMemory::getAvailableSpace() const
+DiskStats DiskMemory::getAvailableSpace() const
 {
-    return 0;
+    return {};
 }
 
-UInt64 DiskMemory::getUnreservedSpace() const
+DiskStats DiskMemory::getUnreservedSpace() const
 {
-    return 0;
+    return {};
 }
 
 bool DiskMemory::exists(const String & path) const

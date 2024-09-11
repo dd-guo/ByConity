@@ -64,7 +64,7 @@ private:
 class DaemonJobTxnGC : public DaemonJob
 {
 public:
-    DaemonJobTxnGC(ContextMutablePtr global_context_) : DaemonJob(global_context_, CnchBGThreadType::TxnGC) { }
+    DaemonJobTxnGC(ContextMutablePtr global_context_) : DaemonJob(std::move(global_context_), CnchBGThreadType::TxnGC) { }
     bool executeImpl() override;
     using TransactionRecords = std::vector<TransactionRecord>;
 
@@ -74,7 +74,9 @@ private:
     void cleanTxnRecord(const TransactionRecord & record, TxnTimestamp current_time, std::vector<TxnTimestamp> & cleanTxnIds, TxnGCLog & summary);
     bool triggerCleanUndoBuffers();
 private:
-    std::chrono::time_point<std::chrono::system_clock> lastCleanUBtime;
+    std::chrono::time_point<std::chrono::system_clock> lastCleanUBtime {std::chrono::system_clock::now()};
 };
+
+std::vector<TxnTimestamp> extractLastElements(std::vector<TxnTimestamp> & from, size_t n);
 
 }

@@ -20,7 +20,6 @@
 #include <CloudServices/CnchServerClient.h>
 #include <Interpreters/Context.h>
 #include <Storages/PartCacheManager.h>
-#include <Storages/CnchStorageCache.h>
 
 namespace DB
 {
@@ -32,9 +31,15 @@ namespace ErrorCodes
 
 CnchTopologyMaster::CnchTopologyMaster(ContextPtr context_)
     : WithContext(context_)
-    , topology_fetcher(getContext()->getTopologySchedulePool().createTask("TopologyFetcher", [&]() { fetchTopologies(); }))
     , settings{context_->getSettings()}
 {
+    topology_fetcher = getContext()->getTopologySchedulePool().createTask("TopologyFetcher", [&]() {
+        bool success = fetchTopologies();
+        fetch_time = time(nullptr);
+        auto schedule_delay = success ? settings.topology_refresh_interval_ms.totalMilliseconds()
+                                      : settings.topology_retry_interval_ms.totalMilliseconds();
+        topology_fetcher->scheduleAfter(schedule_delay);
+    });
     topology_fetcher->activateAndSchedule();
 }
 
@@ -50,7 +55,7 @@ CnchTopologyMaster::~CnchTopologyMaster()
     }
 }
 
-void CnchTopologyMaster::fetchTopologies()
+bool CnchTopologyMaster::fetchTopologies()
 {
     try
     {
@@ -68,22 +73,19 @@ void CnchTopologyMaster::fetchTopologies()
             if (getContext()->getServerType() == ServerType::cnch_server && !last_topology.empty())
             {
                 /// reset cache if the server fails to sync topology for a while, prevent from ABA problem
-                if (topologies.front().getExpiration() > last_topology.front().getExpiration() + 2 * settings.topology_lease_life_ms.totalMilliseconds())
+                if (topologies.front().getExpiration()
+                        > last_topology.front().getExpiration() + 2 * settings.topology_lease_life_ms.totalMilliseconds()
+                    && topologies.front().getTerm() > last_topology.front().getTerm() + 1)
                 {
                     LOG_WARNING(log, "Reset part and table cache because of topology change");
-                    if (getContext()->getPartCacheManager())
-                        getContext()->getPartCacheManager()->reset();
-                    if (getContext()->getCnchStorageCache())
-                        getContext()->getCnchStorageCache()->reset();
+                    if (auto cache_manager = getContext()->getPartCacheManager(); cache_manager)
+                        cache_manager->reset();
                 }
-                else if (!HostWithPorts::isExactlySameVec(topologies.front().getServerList(), last_topology.front().getServerList()))
+                else if (!topologies.front().isSameTopologyWith(last_topology.front()))
                 {
                     LOG_WARNING(log, "Invalid outdated part and table cache because of topology change");
                     if (getContext()->getPartCacheManager())
-                        getContext()->getPartCacheManager()->invalidCacheWithNewTopology(topologies.front().getServerList());
-                    /// TODO: invalid table cache with new topology.
-                    if (getContext()->getCnchStorageCache())
-                        getContext()->getCnchStorageCache()->reset();
+                        getContext()->getPartCacheManager()->invalidCacheWithNewTopology(topologies.front());
                 }
             }
         }
@@ -91,14 +93,16 @@ void CnchTopologyMaster::fetchTopologies()
         {
             /// needed for the 1st time write to kv..
             LOG_TRACE(log, "Cannot fetch topology from remote.");
+            return false;
         }
     }
     catch (...)
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        return false;
     }
 
-    topology_fetcher->scheduleAfter(settings.topology_refresh_interval_ms.totalMilliseconds());
+    return true;
 }
 
 std::list<CnchServerTopology> CnchTopologyMaster::getCurrentTopology()
@@ -107,21 +111,39 @@ std::list<CnchServerTopology> CnchTopologyMaster::getCurrentTopology()
     return topologies;
 }
 
+std::pair<PairInt64, CnchServerTopology> CnchTopologyMaster::getCurrentTopologyVersion()
+{
+    std::pair<PairInt64, CnchServerTopology> res = std::make_pair(PairInt64(0, 0), CnchServerTopology{});
+    UInt64 current_ts = getContext()->tryGetTimestamp(__PRETTY_FUNCTION__);
+    if (TxnTimestamp::fallbackTS() == current_ts)
+        return res;
+    UInt64 current_time = current_ts>>18;
+    std::list<CnchServerTopology> current_topology = getCurrentTopology();
+    UInt64 lease_life_time = getContext()->getSettingsRef().topology_lease_life_ms.totalMilliseconds();
+
+    auto it = current_topology.begin();
+    while (it != current_topology.end())
+    {
+        UInt64 lease_start_time = it->getInitialTime() ? it->getInitialTime() : it->getExpiration() - lease_life_time;
+
+        if (current_time >= lease_start_time && current_time < it->getExpiration() - 6000)
+        {
+            res = std::make_pair(PairInt64{it->getInitialTime(), it->getTerm()}, *it);
+            break;
+        }
+        it++;
+    }
+    return res;
+}
+
 HostWithPorts CnchTopologyMaster::getTargetServerImpl(
         const String & table_uuid,
+        const String server_vw_name,
         std::list<CnchServerTopology> & current_topology,
         const UInt64 current_ts,
         bool allow_empty_result,
         bool allow_tso_unavailable)
 {
-    auto get_server_for_table = [](const String & uuid, const HostWithPortsVec & servers)
-    {
-        if (servers.empty())
-            return HostWithPorts{};
-        auto hashed_index = consistentHashForString(uuid, servers.size());
-        return servers[hashed_index];
-    };
-
     HostWithPorts target_server{};
     UInt64 lease_life_time = settings.topology_lease_life_ms.totalMilliseconds();
     bool tso_is_available = (current_ts != TxnTimestamp::fallbackTS());
@@ -130,31 +152,38 @@ HostWithPorts CnchTopologyMaster::getTargetServerImpl(
     auto it = current_topology.begin();
     while(it != current_topology.end())
     {
-        auto servers = it->getServerList();
-        bool commit_within_lease_life_time = commit_time_ms >= it->getExpiration() - lease_life_time;
+        UInt64 lease_start_time = it->getInitialTime() ? it->getInitialTime() : it->getExpiration() - lease_life_time;
+        bool commit_within_lease_life_time = commit_time_ms >= lease_start_time;
 
-        if (!tso_is_available && allow_tso_unavailable && !servers.empty())
+        if (!tso_is_available && allow_tso_unavailable)
         {
-            target_server = get_server_for_table(table_uuid, servers);
-            LOG_DEBUG(log, "Fallback to first possible target server due to TSO unavailability. servers.size = {}", servers.size());
-            break;
+            target_server = it->getTargetServer(table_uuid, server_vw_name);
+            if (!target_server.empty())
+            {
+                LOG_DEBUG(log, "Fallback to first possible target server due to TSO unavailability. servers vw name is {}", server_vw_name);
+                break;
+            }
         }
 
         /// currently, topology_lease_life_ms is 12000ms by default. we suppose bytekv MultiWrite timeout is 6000ms.
         if (commit_within_lease_life_time && commit_time_ms < it->getExpiration() - 6000)
         {
-            target_server = get_server_for_table(table_uuid, it->getServerList());
+            target_server = it->getTargetServer(table_uuid, server_vw_name);
+            target_server.topology_version = PairInt64(it->getInitialTime(), it->getTerm());
             break;
         }
         else if (commit_within_lease_life_time && commit_time_ms < it->getExpiration())
         {
-            HostWithPorts server_in_old_topology = get_server_for_table(table_uuid, it->getServerList());
+            HostWithPorts server_in_old_topology = it->getTargetServer(table_uuid, server_vw_name);
             it++;
             if (it != current_topology.end())
             {
-                HostWithPorts server_in_new_topology = get_server_for_table(table_uuid, it->getServerList());
+                HostWithPorts server_in_new_topology = it->getTargetServer(table_uuid, server_vw_name);
                 if (server_in_new_topology.isExactlySame(server_in_old_topology))
+                {
                     target_server = server_in_new_topology;
+                    target_server.topology_version = PairInt64(it->getInitialTime(), it->getTerm());
+                }
             }
             break;
         }
@@ -165,28 +194,34 @@ HostWithPorts CnchTopologyMaster::getTargetServerImpl(
     if (target_server.empty())
     {
         if (!allow_empty_result)
-            throw Exception("No available topology for current commit time : " + std::to_string(commit_time_ms) + ". Available topology : " + dumpTopologies(current_topology), ErrorCodes::CNCH_NO_AVAILABLE_TOPOLOGY);
+            throw Exception("No available topology for server vw: " + server_vw_name
+                + ", current commit time : " + std::to_string(commit_time_ms)
+                + ". Available topology : " + dumpTopologies(current_topology)
+                + ". Current time : " + std::to_string(time(nullptr))
+                + ". Fetch time : " + std::to_string(fetch_time)
+                , ErrorCodes::CNCH_NO_AVAILABLE_TOPOLOGY);
         else
-            LOG_INFO(log, "No available topology for current commit time : {}. Available topology : {}", std::to_string(commit_time_ms), dumpTopologies(current_topology));
+            LOG_INFO(log, "No available topology for server vw: {}, current commit time : {}. Available topology : {}. Current time : {}. Fetch time : {}"
+                , server_vw_name, std::to_string(commit_time_ms), dumpTopologies(current_topology), time(nullptr), fetch_time);
     }
 
     return target_server;
 }
 
 
-HostWithPorts CnchTopologyMaster::getTargetServer(const String & table_uuid, bool allow_empty_result, bool allow_tso_unavailable)
+HostWithPorts CnchTopologyMaster::getTargetServer(const String & table_uuid, const String & server_vw_name, bool allow_empty_result, bool allow_tso_unavailable)
 {
     /// Its important to get current topology before get current timestamp.
     std::list<CnchServerTopology> current_topology = getCurrentTopology();
     UInt64 ts = getContext()->tryGetTimestamp(__PRETTY_FUNCTION__);
 
-    return getTargetServerImpl(table_uuid, current_topology, ts, allow_empty_result, allow_tso_unavailable);
+    return getTargetServerImpl(table_uuid, server_vw_name, current_topology, ts, allow_empty_result, allow_tso_unavailable);
 }
 
-HostWithPorts CnchTopologyMaster::getTargetServer(const String & table_uuid, const UInt64 ts,  bool allow_empty_result, bool allow_tso_unavailable)
+HostWithPorts CnchTopologyMaster::getTargetServer(const String & table_uuid, const String & server_vw_name, const UInt64 ts,  bool allow_empty_result, bool allow_tso_unavailable)
 {
     std::list<CnchServerTopology> current_topology = getCurrentTopology();
-    return getTargetServerImpl(table_uuid, current_topology, ts, allow_empty_result, allow_tso_unavailable);
+    return getTargetServerImpl(table_uuid, server_vw_name, current_topology, ts, allow_empty_result, allow_tso_unavailable);
 }
 
 
@@ -194,6 +229,28 @@ void CnchTopologyMaster::shutDown()
 {
     if (topology_fetcher)
         topology_fetcher->deactivate();
+}
+
+void CnchTopologyMaster::dumpStatus() const
+{
+    std::stringstream ss;
+    ss << "[tasks info] : \n"
+       << "current_time : " << time(nullptr) << std::endl
+       << "fetch_time : " << fetch_time << std::endl
+       << "[current fetched topology] : \n";
+
+    {
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (lock.try_lock_for(std::chrono::milliseconds(1000)))
+        {
+            ss << DB::dumpTopologies(topologies);
+        }
+        else
+        {
+            ss << "Failed to accquire topology master lock";
+        }
+    }
+    LOG_INFO(log, "Dump topology master status :\n{}", ss.str());
 }
 
 }

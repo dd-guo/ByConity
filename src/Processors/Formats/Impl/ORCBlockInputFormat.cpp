@@ -1,4 +1,11 @@
 #include "ORCBlockInputFormat.h"
+#include <boost/algorithm/string/case_conv.hpp>
+#include <unordered_map>
+#include "common/logger_useful.h"
+#include "DataTypes/NestedUtils.h"
+#include "Processors/Formats/Impl/LMNativeORCBlockInputFormat.h"
+#include "Processors/Formats/Impl/OrcCommon.h"
+#include "Storages/IStorage.h"
 #if USE_ORC
 
 #include <Formats/FormatFactory.h>
@@ -9,10 +16,10 @@
 #include <arrow/io/memory.h>
 #include "ArrowBufferedStreams.h"
 #include "ArrowColumnToCHColumn.h"
+#include <DataTypes/NestedUtils.h>
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -26,41 +33,54 @@ namespace ErrorCodes
             throw Exception(_s.ToString(), ErrorCodes::BAD_ARGUMENTS); \
     } while (false)
 
-ORCBlockInputFormat::ORCBlockInputFormat(
-    ReadBuffer & in_,
-    Block header_,
-    const FormatSettings & format_settings_,
-    const std::map<String, String> & partition_kv_)
-    : IInputFormat(std::move(header_), in_)
-    , format_settings(format_settings_)
-    , partition_kv{partition_kv_}
- {
- }
+ORCBlockInputFormat::ORCBlockInputFormat(ReadBuffer & in_, Block header_, const FormatSettings & format_settings_)
+    : IInputFormat(std::move(header_), in_), format_settings(format_settings_)
+{
+}
 
 Chunk ORCBlockInputFormat::generate()
 {
+    block_missing_values.clear();
+
     Chunk res;
 
     if (!file_reader)
         prepareReader();
 
+    const auto & skip_stripes = format_settings.orc.skip_stripes;
+    while (!skip_stripes.empty() && stripe_current < stripe_total && skip_stripes.contains(stripe_current))
+        ++stripe_current;
+
     if (stripe_current >= stripe_total)
         return res;
 
-    std::shared_ptr<arrow::RecordBatch> batch_result;
-    arrow::Status batch_status = file_reader->ReadStripe(stripe_current, include_indices, &batch_result);
+    auto batch_status = file_reader->ReadStripe(stripe_current, include_indices );
     if (!batch_status.ok())
-        throw ParsingException(ErrorCodes::CANNOT_READ_ALL_DATA,
-                               "Error while reading batch of ORC data: {}", batch_status.ToString());
+        throw ParsingException(
+            ErrorCodes::CANNOT_READ_ALL_DATA, "Error while reading batch of ORC data: {}", batch_status.status().ToString());
 
-    auto table_result = arrow::Table::FromRecordBatches({batch_result});
+    auto batch = batch_status.ValueOrDie();
+    if (!batch)
+        return {};
+
+    auto table_result = arrow::Table::FromRecordBatches({batch});
     if (!table_result.ok())
-        throw ParsingException(ErrorCodes::CANNOT_READ_ALL_DATA,
-                               "Error while reading batch of ORC data: {}", table_result.status().ToString());
+        throw ParsingException(
+            ErrorCodes::CANNOT_READ_ALL_DATA, "Error while reading batch of ORC data: {}", table_result.status().ToString());
+
+
+    /// We should extract the number of rows directly from the stripe, because in case when
+    /// record batch contains 0 columns (for example if we requested only columns that
+    /// are not presented in data) the number of rows in record batch will be 0.
+    size_t num_rows = file_reader->GetRawORCReader()->getStripe(stripe_current)->getNumberOfRows();
+
+    auto table = table_result.ValueOrDie();
+    if (!table || !num_rows)
+        return {};
 
     ++stripe_current;
-
-    arrow_column_to_ch_column->arrowTableToCHChunk(res, *table_result);
+    BlockMissingValues * block_missing_values_ptr = format_settings.defaults_for_omitted_fields ? &block_missing_values : nullptr;
+    arrow_column_to_ch_column->arrowTableToCHChunk(res, table, num_rows, block_missing_values_ptr);
     return res;
 }
 
@@ -71,6 +91,12 @@ void ORCBlockInputFormat::resetParser()
     file_reader.reset();
     include_indices.clear();
     stripe_current = 0;
+    block_missing_values.clear();
+}
+
+const BlockMissingValues & ORCBlockInputFormat::getMissingValues() const
+{
+    return block_missing_values;
 }
 
 static size_t countIndicesForType(std::shared_ptr<arrow::DataType> type)
@@ -96,39 +122,85 @@ static size_t countIndicesForType(std::shared_ptr<arrow::DataType> type)
     return 1;
 }
 
+std::vector<int> ORCBlockInputFormat::getColumnIndices(
+    const std::shared_ptr<arrow::Schema> & schema, const Block & header, const bool & ignore_case, const bool & import_nested)
+{
+    std::vector<int> include_indices;
+    std::unordered_set<String> nested_table_names;
+    if (import_nested)
+        nested_table_names = Nested::getAllTableNames(header, ignore_case);
+
+    for (int i = 0; i < schema->num_fields(); ++i)
+    {
+        const auto & name = schema->field(i)->name();
+        if (header.has(name, ignore_case) || nested_table_names.contains(ignore_case ? boost::to_lower_copy(name) : name))
+            include_indices.push_back(i);
+    }
+    return include_indices;
+}
+
 void ORCBlockInputFormat::prepareReader()
 {
-    THROW_ARROW_NOT_OK(arrow::adapters::orc::ORCFileReader::Open(asArrowFile(in), arrow::default_memory_pool(), &file_reader));
+    auto arrow_file = asArrowFile(in);
+    auto reader_status = arrow::adapters::orc::ORCFileReader::Open(arrow_file, arrow::default_memory_pool()).Value(&file_reader);
+    if (!reader_status.ok())
+    {
+        throw Exception(reader_status.ToString(), ErrorCodes::BAD_ARGUMENTS);
+    }
     stripe_total = file_reader->NumberOfStripes();
     stripe_current = 0;
 
-    std::shared_ptr<arrow::Schema> schema;
-    THROW_ARROW_NOT_OK(file_reader->ReadSchema(&schema));
+    auto schema_status = file_reader->ReadSchema();
+    if (!schema_status.ok())
+    {
+        throw Exception(schema_status.status().ToString(), ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    if (!schema_status.ok())
+    {
+        throw Exception(schema_status.status().ToString(), ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    auto & schema = schema_status.ValueOrDie();
 
     arrow_column_to_ch_column = std::make_unique<ArrowColumnToCHColumn>(
         getPort().getHeader(),
-        schema,
         "ORC",
+        format_settings.orc.import_nested,
         format_settings.orc.allow_missing_columns,
         format_settings.null_as_default,
-        partition_kv);
+        format_settings.date_time_overflow_behavior,
+        format_settings.orc.case_insensitive_column_matching);
 
-    /// In ReadStripe column indices should be started from 1,
-    /// because 0 indicates to select all columns.
-    int index = 1;
-    for (int i = 0; i < schema->num_fields(); ++i)
-    {
-        /// LIST type require 2 indices, STRUCT - the number of elements + 1,
-        /// so we should recursively count the number of indices we need for this type.
-        int indexes_count = countIndicesForType(schema->field(i)->type());
-        if (getPort().getHeader().has(schema->field(i)->name()))
-        {
-            for (int j = 0; j != indexes_count; ++j)
-                include_indices.push_back(index + j);
-        }
-        index += indexes_count;
-    }
+    include_indices = getColumnIndices(schema, getPort().getHeader(), format_settings.orc.case_insensitive_column_matching, format_settings.orc.import_nested);
 }
+
+IStorage::ColumnSizeByName ORCBlockInputFormat::getColumnSizes()
+{
+    std::atomic_int is_stopped = false;
+    THROW_ARROW_NOT_OK(arrow::adapters::orc::ORCFileReader::Open(
+                           asArrowFile(in, format_settings, is_stopped, "ORC", ORC_MAGIC_BYTES), arrow::default_memory_pool())
+                           .Value(&file_reader));
+    auto * orc_reader = file_reader->GetRawORCReader();
+    if (!orc_reader)
+    {
+        LOG_INFO(&Poco::Logger::get("ORCBlockInputFormat"), "cannot get columns size, raw reader ptr is nullptr.");
+        return {};
+    }
+    return getOrcColumnsSize(*orc_reader);
+}
+
+void ORCBlockInputFormat::setQueryInfo([[maybe_unused]] const SelectQueryInfo & query_info, [[maybe_unused]] ContextPtr local_context)
+{
+    // if(auto select_query = dynamic_cast<ASTSelectQuery*>(query_info.query.get()); select_query)
+    // {
+    //     if(select_query->prewhere())
+    //     {
+    //         throw Exception(ErrorCodes::BAD_ARGUMENTS, "NativeORCBlockInputFormat does not support prewhere");
+    //     }
+    // }
+}
+
 
 void registerInputFormatProcessorORC(FormatFactory &factory)
 {
@@ -139,20 +211,24 @@ void registerInputFormatProcessorORC(FormatFactory &factory)
                 const RowInputFormatParams &,
                 const FormatSettings & settings)
             {
-                return std::make_shared<ORCBlockInputFormat>(buf, sample, settings, settings.orc.partition_kv);
+                InputFormatPtr res;
+                if (settings.orc.use_fast_decoder == 2)
+                    res = std::make_shared<LMNativeORCBlockInputFormat>(buf, sample, settings);
+                else
+                    res = std::make_shared<ORCBlockInputFormat>(buf, sample, settings);
+                return res;
             });
     factory.markFormatAsColumnOriented("ORC");
 }
-
 }
 #else
 
 namespace DB
 {
-    class FormatFactory;
-    void registerInputFormatProcessorORC(FormatFactory &)
-    {
-    }
+class FormatFactory;
+void registerInputFormatProcessorORC(FormatFactory &)
+{
+}
 }
 
 #endif

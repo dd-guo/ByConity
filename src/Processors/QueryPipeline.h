@@ -24,10 +24,12 @@
 #include <DataStreams/IBlockInputStream.h>
 #include <DataStreams/IBlockOutputStream.h>
 #include <Processors/Executors/PipelineExecutor.h>
+#include <Processors/Sources/SourceFromChunks.h>
 #include <Processors/IProcessor.h>
 #include <Processors/Pipe.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/TableLockHolder.h>
+#include <Interpreters/Cache/QueryCache.h> /// nested classes such as QC::Writer can't be fwd declared
 
 namespace DB
 {
@@ -51,7 +53,7 @@ struct ExpressionActionsSettings;
 class IJoin;
 using JoinPtr = std::shared_ptr<IJoin>;
 
-using RuntimeFilterId = UInt64;
+using RuntimeFilterId = UInt32;
 
 class QueryPipeline
 {
@@ -99,6 +101,11 @@ public:
     /// Add totals which returns one chunk with single row with defaults.
     void addDefaultTotals();
 
+    /// set Transform which will transfer data from totals_port to output ports if totals_port is not empty
+    void setTotalsPortToMainPortTransform();
+    /// set Transform which will transfer data from extremes_port to output ports if totals_port is not empty
+    void setExtremesPortToMainPortTransform();
+
     /// Forget about current totals and extremes. It is needed before aggregation, cause they will be calculated again.
     void dropTotalsAndExtremes();
 
@@ -124,7 +131,11 @@ public:
         std::unique_ptr<QueryPipeline> right,
         JoinPtr join,
         size_t max_block_size,
-        Processors * collected_processors = nullptr);
+        size_t max_streams,
+        bool keep_left_read_in_order,
+        bool join_parallel_left_right,
+        Processors * collected_processors = nullptr,
+        bool need_build_runtime_filter = false);
 
     /// Add other pipeline and execute it before current one.
     /// Pipeline must have empty header, it should not generate any chunk.
@@ -140,19 +151,37 @@ public:
     bool hasTotals() const { return pipe.getTotalsPort() != nullptr; }
 
     const Block & getHeader() const { return pipe.getHeader(); }
-
     void addTableLock(TableLockHolder lock) { pipe.addTableLock(std::move(lock)); }
     void addInterpreterContext(std::shared_ptr<const Context> context) { pipe.addInterpreterContext(std::move(context)); }
     void addStorageHolder(StoragePtr storage) { pipe.addStorageHolder(std::move(storage)); }
-    void addRuntimeFilterHolder(RuntimeFilterHolder rf_holder) { pipe.addRuntimeFilterHolder(std::move(rf_holder)); }
+    void addCacheHolder(CacheHolderPtr cache_holder) { pipe.addCacheHolder(std::move(cache_holder)); }
     void addQueryPlan(std::unique_ptr<QueryPlan> plan) { pipe.addQueryPlan(std::move(plan)); }
     void setLimits(const StreamLocalLimits & limits) { pipe.setLimits(limits); }
     void setLeafLimits(const SizeLimits & limits) { pipe.setLeafLimits(limits); }
-    void setQuota(const std::shared_ptr<const EnabledQuota> & quota) { pipe.setQuota(quota); }
+    void setQuota(const std::shared_ptr<const EnabledQuota> & quota_)
+    {
+        pipe.setQuota(quota_);
+        quota = quota_;
+    }
 
     /// For compatibility with IBlockInputStream.
     void setProgressCallback(const ProgressCallback & callback);
     void setProcessListElement(QueryStatus * elem);
+    void setInternalProgressCallback(const ProgressCallback & callback);
+
+    void writeResultIntoQueryCache(std::shared_ptr<QueryCache::Writer> query_cache_writer);
+    void readFromQueryCache(
+        std::unique_ptr<SourceFromChunks> source,
+        std::unique_ptr<SourceFromChunks> source_totals,
+        std::unique_ptr<SourceFromChunks> source_extremes);
+
+    void finalizeWriteInQueryCache();
+
+    /// Create progress callback from limits and quotas.
+    std::unique_ptr<ReadProgressCallback> getReadProgressCallback() const;
+    /// Skip updating profile events.
+    /// For merges in mutations it may need special logic, it's done inside ProgressCallback.
+    void disableProfileEventUpdate() { update_profile_events = false; }
 
     /// Recommend number of threads for pipeline execution.
     size_t getNumThreads() const
@@ -180,13 +209,32 @@ public:
 
     const Processors & getProcessors() const { return pipe.getProcessors(); }
 
+    const CacheHolderPtr getCacheHolder() const;
+
+    void setWriteCacheComplete(const ContextPtr & context);
+
+    void clearUncompletedCache(const ContextPtr & context);
+
     /// Convert query pipeline to pipe.
     static Pipe getPipe(QueryPipeline pipeline) { return std::move(pipeline.pipe); }
 
+    Processors & getPipeProcessors() { return pipe.processors; }
+
+    void complete(std::shared_ptr<IOutputFormat> format);
+
+    /// use for query cache
+    void addUsedStorageIDs(const std::set<StorageID> & storage_id);
+    std::set<StorageID> getUsedStorageIDs() const;
+    bool hasAllUsedStorageIDs() const;
+    void setHasAllUsedStorageIDs(bool val);
 private:
 
     Pipe pipe;
     IOutputFormat * output_format = nullptr;
+
+    ProgressCallback progress_callback;
+    std::shared_ptr<const EnabledQuota> quota;
+    bool update_profile_events = true;
 
     /// Limit on the number of threads. Zero means no limit.
     /// Sometimes, more streams are created then the number of threads for more optimal execution.
@@ -194,6 +242,9 @@ private:
 
     /// Limit on the minimum number of threads.
     size_t min_threads = 0;
+    /// use for query cache to detect which tables is used
+    std::set<StorageID> used_storage_ids;
+    bool has_all_used_storage_ids = true;
 
     QueryStatus * process_list_element = nullptr;
 
@@ -205,6 +256,7 @@ private:
     void setCollectedProcessors(Processors * processors);
 
     friend class QueryPipelineProcessorsCollector;
+    friend class CompletedPipelineExecutor;
 };
 
 /// This is a small class which collects newly added processors to QueryPipeline.

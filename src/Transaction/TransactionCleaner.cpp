@@ -13,16 +13,22 @@
  * limitations under the License.
  */
 
+#include <atomic>
 #include <Transaction/TransactionCleaner.h>
 
+#include <Disks/DiskByteS3.h>
 #include <Catalog/Catalog.h>
 #include <Common/serverLocality.h>
 #include <MergeTreeCommon/CnchTopologyMaster.h>
-// #include <MergeTreeCommon/CnchServerClientPool.h>
+#include <CloudServices/CnchServerClientPool.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
+#include <Interpreters/Context.h>
 #include <Transaction/TransactionCoordinatorRcCnch.h>
 #include <Transaction/TxnTimestamp.h>
 #include <Transaction/TransactionCommon.h>
+#include <Transaction/Actions/S3AttachMetaFileAction.h>
+#include <Transaction/Actions/S3AttachMetaAction.h>
+#include <Transaction/Actions/S3DetachMetaAction.h>
 
 namespace DB
 {
@@ -51,8 +57,19 @@ void TransactionCleaner::cleanTransaction(const TransactionCnchPtr & txn)
         return;
 
     if (!txn_record.ended())
-        txn->abort();
-
+    {
+        try
+        {
+            txn->abort();
+        }
+        catch (...)
+        {
+            /// if abort transaction failed (e.g., bytekv is not stable at this moment),
+            /// we are not 100% sure how is the status going, we let dm to make the correct decision.
+            txn->force_clean_by_dm = true;
+            throw;
+        }
+    }
     if (!txn->async_post_commit)
     {
         TxnCleanTask task(txn->getTransactionID(), CleanTaskPriority::HIGH, txn_record.status());
@@ -85,11 +102,11 @@ void TransactionCleaner::cleanTransaction(const TransactionRecord & txn_record)
 void TransactionCleaner::cleanCommittedTxn(const TransactionRecord & txn_record)
 {
     scheduleTask([this, txn_record, &global_context = *getContext()] {
+        bool clean_fs_lock_by_scan = global_context.getConfigRef().getBool("cnch_txn_clean_fs_lock_by_scan", true);
+
         LOG_DEBUG(log, "Start to clean the committed transaction {}\n", txn_record.txnID().toUInt64());
         TxnCleanTask & task = getCleanTask(txn_record.txnID());
         auto catalog = global_context.getCnchCatalog();
-        // first clear any filesys lock if hold
-        catalog->clearFilesysLock(txn_record.txnID());
         catalog->clearZombieIntent(txn_record.txnID());
         auto undo_buffer = catalog->getUndoBuffer(txn_record.txnID());
 
@@ -99,30 +116,59 @@ void TransactionCleaner::cleanCommittedTxn(const TransactionRecord & txn_record)
         for (const auto & [uuid, resources] : undo_buffer)
         {
             LOG_DEBUG(log, "Get undo buffer of the table {}\n", uuid);
-            auto host_port = global_context.getCnchTopologyMaster()->getTargetServer(uuid, false);
+
+            StoragePtr table = catalog->tryGetTableByUUID(global_context, uuid, TxnTimestamp::maxTS(), true);
+            if (!table)
+                continue;
+
+            auto host_port = global_context.getCnchTopologyMaster()->getTargetServer(uuid, table->getServerVwName(), false);
             auto rpc_address = host_port.getRPCAddress();
             if (!isLocalServer(rpc_address, std::to_string(global_context.getRPCPort())))
             {
                 // TODO: need to fix for multi-table txn
                 LOG_DEBUG(log, "Forward clean task for txn {} to server {}", txn_record.txnID().toUInt64(), rpc_address);
-                // global_context.getCnchServerClientPool().get(rpc_address)->cleanTransaction(txn_record);
+                global_context.getCnchServerClientPool().get(rpc_address)->cleanTransaction(txn_record);
                 return;
             }
-            StoragePtr table = catalog->tryGetTableByUUID(global_context, uuid, TxnTimestamp::maxTS(), true);
-            if (!table)
-                continue;
 
             UndoResourceNames names = integrateResources(resources);
+
+            /// Collect extra parts to update commit time
+            /// We don't want to add it into integrateResources since when clean aborted
+            /// transaction, we need some extra logic rather than just delete it from catalog
+            S3AttachMetaAction::collectUndoResourcesForCommit(resources, names);
+            /// Clean detach parts for s3 committed
+            S3DetachMetaAction::commitByUndoBuffer(global_context, table, resources);
+            /// Clean s3 meta file
+            S3AttachMetaFileAction::commitByUndoBuffer(global_context, resources);
+
+            /// Release directory lock if any
+            if (!names.kvfs_lock_keys.empty())
+            {
+                catalog->clearFilesysLocks({names.kvfs_lock_keys.begin(), names.kvfs_lock_keys.end()}, std::nullopt);
+                clean_fs_lock_by_scan = false;
+            }
+
             auto intermediate_parts = catalog->getDataPartsByNames(names.parts, table, 0);
             auto undo_bitmaps = catalog->getDeleteBitmapByKeys(table, names.bitmaps);
             auto staged_parts = catalog->getStagedDataPartsByNames(names.staged_parts, table, 0);
 
-            {
-                std::lock_guard lock(task.mutex);
-                task.undo_size = intermediate_parts.size() + undo_bitmaps.size();
-            }
-
+            task.undo_size.store(intermediate_parts.size() + undo_bitmaps.size(), std::memory_order_relaxed);
             catalog->setCommitTime(table, Catalog::CommitItems{intermediate_parts, undo_bitmaps, staged_parts}, txn_record.commitTs(), txn_record.txnID());
+
+            // clean vfs if necessary
+            for (const auto & resource : resources)
+            {
+                resource.commit(global_context);
+            }
+        }
+
+        /// Clean fs lock by txn id must be after undo resource clean, otherwise udno resource
+        /// clean may clean other user's fs lock
+        if (clean_fs_lock_by_scan)
+        {
+            // first clear any filesys lock if hold
+            catalog->clearFilesysLock(txn_record.txnID());
         }
 
         catalog->clearUndoBuffer(txn_record.txnID());
@@ -135,6 +181,8 @@ void TransactionCleaner::cleanCommittedTxn(const TransactionRecord & txn_record)
 void TransactionCleaner::cleanAbortedTxn(const TransactionRecord & txn_record)
 {
     scheduleTask([this, txn_record, &global_context = *getContext()]() {
+        bool clean_fs_lock_by_scan = global_context.getConfigRef().getBool("cnch_txn_clean_fs_lock_by_scan", true);
+
         LOG_DEBUG(log, "Start to clean the aborted transaction {}\n", txn_record.txnID().toUInt64());
 
         // abort transaction if it is running
@@ -172,34 +220,16 @@ void TransactionCleaner::cleanAbortedTxn(const TransactionRecord & txn_record)
             StoragePtr table = catalog->tryGetTableByUUID(global_context, uuid, TxnTimestamp::maxTS(), true);
             if (!table)
                 continue;
-
-            auto * storage = dynamic_cast<MergeTreeMetaBase *>(table.get());
-            if (!storage)
-                throw Exception("Table is not of MergeTree class", ErrorCodes::LOGICAL_ERROR);
-
-            UndoResourceNames names = integrateResources(resources);
-            auto intermediate_parts = catalog->getDataPartsByNames(names.parts, table, 0);
-            auto undo_bitmaps = catalog->getDeleteBitmapByKeys(table, names.bitmaps);
-            auto staged_parts = catalog->getStagedDataPartsByNames(names.staged_parts, table, 0);
-
-            {
-                std::lock_guard lock(task.mutex);
-                task.undo_size = intermediate_parts.size() + undo_bitmaps.size();
-            }
-
-            // skip part cache to avoid blocking by write lock of part cache for long time
-            catalog->clearParts(table, Catalog::CommitItems{intermediate_parts, undo_bitmaps, staged_parts}, true);
-
-            // clean vfs
-            for (const auto & resource : resources)
-            {
-                resource.clean(*catalog, storage);
-            }
+            auto undo_size = catalog->applyUndos(txn_record, table, resources, clean_fs_lock_by_scan);
+            task.undo_size.store(undo_size, std::memory_order_relaxed);
+        }
+        if (clean_fs_lock_by_scan)
+        {
+            // remove directory lock if there's one, this is tricky, because we don't know the directory name
+            // current solution: scan all filesys lock and match the transaction id
+            catalog->clearFilesysLock(txn_record.txnID());
         }
 
-        // remove directory lock if there's one, this is tricky, because we don't know the directory name
-        // current solution: scan all filesys lock and match the transaction id
-        catalog->clearFilesysLock(txn_record.txnID());
         catalog->clearUndoBuffer(txn_record.txnID());
         catalog->removeTransactionRecord(txn_record);
         LOG_DEBUG(log, "Finish cleaning aborted transaction {}\n", txn_record.txnID().toUInt64());

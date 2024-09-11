@@ -15,42 +15,45 @@
 
 #include <Analyzers/QueryRewriter.h>
 
+#include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <Analyzers/ExecutePrewhereSubqueryVisitor.h>
 #include <Analyzers/ImplementFunctionVisitor.h>
 #include <Analyzers/ReplaceViewWithSubqueryVisitor.h>
-#include <Analyzers/CheckAliasVisitor.h>
-#include <AggregateFunctions/AggregateFunctionFactory.h>
-#include <Interpreters/ApplyWithSubqueryVisitor.h>
+#include <Analyzers/RewriteFusionMerge.h>
+#include <Analyzers/SimpleFunctionVisitor.h>
 #include <Interpreters/ApplyWithAliasVisitor.h>
+#include <Interpreters/ApplyWithSubqueryVisitor.h>
+#include <Interpreters/CollectJoinOnKeysVisitor.h>
+#include <Interpreters/CrossToInnerJoinVisitor.h>
 #include <Interpreters/DatabaseAndTableWithAlias.h>
+#include <Interpreters/FunctionNameNormalizer.h>
+#include <Interpreters/JoinToSubqueryTransformVisitor.h>
+#include <Interpreters/JoinedTables.h>
+#include <Interpreters/LogicalExpressionsOptimizer.h>
+#include <Interpreters/MarkTableIdentifiersVisitor.h>
+#include <Interpreters/NormalizeSelectWithUnionQueryVisitor.h>
+#include <Interpreters/PredicateExpressionsOptimizer.h>
 #include <Interpreters/QueryAliasesVisitor.h>
 #include <Interpreters/QueryNormalizer.h>
-#include <Interpreters/TranslateQualifiedNamesVisitor.h>
-#include <Interpreters/CrossToInnerJoinVisitor.h>
-#include <Interpreters/JoinToSubqueryTransformVisitor.h>
-#include <Interpreters/LogicalExpressionsOptimizer.h>
-#include <Interpreters/JoinedTables.h>
-#include <Interpreters/TreeRewriter.h>
-#include <Interpreters/TreeOptimizer.h>
-#include <Interpreters/MarkTableIdentifiersVisitor.h>
-#include <Interpreters/FunctionNameNormalizer.h>
-#include <Interpreters/misc.h>
-#include <Interpreters/CollectJoinOnKeysVisitor.h>
-#include <Interpreters/getTableExpressions.h>
-#include <Interpreters/TableJoin.h>
-#include <Interpreters/NormalizeSelectWithUnionQueryVisitor.h>
 #include <Interpreters/SelectIntersectExceptQueryVisitor.h>
+#include <Interpreters/TableJoin.h>
+#include <Interpreters/TranslateQualifiedNamesVisitor.h>
+#include <Interpreters/TreeOptimizer.h>
+#include <Interpreters/TreeRewriter.h>
+#include <Interpreters/getTableExpressions.h>
+#include <Interpreters/misc.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/queryToString.h>
+#include <Storages/StorageSnapshot.h>
+
+#include <common/logger_useful.h>
 
 namespace DB
 {
 
 namespace
 {
-    thread_local int graphviz_index;
-
     template <char const * func_name>
     struct CustomizeFunctionsData
     {
@@ -175,19 +178,26 @@ namespace
     using CustomizeAggregateFunctionsOrNullVisitor = InDepthNodeVisitor<OneTypeMatcher<CustomizeAggregateFunctionsSuffixData>, true>;
     using CustomizeAggregateFunctionsMoveOrNullVisitor = InDepthNodeVisitor<OneTypeMatcher<CustomizeAggregateFunctionsMoveSuffixData>, true>;
 
-    void expandCte(ASTPtr & query, ContextMutablePtr context)
+    void rewriteFusionMerge(ASTPtr & query, ContextMutablePtr context, int & graphviz_index)
+    {
+        RewriteFusionMerge data{context};
+        RewriteFusionMergeVisitor(data).visit(query);
+        GraphvizPrinter::printAST(query, context, std::to_string(graphviz_index++) + "-AST-rewrite-fusionMerge");
+    }
+
+    void expandCte(ASTPtr & query, ContextMutablePtr context, int & graphviz_index)
     {
         ApplyWithSubqueryVisitor::visit(query);
         GraphvizPrinter::printAST(query, context, std::to_string(graphviz_index++) + "-AST-expand-cte");
     }
 
-    void checkAlias(ASTPtr & query)
+    void simpleFunctions(ASTPtr & query, ContextMutablePtr context)
     {
-        CheckAliasVisitor().visit(query);
+        if (context->getSettingsRef().rewrite_like_function)
+            SimpleFunctionVisitor().visit(query);
     }
 
-
-    void expandView(ASTPtr & query, ContextMutablePtr context)
+    void expandView(ASTPtr & query, ContextMutablePtr context, int & graphviz_index)
     {
         ReplaceViewWithSubquery data{context};
         ReplaceViewWithSubqueryVisitor(data).visit(query);
@@ -197,7 +207,7 @@ namespace
     void normalizeUnion(ASTPtr & query, ContextMutablePtr context)
     {
         {
-            SelectIntersectExceptQueryVisitor::Data data{context->getSettingsRef()};
+            SelectIntersectExceptQueryVisitor::Data data{context->getSettingsRef().intersect_default_mode, context->getSettingsRef().except_default_mode};
             SelectIntersectExceptQueryVisitor{data}.visit(query);
         }
 
@@ -207,7 +217,7 @@ namespace
         }
     }
 
-    void normalizeFunctions(ASTPtr & query, ContextMutablePtr context)
+    void normalizeFunctions(ASTPtr & query, ContextMutablePtr context, int & graphviz_index)
     {
         const auto & settings = context->getSettingsRef();
 
@@ -253,7 +263,7 @@ namespace
         GraphvizPrinter::printAST(query, context, std::to_string(graphviz_index++) + "-AST-normal-functions");
     }
 
-    void implementFunctions(ASTPtr & query, ContextMutablePtr context)
+    void implementFunctions(ASTPtr & query, ContextMutablePtr context, int & graphviz_index)
     {
         ImplementFunction data{context};
         ImplementFunctionVisitor(data).visit(query);
@@ -347,7 +357,7 @@ namespace
         RewriteInTableExpressionVisitor(data).visit(query);
     }
 
-    void applyWithAlias(ASTPtr & query, ContextMutablePtr context)
+    void applyWithAlias(ASTPtr & query, ContextMutablePtr context, int & graphviz_index)
     {
         if (context->getSettingsRef().enable_global_with_statement)
         {
@@ -357,7 +367,8 @@ namespace
     }
 
     void normalizeNameAndAliases(ASTPtr & query, Aliases & aliases, const NameSet & source_columns_set, const Settings & settings,
-                                 ContextMutablePtr context, ConstStoragePtr /*storage*/, const StorageMetadataPtr & metadata_snapshot)
+                                 ContextMutablePtr context, ConstStoragePtr /*storage*/, const StorageMetadataPtr & metadata_snapshot,
+                                 int & graphviz_index)
     {
         /// Creates a dictionary `aliases`: alias -> ASTPtr
         QueryAliasesVisitor(aliases).visit(query);
@@ -392,7 +403,13 @@ namespace
         JoinToSubqueryTransformVisitor(join_to_subs_data).visit(query);
     }
 
-    void rewriteSelectQuery(ASTPtr & node, ContextMutablePtr context)
+    struct SelectQueryRewriteContext
+    {
+        TablesWithColumns tables_with_columns;
+        std::optional<TreeRewriterResult> result;
+    };
+
+    void rewriteSelectQuery(ASTPtr & node, SelectQueryRewriteContext & rewrite_context, ContextMutablePtr context, int & graphviz_index)
     {
         /// InterpreterSelectQuery logics:
         JoinedTables joined_tables(context, node->as<ASTSelectQuery &>(), false);
@@ -413,7 +430,8 @@ namespace
         auto & select_query = node->as<ASTSelectQuery &>();
         const auto & settings = context->getSettingsRef();
 
-        TablesWithColumns tables_with_columns = joined_tables.tablesWithColumns();
+        auto & tables_with_columns = rewrite_context.tables_with_columns;
+        tables_with_columns = joined_tables.tablesWithColumns();
         NamesAndTypesList source_columns;
 
         if (!tables_with_columns.empty())
@@ -426,7 +444,11 @@ namespace
         }
 
         StoragePtr storage = joined_tables.getLeftTableStorage();
-        TreeRewriterResult result {source_columns, storage, storage ? storage->getInMemoryMetadataPtr() : nullptr};
+        StorageSnapshotPtr storage_snapshot = nullptr;
+        if (storage)
+            storage_snapshot = storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), context);
+        rewrite_context.result.emplace(source_columns, storage, storage_snapshot);
+        auto & result = *(rewrite_context.result);
 
         if (tables_with_columns.size() > 1)
         {
@@ -439,12 +461,13 @@ namespace
             result.analyzed_join->setColumnsFromJoinedTable(cols_from_joined);
 
             result.analyzed_join->deduplicateAndQualifyColumnNames(
-                result.source_columns_set, right_table.table.getQualifiedNamePrefix());
+                result.source_columns_set, right_table.table.getQualifiedNamePrefix(), settings.check_identifier_begin_valid);
         }
 
         // 2. Rewrite qualified names
         {
-            TranslateQualifiedNamesVisitor::Data visitor_data(result.source_columns_set, tables_with_columns);
+            TranslateQualifiedNamesVisitor::Data visitor_data(
+                result.source_columns_set, tables_with_columns, true, {}, false, settings.check_identifier_begin_valid);
             TranslateQualifiedNamesVisitor visitor(visitor_data);
             visitor.visit(node);
         }
@@ -452,9 +475,24 @@ namespace
         // 3. Optimizes logical expressions.
         LogicalExpressionsOptimizer(&select_query, settings.optimize_min_equality_disjunction_chain_length.value).perform();
 
+        // 6. Execute subquery in prewhere
+        if (select_query.prewhere())
+        {
+            ExecutePrewhereSubquery execute_prewhere_subquery(context);
+            ExecutePrewhereSubqueryVisitor(execute_prewhere_subquery).visit(select_query.refPrewhere());
+        }
+    }
+
+    void postRewriteSelectQuery(ASTPtr & node, SelectQueryRewriteContext & rewrite_context, ContextMutablePtr context, int & graphviz_index)
+    {
+        auto & select_query = node->as<ASTSelectQuery &>();
+        const auto & settings = context->getSettingsRef();
+        auto & tables_with_columns = rewrite_context.tables_with_columns;
+        auto & result = *(rewrite_context.result);
+
         // 4. Normalize
         {
-            normalizeFunctions(node, context);
+            normalizeFunctions(node, context, graphviz_index);
 
             NameSet all_source_columns_set = result.source_columns_set;
             if (result.analyzed_join)
@@ -462,31 +500,25 @@ namespace
                 for (const auto & col : result.analyzed_join->columnsFromJoinedTable())
                     all_source_columns_set.insert(col.name);
             }
-            normalizeNameAndAliases(node, result.aliases, all_source_columns_set, settings, context, result.storage,
-                                    result.metadata_snapshot);
+            normalizeNameAndAliases(
+                node,
+                result.aliases,
+                all_source_columns_set,
+                settings,
+                context,
+                result.storage,
+                result.storage_snapshot ? result.storage_snapshot->metadata : nullptr,
+                graphviz_index);
         }
 
         // 5. Call `TreeOptimizer` since some optimizations will change the query result
+        if (select_query.having()
+            && (!select_query.group_by_with_cube && !select_query.group_by_with_rollup && !select_query.group_by_with_grouping_sets
+                && !select_query.group_by_with_totals))
+            PredicateExpressionsOptimizer(context, tables_with_columns, settings).tryMovePredicatesFromHavingToWhere(select_query);
         TreeOptimizer::apply(node, result, tables_with_columns, context, false);
 
-        // 6. Check JOIN ON
-        if (const auto * join_ast = select_query.join(); join_ast && tables_with_columns.size() >= 2)
-        {
-            auto & table_join = join_ast->table_join->as<ASTTableJoin &>();
-            if (table_join.on_expression)
-            {
-                bool is_asof = (table_join.strictness == ASTTableJoin::Strictness::Asof);
-                CollectJoinOnKeysVisitor::Data data{*result.analyzed_join, tables_with_columns[0], tables_with_columns[1], result.aliases, is_asof};
-                CollectJoinOnKeysVisitor(data).visit(table_join.on_expression);
-            }
-        }
-
-        // 7. Execute subquery in prewhere
-        if (select_query.prewhere())
-        {
-            ExecutePrewhereSubquery execute_prewhere_subquery(context);
-            ExecutePrewhereSubqueryVisitor(execute_prewhere_subquery).visit(select_query.refPrewhere());
-        }
+        result.collectUsedColumns(context, node, true, settings.rewrite_unknown_left_join_identifier);
     }
 
     class MarkTupleLiteralsAsLegacyData
@@ -516,52 +548,73 @@ namespace
 
 ASTPtr QueryRewriter::rewrite(ASTPtr query, ContextMutablePtr context, bool enable_materialized_view)
 {
+    const auto * logger = &Poco::Logger::get("QueryRewriter");
+
     (void) enable_materialized_view;
     graphviz_index = GraphvizPrinter::PRINT_AST_INDEX;
     GraphvizPrinter::printAST(query, context, std::to_string(graphviz_index++) + "-AST-init");
 
-    if (context->getSettingsRef().dialect_type == DialectType::ANSI)
+    if (context->getSettingsRef().dialect_type != DialectType::CLICKHOUSE)
     {
         /// Statement rewriting
-        expandCte(query, context);
-        expandView(query, context);
+        rewriteFusionMerge(query, context, graphviz_index);
+        expandCte(query, context, graphviz_index);
+        expandView(query, context, graphviz_index);
         normalizeUnion(query, context); // queries in union may not be normalized, hence normalize them here
-        checkAlias(query);
+        simpleFunctions(query, context);
 
         /// Expression rewriting
         markTupleLiteralsAsLegacy(query, context);
         markTableIdentifiers(query);
         rewriteInTableExpression(query);
-        normalizeFunctions(query, context);
-        implementFunctions(query, context);
+        normalizeFunctions(query, context, graphviz_index);
+        implementFunctions(query, context, graphviz_index);
     }
     else
     {
-        applyWithAlias(query, context);
-        expandCte(query, context);
-        expandView(query, context);
+        applyWithAlias(query, context, graphviz_index);
+        rewriteFusionMerge(query, context, graphviz_index);
+        expandCte(query, context, graphviz_index);
+        expandView(query, context, graphviz_index);
         normalizeUnion(query, context);
+        simpleFunctions(query, context);
 
         markTupleLiteralsAsLegacy(query, context);
 
         // select query level rewriter, top down rewrite each subquery.
         std::function<void(ASTPtr &)> rewrite_query = [&](ASTPtr & ast) {
+            SelectQueryRewriteContext rewrite_context;
             if (ast->as<ASTSelectQuery>())
             {
-                rewriteSelectQuery(ast, context);
+                rewriteSelectQuery(ast, rewrite_context, context, graphviz_index);
                 GraphvizPrinter::printAST(ast, context, std::to_string(graphviz_index++) + "-AST");
             }
 
             // top down rewrite
             for (ASTPtr item : ast->children)
                 rewrite_query(item);
+
+            // do some bottom-up rewrite
+            if (ast->as<ASTSelectQuery>())
+            {
+                postRewriteSelectQuery(ast, rewrite_context, context, graphviz_index);
+                GraphvizPrinter::printAST(ast, context, std::to_string(graphviz_index++) + "-AST-post");
+            }
         };
 
         rewrite_query(query);
     }
 
+    // if (query->as<ASTExplainQuery>())
+    // {
+    //     auto & explain = query->as<ASTExplainQuery &>();
+    //     explain.getExplainedQuery() = explain.getExplainedQuery();
+    // }
+
     GraphvizPrinter::printAST(query, context, std::to_string(graphviz_index++) + "-AST-done");
 
+    LOG_DEBUG(logger, "rewritten query: {}", query->formatForErrorMessageWithoutAlias());
+    LOG_TRACE(logger, "rewritten ast tree: {}", query->dumpTree());
     return query;
 }
 

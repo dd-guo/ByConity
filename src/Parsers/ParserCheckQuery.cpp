@@ -39,6 +39,8 @@ bool ParserCheckQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserIdentifier table_parser;
     ParserPartition partition_parser(dt);
 
+    ParserKeyword s_auto_remove("AUTO REMOVE");
+
     ASTPtr table;
     ASTPtr database;
 
@@ -53,6 +55,7 @@ bool ParserCheckQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         if (!table_parser.parse(pos, table, expected))
             return false;
 
+        tryRewriteCnchDatabaseName(database, pos.getContext());
         tryGetIdentifierNameInto(database, query->database);
         tryGetIdentifierNameInto(table, query->table);
     }
@@ -66,6 +69,11 @@ bool ParserCheckQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     {
         if (!partition_parser.parse(pos, query->partition, expected))
             return false;
+    }
+
+    if (s_auto_remove.ignore(pos, expected))
+    {
+        query->auto_remove = true;
     }
 
     node = query;

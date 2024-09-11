@@ -46,14 +46,14 @@ public:
     using IdentifierValues = std::unordered_map<String, Field>;
 
     // `optimizeExpression` simplify an expr by constant folding.
-    static std::pair<DataTypePtr, ASTPtr> optimizeExpression(const ConstASTPtr & expression, IdentifierTypes types, ContextMutablePtr context)
+    static std::pair<DataTypePtr, ASTPtr> optimizeExpression(const ConstASTPtr & expression, IdentifierTypes types, ContextPtr context)
     {
         auto interpreter = basicInterpreter(std::move(types), std::move(context));
         return interpreter.optimizeExpression(expression);
     }
 
     // `evaluateConstantExpression` evaluate a constant expr by constant folding, if not successful, return a std::nullopt.
-    static std::optional<std::pair<DataTypePtr, Field>> evaluateConstantExpression(const ConstASTPtr & expression, IdentifierTypes types, ContextMutablePtr context)
+    static std::optional<std::pair<DataTypePtr, Field>> evaluateConstantExpression(const ConstASTPtr & expression, IdentifierTypes types, ContextPtr context)
     {
         auto interpreter = basicInterpreter(std::move(types), std::move(context));
         return interpreter.evaluateConstantExpression(expression);
@@ -63,7 +63,7 @@ public:
     // The simplified expr may have a different type with the origin expr. e.g. given `x` is a Nullable(UInt8) column,
     // `x OR 1` is of type Nullable(UInt8), while the simplified expr `1` is of type UInt8. In some cases, that will
     // lead to a wrong answer, e.g. `toTypeName(x OR 1) = 'Nullable(UInt8)'`, but those should be rare.
-    static ASTPtr optimizePredicate(const ConstASTPtr & expression, IdentifierTypes types, ContextMutablePtr context, IdentifierValues values = {})
+    static ASTPtr optimizePredicate(const ConstASTPtr & expression, IdentifierTypes types, ContextPtr context, IdentifierValues values = {})
     {
         auto interpreter = optimizedInterpreter(std::move(types), std::move(values), std::move(context));
         return interpreter.optimizePredicate(expression);
@@ -77,48 +77,41 @@ public:
         bool enable_function_simplify = false;
     };
 
-    template <typename T, std::enable_if_t<std::is_same_v<T, Field> || std::is_same_v<T, ColumnPtr>, int> = 0>
-    struct ResultBase
+    struct InterpretResult
     {
-        using ValueType = T;
-
         DataTypePtr type;
 
         // one of members is valid
         ASTPtr ast;
-        T value;
+        Field value;
 
-        bool isAST() const { return ast != nullptr; }
-        bool isValue() const { return ast == nullptr; }
-
-        ResultBase() = default;
-        ResultBase(DataTypePtr type_, ASTPtr ast_): type(std::move(type_)), ast(std::move(ast_)) {}
-        ResultBase(DataTypePtr type_, T value_): type(std::move(type_)), value(std::move(value_)) {}
-
-        ASTPtr convertToAST(const ContextMutablePtr & ctx) const
+        InterpretResult() = default;
+        InterpretResult(DataTypePtr type_, ASTPtr ast_) : type(std::move(type_)), ast(std::move(ast_))
         {
-            if (isAST())
-                return ast;
-
-            return LiteralEncoder::encode(getField(), type, ctx);
+        }
+        InterpretResult(DataTypePtr type_, Field value_) : type(std::move(type_)), value(std::move(value_))
+        {
         }
 
-        decltype(auto) getField() const
+        bool isAST() const
+        {
+            return ast != nullptr;
+        }
+        bool isValue() const
+        {
+            return ast == nullptr;
+        }
+        const Field & getField() const
         {
             assert(isValue());
-
-            if constexpr (std::is_same_v<T, Field>)
-                return (value);
-            else
-                return (*value)[0];
+            return value;
         }
+        ASTPtr convertToAST(const ContextPtr & ctx) const;
     };
 
-    using InterpretResult = ResultBase<Field>;
-
-    ExpressionInterpreter(InterpretSetting setting_, ContextMutablePtr context_);
-    static ExpressionInterpreter basicInterpreter(IdentifierTypes types, ContextMutablePtr context);
-    static ExpressionInterpreter optimizedInterpreter(IdentifierTypes types, IdentifierValues values, ContextMutablePtr context);
+    ExpressionInterpreter(InterpretSetting setting_, ContextPtr context_);
+    static ExpressionInterpreter basicInterpreter(IdentifierTypes types, ContextPtr context);
+    static ExpressionInterpreter optimizedInterpreter(IdentifierTypes types, IdentifierValues values, ContextPtr context);
 
     std::pair<DataTypePtr, ASTPtr> optimizeExpression(const ConstASTPtr & expression) const;
     ASTPtr optimizePredicate(const ConstASTPtr & expression) const;
@@ -126,17 +119,48 @@ public:
     InterpretResult evaluate(const ConstASTPtr & expression) const;
 
 private:
-    ContextMutablePtr context;
+    ContextPtr context;
     InterpretSetting setting;
     TypeAnalyzer type_analyzer;
 
 /// public for type alias
 public:
-
-    struct InterpretIMResult: public ResultBase<ColumnPtr>
+    struct InterpretIMResult
     {
-        using ResultBase::ResultBase;
-        InterpretIMResult(DataTypePtr type_, const Field & field);
+        DataTypePtr type;
+
+        // value and ast can be both valid, the ast will be used if the value is not suitable for ASTLiteral
+        ASTPtr ast;
+        ColumnPtr value;
+
+        InterpretIMResult() = default;
+        InterpretIMResult(DataTypePtr type_, ASTPtr ast_) : type(std::move(type_)), ast(std::move(ast_))
+        {
+        }
+        InterpretIMResult(DataTypePtr type_, ASTPtr ast_, ColumnPtr value_)
+            : type(std::move(type_)), ast(std::move(ast_)), value(std::move(value_))
+        {
+        }
+        InterpretIMResult(DataTypePtr type_, ASTPtr ast_, const Field & field);
+
+        bool isAST() const
+        {
+            return value == nullptr;
+        }
+        bool isValue() const
+        {
+            return value != nullptr;
+        }
+        Field getField() const
+        {
+            assert(isValue());
+            return (*value)[0];
+        }
+        bool isNull() const;
+
+        // large literals has bad performance of AST operations(e.g. clone, compares, serialization) and should not be constant folding
+        bool isSuitablyRepresentedByValue() const;
+        ASTPtr convertToAST(const ContextPtr & ctx) const;
     };
 
     using InterpretIMResults = std::vector<InterpretIMResult>;
@@ -145,12 +169,13 @@ private:
     InterpretIMResult visit(const ConstASTPtr & node) const;
     InterpretIMResult visitASTLiteral(const ASTLiteral & literal, const ConstASTPtr & node) const;
     InterpretIMResult visitASTIdentifier(const ASTIdentifier & identifier, const ConstASTPtr & node) const;
+    InterpretIMResult visitASTPreparedParameter(const ASTPreparedParameter & prepared_param, const ConstASTPtr & node) const;
     InterpretIMResult visitOrdinaryFunction(const ASTFunction & function, const ConstASTPtr & node) const;
     InterpretIMResult visitInFunction(const ASTFunction & function, const ConstASTPtr & node) const;
 
     DataTypePtr getType(const ConstASTPtr & node) const
     {
-        return type_analyzer.getType(node);
+        return type_analyzer.getTypeWithoutCheck(node);
     }
 
     InterpretIMResult originalNode(const ConstASTPtr & node) const

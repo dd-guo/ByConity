@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Parsers/ASTQueryWithOutput.h>
+#include <Parsers/SelectUnionMode.h>
 
 
 namespace DB
@@ -40,22 +41,11 @@ public:
 
     void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 
-    void collectAllTables(std::vector<ASTPtr> &, bool &) const;
+    String formatOutputTree();
 
     void resetTEALimit();
 
-    enum class Mode
-    {
-        Unspecified,
-        ALL,
-        DISTINCT,
-        EXCEPT_UNSPECIFIED,
-        EXCEPT_ALL,
-        EXCEPT_DISTINCT,
-        INTERSECT_UNSPECIFIED,
-        INTERSECT_ALL,
-        INTERSECT_DISTINCT
-    };
+    using  Mode = SelectUnionMode;
 
     using UnionModes = std::vector<Mode>;
     using UnionModesSet = std::unordered_set<Mode>;

@@ -51,6 +51,8 @@ struct PartitionCommand
         DROP_PARTITION,
         DROP_DETACHED_PARTITION,
         DROP_PARTITION_WHERE,
+        RECLUSTER_PARTITION,
+        RECLUSTER_PARTITION_WHERE,
         FETCH_PARTITION,
         FETCH_PARTITION_WHERE,
         REPAIR_PARTITION,
@@ -82,6 +84,13 @@ struct PartitionCommand
     /// true for DROP/DETACH PARTITION [WHERE]
     bool cascading = false;
 
+    /// true for DETACH/DROP STAGED PARTITION/PART, only used by unique table
+    bool staging_area = false;
+
+    /// true for DETACH/ATTACH PARTITION xxx BUCKET xxx
+    bool specify_bucket = false;
+    UInt64 bucket_number;
+
     /// For ATTACH PARTITION partition FROM db.table
     String from_database;
     String from_table;
@@ -100,14 +109,19 @@ struct PartitionCommand
     /// columns for INGEST PARTITION
     Names column_names;
     Names key_names;
+    std::vector<Int64> bucket_nums;
 
     /// expression for sample / split / resharding
     ASTPtr sharding_exp;
+
+    // ASTAlterCommand for RECLUSTER PARTITION
+    ASTPtr ast;
 
     enum MoveDestinationType
     {
         DISK,
         VOLUME,
+        BYTECOOL,
         TABLE,
         SHARD,
     };

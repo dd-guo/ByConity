@@ -120,6 +120,16 @@ void IStorageCnchKafka::checkAndLoadingSettings(KafkaSettings &kafka_settings)
         if (kafka_settings.unique_group_prefix.value.empty())
             LOG_WARNING(&Poco::Logger::get("IStorageCnchKafka"), "No unique prefix set for tob kafka, which may cause duplicate keys for offset in bytekv");
     }
+
+    /// Use global schema_registry_url if the user does not set the table level setting parameter
+    if (kafka_settings.format.changed && kafka_settings.format.value == "AvroConfluent")
+    {
+        if (!kafka_settings.avro_schema_registry_url.changed)
+            kafka_settings.avro_schema_registry_url.value = getContext()->getSettings().format_avro_schema_registry_url.toString();
+
+        if (kafka_settings.avro_schema_registry_url.value.empty())
+            throw Exception("schema_registry_url is required for AvroConfluent format", ErrorCodes::BAD_ARGUMENTS);
+    }
 }
 
 String IStorageCnchKafka::getGroupForBytekv() const
@@ -130,12 +140,12 @@ String IStorageCnchKafka::getGroupForBytekv() const
     return settings.unique_group_prefix.value + "_" + settings.group_name.value;
 }
 
-void IStorageCnchKafka::getKafkaTableInfo(KafkaTableInfo & table_info)
+void IStorageCnchKafka::getKafkaTableInfo(KafkaTableInfo & table_info) const
 {
     table_info.database = getDatabaseName();
     table_info.table = getTableName();
     table_info.uuid = UUIDHelpers::UUIDToString(getStorageUUID());
-    table_info.cluster = settings.cluster.value;
+    table_info.cluster = getCluster();
     table_info.topics = topics;
     table_info.consumer_group = settings.group_name.value;
 }

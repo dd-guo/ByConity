@@ -43,13 +43,11 @@ public:
     ~CnchKafkaConsumeManager() override;
 
     void preStart() override;
-    void stop() override;
 
     void runImpl() override;
     void iterate(StorageCnchKafka & kafka_table);
 
     void stopConsumers();
-    void restartConsumers();
 
     bool checkDependencies(const StorageID & storage_id);
     ConsumerDependencies getDependenciesFromCatalog(const StorageID & storage_id);
@@ -70,6 +68,7 @@ public:
         mutable std::mutex mutex;
         size_t index;
         cppkafka::TopicPartitionList partitions;
+        std::set<cppkafka::TopicPartition> sample_partitions;
         CnchWorkerClientPtr worker_client;
         bool is_running{false};
         String table_suffix;
@@ -78,19 +77,28 @@ public:
     std::vector<KafkaConsumerRunningInfo> getConsumerInfos() const;
     void getOffsetsFromCatalog(cppkafka::TopicPartitionList & offsets, const StorageID & buffer_table, const String & consumer_group);
 
+    void setCurrentTransactionForConsumer(size_t consumer_index, const TxnTimestamp & txn_id);
+
 private:
+    void clearData() override;
+
+    StoragePtr rewriteCreateTableSQL(const StorageID & dependence, const StorageID & replace_storage_id, const String & table_suffix, std::vector<String> & create_commands, bool enable_staging_area);
     void updatePartitionCountOfTopics(StorageCnchKafka & kafka_table, bool & partitions_changed);
 
     CnchWorkerClientPtr selectWorker(size_t index, const String & table_suffix);
     void assignPartitionsToConsumers(StorageCnchKafka & kafka_table);
 
     bool checkTargetTable(const StorageCnchMergeTree *);
-    void checkConsumerStatus(ConsumerInfo & info);
+    void checkConsumerStatus(ConsumerInfo & info, std::unique_lock<std::mutex> & info_lock);
 
-    void dispatchConsumerToWorker(StorageCnchKafka & kafka_table, ConsumerInfo & info, std::exception_ptr & exception);
+    void dispatchConsumerToWorker(StorageCnchKafka & kafka_table, ConsumerInfo & info,
+                                 std::unique_lock<std::mutex> & info_lock, std::exception_ptr & exception);
     void stopConsumerOnWorker(ConsumerInfo & info);
 
+    String getVWNameForConsumerTask(const StorageCnchKafka & kafka_table);
     void initConsumerScheduler();
+
+    bool checkConsumerHasActiveTransaction(size_t consumer_index);
 
     ContextPtr createQueryContext();
 

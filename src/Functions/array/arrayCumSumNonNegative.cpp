@@ -1,9 +1,10 @@
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypesDecimal.h>
-#include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnDecimal.h>
-#include "FunctionArrayMapped.h"
+#include <Columns/ColumnsNumber.h>
+#include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
+
+#include "FunctionArrayMapped.h"
 
 
 namespace DB
@@ -19,6 +20,9 @@ namespace ErrorCodes
   */
 struct ArrayCumSumNonNegativeImpl
 {
+    using column_type = ColumnArray;
+    using data_type = DataTypeArray;
+
     static bool needBoolean() { return false; }
     static bool needExpression() { return false; }
     static bool needOneArray() { return false; }
@@ -39,7 +43,11 @@ struct ArrayCumSumNonNegativeImpl
         if (which.isDecimal())
         {
             UInt32 scale = getDecimalScale(*expression_return);
-            DataTypePtr nested = std::make_shared<DataTypeDecimal<Decimal128>>(DecimalUtils::max_precision<Decimal128>, scale);
+            DataTypePtr nested;
+            if (which.isDecimal256())
+                nested = std::make_shared<DataTypeDecimal<Decimal256>>(DecimalUtils::max_precision<Decimal256>, scale);
+            else
+                nested = std::make_shared<DataTypeDecimal<Decimal128>>(DecimalUtils::max_precision<Decimal128>, scale);
             return std::make_shared<DataTypeArray>(nested);
         }
 
@@ -112,7 +120,8 @@ struct ArrayCumSumNonNegativeImpl
             executeType<Float64,Float64>(mapped, array, res) ||
             executeType<Decimal32, Decimal128>(mapped, array, res) ||
             executeType<Decimal64, Decimal128>(mapped, array, res) ||
-            executeType<Decimal128, Decimal128>(mapped, array, res))
+            executeType<Decimal128, Decimal128>(mapped, array, res) ||
+            executeType<Decimal256, Decimal256>(mapped, array, res))
             return res;
         else
             throw Exception("Unexpected column for arrayCumSumNonNegativeImpl: " + mapped->getName(), ErrorCodes::ILLEGAL_COLUMN);
@@ -123,7 +132,7 @@ struct ArrayCumSumNonNegativeImpl
 struct NameArrayCumSumNonNegative { static constexpr auto name = "arrayCumSumNonNegative"; };
 using FunctionArrayCumSumNonNegative = FunctionArrayMapped<ArrayCumSumNonNegativeImpl, NameArrayCumSumNonNegative>;
 
-void registerFunctionArrayCumSumNonNegative(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayCumSumNonNegative)
 {
     factory.registerFunction<FunctionArrayCumSumNonNegative>();
 }

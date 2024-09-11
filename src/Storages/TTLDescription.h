@@ -36,7 +36,8 @@ using TTLAggregateDescriptions = std::vector<TTLAggregateDescription>;
 /// Common struct for TTL record in storage
 struct TTLDescription
 {
-    TTLMode mode;
+    /// Set a default value in case some engines won't set TTL and cause it uninitialized, i.e Kafka/HaKafka
+    TTLMode mode = TTLMode::DELETE;
 
     /// Expression part of TTL AST:
     /// TTL d + INTERVAL 1 DAY
@@ -70,7 +71,7 @@ struct TTLDescription
 
     /// Destination type, only valid for table TTLs.
     /// For example DISK or VOLUME
-    DataDestinationType destination_type;
+    DataDestinationType destination_type = DataDestinationType::DELETE;
 
     /// Name of destination disk or volume
     String destination_name;
@@ -80,7 +81,15 @@ struct TTLDescription
 
     /// Parse TTL structure from definition. Able to parse both column and table
     /// TTLs.
-    static TTLDescription getTTLFromAST(const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key);
+    static TTLDescription getTTLFromAST(const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key, bool allow_nullable_type = false);
+
+    /// Previously, HaMergeTree storages calculate partition level TTL for each part to decide whether
+    /// need to remove the data part. For those tables that partition key contains function like 'toDate(xxx)',
+    /// the function also need to be evaluated when calculate the partition level TTL. However, if we directly
+    /// execute the ttl_expression, it will throw required column 'xxx' not found exception because we construct the source block
+    /// from partition value, which only contains column 'toDate(xxx)'. To fix this, we can replace the ASTFunction in
+    /// the TTL with ASTIdentifier when the function shows up in partition definition.
+    static void tryRewriteTTLWithPartitionKey(TTLDescription & ttl_description, const ColumnsDescription & columns, const KeyDescription & partition_key, const KeyDescription & primary_key, ContextPtr context);
 
     TTLDescription() = default;
     TTLDescription(const TTLDescription & other);
@@ -117,7 +126,11 @@ struct TTLTableDescription
     TTLTableDescription & operator=(const TTLTableDescription & other);
 
     static TTLTableDescription getTTLForTableFromAST(
-        const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key);
+        const ASTPtr & definition_ast,
+        const ColumnsDescription & columns,
+        ContextPtr context,
+        const KeyDescription & primary_key,
+        bool allow_nullable_type = false);
 };
 
 }

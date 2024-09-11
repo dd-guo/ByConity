@@ -35,10 +35,11 @@ public:
             double remerge_lowered_memory_bytes_ratio_,
             size_t max_bytes_before_external_sort_,
             VolumePtr tmp_volume_,
-            size_t min_free_disk_space_);
+            size_t min_free_disk_space_,
+            bool enable_adaptive_spill_);
 
     explicit MergeSortingStep(const DataStream & input_stream, const SortDescription & description_, UInt64 limit_)
-        : MergeSortingStep(input_stream, description_, 0, limit_, 0, 0, 0, nullptr, 0)
+        : MergeSortingStep(input_stream, description_, 0, limit_, 0, 0, 0, nullptr, 0, false)
     {
     }
 
@@ -47,7 +48,13 @@ public:
     Type getType() const override { return Type::MergeSorting; }
     const SortDescription & getSortDescription() const { return description; }
     UInt64 getLimit() const { return limit; }
-
+    size_t getMaxMergedBlockSize() const { return max_merged_block_size; }
+    size_t getMaxBytesBeforeRemerge() const { return max_bytes_before_remerge; }
+    double getRemergeLoweredMemoryBytesRatio() const { return remerge_lowered_memory_bytes_ratio; }
+    size_t getMaxBytesBeforeExternalSort() const { return max_bytes_before_external_sort; }
+    bool isAdaptiveSpillEnabled() const { return enable_adaptive_spill; }
+    VolumePtr getVolumPtr() const { return tmp_volume; }
+    size_t getMinFreeDiskSpace() const { return min_free_disk_space; }
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
     void describeActions(JSONBuilder::JSONMap & map) const override;
@@ -56,8 +63,8 @@ public:
     /// Add limit or change it to lower value.
     void updateLimit(size_t limit_);
 
-    void serialize(WriteBuffer &) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer &, ContextPtr context_ = nullptr);
+    void toProto(Protos::MergeSortingStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<MergeSortingStep> fromProto(const Protos::MergeSortingStep & proto, ContextPtr context);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 
@@ -71,6 +78,7 @@ private:
     size_t max_bytes_before_external_sort;
     VolumePtr tmp_volume;
     size_t min_free_disk_space;
+    bool enable_adaptive_spill;
 };
 
 }

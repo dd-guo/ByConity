@@ -138,6 +138,8 @@ namespace DB
             return return_type;
         }
 
+        bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
         ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName &) const override
         {
             return std::make_unique<ExecutableFunctionToModifiedJulianDay<Name, ToDataType, nullOnErrors>>();
@@ -229,7 +231,7 @@ namespace DB
         static constexpr auto name = "toModifiedJulianDayOrNull";
     };
 
-    void registerFunctionToModifiedJulianDay(FunctionFactory & factory)
+    REGISTER_FUNCTION(ToModifiedJulianDay)
     {
         factory.registerFunction<ToModifiedJulianDayOverloadResolver<NameToModifiedJulianDay, DataTypeInt32, false>>();
         factory.registerFunction<ToModifiedJulianDayOverloadResolver<NameToModifiedJulianDayOrNull, DataTypeInt32, true>>();

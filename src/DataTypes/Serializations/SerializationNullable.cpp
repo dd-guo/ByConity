@@ -1,7 +1,14 @@
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/Serializations/SerializationNullable.h>
 #include <DataTypes/Serializations/SerializationNumber.h>
-
+#include <DataTypes/Serializations/SerializationNamed.h>
+#include <DataTypes/Serializations/SerializationDate.h>
+#include <DataTypes/Serializations/SerializationDate32.h>
+#include <DataTypes/Serializations/SerializationDateTime.h>
+#include <DataTypes/Serializations/SerializationDateTime64.h>
 #include <Columns/ColumnNullable.h>
+#include <Columns/ColumnsDateTime.h>
 #include <Core/Field.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -20,22 +27,72 @@ namespace ErrorCodes
     extern const int CANNOT_READ_ALL_DATA;
 }
 
-void SerializationNullable::enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const
+void SerializationNullable::convertOverflowDataToNull(IColumn & column, const FormatSettings & settings)
 {
-    path.push_back(Substream::NullMap);
-    callback(path);
-    path.back() = Substream::NullableElements;
-    nested->enumerateStreams(callback, path);
-    path.pop_back();
+    if (!settings.check_data_overflow || !current_thread || !current_thread->getOverflow())
+        return;
+
+    current_thread->resetOverflow();
+    ColumnNullable & col = assert_cast<ColumnNullable &>(column);
+    col.popBack(1);
+    col.insertDefault();
 }
 
+DataTypePtr SerializationNullable::SubcolumnCreator::create(const DataTypePtr & prev) const
+{
+    return std::make_shared<DataTypeNullable>(prev);
+}
+
+SerializationPtr SerializationNullable::SubcolumnCreator::create(const SerializationPtr & prev) const
+{
+    return std::make_shared<SerializationNullable>(prev);
+}
+
+ColumnPtr SerializationNullable::SubcolumnCreator::create(const ColumnPtr & prev) const
+{
+    return ColumnNullable::create(prev, null_map);
+}
+
+void SerializationNullable::enumerateStreams(
+    EnumerateStreamsSettings & settings,
+    const StreamCallback & callback,
+    const SubstreamData & data) const
+{
+    const auto * type_nullable = data.type ? &assert_cast<const DataTypeNullable &>(*data.type) : nullptr;
+    const auto * column_nullable = data.column ? &assert_cast<const ColumnNullable &>(*data.column) : nullptr;
+
+    auto null_map_serialization = std::make_shared<SerializationNamed>(std::make_shared<SerializationNumber<UInt8>>(), "null", false);
+
+    settings.path.push_back(Substream::NullMap);
+    auto null_map_data = SubstreamData(null_map_serialization)
+        .withType(type_nullable ? std::make_shared<DataTypeUInt8>() : nullptr)
+        .withColumn(column_nullable ? column_nullable->getNullMapColumnPtr() : nullptr)
+        .withSerializationInfo(data.serialization_info);
+
+    settings.path.back().data = null_map_data;
+    callback(settings.path);
+
+    settings.path.back() = Substream::NullableElements;
+    settings.path.back().creator = std::make_shared<SubcolumnCreator>(null_map_data.column);
+    settings.path.back().data = data;
+
+    auto next_data = SubstreamData(nested)
+        .withType(type_nullable ? type_nullable->getNestedType() : nullptr)
+        .withColumn(column_nullable ? column_nullable->getNestedColumnPtr() : nullptr)
+        .withSerializationInfo(data.serialization_info);
+
+    nested->enumerateStreams(settings, callback, next_data);
+    settings.path.pop_back();
+}
 
 void SerializationNullable::serializeBinaryBulkStatePrefix(
+        const IColumn & column,
         SerializeBinaryBulkSettings & settings,
         SerializeBinaryBulkStatePtr & state) const
 {
     settings.path.push_back(Substream::NullableElements);
-    nested->serializeBinaryBulkStatePrefix(settings, state);
+    const auto & column_nullable = assert_cast<const ColumnNullable &>(column);
+    nested->serializeBinaryBulkStatePrefix(column_nullable.getNestedColumn(), settings, state);
     settings.path.pop_back();
 }
 
@@ -82,7 +139,7 @@ void SerializationNullable::serializeBinaryBulkWithMultipleStreams(
 }
 
 
-void SerializationNullable::deserializeBinaryBulkWithMultipleStreams(
+size_t SerializationNullable::deserializeBinaryBulkWithMultipleStreams(
     ColumnPtr & column,
     size_t limit,
     DeserializeBinaryBulkSettings & settings,
@@ -92,20 +149,32 @@ void SerializationNullable::deserializeBinaryBulkWithMultipleStreams(
     auto mutable_column = column->assumeMutable();
     ColumnNullable & col = assert_cast<ColumnNullable &>(*mutable_column);
 
+    /// NOTE: nullmap_processed_rows may smaller than column's nullmap size
     settings.path.push_back(Substream::NullMap);
-    if (auto cached_column = getFromSubstreamsCache(cache, settings.path))
+    size_t nullmap_processed_rows = 0;
+    if (auto cache_entry = getFromSubstreamsCache(cache, settings.path); cache_entry.has_value())
     {
-        col.getNullMapColumnPtr() = cached_column;
+        col.getNullMapColumnPtr() = cache_entry->column;
+        nullmap_processed_rows = cache_entry->rows_before_filter;
     }
     else if (auto * stream = settings.getter(settings.path))
     {
-        SerializationNumber<UInt8>().deserializeBinaryBulk(col.getNullMapColumn(), *stream, limit, 0);
-        addToSubstreamsCache(cache, settings.path, col.getNullMapColumnPtr());
+        nullmap_processed_rows = SerializationNumber<UInt8>().deserializeBinaryBulk(
+            col.getNullMapColumn(), *stream, limit, 0, settings.zero_copy_read_from_cache,
+            settings.filter);
+        addToSubstreamsCache(cache, settings.path, nullmap_processed_rows, col.getNullMapColumnPtr());
     }
 
     settings.path.back() = Substream::NullableElements;
-    nested->deserializeBinaryBulkWithMultipleStreams(col.getNestedColumnPtr(), limit, settings, state, cache);
+    size_t element_processed_rows = nested->deserializeBinaryBulkWithMultipleStreams(
+        col.getNestedColumnPtr(), limit, settings, state, cache);
     settings.path.pop_back();
+    if (nullmap_processed_rows != element_processed_rows)
+    {
+        throw Exception(fmt::format("Nullmap processed rows {} differs from value processed rows {}",
+            nullmap_processed_rows, element_processed_rows), ErrorCodes::LOGICAL_ERROR);
+    }
+    return element_processed_rows;
 }
 
 
@@ -216,6 +285,7 @@ void SerializationNullable::serializeTextEscaped(const IColumn & column, size_t 
 void SerializationNullable::deserializeTextEscaped(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
     deserializeTextEscapedImpl<void>(column, istr, settings, nested);
+    convertOverflowDataToNull(column, settings);
 }
 
 template<typename ReturnType>
@@ -288,6 +358,7 @@ void SerializationNullable::serializeTextQuoted(const IColumn & column, size_t r
 void SerializationNullable::deserializeTextQuoted(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
     deserializeTextQuotedImpl<void>(column, istr, settings, nested);
+    convertOverflowDataToNull(column, settings);
 }
 
 template<typename ReturnType>
@@ -306,6 +377,7 @@ ReturnType SerializationNullable::deserializeTextQuotedImpl(IColumn & column, Re
 void SerializationNullable::deserializeWholeText(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
     deserializeWholeTextImpl<void>(column, istr, settings, nested);
+    convertOverflowDataToNull(column, settings);
 }
 
 template <typename ReturnType>
@@ -335,6 +407,7 @@ void SerializationNullable::serializeTextCSV(const IColumn & column, size_t row_
 void SerializationNullable::deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
     deserializeTextCSVImpl<void>(column, istr, settings, nested);
+    convertOverflowDataToNull(column, settings);
 }
 
 template<typename ReturnType>
@@ -443,6 +516,7 @@ void SerializationNullable::serializeTextJSON(const IColumn & column, size_t row
 void SerializationNullable::deserializeTextJSON(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
     deserializeTextJSONImpl<void>(column, istr, settings, nested);
+    convertOverflowDataToNull(column, settings);
 }
 
 template<typename ReturnType>

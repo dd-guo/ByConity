@@ -21,17 +21,29 @@
 
 #pragma once
 
-#include <Interpreters/PreparedSets.h>
-#include <Interpreters/DatabaseAndTableWithAlias.h>
-#include <Core/SortDescription.h>
 #include <Core/Names.h>
-#include <Storages/ProjectionsDescription.h>
+#include <Core/SortDescription.h>
 #include <Interpreters/AggregateDescription.h>
 #include <Interpreters/Context_fwd.h>
+#include <Interpreters/DatabaseAndTableWithAlias.h>
+#include <Interpreters/PreparedSets.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Processors/IntermediateResult/TableScanCacheInfo.h>
+#include <Storages/IStorage_fwd.h>
+#include <Storages/MergeTree/Index/MergeTreeIndexHelper.h>
+#include <sstream>
+#include <Storages/ProjectionsDescription.h>
 #include <memory>
+#include <vector>
 
 namespace DB
 {
+
+namespace Protos
+{
+    class InputOrderInfo;
+    class SelectQueryInfo;
+}
 
 class ExpressionActions;
 using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
@@ -42,6 +54,9 @@ using ActionsDAGPtr = std::shared_ptr<ActionsDAG>;
 struct PrewhereInfo;
 using PrewhereInfoPtr = std::shared_ptr<PrewhereInfo>;
 
+struct AtomicPredicate;
+using AtomicPredicatePtr = std::shared_ptr<AtomicPredicate>;
+
 struct FilterInfo;
 using FilterInfoPtr = std::shared_ptr<FilterInfo>;
 
@@ -49,7 +64,7 @@ struct FilterDAGInfo;
 using FilterDAGInfoPtr = std::shared_ptr<FilterDAGInfo>;
 
 struct InputOrderInfo;
-using InputOrderInfoPtr = std::shared_ptr<const InputOrderInfo>;
+using InputOrderInfoPtr = std::shared_ptr<InputOrderInfo>;
 
 struct TreeRewriterResult;
 using TreeRewriterResultPtr = std::shared_ptr<const TreeRewriterResult>;
@@ -59,6 +74,9 @@ using ReadInOrderOptimizerPtr = std::shared_ptr<const ReadInOrderOptimizer>;
 
 class Cluster;
 using ClusterPtr = std::shared_ptr<Cluster>;
+
+struct MergeTreeDataSelectAnalysisResult;
+using MergeTreeDataSelectAnalysisResultPtr = std::shared_ptr<MergeTreeDataSelectAnalysisResult>;
 
 struct PrewhereInfo
 {
@@ -73,15 +91,35 @@ struct PrewhereInfo
     String prewhere_column_name;
     bool remove_prewhere_column = false;
     bool need_filter = false;
+    MergeTreeIndexContextPtr index_context;
 
     PrewhereInfo() = default;
+    PrewhereInfo(const PrewhereInfo &) = default;
     explicit PrewhereInfo(ActionsDAGPtr prewhere_actions_, String prewhere_column_name_)
             : prewhere_actions(std::move(prewhere_actions_)), prewhere_column_name(std::move(prewhere_column_name_)) {}
 
     std::string dump() const;
+};
 
-    void serialize(WriteBuffer & buf) const;
-    static PrewhereInfoPtr deserialize(ReadBuffer & buf, ContextPtr context);
+/// An atomic predicate expression associated with a group of columns
+struct AtomicPredicate
+{
+    ActionsDAGPtr predicate_actions;
+    /// Name of the filter column after executing the predicate action
+    String filter_column_name;
+    /// Is this predicate a row level filter? If yes, then we MUST filter the block with this fitlter first
+    /// before execute any other predicates to prevent predicate injection attack. Currently, row-level filter
+    /// comes from 2 sources: (1) delete bitmap for unique table and (2) row-level policy conditions.
+    bool is_row_filter = false;
+    /// Is this predicate is actually a bitmap index? If yes, then we don't read the actual column but read the
+    /// index instead.
+    MergeTreeIndexContextPtr index_context;
+    /// Should we keep the filter column or not, unused for now
+    [[maybe_unused]] bool remove_filter_column = false;
+    AtomicPredicate() = default;
+    explicit AtomicPredicate(ActionsDAGPtr prewhere_actions_, String prewhere_column_name_)
+            : predicate_actions(std::move(prewhere_actions_)), filter_column_name(std::move(prewhere_column_name_)) {}
+    String dump() const;
 };
 
 /// Helper struct to store all the information about the filter expression.
@@ -120,8 +158,8 @@ struct InputOrderInfo
 
     bool operator !=(const InputOrderInfo & other) const { return !(*this == other); }
 
-    void serialize(WriteBuffer & buf) const;
-    void deserialize(ReadBuffer & buf);
+    void toProto(Protos::InputOrderInfo & proto) const;
+    static std::shared_ptr<InputOrderInfo> fromProto(const Protos::InputOrderInfo & proto);
 };
 
 class IMergeTreeDataPart;
@@ -148,6 +186,7 @@ struct ProjectionCandidate
     ManyExpressionActions group_by_elements_actions;
 };
 
+class InterpreterSelectQuery;
 /** Query along with some additional data,
   *  that can be used during query processing
   *  inside storage engines.
@@ -156,6 +195,7 @@ struct SelectQueryInfo
 {
     ASTPtr query;
     ASTPtr view_query; /// Optimized VIEW query
+    ASTPtr partition_filter; /// partition filter
 
     /// Cluster for the query.
     ClusterPtr cluster;
@@ -172,6 +212,8 @@ struct SelectQueryInfo
     ReadInOrderOptimizerPtr order_optimizer;
     /// Can be modified while reading from storage
     InputOrderInfoPtr input_order_info;
+
+    MergeTreeIndexContextPtr index_context;
 
     /// Prepared sets are used for indices by storage engine.
     /// Example: x IN (1, 2, 3)
@@ -190,8 +232,55 @@ struct SelectQueryInfo
     /// Read from local table
     bool read_local_table = true;
 
+    /// predicate ast
+    std::vector<ASTPtr> atomic_predicates_expr;
+    /// atomic predicate, may > predicate ast
+    std::deque<AtomicPredicatePtr> atomic_predicates;
+
+    /// cache digest, used for matching with cache when enable query cache
+    TableScanCacheInfo cache_info;
+
     void serialize(WriteBuffer &) const;
     void deserialize(ReadBuffer &);
+    /// Read from index
+    bool read_bitmap_index = false;
+
+    void toProto(Protos::SelectQueryInfo & proto) const;
+    void fillFromProto(const Protos::SelectQueryInfo & proto);
+
+    const ASTSelectQuery * getSelectQuery() const
+    {
+        if (!query)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Query info query is not set");
+
+        auto * select_query = query->as<ASTSelectQuery>();
+        if (!select_query)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Query info query is not a ASTSelectQuery");
+
+        return select_query;
+    }
+
+    void appendPartitonFilters(ASTs conjuncts);
+
+    ASTSelectQuery * getSelectQuery()
+    {
+        return const_cast<ASTSelectQuery *>((const_cast<const SelectQueryInfo *>(this))->getSelectQuery());
+    }
 };
 
+/// Collect all query 's predicates from query info, mainly used for collecting index.
+///  The predicates may come from 3 sources:
+/// - query.where()
+/// - query.prewhere()
+/// - atomic_predicates_expr
+ASTPtr getFilterFromQueryInfo(const SelectQueryInfo & query_info, bool clone = false);
+
+/// Helper function for dealing with projection
+const PrewhereInfoPtr & getPrewhereInfo(const SelectQueryInfo & query_info);
+
+const std::deque<AtomicPredicatePtr> & getAtomicPredicates(const SelectQueryInfo & query_info);
+
+MergeTreeIndexContextPtr getIndexContext(const SelectQueryInfo & query_info);
+
+TableScanCacheInfo getTableScanCacheInfo(const SelectQueryInfo & query_info);
 }

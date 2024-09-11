@@ -1,0 +1,11 @@
+Projection
+└─ Distinct
+   └─ Gather Exchange
+      └─ Distinct
+         └─ TableScan explain_setting.test4601
+Projection
+└─ Gather Exchange
+   └─ MergingAggregated
+      └─ Repartition Exchange
+         └─ Aggregating
+            └─ TableScan explain_setting.test4601

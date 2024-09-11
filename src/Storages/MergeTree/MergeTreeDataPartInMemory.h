@@ -55,8 +55,10 @@ public:
         UncompressedCache * uncompressed_cache,
         MarkCache * mark_cache,
         const MergeTreeReaderSettings & reader_settings_,
+        MergeTreeIndexExecutor * index_executor,
         const ValueSizeMap & avg_value_size_hints,
-        const ReadBufferFromFileBase::ProfileCallback & profile_callback) const override;
+        const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+        [[maybe_unused]] const ProgressCallback & internal_progress_cb) const override;
 
     MergeTreeWriterPtr getWriter(
         const NamesAndTypesList & columns_list,
@@ -64,9 +66,11 @@ public:
         const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
         const CompressionCodecPtr & default_codec_,
         const MergeTreeWriterSettings & writer_settings,
-        const MergeTreeIndexGranularity & computed_index_granularity) const override;
+        const MergeTreeIndexGranularity & computed_index_granularity,
+        const BitmapBuildInfo & bitmap_build_info) const override;
 
     bool isStoredOnDisk() const override { return false; }
+    bool isStoredOnRemoteDisk() const override { return false; }
     bool hasColumnFiles(const NameAndTypePair & column) const override { return !!getColumnPosition(column.name); }
     String getFileNameForColumn(const NameAndTypePair & /* column */) const override { return ""; }
     void renameTo(const String & new_relative_path, bool remove_new_dir_if_exists) const override;

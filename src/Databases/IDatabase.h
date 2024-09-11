@@ -21,12 +21,13 @@
 
 #pragma once
 
-#include <common/types.h>
+#include <Core/UUID.h>
+#include <Databases/Snapshot.h>
+#include <Interpreters/Context_fwd.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/IStorage_fwd.h>
-#include <Interpreters/Context_fwd.h>
 #include <Common/Exception.h>
-#include <Core/UUID.h>
+#include <common/types.h>
 
 #include <ctime>
 #include <functional>
@@ -45,6 +46,8 @@ struct IndicesDescription;
 struct StorageInMemoryMetadata;
 struct StorageID;
 class ASTCreateQuery;
+class AlterCommands;
+class SettingsChanges;
 using DictionariesWithID = std::vector<std::pair<String, UUID>>;
 
 namespace ErrorCodes
@@ -78,6 +81,21 @@ public:
 protected:
     const String database_name;
 };
+
+class EmptyDatabaseTablesIterator : public IDatabaseTablesIterator
+{
+public:
+    EmptyDatabaseTablesIterator(const std::string & name) : IDatabaseTablesIterator(name) { }
+    void next() override { }
+    bool isValid() const override { return false; }
+    const String & name() const override {return database_name;}
+    const StoragePtr & table() const override { return dummy; }
+
+
+private:
+    StoragePtr dummy = nullptr;
+};
+
 
 /// Copies list of tables and iterates through such snapshot.
 class DatabaseTablesSnapshotIterator : public IDatabaseTablesIterator
@@ -151,6 +169,7 @@ public:
 
     /// Get the table for work. Return nullptr if there is no table.
     virtual StoragePtr tryGetTable(const String & name, ContextPtr context) const = 0;
+    virtual StoragePtr tryGetTable(const String & name, ContextPtr local_context, bool /* ignore_status */) const { return tryGetTable(name, local_context); }
 
     virtual UUID tryGetTableUUID(const String & /*table_name*/) const { return UUIDHelpers::Nil; }
 
@@ -291,9 +310,49 @@ public:
     virtual std::map<String, String> getBrokenTables() {return {};}
     virtual void clearBrokenTables() {}
 
+    virtual void applySettingsChanges(const SettingsChanges &, ContextPtr)
+    {
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Database engine {} either does not support settings, or does not support altering settings",
+            getEngineName());
+    }
+
+    virtual bool supportSnapshot() const { return false; }
+
+    virtual void dropSnapshot(ContextPtr /*local_context*/, const String & /*snapshot_name*/)
+    {
+        assertSupportSnapshot();
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: DROP SNAPSHOT is not supported");
+    }
+
+    virtual SnapshotPtr tryGetSnapshot(const String & /*snapshot_name*/) const
+    {
+        assertSupportSnapshot();
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: GET SNAPSHOT is not supported");
+    }
+
+    virtual Snapshots getAllSnapshots() const
+    {
+        assertSupportSnapshot();
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: SHOW SNAPSHOTS is not supported");
+    }
+
+    virtual Snapshots getAllSnapshotsForStorage(UUID /*storage_uuid*/) const
+    {
+        assertSupportSnapshot();
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{}: SHOW SNAPSHOTS is not supported");
+    }
+
     virtual ~IDatabase() = default;
 
 protected:
+    void assertSupportSnapshot() const
+    {
+        if (!supportSnapshot())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Database engine {} doesn't support snapshots", getEngineName());
+    }
+
     virtual ASTPtr getCreateTableQueryImpl(const String & /*name*/, ContextPtr /*context*/, bool throw_on_error) const
     {
         if (throw_on_error)

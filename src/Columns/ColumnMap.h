@@ -25,11 +25,14 @@
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnVector.h>
 #include <Columns/ColumnTuple.h>
+#include <DataTypes/DataTypeMap.h>
 
 namespace DB
 {
 
-/** Column, that stores a nested Array(Tuple(key, value)) column.
+/** 
+ * Column, that stores a nested Array(Tuple(key, value)) column.
+ * Column, runtime ColumnMap is implicited stored as two implicit columns(key, value) and one offset column to count # k-v pair per row. 
  */
 class ColumnMap final : public COWHelper<IColumn, ColumnMap>
 {
@@ -37,6 +40,8 @@ private:
     friend class COWHelper<IColumn, ColumnMap>;
 
     WrappedPtr nested;
+
+    using RowValue = std::map<Field, Field>;
 
     explicit ColumnMap(MutableColumnPtr && nested_);
 
@@ -48,6 +53,8 @@ public:
       */
     using Base = COWHelper<IColumn, ColumnMap>;
 
+    using ColumnOffsets = ColumnArray::ColumnOffsets;
+
     static Ptr create(const ColumnPtr & keys, const ColumnPtr & values, const ColumnPtr & offsets)
     {
         auto nested_column = ColumnArray::create(ColumnTuple::create(Columns{keys, values}), offsets);
@@ -57,8 +64,9 @@ public:
     static Ptr create(const ColumnPtr & column) { return ColumnMap::create(column->assumeMutable()); }
     static Ptr create(ColumnPtr && arg) { return create(arg); }
 
-    template <typename Arg, typename = typename std::enable_if<std::is_rvalue_reference<Arg &&>::value>::type>
-    static MutablePtr create(Arg && arg) { return Base::create(std::forward<Arg>(arg)); }
+    template <typename ... Args>
+    requires (IsMutableColumns<Args ...>::value)
+    static MutablePtr create(Args &&... args) { return Base::create(std::forward<Args>(args)...); }
 
     std::string getName() const override;
     const char * getFamilyName() const override { return "Map"; }
@@ -69,9 +77,20 @@ public:
 
     size_t size() const override { return nested->size(); }
 
+    size_t ALWAYS_INLINE offsetAt(size_t i) const {return getOffsets()[i-1];}
+    size_t ALWAYS_INLINE sizeAt(size_t i) const {return getOffsets()[i] - getOffsets()[i-1];}
+
+    void tryToFlushZeroCopyBuffer() const override
+    {
+        
+        if (nested)
+            nested->tryToFlushZeroCopyBuffer();
+    }
+
     Field operator[](size_t n) const override;
     void get(size_t n, Field & res) const override;
 
+    bool isDefaultAt(size_t n) const override;
     StringRef getDataAt(size_t n) const override;
     void insertData(const char * pos, size_t length) override;
     void insert(const Field & x) override;
@@ -86,6 +105,7 @@ public:
     void insertRangeFrom(const IColumn & src, size_t start, size_t length) override;
     void insertRangeSelective(const IColumn & src, const Selector & selector, size_t selector_start, size_t length) override;
     ColumnPtr filter(const Filter & filt, ssize_t result_size_hint) const override;
+    void expand(const Filter & mask, bool inverted) override;
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
     ColumnPtr index(const IColumn & indexes, size_t limit) const override;
     ColumnPtr replicate(const Offsets & offsets) const override;
@@ -97,16 +117,23 @@ public:
                        int direction, int nan_direction_hint) const override;
     bool hasEqualValues() const override;
     void getExtremes(Field & min, Field & max) const override;
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
-    void updatePermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_range) const override;
+    void getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, IColumn::Permutation & res) const override;
+    void updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_ranges) const override;
     void reserve(size_t n) override;
     size_t byteSize() const override;
     size_t byteSizeAt(size_t n) const override;
     size_t allocatedBytes() const override;
     void protect() override;
-    void forEachSubcolumn(ColumnCallback callback) override;
+    void forEachSubcolumn(MutableColumnCallback callback) override;
+    void forEachSubcolumnRecursively(RecursiveMutableColumnCallback callback) override;
     bool structureEquals(const IColumn & rhs) const override;
+    double getRatioOfDefaultRows(double sample_ratio) const override;
+    UInt64 getNumberOfDefaultRows() const override;
+    void getIndicesOfNonDefaultRows(Offsets & indices, size_t from, size_t limit) const override;
 
+    /** Access embeded columns*/
     const ColumnArray & getNestedColumn() const { return assert_cast<const ColumnArray &>(*nested); }
     ColumnArray & getNestedColumn() { return assert_cast<ColumnArray &>(*nested); }
 
@@ -115,6 +142,50 @@ public:
 
     const ColumnTuple & getNestedData() const { return assert_cast<const ColumnTuple &>(getNestedColumn().getData()); }
     ColumnTuple & getNestedData() { return assert_cast<ColumnTuple &>(getNestedColumn().getData()); }
+
+    IColumn & getKey() { return getNestedData().getColumnPtr(0)->assumeMutableRef(); }
+    const IColumn & getKey() const { return getNestedData().getColumn(0); }
+
+    ColumnPtr & getKeyPtr() { return getNestedData().getColumnPtr(0); }
+    const ColumnPtr & getKeyPtr() const { return getNestedData().getColumnPtr(0); }
+
+    IColumn & getValue() { return getNestedData().getColumnPtr(1)->assumeMutableRef(); }
+    const IColumn & getValue() const { return getNestedData().getColumn(1); }
+
+    ColumnPtr & getValuePtr() { return getNestedData().getColumnPtr(1); }
+    const ColumnPtr & getValuePtr() const { return getNestedData().getColumnPtr(1); }
+
+    ColumnPtr & getOffsetsPtr() { return getNestedColumn().getOffsetsPtr(); }
+    const ColumnPtr & getOffsetsPtr() const { return getNestedColumn().getOffsetsPtr(); }
+
+    IColumn & getOffsetsColumn() { return getNestedColumn().getOffsetsPtr()->assumeMutableRef(); }
+    const IColumn & getOffsetsColumn() const { return *getNestedColumn().getOffsetsPtr(); }
+
+    Offsets & ALWAYS_INLINE getOffsets() { return static_cast<ColumnOffsets &>(getNestedColumn().getOffsetsPtr()->assumeMutableRef()).getData(); }
+
+    const Offsets & ALWAYS_INLINE getOffsets() const { return static_cast<const ColumnOffsets &>(*getNestedColumn().getOffsetsPtr()).getData(); }
+
+    /// For ByteMap
+    /** Read limited implicit column for the given key. */
+    ColumnPtr getValueColumnByKey(const StringRef & key, size_t rows_to_read = 0) const;
+
+    /** Read all data and construct implicit columns. */
+    void constructAllImplicitColumns(
+        std::unordered_map<StringRef, String> & key_name_map, std::unordered_map<StringRef, ColumnPtr> & value_columns) const;
+
+    /** This routine will reconsturct MAP column based on its implicit columns. */
+    void fillByExpandedColumns(const DataTypeMap &, const std::map<String, std::pair<size_t, const IColumn *>> &, size_t row);
+
+    /**
+     * Remove data of map keys from the column. 
+     * Note: currently, this mothod is only used in the case that handling command of "clear map key" and the type of part is in-memory. In other on-disk part type(compact and wide), it can directly handle the files.
+     */
+    void removeKeys(const NameSet & keys);
+
+    void insertImplicitMapColumns(const std::unordered_map<String, ColumnPtr> & implicit_columns);
+
+    /** Make column nullable for implicit column */
+    ColumnPtr createEmptyImplicitColumn() const;
 
     ColumnPtr compress() const override;
 };

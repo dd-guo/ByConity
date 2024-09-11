@@ -2,7 +2,7 @@
 #include <Parsers/ASTCreateQuotaQuery.h>
 #include <Parsers/ASTRolesOrUsersSet.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/executeDDLQueryOnCluster.h>
+// #include <Interpreters/executeDDLQueryOnCluster.h>
 #include <Access/AccessControlManager.h>
 #include <Access/AccessFlags.h>
 #include <common/range.h>
@@ -59,7 +59,11 @@ namespace
             auto & quota_limits = *it;
             quota_limits.randomize_interval = query_limits.randomize_interval;
             for (auto resource_type : collections::range(Quota::MAX_RESOURCE_TYPE))
+            {
+                //range returns a half-closed interval [begin, end) so we won't overrun
+                //coverity[overrun-local]
                 quota_limits.max[resource_type] = query_limits.max[resource_type];
+            }
         }
 
         if (override_to_roles)
@@ -76,11 +80,11 @@ BlockIO InterpreterCreateQuotaQuery::execute()
     auto & access_control = getContext()->getAccessControlManager();
     getContext()->checkAccess(query.alter ? AccessType::ALTER_QUOTA : AccessType::CREATE_QUOTA);
 
-    if (!query.cluster.empty())
-    {
-        query.replaceCurrentUserTag(getContext()->getUserName());
-        return executeDDLQueryOnCluster(query_ptr, getContext());
-    }
+    // if (!query.cluster.empty())
+    // {
+    //     query.replaceCurrentUserTag(getContext()->getUserName());
+    //     return executeDDLQueryOnCluster(query_ptr, getContext());
+    // }
 
     std::optional<RolesOrUsersSet> roles_from_query;
     if (query.roles)

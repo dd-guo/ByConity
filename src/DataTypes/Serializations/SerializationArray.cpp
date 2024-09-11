@@ -1,5 +1,7 @@
 #include <DataTypes/Serializations/SerializationArray.h>
+#include <common/scope_guard.h>
 #include <DataTypes/Serializations/SerializationNumber.h>
+#include <DataTypes/Serializations/SerializationNamed.h>
 #include <Columns/ColumnArray.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
@@ -8,6 +10,8 @@
 
 #include <Formats/FormatSettings.h>
 #include <Formats/ProtobufReader.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypesNumber.h>
 
 namespace DB
 {
@@ -109,7 +113,7 @@ namespace
         }
     }
 
-    void deserializeArraySizesPositionIndependent(ColumnArray & column_array, ReadBuffer & istr, UInt64 limit)
+    size_t deserializeArraySizesPositionIndependent(ColumnArray & column_array, ReadBuffer & istr, UInt64 limit)
     {
         ColumnArray::Offsets & offset_values = column_array.getOffsets();
         size_t initial_size = offset_values.size();
@@ -127,6 +131,8 @@ namespace
         }
 
         offset_values.resize(i);
+
+        return i - initial_size;
     }
 
     ColumnPtr arraySizesToOffsets(const IColumn & column)
@@ -177,23 +183,68 @@ ColumnPtr arrayOffsetsToSizes(const IColumn & column)
     return column_sizes;
 }
 
-
-void SerializationArray::enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const
+DataTypePtr SerializationArray::SubcolumnCreator::create(const DataTypePtr & prev) const
 {
-    path.push_back(Substream::ArraySizes);
-    callback(path);
-    path.back() = Substream::ArrayElements;
-    nested->enumerateStreams(callback, path);
-    path.pop_back();
+    return std::make_shared<DataTypeArray>(prev);
 }
 
+SerializationPtr SerializationArray::SubcolumnCreator::create(const SerializationPtr & prev) const
+{
+    return std::make_shared<SerializationArray>(prev);
+}
+
+ColumnPtr SerializationArray::SubcolumnCreator::create(const ColumnPtr & prev) const
+{
+    return ColumnArray::create(prev, offsets);
+}
+
+void SerializationArray::enumerateStreams(
+    EnumerateStreamsSettings & settings,
+    const StreamCallback & callback,
+    const SubstreamData & data) const
+{
+    const auto * type_array = data.type ? &assert_cast<const DataTypeArray &>(*data.type) : nullptr;
+    const auto * column_array = data.column ? &assert_cast<const ColumnArray &>(*data.column) : nullptr;
+    auto offsets = column_array ? column_array->getOffsetsPtr() : nullptr;
+
+    auto offsets_serialization =
+        std::make_shared<SerializationNamed>(
+            std::make_shared<SerializationNumber<UInt64>>(),
+                "size" + std::to_string(getArrayLevel(settings.path)), false);
+
+    auto offsets_column = offsets && !settings.position_independent_encoding
+        ? arrayOffsetsToSizes(*offsets)
+        : offsets;
+
+    settings.path.push_back(Substream::ArraySizes);
+    settings.path.back().data = SubstreamData(offsets_serialization)
+        .withType(type_array ? std::make_shared<DataTypeUInt64>() : nullptr)
+        .withColumn(std::move(offsets_column))
+        .withSerializationInfo(data.serialization_info);
+
+    callback(settings.path);
+
+    settings.path.back() = Substream::ArrayElements;
+    settings.path.back().data = data;
+    settings.path.back().creator = std::make_shared<SubcolumnCreator>(offsets);
+
+    auto next_data = SubstreamData(nested)
+        .withType(type_array ? type_array->getNestedType() : nullptr)
+        .withColumn(column_array ? column_array->getDataPtr() : nullptr)
+        .withSerializationInfo(data.serialization_info);
+
+    nested->enumerateStreams(settings, callback, next_data);
+    settings.path.pop_back();
+}
 
 void SerializationArray::serializeBinaryBulkStatePrefix(
+    const IColumn & column,
     SerializeBinaryBulkSettings & settings,
     SerializeBinaryBulkStatePtr & state) const
 {
     settings.path.push_back(Substream::ArrayElements);
-    nested->serializeBinaryBulkStatePrefix(settings, state);
+    const auto & column_array = assert_cast<const ColumnArray &>(column);
+    nested->serializeBinaryBulkStatePrefix(column_array.getData(), settings, state);
     settings.path.pop_back();
 }
 
@@ -265,29 +316,47 @@ void SerializationArray::serializeBinaryBulkWithMultipleStreams(
 }
 
 
-void SerializationArray::deserializeBinaryBulkWithMultipleStreams(
+size_t SerializationArray::deserializeBinaryBulkWithMultipleStreams(
     ColumnPtr & column,
     size_t limit,
     DeserializeBinaryBulkSettings & settings,
     DeserializeBinaryBulkStatePtr & state,
     SubstreamsCache * cache) const
 {
+    if (settings.filter != nullptr && !settings.position_independent_encoding)
+    {
+        throw Exception("SerializationArrray didn't support deserialize filter "
+            "with position independent encoding by now", ErrorCodes::LOGICAL_ERROR);
+    }
+
     auto mutable_column = column->assumeMutable();
     ColumnArray & column_array = typeid_cast<ColumnArray &>(*mutable_column);
     settings.path.push_back(Substream::ArraySizes);
 
-    if (auto cached_column = getFromSubstreamsCache(cache, settings.path))
+    size_t init_arr_size = column_array.getOffsets().size();
+    /// NOTE: offset_processed_rows may smaller than offset's size, if we deserialize to a
+    /// existing array colum
+    size_t offset_processed_rows = 0;
+    if (auto cache_entry = getFromSubstreamsCache(cache, settings.path); cache_entry.has_value())
     {
-        column_array.getOffsetsPtr() = arraySizesToOffsets(*cached_column);
+        /// When there is a deserialize filter, other serialization method will cache
+        /// filtered result in substream cache, array will cache offsets before filter
+        /// in substream cache, and we need to apply filter again after retrieve it from
+        /// substream cache(since column array use offset rather than size in memory)
+        column_array.getOffsetsPtr() = arraySizesToOffsets(*(cache_entry->column));
+        offset_processed_rows = cache_entry->rows_before_filter;
     }
     else if (auto * stream = settings.getter(settings.path))
     {
         if (settings.position_independent_encoding)
-            deserializeArraySizesPositionIndependent(column_array, *stream, limit);
+            offset_processed_rows = deserializeArraySizesPositionIndependent(column_array, *stream,
+                limit);
         else
-            SerializationNumber<ColumnArray::Offset>().deserializeBinaryBulk(column_array.getOffsetsColumn(), *stream, limit, 0);
+            offset_processed_rows = SerializationNumber<ColumnArray::Offset>().deserializeBinaryBulk(
+                column_array.getOffsetsColumn(), *stream, limit, 0,
+                settings.zero_copy_read_from_cache, settings.filter);
 
-        addToSubstreamsCache(cache, settings.path, arrayOffsetsToSizes(column_array.getOffsetsColumn()));
+        addToSubstreamsCache(cache, settings.path, offset_processed_rows, arrayOffsetsToSizes(column_array.getOffsetsColumn()));
     }
 
     settings.path.back() = Substream::ArrayElements;
@@ -299,12 +368,55 @@ void SerializationArray::deserializeBinaryBulkWithMultipleStreams(
     size_t last_offset = offset_values.back();
     if (last_offset < nested_column->size())
         throw Exception("Nested column is longer than last offset", ErrorCodes::LOGICAL_ERROR);
-    size_t nested_limit = last_offset - nested_column->size();
+    size_t init_nested_size = init_arr_size == 0 ? 0 : offset_values[init_arr_size - 1];
+    size_t nested_limit = last_offset - init_nested_size;
 
     /// Adjust value size hint. Divide it to the average array size.
     settings.avg_value_size_hint = nested_limit ? settings.avg_value_size_hint / nested_limit * offset_values.size() : 0;
 
-    nested->deserializeBinaryBulkWithMultipleStreams(nested_column, nested_limit, settings, state, cache);
+    if (settings.filter == nullptr)
+    {
+        nested->deserializeBinaryBulkWithMultipleStreams(nested_column, nested_limit, settings, state, cache);
+    }
+    else
+    {
+        /// Need to generate a new deserialize filter for nested column
+        PaddedPODArray<UInt8> new_filter;
+        new_filter.reserve(nested_limit);
+        for (size_t i = init_arr_size, sz = offset_values.size(), filter_size = 0;
+            i < sz; ++i)
+        {
+            filter_size += offset_values[i] - (i == 0 ? 0 : offset_values[i - 1]);
+            new_filter.resize_fill(filter_size, *(settings.filter + i - init_arr_size) ? 1 : 0);
+        }
+
+        /// Compact offset columns
+        size_t filtered_element = 0;
+        size_t prev_offset = init_nested_size;
+        size_t current_element_size = offset_values[init_arr_size] - prev_offset;
+        for (size_t i = 0, sz = offset_values.size() - init_arr_size; i < sz; ++i)
+        {
+            size_t element_size = current_element_size;
+            current_element_size = i == sz - 1 ?
+                0 : offset_values[init_arr_size + i + 1] - offset_values[init_arr_size + i];
+            if (*(settings.filter + i) != 0)
+            {
+                prev_offset += element_size;
+                offset_values[init_arr_size + filtered_element] = prev_offset;
+                ++filtered_element;
+            }
+        }
+        offset_values.resize(init_arr_size + filtered_element);
+        last_offset = offset_values.back();
+
+        /// Deserialize columns
+        const UInt8* saved_filter = settings.filter;
+        SCOPE_EXIT(settings.filter = saved_filter);
+        settings.filter = new_filter.cbegin();
+
+        nested->deserializeBinaryBulkWithMultipleStreams(nested_column, nested_limit,
+            settings, state, cache);
+    }
 
     settings.path.pop_back();
 
@@ -315,6 +427,8 @@ void SerializationArray::deserializeBinaryBulkWithMultipleStreams(
             ErrorCodes::CANNOT_READ_ALL_DATA);
 
     column = std::move(mutable_column);
+
+    return offset_processed_rows;
 }
 
 

@@ -21,29 +21,35 @@
 
 #pragma once
 
+#include <memory>
 #include <Poco/Net/TCPServerConnection.h>
 
-#include <common/getFQDNOrHostName.h>
-#include <Common/CurrentMetrics.h>
-#include <Common/Stopwatch.h>
 #include <Core/Protocol.h>
 #include <Core/QueryProcessingStage.h>
+#include <DataStreams/BlockIO.h>
 #include <IO/Progress.h>
 #include <IO/TimeoutSetter.h>
-#include <DataStreams/BlockIO.h>
-#include <Interpreters/InternalTextLogsQueue.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DistributedStages/PlanSegment.h>
+#include <Interpreters/InternalTextLogsQueue.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/Stopwatch.h>
+#include <common/getFQDNOrHostName.h>
 
+#include "IO/ReadBuffer.h"
 #include "IServer.h"
+#include "Interpreters/Context_fwd.h"
 
 
 namespace CurrentMetrics
 {
-    extern const Metric TCPConnection;
+extern const Metric TCPConnection;
 }
 
-namespace Poco { class Logger; }
+namespace Poco
+{
+class Logger;
+}
 
 namespace DB
 {
@@ -143,7 +149,9 @@ public:
     void run() override;
 
     /// This method is called right before the query execution.
-    virtual void customizeContext(ContextMutablePtr /*context*/) {}
+    virtual void customizeContext(ContextMutablePtr /*context*/)
+    {
+    }
 
 private:
     IServer & server;
@@ -216,12 +224,13 @@ private:
     /// Process a request that does not require the receiving of data blocks from the client
     void processOrdinaryQuery();
 
+    template <typename Trait>
     void processOrdinaryQueryWithProcessors();
 
     void processTablesStatusRequest();
 
     void sendHello();
-    void sendData(const Block & block);    /// Write a block to the network.
+    void sendData(const Block & block); /// Write a block to the network.
     void sendLogData(const Block & block);
     void sendTableColumns(const ColumnsDescription & columns);
     void sendException(const Exception & e, bool with_stack_trace);
@@ -231,7 +240,6 @@ private:
     void sendPartUUIDs();
     void sendReadTaskRequestAssumeLocked();
     void sendProfileInfo(const BlockStreamProfileInfo & info);
-    void sendQueryWorkerMetrics();
     void sendTotals(const Block & totals);
     void sendExtremes(const Block & extremes);
 
@@ -245,5 +253,4 @@ private:
     /// This function is called from different threads.
     void updateProgress(const Progress & value);
 };
-
 }

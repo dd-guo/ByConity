@@ -40,6 +40,7 @@ namespace ErrorCodes
 {
     extern const int INCORRECT_QUERY;
     extern const int LOGICAL_ERROR;
+    extern const int TYPE_MISMATCH;
 };
 
 IndexDescription::IndexDescription(const IndexDescription & other)
@@ -120,6 +121,10 @@ IndexDescription IndexDescription::getIndexFromAST(const ASTPtr & definition_ast
     for (size_t i = 0; i < block_without_columns.columns(); ++i)
     {
         const auto & column = block_without_columns.getByPosition(i);
+        if (column.type->hasDynamicSubcolumns())
+            throw Exception(
+                fmt::format("Column {} with type {} is not allowed in index expression.", column.name, column.type->getName()),
+                ErrorCodes::TYPE_MISMATCH);
         result.column_names.emplace_back(column.name);
         result.data_types.emplace_back(column.type);
         result.sample_block.insert(ColumnWithTypeAndName(column.type->createColumn(), column.type, column.name));
@@ -172,7 +177,7 @@ IndicesDescription IndicesDescription::parse(const String & str, const ColumnsDe
     if (str.empty())
         return result;
 
-    ParserIndexDeclarationList parser(ParserSettings::valueOf(context->getSettingsRef().dialect_type));
+    ParserIndexDeclarationList parser(ParserSettings::valueOf(context->getSettingsRef()));
     ASTPtr list = parseQuery(parser, str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
 
     for (const auto & index : list->children)

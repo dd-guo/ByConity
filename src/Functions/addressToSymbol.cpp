@@ -44,6 +44,8 @@ public:
         return 1;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
         if (arguments.size() != 1)
@@ -92,7 +94,7 @@ public:
 
 }
 
-void registerFunctionAddressToSymbol(FunctionFactory & factory)
+REGISTER_FUNCTION(AddressToSymbol)
 {
     factory.registerFunction<FunctionAddressToSymbol>();
 }

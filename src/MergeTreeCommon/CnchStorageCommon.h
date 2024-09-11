@@ -15,22 +15,32 @@
 
 #pragma once
 
+#include <CloudServices/CnchCreateQueryHelper.h>
+#include <DataStreams/NullBlockOutputStream.h>
+#include <DataStreams/copyData.h>
+#include <Interpreters/ProcessList.h>
 #include <Interpreters/WorkerGroupHandle.h>
+#include <MergeTreeCommon/CnchTopologyMaster.h>
+#include <Storages/DataPart_fwd.h>
+#include <Storages/Hive/HiveFile/IHiveFile_fwd.h>
 #include <Transaction/Actions/DDLAlterAction.h>
 #include <Transaction/ICnchTransaction.h>
 #include <Transaction/TransactionCoordinatorRcCnch.h>
-#include <DataStreams/NullBlockOutputStream.h>
-#include <DataStreams/copyData.h>
-#include <MergeTreeCommon/CnchTopologyMaster.h>
-#include <Interpreters/ProcessList.h>
 
 namespace DB
 {
+struct PrepareContextResult
+{
+    String local_table_name;
+    ServerDataPartsVector parts;
+    HiveFiles hive_files;
+    FileDataPartsCNCHVector file_parts;
+};
 
 enum class WorkerGroupUsageType
 {
     NORMAL,
-    WRITE,    /// write group for INSERT SELECT and INSERT INFILE
+    WRITE, /// write group for INSERT SELECT and INSERT INFILE
     BUFFER,
 };
 
@@ -58,18 +68,18 @@ enum class CNCHStorageMediumType
 };
 
 String toStr(CNCHStorageMediumType tp);
-CNCHStorageMediumType fromStr(const String& type_str);
+CNCHStorageMediumType fromStr(const String & type_str);
 
 class CnchStorageCommonHelper
 {
 public:
     CnchStorageCommonHelper(const StorageID & table_id_, const String & remote_database_, const String & remote_table_);
 
-    bool forwardQueryToServerIfNeeded(ContextPtr query_context, const UUID & storage_uuid) const;
+    bool forwardQueryToServerIfNeeded(ContextPtr query_context, const StorageID & storage_id, const String & query_to_forward = "", bool need_process_entry = true) const;
 
     static bool healthCheckForWorkerGroup(ContextPtr context, WorkerGroupHandle & worker_group);
 
-    static void sendQueryPerShard(
+    static BlockInputStreamPtr sendQueryPerShard(
         ContextPtr context,
         const String & query,
         const WorkerGroupHandleImpl::ShardInfo & shard_info,
@@ -95,20 +105,17 @@ public:
     // when move these conditions from where to implicit_where.
     static ASTs getConditions(const ASTPtr & ast);
 
+    // TODO: too many arguments, try remove `enable_staging_area', `cnch_storage_id', `engine_args', `local_database_name'.
+    // check StorageCnchMergeTree::genViewDependencyCreateQueries to see whether it's possible
     String getCreateQueryForCloudTable(
         const String & query,
         const String & local_table_name,
         const ContextPtr & context = nullptr,
         bool enable_staging_area = false,
-        const std::optional<StorageID> & cnch_storage_id = std::nullopt) const;
-
-    String getCreateQueryForCloudTable(
-        const String & query,
-        const String & local_table_name,
-        const String & local_database_name,
-        const ContextPtr & context = nullptr,
-        bool enable_staging_area = false,
-        const std::optional<StorageID> & cnch_storage_id = std::nullopt) const;
+        const std::optional<StorageID> & cnch_storage_id = std::nullopt,
+        const Strings & engine_args = {},
+        const String & local_database_name = {},
+        WorkerEngineType engine_type = WorkerEngineType::CLOUD) const;
 
     static void rewritePlanSegmentQueryImpl(ASTPtr & query, const std::string & database, const std::string & table);
 

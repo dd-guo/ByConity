@@ -104,6 +104,8 @@ namespace
                 bool need_comma = false;
                 for (auto resource_type : collections::range(Quota::MAX_RESOURCE_TYPE))
                 {
+                    //range returns a half-closed interval [begin, end) so we won't overrun
+                    //coverity[overrun-local]
                     if (limits.max[resource_type])
                     {
                         if (std::exchange(need_comma, true))
@@ -170,7 +172,7 @@ void ASTCreateQuotaQuery::formatImpl(const FormatSettings & settings, FormatStat
         settings.ostr << (settings.hilite ? hilite_keyword : "") << " OR REPLACE" << (settings.hilite ? hilite_none : "");
 
     formatNames(names, settings);
-    formatOnCluster(settings);
+    // formatOnCluster(settings);
 
     if (!new_name.empty())
         formatRenameTo(new_name, settings);

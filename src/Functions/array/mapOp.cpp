@@ -56,6 +56,7 @@ private:
     size_t getNumberOfArguments() const override { return 0; }
     bool isVariadic() const override { return true; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     void checkTypes(
         DataTypePtr & key_type, DataTypePtr & promoted_val_type, const DataTypePtr & check_key_type, DataTypePtr & check_val_type) const
@@ -300,6 +301,10 @@ private:
                 return execute2<KeyType, UInt256>(row_count, args, res_type);
             case TypeIndex::Float64:
                 return execute2<KeyType, Float64>(row_count, args, res_type);
+            case TypeIndex::Decimal128:
+                return execute2<KeyType, Decimal128>(row_count, args, res_type);
+            case TypeIndex::Decimal256:
+                return execute2<KeyType, Decimal256>(row_count, args, res_type);
             default:
                 throw Exception(
                     "Illegal column type " + res_value_type->getName() + " for values in arguments of function " + getName(),
@@ -449,7 +454,7 @@ private:
 
 }
 
-void registerFunctionMapOp(FunctionFactory & factory)
+REGISTER_FUNCTION(MapOp)
 {
     factory.registerFunction<FunctionMapOp<OpTypes::ADD>>();
     factory.registerFunction<FunctionMapOp<OpTypes::SUBTRACT>>();

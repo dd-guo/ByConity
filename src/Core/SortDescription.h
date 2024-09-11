@@ -33,6 +33,13 @@ class Collator;
 namespace DB
 {
 
+namespace Protos
+{
+    class FillColumnDescription;
+    class SortColumnDescription;
+    class SortDescription;
+}
+
 namespace JSONBuilder
 {
     class JSONMap;
@@ -52,8 +59,8 @@ struct FillColumnDescription
     Field fill_to;          /// Fill value + STEP < FILL_TO
     Field fill_step;        /// Default = 1 or -1 according to direction
 
-    void serialize(WriteBuffer & buffer) const;
-    void deserialize(ReadBuffer & buffer);
+    void toProto(Protos::FillColumnDescription & proto) const;
+    void fillFromProto(const Protos::FillColumnDescription & proto);
 };
 
 /// Description of the sorting rule by one column.
@@ -86,8 +93,8 @@ struct SortColumnDescription
 
     bool operator == (const SortColumnDescription & other) const
     {
-        return column_name == other.column_name && column_number == other.column_number
-            && direction == other.direction && nulls_direction == other.nulls_direction;
+        return column_name == other.column_name && column_number == other.column_number && direction == other.direction
+            && nulls_direction == other.nulls_direction;
     }
 
     bool operator != (const SortColumnDescription & other) const
@@ -100,17 +107,31 @@ struct SortColumnDescription
         return fmt::format("{}:{}:dir {}nulls ", column_name, column_number, direction, nulls_direction);
     }
 
+    std::string format() const
+    {
+        return fmt::format(
+            "{} {} {}", 
+            column_name, 
+            direction == 1 ? "ASC" : "DESC", 
+            nulls_direction == 0 ? "ANY" : 
+                (nulls_direction == direction ? "NULLS LAST" : "NULLS FIRST"));
+    }
+
     void explain(JSONBuilder::JSONMap & map, const Block & header) const;
 
     /// It seems that the current construction of SortColumnDescription only uses the first four fields,
     /// so this time will temporarily ignore the serialize/deserialize of field collator/with_fill/fill_description
 
-    void serialize(WriteBuffer & buffer) const;
-    void deserialize(ReadBuffer & buffer);
+    void toProto(Protos::SortColumnDescription & proto) const;
+    void fillFromProto(const Protos::SortColumnDescription & proto);
 };
 
 /// Description of the sorting rule for several columns.
-using SortDescription = std::vector<SortColumnDescription>;
+class SortDescription : public std::vector<SortColumnDescription>
+{
+public:
+    using vector::vector;
+};
 
 /// Outputs user-readable description into `out`.
 void dumpSortDescription(const SortDescription & description, const Block & header, WriteBuffer & out);
@@ -118,8 +139,5 @@ void dumpSortDescription(const SortDescription & description, const Block & head
 std::string dumpSortDescription(const SortDescription & description);
 
 JSONBuilder::ItemPtr explainSortDescription(const SortDescription & description, const Block & header);
-
-void serializeSortDescription(const SortDescription & sort_descriptions, WriteBuffer & buffer);
-void deserializeSortDescription(SortDescription & sort_descriptions, ReadBuffer & buffer);
 
 }

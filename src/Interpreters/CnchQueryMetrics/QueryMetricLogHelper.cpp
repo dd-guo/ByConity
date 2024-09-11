@@ -43,8 +43,8 @@ namespace ProfileEvents
     extern const Event SelectedParts;
     extern const Event SelectedRanges;
     extern const Event SelectedMarks;
-    extern const Event HDFSReadElapsedMilliseconds;
-    extern const Event HDFSWriteElapsedMilliseconds;
+    extern const Event HDFSReadElapsedMicroseconds;
+    extern const Event HDFSWriteElapsedMicroseconds;
 }
 
 namespace DB
@@ -127,7 +127,7 @@ void extractDatabaseAndTableNames(const ContextPtr & context, const ASTPtr & ast
     {
         ASTs all_tables;
         bool dummy = false;
-        select_union->collectAllTables(all_tables, dummy);
+        ASTSelectQuery::collectAllTables(select_union, all_tables, dummy);
         bool first = true;
         for (const auto & db_table : all_tables)
         {
@@ -159,13 +159,13 @@ void extractDatabaseAndTableNames(const ContextPtr & context, const ASTPtr & ast
 
         if (insert->select)
         {
-            const auto & select_ast = insert->select->as<ASTSelectWithUnionQuery &>();
+            const auto * select_ast = insert->select->as<ASTSelectWithUnionQuery>();
             ASTs all_tables;
             bool dummy = false;
-            select_ast.collectAllTables(all_tables, dummy);
+            ASTSelectQuery::collectAllTables(select_ast, all_tables, dummy);
             for (const auto & db_table : all_tables)
             {
-                auto table_id = context->resolveStorageID(db_table);
+                StorageID table_id{db_table};
                 String database_name = table_id.database_name;
                 String table_name = table_id.table_name;
                 if (database_name.empty())
@@ -191,7 +191,7 @@ static bool checkSelectForFilteredTables(const ASTPtr & ast, const ContextPtr & 
     {
         std::vector<ASTPtr> all_base_tables;
         bool dummy = false;
-        select_ast->collectAllTables(all_base_tables, dummy);
+        ASTSelectQuery::collectAllTables(select_ast, all_base_tables, dummy);
         for (auto & table_ast : all_base_tables)
         {
             DatabaseAndTableWithAlias database_table(table_ast);
@@ -200,7 +200,8 @@ static bool checkSelectForFilteredTables(const ASTPtr & ast, const ContextPtr & 
             if ((database == CNCH_SYSTEM_LOG_DB_NAME || database == "system")
                 && ((!context->getSettingsRef().enable_query_metrics_tables_profiling
                         && (table == CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME || table == CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME))
-                    || (!context->getSettingsRef().enable_kafka_log_profiling && table == CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME)))
+                    || (!context->getSettingsRef().enable_kafka_log_profiling && table == CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME)
+                    || (!context->getSettingsRef().enable_materialized_mysql_log_profiling && table == CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME)))
             {
                 return true;
             }
@@ -228,7 +229,7 @@ void insertCnchQueryMetric(
     if (ast && checkSelectForFilteredTables(ast, context))
     {
         LOG_DEBUG(&Poco::Logger::get("QueryMetricLogHelper"),
-            "Not inserting query metric for SELECT query from query metrics or kafka log tables");
+            "Not inserting query metric for SELECT query from query metrics or kafka/materialized_mysql log tables");
         return;
     }
     else
@@ -249,10 +250,10 @@ void insertCnchQueryMetric(
         String server_id = getenv("SERVER_ID") ? getenv("SERVER_ID") : context->getHostWithPorts().getTCPAddress();
         time_t event_time = current_time;
         UInt32 latency = (info) ? info->elapsed_seconds * 1000 : 0;
-        UInt32 catalog_time = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::CatalogTime]).load() : 0;
-        UInt32 total_partitions = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::TotalPartitions]).load() : 0;
-        UInt32 pruned_partitions = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::PrunedPartitions]).load() : 0;
-        UInt32 selected_parts = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedParts]).load() : 0;
+        UInt32 catalog_time = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::CatalogTime]) : 0;
+        UInt32 total_partitions = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::TotalPartitions]) : 0;
+        UInt32 pruned_partitions = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::PrunedPartitions]) : 0;
+        UInt32 selected_parts = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedParts]) : 0;
         UInt64 peak_memory = (info) ? info->peak_memory_usage : 0;
         UInt32 read_rows = 0;
         UInt64 read_bytes = 0;
@@ -278,7 +279,7 @@ void insertCnchQueryMetric(
         {
             read_rows = info->read_rows;
             read_bytes = info->read_bytes;
-            read_cached_bytes = info->disk_cache_bytes;
+            read_cached_bytes = info->disk_cache_read_bytes;
 
             write_rows = info->written_rows;
             write_bytes = info->written_bytes;
@@ -341,20 +342,20 @@ void insertCnchQueryMetric(
         String worker_id = getWorkerID(context);
         time_t event_time = current_time;
         UInt32 latency = (info) ? info->elapsed_seconds * 1000 : 0;
-        UInt32 selected_parts = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedParts]).load() : 0;
-        UInt32 selected_ranges = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedRanges]).load() : 0;
-        UInt32 selected_marks = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedMarks]).load() : 0;
+        UInt32 selected_parts = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedParts]) : 0;
+        UInt32 selected_ranges = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedRanges]) : 0;
+        UInt32 selected_marks = (info && info->profile_counters) ? ((*info->profile_counters)[ProfileEvents::SelectedMarks]) : 0;
         UInt64 peak_memory = (info) ? info->peak_memory_usage : 0;
         UInt32 read_rows = (info) ? info->read_rows : 0;
         UInt64 read_bytes = (info) ? info->read_bytes : 0;
-        UInt64 read_cached_bytes = (info) ? info->disk_cache_bytes : 0;
+        UInt64 read_cached_bytes = (info) ? info->disk_cache_read_bytes : 0;
         UInt32 write_rows = (info) ? info->written_rows : 0;
         UInt64 write_bytes = (info) ? info->written_bytes : 0;
         UInt64 write_duration = (info) ? info->written_duration : 0;
         UInt32 vfs_time = (info && info->profile_counters)
-            ? ((*info->profile_counters)[ProfileEvents::HDFSReadElapsedMilliseconds]
-                   ? ((*info->profile_counters)[ProfileEvents::HDFSReadElapsedMilliseconds]).load()
-                   : ((*info->profile_counters)[ProfileEvents::HDFSWriteElapsedMilliseconds]).load())
+            ? ((*info->profile_counters)[ProfileEvents::HDFSReadElapsedMicroseconds]
+                   ? ((*info->profile_counters)[ProfileEvents::HDFSReadElapsedMicroseconds])
+                   : ((*info->profile_counters)[ProfileEvents::HDFSWriteElapsedMicroseconds]))
             : 0;
 
         String operator_level = (info) ? info->operator_level : "";

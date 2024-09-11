@@ -32,7 +32,7 @@
 #include <Columns/ColumnConst.h>
 
 #include <iterator>
-
+#include <boost/algorithm/string.hpp>
 
 namespace DB
 {
@@ -207,8 +207,18 @@ const ColumnWithTypeAndName & Block::safeGetByPosition(size_t position) const
 }
 
 
-const ColumnWithTypeAndName * Block::findByName(const std::string & name) const
+const ColumnWithTypeAndName * Block::findByName(const std::string & name, bool case_insensitive) const
 {
+    if (case_insensitive)
+    {
+        auto found = std::find_if(data.begin(), data.end(), [&](const auto & column) { return boost::iequals(column.name, name); });
+        if (found == data.end())
+        {
+            return nullptr;
+        }
+        return &*found;
+    }
+
     auto it = index_by_name.find(name);
     if (index_by_name.end() == it)
     {
@@ -218,9 +228,9 @@ const ColumnWithTypeAndName * Block::findByName(const std::string & name) const
 }
 
 
-const ColumnWithTypeAndName & Block::getByName(const std::string & name) const
+const ColumnWithTypeAndName & Block::getByName(const std::string & name, bool case_insensitive) const
 {
-    const auto * result = findByName(name);
+    const auto * result = findByName(name, case_insensitive);
     if (!result)
         throw Exception("Not found column " + name + " in block. There are only columns: " + dumpNames()
             , ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
@@ -229,10 +239,13 @@ const ColumnWithTypeAndName & Block::getByName(const std::string & name) const
 }
 
 
-bool Block::has(const std::string & name) const
+bool Block::has(const std::string & name, bool case_insensitive) const
 {
-    return index_by_name.end() != index_by_name.find(name);
-}
+    if (case_insensitive)
+        return std::find_if(data.begin(), data.end(), [&](const auto & column) { return boost::iequals(column.name, name); })
+            != data.end();
+
+    return index_by_name.end() != index_by_name.find(name);}
 
 
 size_t Block::getPositionByName(const std::string & name) const
@@ -704,6 +717,31 @@ void getBlocksDifference(const Block & lhs, const Block & rhs, std::string & out
     }
 }
 
+Block concatenateBlocks(const std::vector<Block> & blocks)
+{
+    if (blocks.empty())
+        return {};
+
+    size_t num_rows = 0;
+    for (const auto & block : blocks)
+        num_rows += block.rows();
+
+    Block out = blocks[0].cloneEmpty();
+    MutableColumns columns = out.mutateColumns();
+
+    for (size_t i = 0; i < columns.size(); ++i)
+    {
+        columns[i]->reserve(num_rows);
+        for (const auto & block : blocks)
+        {
+            const auto & tmp_column = *block.getByPosition(i).column;
+            columns[i]->insertRangeFrom(tmp_column, 0, block.rows());
+        }
+    }
+
+    out.setColumns(std::move(columns));
+    return out;
+}
 
 void Block::clear()
 {

@@ -50,7 +50,14 @@ public:
          return expr_columns.getByName(signature->return_name).column;
     }
 
-bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNulls() const override
+    {
+        return false;
+    }
+    bool useDefaultImplementationForNothing() const override
+    {
+        return false;
+    }
 
 private:
     ExpressionActionsPtr expression_actions;
@@ -77,6 +84,7 @@ public:
 
     bool isDeterministic() const override { return true; }
     bool isDeterministicInScopeOfQuery() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     const DataTypes & getArgumentTypes() const override { return argument_types; }
     const DataTypePtr & getResultType() const override { return return_type; }
@@ -117,6 +125,10 @@ public:
     String getName() const override { return "FunctionCapture"; }
 
     bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNothing() const override
+    {
+        return false;
+    }
     bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
@@ -169,6 +181,7 @@ public:
 
     bool isDeterministic() const override { return true; }
     bool isDeterministicInScopeOfQuery() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     const DataTypes & getArgumentTypes() const override { return capture->captured_types; }
     const DataTypePtr & getResultType() const override { return return_type; }
@@ -245,6 +258,10 @@ public:
 
     String getName() const override { return name; }
     bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNothing() const override
+    {
+        return false;
+    }
     bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName &) const override { return return_type; }
     size_t getNumberOfArguments() const override { return capture->captured_types.size(); }

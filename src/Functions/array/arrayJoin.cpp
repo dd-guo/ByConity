@@ -1,7 +1,8 @@
-#include <Functions/IFunction.h>
-#include <Functions/FunctionHelpers.h>
-#include <Functions/FunctionFactory.h>
 #include <DataTypes/DataTypeArray.h>
+#include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
+#include <Interpreters/ArrayJoinAction.h>
 
 
 namespace DB
@@ -11,6 +12,7 @@ namespace ErrorCodes
 {
     extern const int FUNCTION_IS_SPECIAL;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int TYPE_MISMATCH;
 }
 
 /** arrayJoin(arr) - a special function - it can not be executed directly;
@@ -37,6 +39,8 @@ public:
         return 1;
     }
 
+    bool useDefaultImplementationForNulls() const override { return false; }
+
     /** It could return many different values for single argument. */
     bool isDeterministic() const override { return false; }
 
@@ -45,11 +49,13 @@ public:
         return false;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
-        const DataTypeArray * arr = checkAndGetDataType<DataTypeArray>(arguments[0].get());
+        const auto arr = getArrayJoinDataType(arguments[0]);
         if (!arr)
-            throw Exception("Argument for function " + getName() + " must be Array.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception("Argument for function " + getName() + " must be Array or Map.", ErrorCodes::TYPE_MISMATCH);
 
         return arr->getNestedType();
     }
@@ -67,7 +73,7 @@ public:
 };
 
 
-void registerFunctionArrayJoin(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayJoin)
 {
     factory.registerFunction<FunctionArrayJoin>();
 }

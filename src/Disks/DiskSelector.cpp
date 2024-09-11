@@ -19,9 +19,10 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include "DiskLocal.h"
 #include "DiskSelector.h"
 
+#include <Disks/IDisk.h>
+#include <Disks/DiskLocal.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
@@ -30,6 +31,7 @@
 #include <Common/quoteString.h>
 #include <common/logger_useful.h>
 #include <Interpreters/Context.h>
+#include <Poco/Logger.h>
 
 #include <set>
 
@@ -70,7 +72,7 @@ DiskSelector::DiskSelector(const Poco::Util::AbstractConfiguration & config, con
         disks.emplace(disk_name, factory.create(disk_name, config, disk_config_prefix, context));
     }
     if (!has_default_disk)
-        disks.emplace(default_disk_name, std::make_shared<DiskLocal>(default_disk_name, context->getPath(), 0));
+        disks.emplace(default_disk_name, std::make_shared<DiskLocal>(default_disk_name, context->getPath(), DiskStats{}));
 
     /// fill id_to_disks.
     for (auto & [ _, disk_ptr] : disks)
@@ -187,6 +189,8 @@ DiskPtr DiskSelector::getByID(const UInt64 & disk_id) const
 
 void DiskSelector::flushDiskInfo() const
 {
+    if (!fs::exists(disks_path))
+        return;
     auto tmp_path = disks_path / (String(ALL_DISK_INFO_FILE) + ".tmp");
     fs::remove(tmp_path);
     {

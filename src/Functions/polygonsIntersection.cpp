@@ -60,6 +60,8 @@ public:
         return DataTypeFactory::instance().get("MultiPolygon");
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & /*result_type*/, size_t input_rows_count) const override
     {
         MultiPolygonSerializer<Point> serializer;
@@ -113,7 +115,7 @@ template <>
 const char * FunctionPolygonsIntersection<SphericalPoint>::name = "polygonsIntersectionSpherical";
 
 
-void registerFunctionPolygonsIntersection(FunctionFactory & factory)
+REGISTER_FUNCTION(PolygonsIntersection)
 {
     factory.registerFunction<FunctionPolygonsIntersection<CartesianPoint>>();
     factory.registerFunction<FunctionPolygonsIntersection<SphericalPoint>>();

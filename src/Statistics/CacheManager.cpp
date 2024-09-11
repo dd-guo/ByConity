@@ -23,6 +23,7 @@ namespace DB::Statistics
 
 std::unique_ptr<CacheManager::CacheType> CacheManager::cache;
 
+
 void CacheManager::initialize(ContextPtr context)
 {
     if (cache)
@@ -37,26 +38,23 @@ void CacheManager::initialize(ContextPtr context)
     initialize(max_size, expire_time);
 }
 
-void CacheManager::initialize(UInt64 max_size, std::chrono::seconds expire_time)
+void CacheManager::initialize(UInt64 entry_size, std::chrono::seconds expire_time)
 {
-    Poco::Timestamp::TimeDiff the_time = expire_time.count() * 1000;
-    cache = std::make_unique<CacheType>(max_size, the_time);
+    (void)entry_size;
+    cache = std::make_unique<CacheType>(expire_time);
+}
+
+void CacheManager::reset()
+{
+    cache->clear();
 }
 
 void CacheManager::invalidate(ContextPtr context, const StatsTableIdentifier & table)
 {
-    if (!cache)
-        throw Exception("CacheManager not initialized", ErrorCodes::LOGICAL_ERROR);
-
-    auto catalog = createConstCatalogAdaptor(context);
-    auto columns = catalog->getCollectableColumns(table);
-    cache->remove(std::make_pair(table.getUniqueKey(), ""));
-    for (auto & pr : columns)
-    {
-        auto & col_name = pr.name;
-        auto key = std::make_pair(table.getUniqueKey(), col_name);
-        cache->remove(key);
-    }
+    (void)context;
+    // this operation is lightweight:
+    //     local, in memory and exception free
+    if (cache)
+        cache->invalidate(table.getUniqueKey());
 }
-
 } // namespace DB::Statistics

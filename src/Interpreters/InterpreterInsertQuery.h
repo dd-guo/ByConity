@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <Access/AccessType.h>
 #include <DataStreams/IBlockOutputStream.h>
 #include <DataStreams/BlockIO.h>
 #include <Interpreters/IInterpreter.h>
@@ -40,7 +41,8 @@ public:
         ContextPtr context_,
         bool allow_materialized_ = false,
         bool no_squash_ = false,
-        bool no_destination_ = false);
+        bool no_destination_ = false,
+        AccessType access_type_ = AccessType::INSERT);
 
     /** Prepare a request for execution. Return block streams
       * - the stream into which you can write data to execute the query, if INSERT;
@@ -53,7 +55,15 @@ public:
 
     void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr context_) const override;
 
-    static BlockInputStreamPtr buildInputStreamFromSource(const ContextPtr context_ptr, const Block & sample, const Settings & settings, const String & source_uri, const String & format);
+    static BlockInputStreamPtr buildInputStreamFromSource(
+      const ContextPtr context_ptr,
+      const ColumnsDescription & columns, 
+      const Block & sample,
+      const Settings & settings,
+      const String & source_uri,
+      const String & format,
+      bool is_enable_squash = false,
+      const String & compression_method = "");
 
 private:
     StoragePtr getTable(ASTInsertQuery & query);
@@ -63,6 +73,7 @@ private:
     const bool allow_materialized;
     const bool no_squash;
     const bool no_destination;
+    AccessType access_type{AccessType::INSERT};
 };
 
 

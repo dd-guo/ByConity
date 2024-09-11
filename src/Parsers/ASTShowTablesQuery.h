@@ -30,22 +30,26 @@ namespace DB
 {
 
 
-/** Query SHOW TABLES or SHOW DATABASES or SHOW CLUSTERS
+/** Query SHOW TABLES or SHOW DATABASES or SHOW CLUSTERS or SHOW SNAPSHOTS
   */
 class ASTShowTablesQuery : public ASTQueryWithOutput
 {
 public:
+    bool catalog{false};
     bool databases{false};
     bool clusters{false};
     bool cluster{false};
     bool dictionaries{false};
+    bool snapshots{false};
     bool m_settings{false};
     bool changed{false};
+    bool full{false};
     bool temporary{false};
     bool history{false};   // if set true, will show databases/tables in trash.
-
+    bool external{false};
     String cluster_str;
-    String from;
+    String from; // database name
+    String from_catalog; // catalog name
     String like;
 
     bool not_like{false};
@@ -61,6 +65,21 @@ public:
 
     ASTPtr clone() const override;
 
+    void toLowerCase() override 
+    {
+        boost::to_lower(cluster_str);
+        boost::to_lower(from);
+        boost::to_lower(from_catalog);
+        boost::to_lower(like);
+    }
+
+    void toUpperCase() override 
+    {
+        boost::to_upper(cluster_str);
+        boost::to_upper(from);
+        boost::to_upper(from_catalog);
+        boost::to_upper(like);
+    }
 protected:
     void formatLike(const FormatSettings & settings) const;
     void formatLimit(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const;

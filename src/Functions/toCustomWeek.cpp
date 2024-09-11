@@ -30,17 +30,20 @@
 namespace DB
 {
 using FunctionToWeek = FunctionCustomWeekToSomething<DataTypeUInt8, ToWeekImpl>;
+using FunctionToWeekOfYear = FunctionCustomWeekToSomething<DataTypeUInt8, ToWeekOfYearImpl>;
 using FunctionToYearWeek = FunctionCustomWeekToSomething<DataTypeUInt32, ToYearWeekImpl>;
 using FunctionToStartOfWeek = FunctionCustomWeekToDateOrDate32<ToStartOfWeekImpl>;
 
-void registerFunctionToCustomWeek(FunctionFactory & factory)
+REGISTER_FUNCTION(ToCustomWeek)
 {
     factory.registerFunction<FunctionToWeek>();
+    factory.registerFunction<FunctionToWeekOfYear>();
     factory.registerFunction<FunctionToYearWeek>();
     factory.registerFunction<FunctionToStartOfWeek>();
 
     /// Compatibility aliases for mysql.
     factory.registerAlias("week", "toWeek", FunctionFactory::CaseInsensitive);
+    factory.registerAlias("weekofyear", "toWeekOfYear", FunctionFactory::CaseInsensitive);
     factory.registerAlias("yearweek", "toYearWeek", FunctionFactory::CaseInsensitive);
 }
 

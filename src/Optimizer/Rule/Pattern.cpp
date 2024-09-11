@@ -19,67 +19,6 @@
 
 namespace DB
 {
-PatternPtr Pattern::capturedAs(const Capture & capture)
-{
-    return capturedAs(
-        capture, [](const PlanNodePtr & node) { return std::any{node}; }, "`this`");
-}
-
-PatternPtr Pattern::capturedAs(const Capture & capture, const PatternProperty & property)
-{
-    return capturedAs(capture, property, "unknown");
-}
-
-PatternPtr Pattern::capturedAs(const Capture & capture, const PatternProperty & property, const std::string & name)
-{
-    return std::make_shared<CapturePattern>(name, property, capture, this->shared_from_this());
-}
-
-PatternPtr Pattern::matching(const PatternPredicate & predicate)
-{
-    return matching(predicate, "unknown");
-}
-
-PatternPtr Pattern::matching(const PatternPredicate & predicate, const std::string & name)
-{
-    return std::make_shared<FilterPattern>(name, predicate, this->shared_from_this());
-}
-
-PatternPtr Pattern::matchingCapture(const std::function<bool(const Captures &)> & capture_predicate)
-{
-    return matchingCapture(capture_predicate, "unknown");
-}
-
-PatternPtr Pattern::matchingCapture(const std::function<bool(const Captures &)> & capture_predicate, const std::string & name)
-{
-    return matching(std::bind(capture_predicate, std::placeholders::_2), name); // NOLINT(modernize-avoid-bind)
-}
-
-PatternPtr Pattern::withEmpty()
-{
-    return std::make_shared<WithPattern>(PatternQuantifier::EMPTY, nullptr, this->shared_from_this());
-}
-
-PatternPtr Pattern::withSingle(const PatternPtr & sub_pattern)
-{
-    return std::make_shared<WithPattern>(PatternQuantifier::SINGLE, sub_pattern, this->shared_from_this());
-}
-
-PatternPtr Pattern::withAny(const PatternPtr & sub_pattern)
-{
-    return std::make_shared<WithPattern>(PatternQuantifier::ANY, sub_pattern, this->shared_from_this());
-}
-
-PatternPtr Pattern::withAll(const PatternPtr & sub_pattern)
-{
-    return std::make_shared<WithPattern>(PatternQuantifier::ALL, sub_pattern, this->shared_from_this());
-}
-
-PatternPtr Pattern::with(std::vector<PatternPtr> sub_patterns)
-{
-    return std::make_shared<WithPattern>(PatternQuantifier::ALL, sub_patterns, this->shared_from_this());
-}
-
 std::optional<Match> Pattern::match(const PlanNodePtr & node, Captures & captures) const
 {
     if (!previous)
@@ -91,42 +30,62 @@ std::optional<Match> Pattern::match(const PlanNodePtr & node, Captures & capture
         return {};
 }
 
-std::vector<PatternPtr> Pattern::getChildrenPatterns()
+PatternRawPtrs Pattern::getChildrenPatterns() const
 {
-    std::vector<PatternPtr> children_patterns;
-    auto pattern = this->shared_from_this();
+    PatternRawPtrs children_patterns;
+    PatternRawPtr pattern = this;
     while (pattern->getPrevious())
     {
-        if (auto with_pattern = std::dynamic_pointer_cast<WithPattern>(pattern))
+        if (const auto * with_pattern = dynamic_cast<const WithPattern *>(pattern))
         {
             children_patterns = with_pattern->getSubPatterns();
         }
         pattern = pattern->getPrevious();
     }
 
-    if (auto type_of_pattern = std::dynamic_pointer_cast<TypeOfPattern>(pattern))
+    if (const auto * type_of_pattern = dynamic_cast<const TypeOfPattern *>(pattern))
     {
         if (type_of_pattern->type == IQueryPlanStep::Type::Tree)
-            return {Patterns::tree()};
+            return {type_of_pattern};
     }
     return children_patterns;
 }
 
 // By convention, the head pattern is a TypeOfPattern,
 // which indicates which plan node type this pattern is targeted to
-IQueryPlanStep::Type Pattern::getTargetType()
+std::unordered_set<IQueryPlanStep::Type> Pattern::getTargetTypes() const
 {
-    auto pattern = this->shared_from_this();
+    PatternRawPtr pattern = this;
     while (pattern->getPrevious())
         pattern = pattern->getPrevious();
 
-    if (auto type_of_pattern = std::dynamic_pointer_cast<TypeOfPattern>(pattern))
-        return type_of_pattern->type;
+    if (const auto * type_of_pattern = dynamic_cast<const TypeOfPattern *>(pattern))
+        return {type_of_pattern->type};
+    else if (const auto * or_pattern = dynamic_cast<const OneOfPattern *>(pattern))
+    {
+        std::unordered_set<IQueryPlanStep::Type> result;
+        for (const auto & sub_pat : or_pattern->getSubPatterns())
+        {
+            auto sub_res = sub_pat->getTargetTypes();
+            result.insert(sub_res.begin(), sub_res.end());
+        }
+        return result;
+    }
     else
-        throw Exception("Head pattern must be a TypeOfPattern, illegal pattern found: " + toString(), ErrorCodes::LOGICAL_ERROR);
+        throw Exception(
+            "Head pattern must be a TypeOfPattern or OneOfPattern, illegal pattern found: " + toString(), ErrorCodes::LOGICAL_ERROR);
 }
 
-String Pattern::toString()
+IQueryPlanStep::Type Pattern::getTargetType() const
+{
+    auto types = getTargetTypes();
+    if (types.size() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "pattern's target type is not unique");
+
+    return *types.begin();
+}
+
+String Pattern::toString() const
 {
     PatternPrinter printer;
     this->accept(printer);
@@ -136,12 +95,16 @@ String Pattern::toString()
 std::optional<Match> TypeOfPattern::accept(const PlanNodePtr & node, Captures & captures) const
 {
     if (type == IQueryPlanStep::Type::Any || type == IQueryPlanStep::Type::Tree || type == node->getStep()->getType())
+    {
+        if (attaching_predicate && !attaching_predicate(node->getStep(), captures))
+            return {};
         return {Match{std::move(captures)}};
+    }
     else
         return {};
 }
 
-void TypeOfPattern::accept(PatternVisitor & pattern_visitor)
+void TypeOfPattern::accept(PatternVisitor & pattern_visitor) const
 {
     pattern_visitor.visitTypeOfPattern(*this);
 }
@@ -149,25 +112,14 @@ void TypeOfPattern::accept(PatternVisitor & pattern_visitor)
 std::optional<Match> CapturePattern::accept(const PlanNodePtr & node, Captures & captures) const
 {
     captures.insert(std::make_pair(capture, property(node)));
-    return {Match{std::move(captures)}};
+    if (!attaching_predicate || attaching_predicate(node->getStep(), captures))
+        return {Match{std::move(captures)}};
+    return {};
 }
 
-void CapturePattern::accept(PatternVisitor & pattern_visitor)
+void CapturePattern::accept(PatternVisitor & pattern_visitor) const
 {
     pattern_visitor.visitCapturePattern(*this);
-}
-
-std::optional<Match> FilterPattern::accept(const PlanNodePtr & node, Captures & captures) const
-{
-    if (predicate(node, captures))
-        return {Match{std::move(captures)}};
-    else
-        return {};
-}
-
-void FilterPattern::accept(PatternVisitor & pattern_visitor)
-{
-    pattern_visitor.visitFilterPattern(*this);
 }
 
 std::optional<Match> WithPattern::accept(const PlanNodePtr & node, Captures & captures) const
@@ -195,10 +147,10 @@ std::optional<Match> WithPattern::accept(const PlanNodePtr & node, Captures & ca
         for (const PlanNodePtr & subNode : sub_nodes)
         {
             Captures sub_captures = captures;
-            auto pattern = sub_patterns[0];
+            const auto * pattern = sub_patterns[0].get();
             if (sub_patterns.size() > index)
             {
-                pattern = sub_patterns[index];
+                pattern = sub_patterns[index].get();
                 index++;
             }
             std::optional<Match> subResult = pattern->match(subNode, sub_captures);
@@ -222,9 +174,39 @@ std::optional<Match> WithPattern::accept(const PlanNodePtr & node, Captures & ca
     }
 }
 
-void WithPattern::accept(PatternVisitor & pattern_visitor)
+PatternRawPtrs WithPattern::getSubPatterns() const
+{
+    PatternRawPtrs res;
+    for (const auto & sub: sub_patterns)
+        res.emplace_back(sub.get());
+    return res;
+}
+
+void WithPattern::accept(PatternVisitor & pattern_visitor) const
 {
     pattern_visitor.visitWithPattern(*this);
+}
+
+PatternRawPtrs OneOfPattern::getSubPatterns() const
+{
+    PatternRawPtrs res;
+    for (const auto & sub : sub_patterns)
+        res.emplace_back(sub.get());
+    return res;
+}
+
+std::optional<Match> OneOfPattern::accept(const PlanNodePtr & node, Captures & captures) const
+{
+    for (const auto & sub_pattern : sub_patterns)
+        if (auto sub_res = sub_pattern->match(node, captures))
+            return sub_res;
+
+    return std::nullopt;
+}
+
+void OneOfPattern::accept(PatternVisitor & pattern_visitor) const
+{
+    pattern_visitor.visitOneOfPattern(*this);
 }
 
 void PatternPrinter::appendLine(const std::string & str)
@@ -237,11 +219,11 @@ void PatternPrinter::appendLine(const std::string & str)
     formatted_str << std::string(level, '\t') << str;
 }
 
-void PatternPrinter::visitWithPattern(WithPattern & pattern)
+void PatternPrinter::visitWithPattern(const WithPattern & pattern)
 {
     visitPrevious(pattern);
 
-    std::string withType = ([](WithPattern & pattern_) -> std::string {
+    std::string withType = ([](const WithPattern & pattern_) -> std::string {
         switch (pattern_.getQuantifier())
         {
             case PatternQuantifier::EMPTY:
@@ -267,7 +249,7 @@ void PatternPrinter::visitWithPattern(WithPattern & pattern)
     }
 }
 
-void PatternPrinter::visitTypeOfPattern(TypeOfPattern & pattern)
+void PatternPrinter::visitTypeOfPattern(const TypeOfPattern & pattern)
 {
     visitPrevious(pattern);
 #define PRINT_STEP_TYPE(ITEM) \
@@ -284,19 +266,26 @@ void PatternPrinter::visitTypeOfPattern(TypeOfPattern & pattern)
         default:
             break;
     }
+    if (pattern.attaching_predicate)
+        appendLine("has attaching_predicate");
 #undef PRINT_STEP_TYPE
 }
 
-void PatternPrinter::visitCapturePattern(CapturePattern & pattern)
+void PatternPrinter::visitCapturePattern(const CapturePattern & pattern)
 {
     visitPrevious(pattern);
-    appendLine("capture " + pattern.name + " as: " + pattern.capture.desc);
+    appendLine("capture " + pattern.name + " as: " + String{pattern.capture});
 }
 
-void PatternPrinter::visitFilterPattern(FilterPattern & pattern)
+void PatternPrinter::visitOneOfPattern(const OneOfPattern & pattern)
 {
     visitPrevious(pattern);
-    appendLine("filter by: " + pattern.name);
+    appendLine("or:");
+    for (auto & sub_pattern : pattern.getSubPatterns())
+    {
+        level++;
+        sub_pattern->accept(*this);
+        level--;
+    }
 }
-
 }

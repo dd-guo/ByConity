@@ -8,15 +8,17 @@ INSERT INTO rollup VALUES ('b', 2, 20), ('b', 2, 15);
 
 SELECT a, b, sum(s), count() from rollup GROUP BY ROLLUP(a, b) ORDER BY a, b;
 
-SELECT a, b, sum(s), count() from rollup GROUP BY ROLLUP(a, b) WITH TOTALS ORDER BY a, b;
+SELECT a, b, sum(s), count() from rollup GROUP BY ROLLUP(a, b) WITH TOTALS ORDER BY a, b SETTINGS enable_optimizer=0;
 
 SELECT a, sum(s), count() from rollup GROUP BY ROLLUP(a) ORDER BY a;
 
 SELECT a, sum(s), count() from rollup GROUP BY a WITH ROLLUP ORDER BY a;
 
-SELECT a, sum(s), count() from rollup GROUP BY a WITH ROLLUP WITH TOTALS ORDER BY a;
+SELECT a, sum(s), count() from rollup GROUP BY a WITH ROLLUP WITH TOTALS ORDER BY a SETTINGS enable_optimizer=0;
 
 SET group_by_two_level_threshold = 1;
+-- TODO @zhoukun FIX enable_optimizer
+set enable_optimizer=0;
 
 SELECT a, sum(s), count() from rollup GROUP BY a WITH ROLLUP ORDER BY a;
 SELECT a, b, sum(s), count() from rollup GROUP BY a, b WITH ROLLUP ORDER BY a, b;

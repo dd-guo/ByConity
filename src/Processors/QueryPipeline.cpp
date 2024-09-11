@@ -21,27 +21,37 @@
 
 #include <Processors/QueryPipeline.h>
 
-#include <Processors/ResizeProcessor.h>
-#include <Processors/LimitTransform.h>
-#include <Processors/Transforms/TotalsHavingTransform.h>
-#include <Processors/Transforms/ExtremesTransform.h>
-#include <Processors/Transforms/CreatingSetsTransform.h>
-#include <Processors/Transforms/ExpressionTransform.h>
-#include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
-#include <Processors/Transforms/JoiningTransform.h>
-#include <Processors/Formats/IOutputFormat.h>
-#include <Processors/Sources/SourceFromInputStream.h>
-#include <Processors/Executors/PipelineExecutor.h>
-#include <Processors/Transforms/PartialSortingTransform.h>
-#include <Processors/Sources/SourceFromSingleChunk.h>
 #include <IO/WriteHelpers.h>
+#include <Interpreters/ConcurrentHashJoin.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
-#include <Common/typeid_cast.h>
-#include <Common/CurrentThread.h>
+#include <Interpreters/IJoin.h>
 #include <Processors/DelayedPortsProcessor.h>
+#include <Processors/Executors/PipelineExecutor.h>
+#include <Processors/Formats/IOutputFormat.h>
+#include <Processors/IntermediateResult/CacheManager.h>
+#include <Processors/LimitTransform.h>
+#include <Processors/ReadProgressCallback.h>
+#include <Processors/ResizeProcessor.h>
 #include <Processors/RowsBeforeLimitCounter.h>
+#include <Processors/Sources/NullSource.h>
 #include <Processors/Sources/RemoteSource.h>
+#include <Processors/Sources/SourceFromInputStream.h>
+#include <Processors/Sources/SourceFromSingleChunk.h>
+#include <Processors/Transforms/CreatingSetsTransform.h>
+#include <Processors/Transforms/ExpressionTransform.h>
+#include <Processors/Transforms/ExtremesTransform.h>
+#include <Processors/Transforms/JoiningTransform.h>
+#include <Processors/Transforms/MaterializingTransform.h>
+#include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
+#include <Processors/Transforms/PartialSortingTransform.h>
+#include <Processors/Transforms/ToMainPortTransform.h>
+#include <Processors/Transforms/TotalsHavingTransform.h>
+#include <Common/CurrentThread.h>
+#include <Common/typeid_cast.h>
+#include "Processors/Transforms/TableFinishTransform.h"
+
+#include <sys/eventfd.h>
 
 namespace DB
 {
@@ -200,6 +210,26 @@ void QueryPipeline::addDefaultTotals()
     pipe.addTotalsSource(std::move(source));
 }
 
+void QueryPipeline::setTotalsPortToMainPortTransform()
+{
+    if (pipe.getTotalsPort())
+    {
+        checkInitializedAndNotCompleted();
+        auto transform = std::make_shared<TotalsPortToMainPortTransform>(getHeader());
+        pipe.addSimpleTransformToPort(transform, pipe.getTotalsPort());
+    }
+}
+
+void QueryPipeline::setExtremesPortToMainPortTransform()
+{
+    if (pipe.getExtremesPort())
+    {
+        checkInitializedAndNotCompleted();
+        auto transform = std::make_shared<ExtremesPortToMainPortTransform>(getHeader());
+        pipe.addSimpleTransformToPort(transform, pipe.getExtremesPort());
+    }
+}
+
 void QueryPipeline::dropTotalsAndExtremes()
 {
     pipe.dropTotals();
@@ -291,7 +321,11 @@ std::unique_ptr<QueryPipeline> QueryPipeline::joinPipelines(
     std::unique_ptr<QueryPipeline> right,
     JoinPtr join,
     size_t max_block_size,
-    Processors * collected_processors)
+    size_t max_streams,
+    bool keep_left_read_in_order,
+    bool join_parallel_left_right,
+    Processors * collected_processors,
+    bool need_build_runtime_filter)
 {
     left->checkInitializedAndNotCompleted();
     right->checkInitializedAndNotCompleted();
@@ -322,30 +356,124 @@ std::unique_ptr<QueryPipeline> QueryPipeline::joinPipelines(
     /// (totals) ─────────┘                        ╙─────┘
 
     size_t num_streams = left->getNumStreams();
-    right->resize(1);
 
-    auto adding_joined = std::make_shared<FillingRightJoinSideTransform>(right->getHeader(), join);
-    InputPort * totals_port = nullptr;
-    if (right->hasTotals())
-        totals_port = adding_joined->addTotalsPort();
+    if (join->supportParallelJoin() && !right->hasTotals())
+    {
+        if (!keep_left_read_in_order)
+        {
+            left->resize(max_streams);
+            num_streams = max_streams;
+        }
 
-    right->addTransform(std::move(adding_joined), totals_port, nullptr);
+        right->resize(max_streams);
+        std::shared_ptr<JoiningTransform::FinishCounter> finish_counter;
+        if (need_build_runtime_filter)
+            finish_counter = std::make_shared<JoiningTransform::FinishCounter>(max_streams);
+
+        auto concurrent_right_filling_transform = [&](OutputPortRawPtrs outports)
+        {
+            Processors processors;
+            for (auto & outport : outports)
+            {
+                auto adding_joined = std::make_shared<FillingRightJoinSideTransform>(right->getHeader(), join, finish_counter);
+                connect(*outport, adding_joined->getInputs().front());
+                processors.emplace_back(adding_joined);
+            }
+            return processors;
+        };
+        right->transform(concurrent_right_filling_transform);
+        right->resize(1);
+    }
+    else
+    {
+        right->resize(1);
+        std::shared_ptr<JoiningTransform::FinishCounter> finish_counter;
+        if (need_build_runtime_filter)
+            finish_counter = std::make_shared<JoiningTransform::FinishCounter>(1);
+
+        auto adding_joined = std::make_shared<FillingRightJoinSideTransform>(right->getHeader(), join, finish_counter);
+        InputPort * totals_port = nullptr;
+        if (right->hasTotals())
+            totals_port = adding_joined->addTotalsPort();
+
+        right->addTransform(std::move(adding_joined), totals_port, nullptr);
+    }
 
     size_t num_streams_including_totals = num_streams + (left->hasTotals() ? 1 : 0);
     right->resize(num_streams_including_totals);
 
     /// This counter is needed for every Joining except totals, to decide which Joining will generate non joined rows.
     auto finish_counter = std::make_shared<JoiningTransform::FinishCounter>(num_streams);
+    auto finish_pipe = std::make_shared<std::vector<JoiningTransform::EventFdStruct>>();
+    if (join->getType() == JoinType::PARALLEL_HASH)
+    {
+        for (size_t i = 0; i < num_streams; i++)
+        {
+            finish_pipe->push_back({-1});
+        }
+
+        for (size_t i = 0; i < num_streams; i++)
+        {
+            int event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+            if (-1 == event_fd)
+                throwFromErrno("Cannot create event_fd for ConcurrentJoin", ErrorCodes::CANNOT_OPEN_FILE);
+            (*finish_pipe)[i].event_fd = event_fd;
+        }
+    }
 
     auto lit = left->pipe.output_ports.begin();
     auto rit = right->pipe.output_ports.begin();
 
+    std::vector<OutputPort *> joined_output_ports;
+    std::vector<OutputPort *> delayed_root_output_ports;
+
+    std::shared_ptr<DelayedJoinedBlocksTransform> delayed_root = nullptr;
+    if (join->hasDelayedBlocks())
+    {
+        delayed_root = std::make_shared<DelayedJoinedBlocksTransform>(num_streams, join);
+        if (!delayed_root->getInputs().empty() || delayed_root->getOutputs().size() != num_streams)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "DelayedJoinedBlocksTransform should have no inputs and {} outputs, "
+                            "but has {} inputs and {} outputs",
+                            num_streams, delayed_root->getInputs().size(), delayed_root->getOutputs().size());
+
+        if (collected_processors)
+            collected_processors->emplace_back(delayed_root);
+        left->pipe.processors.emplace_back(delayed_root);
+
+        for (auto & outport : delayed_root->getOutputs())
+            delayed_root_output_ports.emplace_back(&outport);
+    }
+
+
+    Block left_header = left->getHeader();
+    Block joined_header = JoiningTransform::transformHeader(left_header, join);
+
     for (size_t i = 0; i < num_streams; ++i)
     {
-        auto joining = std::make_shared<JoiningTransform>(left->getHeader(), join, max_block_size, false, default_totals, finish_counter);
+        auto joining = std::make_shared<JoiningTransform>(left->getHeader(), join, max_block_size, false, default_totals, join_parallel_left_right,finish_counter, num_streams, i, finish_pipe);
         connect(**lit, joining->getInputs().front());
         connect(**rit, joining->getInputs().back());
-        *lit = &joining->getOutputs().front();
+        if (delayed_root)
+        {
+            // Process delayed joined blocks when all JoiningTransform are finished.
+            auto delayed = std::make_shared<DelayedJoinedBlocksWorkerTransform>(left_header, joined_header, max_block_size, join);
+            if (delayed->getInputs().size() != 1 || delayed->getOutputs().size() != 1)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "DelayedJoinedBlocksWorkerTransform should have one input and one output");
+
+            connect(*delayed_root_output_ports[i], delayed->getInputs().front());
+
+            joined_output_ports.push_back(&joining->getOutputs().front());
+            joined_output_ports.push_back(&delayed->getOutputs().front());
+
+            if (collected_processors)
+                collected_processors->emplace_back(delayed);
+            left->pipe.processors.emplace_back(std::move(delayed));
+        }
+        else
+        {
+            *lit = &joining->getOutputs().front();
+        }
 
         ++lit;
         ++rit;
@@ -356,9 +484,33 @@ std::unique_ptr<QueryPipeline> QueryPipeline::joinPipelines(
         left->pipe.processors.emplace_back(std::move(joining));
     }
 
+    if (delayed_root)
+    {
+        // Process DelayedJoinedBlocksTransform after all JoiningTransforms.
+        DelayedPortsProcessor::PortNumbers delayed_ports_numbers;
+        delayed_ports_numbers.reserve(joined_output_ports.size() / 2);
+        for (size_t i = 1; i < joined_output_ports.size(); i += 2)
+            delayed_ports_numbers.push_back(i);
+
+        auto delayed_processor = std::make_shared<DelayedPortsProcessor>(joined_header, 2 * num_streams, delayed_ports_numbers);
+        if (collected_processors)
+            collected_processors->emplace_back(delayed_processor);
+        left->pipe.processors.emplace_back(delayed_processor);
+
+        // Connect @delayed_processor ports with inputs (JoiningTransforms & DelayedJoinedBlocksTransforms) / pipe outputs
+        auto next_delayed_input = delayed_processor->getInputs().begin();
+        for (OutputPort * port : joined_output_ports)
+            connect(*port, *next_delayed_input++);
+        left->pipe.output_ports.clear();
+        for (OutputPort & port : delayed_processor->getOutputs())
+            left->pipe.output_ports.push_back(&port);
+        left->pipe.header = joined_header;
+        left->resize(num_streams);
+    }
+
     if (left->hasTotals())
     {
-        auto joining = std::make_shared<JoiningTransform>(left->getHeader(), join, max_block_size, true, default_totals);
+        auto joining = std::make_shared<JoiningTransform>(left->getHeader(), join, max_block_size, true, default_totals, join_parallel_left_right);
         connect(*left->pipe.totals_port, joining->getInputs().front());
         connect(**rit, joining->getInputs().back());
         left->pipe.totals_port = &joining->getOutputs().front();
@@ -422,11 +574,28 @@ void QueryPipeline::addPipelineBefore(QueryPipeline pipeline)
 
 void QueryPipeline::setProgressCallback(const ProgressCallback & callback)
 {
+    progress_callback = callback;
     for (auto & processor : pipe.processors)
     {
         if (auto * source = dynamic_cast<ISourceWithProgress *>(processor.get()))
             source->setProgressCallback(callback);
+        if (auto * finish_transform = dynamic_cast<TableFinishTransform *>(processor.get()))
+            finish_transform->setProgressCallback(callback);
     }
+}
+
+std::unique_ptr<ReadProgressCallback> QueryPipeline::getReadProgressCallback() const
+{
+    auto callback = std::make_unique<ReadProgressCallback>();
+
+    callback->setProgressCallback(progress_callback);
+    callback->setQuota(quota);
+    callback->setProcessListElement(process_list_element);
+
+    if (!update_profile_events)
+        callback->disableProfileEventUpdate();
+
+    return callback;
 }
 
 void QueryPipeline::setProcessListElement(QueryStatus * elem)
@@ -437,6 +606,8 @@ void QueryPipeline::setProcessListElement(QueryStatus * elem)
     {
         if (auto * source = dynamic_cast<ISourceWithProgress *>(processor.get()))
             source->setProcessListElement(elem);
+        if (auto * finish_transform = dynamic_cast<TableFinishTransform *>(processor.get()))
+            finish_transform->setProcessListElement(elem);
     }
 }
 
@@ -542,11 +713,94 @@ PipelineExecutorPtr QueryPipeline::execute()
     return std::make_shared<PipelineExecutor>(pipe.processors, process_list_element);
 }
 
+static void addMaterializing(OutputPort *& output, Processors & processors)
+{
+    if (!output)
+        return;
+
+    auto materializing = std::make_shared<MaterializingTransform>(output->getHeader());
+    connect(*output, materializing->getInputPort());
+    output = &materializing->getOutputPort();
+    processors.emplace_back(std::move(materializing));
+}
+
+void QueryPipeline::complete(std::shared_ptr<IOutputFormat> format)
+{
+    auto & output = pipe.output_ports[0];
+    auto & totals = pipe.totals_port;
+    auto & extremes = pipe.extremes_port;
+
+    if (format->expectMaterializedColumns())
+    {
+        addMaterializing(output, pipe.processors);
+        addMaterializing(totals, pipe.processors);
+        addMaterializing(extremes, pipe.processors);
+    }
+
+    auto & format_main = format->getPort(IOutputFormat::PortKind::Main);
+    auto & format_totals = format->getPort(IOutputFormat::PortKind::Totals);
+    auto & format_extremes = format->getPort(IOutputFormat::PortKind::Extremes);
+
+    if (!totals)
+    {
+        auto source = std::make_shared<NullSource>(format_totals.getHeader());
+        totals = &source->getPort();
+        pipe.processors.emplace_back(std::move(source));
+    }
+
+    if (!extremes)
+    {
+        auto source = std::make_shared<NullSource>(format_extremes.getHeader());
+        extremes = &source->getPort();
+        pipe.processors.emplace_back(std::move(source));
+    }
+
+    connect(*output, format_main);
+    connect(*totals, format_totals);
+    connect(*extremes, format_extremes);
+
+    output = nullptr;
+    totals = nullptr;
+    extremes = nullptr;
+    pipe.output_ports.clear();
+
+    output_format = format.get();
+
+    pipe.processors.emplace_back(std::move(format));
+}
+
 void QueryPipeline::setCollectedProcessors(Processors * processors)
 {
     pipe.collected_processors = processors;
 }
 
+const CacheHolderPtr QueryPipeline::getCacheHolder() const
+{
+    return pipe.holder.cache_holder;
+}
+
+void QueryPipeline::setWriteCacheComplete(const ContextPtr & context)
+{
+    if (!pipe.holder.cache_holder)
+        return;
+
+    auto cache = context->getIntermediateResultCache();
+    auto & write_cache = pipe.holder.cache_holder->write_cache;
+    for (auto cache_key : write_cache)
+        cache->setComplete(cache_key);
+    write_cache.clear();
+}
+
+void QueryPipeline::clearUncompletedCache(const ContextPtr & context)
+{
+    if (!pipe.holder.cache_holder)
+        return;
+
+    auto cache = context->getIntermediateResultCache();
+    auto & write_cache = pipe.holder.cache_holder->write_cache;
+    for (auto cache_key : write_cache)
+        cache->eraseUncompletedCache(cache_key);
+}
 
 QueryPipelineProcessorsCollector::QueryPipelineProcessorsCollector(QueryPipeline & pipeline_, IQueryPlanStep * step_)
     : pipeline(pipeline_), step(step_)
@@ -569,4 +823,44 @@ Processors QueryPipelineProcessorsCollector::detachProcessors(size_t group)
     return res;
 }
 
+void QueryPipeline::writeResultIntoQueryCache(std::shared_ptr<QueryCache::Writer> query_cache_writer)
+{
+    assert(getNumStreams() > 0);
+    pipe.addQueryCacheTransform(std::move(query_cache_writer));
 }
+
+void QueryPipeline::finalizeWriteInQueryCache()
+{
+    pipe.finalizeWriteInQueryCache();
+}
+
+void QueryPipeline::readFromQueryCache(
+        std::unique_ptr<SourceFromChunks> source,
+        std::unique_ptr<SourceFromChunks> source_totals,
+        std::unique_ptr<SourceFromChunks> source_extremes)
+{
+    pipe.readFromQueryCache(std::move(source), std::move(source_totals), std::move(source_extremes));
+}
+
+void QueryPipeline::addUsedStorageIDs(const std::set<StorageID> & used_storage_ids_)
+{
+    used_storage_ids.insert(used_storage_ids_.begin(), used_storage_ids_.end());
+}
+
+std::set<StorageID> QueryPipeline::getUsedStorageIDs() const
+{
+    return used_storage_ids;
+}
+
+bool QueryPipeline::hasAllUsedStorageIDs() const
+{
+    return has_all_used_storage_ids;
+}
+
+void QueryPipeline::setHasAllUsedStorageIDs(bool val)
+{
+    has_all_used_storage_ids = val;
+}
+
+}
+

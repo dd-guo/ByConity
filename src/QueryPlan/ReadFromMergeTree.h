@@ -1,13 +1,46 @@
 #pragma once
 #include <QueryPlan/ISourceStep.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
+//#include <Storages/MergeTree/MergeTreeBaseSelectProcessor.h>
+#include <boost/rational.hpp>   /// For calculations related to sampling coefficients.
+#include <Parsers/ASTSampleRatio.h>
+#include <Interpreters/ExpressionActionsSettings.h>
+#include <Interpreters/ExtractExpressionInfoVisitor.h>
+#include <Core/Names.h>
 
 namespace DB
 {
 
 using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
-
+using RelativeSize = boost::rational<ASTSampleRatio::BigNum>;
 class Pipe;
+
+struct MergeTreeStreamSettings
+{
+    UInt64 min_marks_for_concurrent_read;
+    UInt64 max_block_size;
+    UInt64 preferred_block_size_bytes;
+    UInt64 preferred_max_column_in_block_size_bytes;
+    bool use_uncompressed_cache;
+    ExpressionActionsSettings actions_settings;
+    MergeTreeReaderSettings reader_settings = {};
+};
+
+struct MergeTreeDataSelectSamplingData
+{
+    bool use_sampling = false;
+    bool read_nothing = false;
+    Float64 used_sample_factor = 1.0;
+    std::shared_ptr<ASTFunction> filter_function;
+    ActionsDAGPtr filter_expression;
+    RelativeSize relative_sample_size = 0;
+};
+
+struct MergeTreeDataSelectAnalysisResult;
+using MergeTreeDataSelectAnalysisResultPtr = std::shared_ptr<MergeTreeDataSelectAnalysisResult>;
+
+namespace IntermediateResult { struct CacheHolder; }
+using CacheHolderPtr = std::shared_ptr<IntermediateResult::CacheHolder>;
 
 /// This step is created to read from MergeTree* table.
 /// For now, it takes a list of parts and creates source from it.
@@ -22,6 +55,7 @@ public:
         Partition,
         PrimaryKey,
         Skip,
+        Bitmap,
     };
 
     /// This is a struct with information about applied indexes.
@@ -54,6 +88,24 @@ public:
         InReverseOrder,
     };
 
+    struct AnalysisResult
+    {
+        RangesInDataParts parts_with_ranges;
+        CacheHolderPtr part_cache_holder;
+        MergeTreeDataSelectSamplingData sampling;
+        IndexStats index_stats;
+        Names column_names_to_read;
+        ReadFromMergeTree::ReadType read_type = ReadFromMergeTree::ReadType::Default;
+        UInt64 total_parts = 0;
+        UInt64 parts_before_pk = 0;
+        UInt64 selected_parts = 0;
+        UInt64 selected_ranges = 0;
+        UInt64 selected_marks = 0;
+        UInt64 selected_marks_pk = 0;
+        UInt64 total_marks_pk = 0;
+        UInt64 selected_rows = 0;
+    };
+
     ReadFromMergeTree(
         MergeTreeMetaBase::DataPartsVector parts_,
         MergeTreeMetaBase::DeleteBitmapGetter delete_bitmap_getter_,
@@ -61,15 +113,15 @@ public:
         Names virt_column_names_,
         const MergeTreeMetaBase & data_,
         const SelectQueryInfo & query_info_,
-        StorageMetadataPtr metadata_snapshot_,
-        StorageMetadataPtr metadata_snapshot_base_,
+        StorageSnapshotPtr storage_snapshot,
         ContextPtr context_,
         size_t max_block_size_,
         size_t num_streams_,
         bool sample_factor_column_queried_,
         bool map_column_keys_column_queried_,
         std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read_,
-        Poco::Logger * log_
+        Poco::Logger * log_,
+        MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_
     );
 
     String getName() const override { return "ReadFromMergeTree"; }
@@ -85,6 +137,30 @@ public:
     void describeIndexes(JSONBuilder::JSONMap & map) const override;
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
 
+    StorageID getStorageID() const { return data.getStorageID(); }
+    UInt64 getSelectedParts() const { return selected_parts; }
+    UInt64 getSelectedRows() const { return selected_rows; }
+    UInt64 getSelectedMarks() const { return selected_marks; }
+
+    static MergeTreeDataSelectAnalysisResultPtr selectRangesToRead(
+    MergeTreeData::DataPartsVector parts,
+    const StorageMetadataPtr & metadata_snapshot_base,
+    const StorageMetadataPtr & metadata_snapshot,
+    const SelectQueryInfo & query_info,
+    ContextPtr context,
+    unsigned num_streams,
+    std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read,
+    const MergeTreeMetaBase & data,
+    const Names & real_column_names,
+    bool sample_factor_column_queried,
+    Poco::Logger * log);
+
+    ContextPtr getContext() const { return context; }
+    const SelectQueryInfo & getQueryInfo() const { return query_info; }
+    StorageMetadataPtr getStorageMetadata() const { return storage_snapshot->getMetadataForQuery(); }
+
+    void requestReadingInOrder(size_t prefix_size, int direction, size_t limit);
+    ReadFromMergeTree::AnalysisResult getAnalysisResult() const;
 private:
     const MergeTreeReaderSettings reader_settings;
 
@@ -98,8 +174,8 @@ private:
     PrewhereInfoPtr prewhere_info;
     ExpressionActionsSettings actions_settings;
 
-    StorageMetadataPtr metadata_snapshot;
-    StorageMetadataPtr metadata_snapshot_base;
+    StorageSnapshotPtr storage_snapshot;
+    StorageMetadataPtr metadata_for_reading;
 
     ContextPtr context;
 
@@ -113,13 +189,16 @@ private:
     std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read;
 
     Poco::Logger * log;
+    UInt64 selected_parts = 0;
+    UInt64 selected_rows = 0;
+    UInt64 selected_marks = 0;
 
     Pipe read(RangesInDataParts parts_with_range, Names required_columns, ReadType read_type, size_t max_streams, size_t min_marks_for_concurrent_read, bool use_uncompressed_cache);
     Pipe readFromPool(RangesInDataParts parts_with_ranges, Names required_columns, size_t max_streams, size_t min_marks_for_concurrent_read, bool use_uncompressed_cache);
     Pipe readInOrder(RangesInDataParts parts_with_range, Names required_columns, ReadType read_type, bool use_uncompressed_cache);
 
     template<typename TSource>
-    ProcessorPtr createSource(const RangesInDataPart & part, const Names & required_columns, bool use_uncompressed_cache);
+    ProcessorPtr createSource(const RangesInDataPart & part, const Names & required_columns,const MergeTreeStreamSettings & stream_settings);
 
     Pipe spreadMarkRangesAmongStreams(
         RangesInDataParts && parts_with_ranges,
@@ -137,8 +216,16 @@ private:
         const Names & column_names,
         ActionsDAGPtr & out_projection);
 
-    struct AnalysisResult;
-    AnalysisResult selectRangesToRead(MergeTreeMetaBase::DataPartsVector parts) const;
+    MergeTreeDataSelectAnalysisResultPtr selectRangesToRead(MergeTreeData::DataPartsVector parts) const;
+    MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr;
+};
+
+struct MergeTreeDataSelectAnalysisResult
+{
+    std::variant<std::exception_ptr, ReadFromMergeTree::AnalysisResult> result;
+
+    bool error() const;
+    size_t marks() const;
 };
 
 }

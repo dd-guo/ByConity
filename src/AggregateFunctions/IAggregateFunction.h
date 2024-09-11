@@ -29,6 +29,7 @@
 #include <Common/Exception.h>
 #include <common/types.h>
 #include <Common/Exception.h>
+#include <Common/MySqlEnums.h>
 #include <Common/ThreadPool.h>
 
 #if !defined(ARCADIA_BUILD)
@@ -98,8 +99,12 @@ public:
 
     virtual bool handleNullItSelf() const { return false; }
 
+    virtual bool returnTypeCanBeNullable() const { return true; }
+
     /// Get the result type.
     virtual DataTypePtr getReturnType() const = 0;
+
+    virtual ArgType getMySqlArgumentTypes() const { return ArgType::NUMBERS; }
 
     /// Get the data type of internal state. By default it is AggregateFunction(name(params), argument_types...).
     virtual DataTypePtr getStateType() const;
@@ -109,6 +114,12 @@ public:
     {
         throw Exception("Prediction is not supported for " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
+
+    virtual bool isVersioned() const { return false; }
+
+    virtual size_t getVersionFromRevision(size_t /* revision */) const { return 0; }
+
+    virtual size_t getDefaultVersion() const { return 0; }
 
     virtual ~IAggregateFunction() = default;
 
@@ -121,6 +132,17 @@ public:
 
     /// Delete data for aggregation.
     virtual void destroy(AggregateDataPtr __restrict place) const noexcept = 0;
+
+    /// Delete all combinator states that were used after combinator -State.
+    /// For example for uniqArrayStateForEachMap(...) it will destroy
+    /// states that were created by combinators Map and ForEach.
+    /// It's needed because ColumnAggregateFunction in the result will be
+    /// responsible only for destruction of states that were created
+    /// by aggregate function and all combinators before -State combinator.
+    virtual void destroyUpToState(AggregateDataPtr __restrict place) const noexcept
+    {
+        destroy(place);
+    }
 
     /// It is not necessary to delete data.
     virtual bool hasTrivialDestructor() const = 0;
@@ -160,6 +182,12 @@ public:
     /// Returns true if a function requires Arena to handle own states (see add(), merge(), deserialize()).
     virtual bool allocatesMemoryInArena() const = 0;
 
+    // return false if mid-state won't be very large or not supported yet in current agg func.
+    virtual bool mayAggStateVeryLarge() const { 
+        return false;
+    }
+
+
     /// To calculate step result and store it back to aggregation states
     virtual inline bool needCalculateStep(AggregateDataPtr) const {return true;}
 
@@ -172,6 +200,18 @@ public:
     /// in `runningAccumulate`, or when calculating an aggregate function as a
     /// window function.
     virtual void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena * arena) const = 0;
+
+    /// Special method for aggregate functions with -State combinator, it behaves the same way as insertResultInto,
+    /// but if we need to insert AggregateData into ColumnAggregateFunction we use special method
+    /// insertInto that inserts default value and then performs merge with provided AggregateData
+    /// instead of just copying pointer to this AggregateData. Used in WindowTransform.
+    virtual void insertMergeResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena * arena) const
+    {
+        if (isState())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Function {} is marked as State but method insertMergeResultInto is not implemented");
+
+        insertResultInto(place, to, arena);
+    }
 
     /// Used for machine learning methods. Predict result from trained model.
     /// Will insert result into `to` column for rows in range [offset, offset + limit).
@@ -265,8 +305,7 @@ public:
         Arena * arena) const = 0;
 
     /** Insert result of aggregate function into result column with batch size.
-      * If destroy_place_after_insert is true. Then implementation of this method
-      * must destroy aggregate place if insert state into result column was successful.
+      * The implementation of this method will destroy aggregate place up to -State if insert state into result column was successful.
       * All places that were not inserted must be destroyed if there was exception during insert into result column.
       */
     virtual void insertResultIntoBatch(
@@ -274,8 +313,7 @@ public:
         AggregateDataPtr * places,
         size_t place_offset,
         IColumn & to,
-        Arena * arena,
-        bool destroy_place_after_insert) const = 0;
+        Arena * arena) const = 0;
 
     /** Destroy batch of aggregate places.
       */
@@ -295,6 +333,14 @@ public:
         const Array & /*params*/, const AggregateFunctionProperties & /*properties*/) const
     {
         return nullptr;
+    }
+        
+    /// For most functions if one of arguments is always NULL, we return NULL (it's implemented in combinator Null),
+    /// but in some functions we can want to process this argument somehow (for example condition argument in If combinator).
+    /// This method returns the set of argument indexes that can be always NULL, they will be skipped in combinator Null.
+    virtual std::unordered_set<size_t> getArgumentsThatCanBeOnlyNull() const
+    {
+        return {};
     }
 
     /** Return the nested function if this is an Aggregate Function Combinator.
@@ -526,7 +572,7 @@ public:
         }
     }
 
-    void insertResultIntoBatch(size_t batch_size, AggregateDataPtr * places, size_t place_offset, IColumn & to, Arena * arena, bool destroy_place_after_insert) const override
+    void insertResultIntoBatch(size_t batch_size, AggregateDataPtr * places, size_t place_offset, IColumn & to, Arena * arena) const override
     {
         size_t batch_index = 0;
 
@@ -536,8 +582,9 @@ public:
             {
                 static_cast<const Derived *>(this)->insertResultInto(places[batch_index] + place_offset, to, arena);
 
-                if (destroy_place_after_insert)
-                    static_cast<const Derived *>(this)->destroy(places[batch_index] + place_offset);
+                /// For State AggregateFunction ownership of aggregate place is passed to result column after insert,
+                /// so we need to destroy all states up to state of -State combinator.
+                static_cast<const Derived *>(this)->destroyUpToState(places[batch_index] + place_offset);
             }
         }
         catch (...)
@@ -576,7 +623,7 @@ public:
     IAggregateFunctionDataHelper(const DataTypes & argument_types_, const Array & parameters_)
         : IAggregateFunctionHelper<Derived>(argument_types_, parameters_) {}
 
-    void create(AggregateDataPtr place) const override
+    void create(AggregateDataPtr __restrict place) const override /// NOLINT
     {
         new (place) Data;
     }
@@ -692,6 +739,9 @@ struct AggregateFunctionProperties
       * Some may also name this property as "non-commutative".
       */
     bool is_order_dependent = false;
+
+    /// Indicates if it's actually window function.
+    bool is_window_function = false;
 };
 
 

@@ -65,8 +65,17 @@ InterpreterAlterQuery::InterpreterAlterQuery(const ASTPtr & query_ptr_, ContextP
 
 BlockIO InterpreterAlterQuery::execute()
 {
-    BlockIO res;
     const auto & alter = query_ptr->as<ASTAlterQuery &>();
+    if (alter.alter_object == ASTAlterQuery::AlterObjectType::DATABASE)
+        return executeToDatabase(alter);
+    else if (alter.alter_object == ASTAlterQuery::AlterObjectType::TABLE || alter.alter_object == ASTAlterQuery::AlterObjectType::LIVE_VIEW)
+        return executeToTable(alter);
+    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown alter object type");
+}
+
+BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
+{
+    BlockIO res;
 
     if (!alter.cluster.empty())
         return executeDDLQueryOnCluster(query_ptr, getContext(), getRequiredAccess());
@@ -86,7 +95,7 @@ BlockIO InterpreterAlterQuery::execute()
 
     StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
 
-    auto alter_lock = table->lockForAlter(getContext()->getCurrentQueryId(), getContext()->getSettingsRef().lock_acquire_timeout);
+    TableLockHolder alter_lock;
     IntentLockPtr cnch_table_lock;
     auto metadata_snapshot = table->getInMemoryMetadataPtr();
 
@@ -99,6 +108,11 @@ BlockIO InterpreterAlterQuery::execute()
 
         LOG_INFO(&Poco::Logger::get("InterpreterAlterQuery"), "Waiting for cnch_lock for " + table_id.database_name + "." + table_id.table_name + ".");
         cnch_table_lock = cnch_txn->createIntentLock(IntentLock::TB_LOCK_PREFIX, table->getStorageID().database_name, table->getStorageID().table_name);
+    }
+    else
+    {
+        /// Only accquire lock for non-cnch table
+        alter_lock = table->lockForAlter(getContext()->getCurrentQueryId(), getContext()->getSettingsRef().lock_acquire_timeout);
     }
 
     /// Add default database to table identifiers that we can encounter in e.g. default expressions, mutation expression, etc.
@@ -113,7 +127,7 @@ BlockIO InterpreterAlterQuery::execute()
     for (const auto & child : alter.command_list->children)
     {
         auto * command_ast = child->as<ASTAlterCommand>();
-        if (auto alter_command = AlterCommand::parse(command_ast))
+        if (auto alter_command = AlterCommand::parse(command_ast, getContext()))
             alter_commands.emplace_back(std::move(*alter_command));
         else if (auto partition_command = PartitionCommand::parse(command_ast))
         {
@@ -153,7 +167,7 @@ BlockIO InterpreterAlterQuery::execute()
     if (!partition_commands.empty())
     {
         table->checkAlterPartitionIsPossible(partition_commands, metadata_snapshot, getContext()->getSettingsRef());
-        auto partition_commands_pipe = table->alterPartition(metadata_snapshot, partition_commands, getContext());
+        auto partition_commands_pipe = table->alterPartition(metadata_snapshot, partition_commands, getContext(), query_ptr);
         if (!partition_commands_pipe.empty())
             res.pipeline.init(std::move(partition_commands_pipe));
         table->setUpdateTimeNow();
@@ -181,12 +195,59 @@ BlockIO InterpreterAlterQuery::execute()
     {
         if (cnch_table_lock && !cnch_table_lock->isLocked())
             cnch_table_lock->lock();
+        /// Make sure cnch table also accquire lock for DDL
+        if (!alter_lock)
+            alter_lock = table->lockForAlter(getContext()->getCurrentQueryId(), getContext()->getSettingsRef().lock_acquire_timeout);
         StorageInMemoryMetadata metadata = table->getInMemoryMetadata();
         alter_commands.validate(metadata, getContext());
         alter_commands.prepare(metadata);
         table->checkAlterIsPossible(alter_commands, getContext());
         table->alter(alter_commands, getContext(), alter_lock);
         table->setUpdateTimeNow();
+    }
+
+    return res;
+}
+
+BlockIO InterpreterAlterQuery::executeToDatabase(const ASTAlterQuery & alter)
+{
+    BlockIO res;
+
+    if (!alter.cluster.empty())
+        return executeDDLQueryOnCluster(query_ptr, getContext(), getRequiredAccess());
+
+    getContext()->checkAccess(getRequiredAccess());
+    DatabasePtr database = DatabaseCatalog::instance().getDatabase(alter.database, getContext());
+    AlterCommands alter_commands;
+
+    for (const auto & child : alter.command_list->children)
+    {
+        auto * command_ast = child->as<ASTAlterCommand>();
+        if (auto alter_command = AlterCommand::parse(command_ast, getContext()))
+            alter_commands.emplace_back(std::move(*alter_command));
+        else
+            throw Exception("Wrong parameter type in ALTER DATABASE query", ErrorCodes::LOGICAL_ERROR);
+    }
+
+    if (!alter_commands.empty())
+    {
+        /// Only ALTER SETTING is supported.
+        for (const auto & command : alter_commands)
+        {
+            if (command.type != AlterCommand::MODIFY_DATABASE_SETTING)
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported alter type for database engines");
+        }
+
+        for (const auto & command : alter_commands)
+        {
+            if (!command.ignore)
+            {
+                if (command.type == AlterCommand::MODIFY_DATABASE_SETTING)
+                    database->applySettingsChanges(command.settings_changes, getContext());
+                else
+                    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported alter command");
+            }
+        }
     }
 
     return res;
@@ -290,6 +351,26 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
             required_access.emplace_back(AccessType::ALTER_DROP_CONSTRAINT, database, table);
             break;
         }
+        case ASTAlterCommand::ADD_FOREIGN_KEY:
+        {
+            required_access.emplace_back(AccessType::ALTER_ADD_FOREIGN_KEY, database, table);
+            break;
+        }
+        case ASTAlterCommand::DROP_FOREIGN_KEY:
+        {
+            required_access.emplace_back(AccessType::ALTER_DROP_FOREIGN_KEY, database, table);
+            break;
+        }
+        case ASTAlterCommand::ADD_UNIQUE_NOT_ENFORCED:
+        {
+            required_access.emplace_back(AccessType::ALTER_ADD_UNIQUE_NOT_ENFORCED, database, table);
+            break;
+        }
+        case ASTAlterCommand::DROP_UNIQUE_NOT_ENFORCED:
+        {
+            required_access.emplace_back(AccessType::ALTER_DROP_UNIQUE_NOT_ENFORCED, database, table);
+            break;
+        }
         case ASTAlterCommand::ADD_PROJECTION:
         {
             required_access.emplace_back(AccessType::ALTER_ADD_PROJECTION, database, table);
@@ -327,7 +408,7 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
         }
         case ASTAlterCommand::ATTACH_PARTITION:
         case ASTAlterCommand::ATTACH_DETACHED_PARTITION:
-        {
+        case ASTAlterCommand::PREATTACH_PARTITION: {
             required_access.emplace_back(AccessType::INSERT, database, table);
             break;
         }
@@ -346,6 +427,7 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
             {
                 case DataDestinationType::DISK: [[fallthrough]];
                 case DataDestinationType::VOLUME:
+                case DataDestinationType::BYTECOOL:
                     required_access.emplace_back(AccessType::ALTER_MOVE_PARTITION, database, table);
                     break;
                 case DataDestinationType::TABLE:
@@ -399,6 +481,11 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
             required_access.emplace_back(AccessType::ALTER_FREEZE_PARTITION, database, table);
             break;
         }
+        case ASTAlterCommand::RECLUSTER_PARTITION_WHERE:
+        {
+            required_access.emplace_back(AccessType::ALTER_RECLUSTER_PARTITION, database, table);
+            break;
+        }
         case ASTAlterCommand::MODIFY_QUERY:
         {
             required_access.emplace_back(AccessType::ALTER_VIEW_MODIFY_QUERY, database, table);
@@ -438,6 +525,23 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
             required_access.emplace_back(AccessType::ALTER_MODIFY_COLUMN, database, table, column_name_from_col_decl());
             break;
         }
+        case ASTAlterCommand::CHANGE_ENGINE:
+        {
+            break;
+        }
+        case ASTAlterCommand::MODIFY_DATABASE_SETTING:
+        {
+            required_access.emplace_back(AccessType::ALTER_DATABASE_SETTINGS, database, table);
+            break;
+        }
+        case ASTAlterCommand::RENAME_TABLE:
+        {
+            break;
+        }
+        case ASTAlterCommand::PARTITION_BY:
+        {
+            break;
+        }
     }
 
     return required_access;
@@ -448,7 +552,7 @@ void InterpreterAlterQuery::extendQueryLogElemImpl(QueryLogElement & elem, const
     const auto & alter = ast->as<const ASTAlterQuery &>();
 
     elem.query_kind = "Alter";
-    if (alter.command_list != nullptr)
+    if (alter.command_list != nullptr && alter.alter_object != ASTAlterQuery::AlterObjectType::DATABASE)
     {
         // Alter queries already have their target table inserted into `elem`.
         if (elem.query_tables.size() != 1)

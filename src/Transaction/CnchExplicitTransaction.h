@@ -20,6 +20,7 @@
 #include <Transaction/Actions/IAction.h>
 #include <Transaction/ICnchTransaction.h>
 #include <Common/CurrentMetrics.h>
+#include <Catalog/MetastoreCommon.h>
 
 namespace DB
 {
@@ -27,6 +28,7 @@ namespace DB
     {
     friend class TransactionCoordinatorRcCnch;
     using Base = ICnchTransaction;
+
     private:
         Poco::Logger * log {&Poco::Logger::get("CnchExplicitTransaction")};
         std::vector<TransactionCnchPtr> secondary_txns;
@@ -44,7 +46,7 @@ namespace DB
         TxnTimestamp rollback() override;
         TxnTimestamp abort() override;
         void clean(TxnCleanTask & task) override;
-        bool addSecondaryTransaction(const TransactionCnchPtr & txn);
+        void addSecondaryTransaction(const TransactionCnchPtr & txn);
         bool addStatement(const String & statement);
         const std::vector<String> & getStatements() const { return statements; }
         const std::vector<TransactionCnchPtr> & getSecondaryTransactions() const { return secondary_txns; }

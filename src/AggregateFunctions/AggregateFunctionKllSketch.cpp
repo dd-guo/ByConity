@@ -19,6 +19,7 @@
 #include <AggregateFunctions/Helpers.h>
 #include <Statistics/Base64.h>
 #include <Statistics/StatsKllSketchImpl.h>
+#include "Columns/ColumnSketchBinary.h"
 
 // TODO: use datasketches
 namespace DB
@@ -31,6 +32,8 @@ struct KllData
     // datasketches::kll_sketch<T> data_{};
     using EmbeddedType = std::conditional_t<std::is_same_v<T, UUID>, UInt128, T>;
     Statistics::StatsKllSketchImpl<EmbeddedType> data_;
+
+    explicit KllData(UInt64 logK = DEFAULT_KLL_SKETCH_LOG_K) : data_(logK) {}
 
     void add(T value) { data_.update(value); }
 
@@ -54,9 +57,8 @@ struct KllData
 
     void insertResultInto(IColumn & to) const
     {
-        auto blob_raw = data_.serialize();
-        auto blob_b64 = base64Encode(blob_raw);
-        static_cast<ColumnString &>(to).insertData(blob_b64.c_str(), blob_b64.size());
+        auto blob = data_.serialize();
+        static_cast<ColumnSketchBinary &>(to).insertData(blob.c_str(), blob.size());
     }
 
     static String getName() { return "kll"; }
@@ -67,7 +69,20 @@ template <template <typename> class Function>
 AggregateFunctionPtr
 createAggregateFunctionKllSketch(const std::string & name, const DataTypes & argument_types, const Array & parameters, const Settings *)
 {
-    assertNoParameters(name, parameters);
+    UInt64 logK;
+    if (parameters.empty())
+    {
+        logK = DEFAULT_KLL_SKETCH_LOG_K;
+    }
+    else if (parameters.size() == 1)
+    {
+        logK = parameters[0].safeGet<UInt64>();
+    }
+    else
+    {
+        throw Exception("Aggregate function " + name + " requires 0 or 1 parameter", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+    }
+
     assertUnary(name, argument_types);
 
     AggregateFunctionPtr res;
@@ -76,11 +91,7 @@ createAggregateFunctionKllSketch(const std::string & name, const DataTypes & arg
     // TODO: support most data_type
     if (isColumnedAsNumber(data_type))
     {
-        res.reset(createWithNumericBasedType<Function>(*data_type, argument_types));
-    }
-    else if (isStringOrFixedString(data_type))
-    {
-        res = std::make_shared<AggregateFunctionCboFamilyForString<KllData<String>>>(argument_types);
+        res.reset(createWithNumericBasedType<Function>(*data_type, argument_types, logK));
     }
 
     if (!res)

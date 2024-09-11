@@ -21,10 +21,10 @@
 
 #include "MergeTreeDataPartCompact.h"
 #include <DataTypes/NestedUtils.h>
-#include <DataTypes/DataTypeByteMap.h>
 #include <DataTypes/MapHelpers.h>
 #include <Storages/MergeTree/MergeTreeReaderCompact.h>
 #include <Storages/MergeTree/MergeTreeDataPartWriterCompact.h>
+#include "IO/ReadSettings.h"
 
 
 namespace DB
@@ -69,8 +69,10 @@ IMergeTreeDataPart::MergeTreeReaderPtr MergeTreeDataPartCompact::getReader(
     UncompressedCache * uncompressed_cache,
     MarkCache * mark_cache,
     const MergeTreeReaderSettings & reader_settings,
+    MergeTreeIndexExecutor * /* index_executor */,
     const ValueSizeMap & avg_value_size_hints,
-    const ReadBufferFromFileBase::ProfileCallback & profile_callback) const
+    const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+    [[maybe_unused]] const ProgressCallback & internal_progress_cb) const
 {
     auto ptr = std::static_pointer_cast<const MergeTreeDataPartCompact>(shared_from_this());
     return std::make_unique<MergeTreeReaderCompact>(
@@ -85,10 +87,11 @@ IMergeTreeDataPart::MergeTreeWriterPtr MergeTreeDataPartCompact::getWriter(
     const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & writer_settings,
-    const MergeTreeIndexGranularity & computed_index_granularity) const
+    const MergeTreeIndexGranularity & computed_index_granularity,
+    const BitmapBuildInfo & /* bitmap_build_info */) const
 {
     /// Handle implicit col when merging. Because it will use Vertical algorithm when there has map column and all map columns will in gathering column, each implicit map column will be handled one by one.
-    if (columns_list.size() == 1 && isMapImplicitKeyNotKV(columns_list.front().name))
+    if (columns_list.size() == 1 && isMapImplicitKey(columns_list.front().name))
         return std::make_unique<MergeTreeDataPartWriterCompact>(
             shared_from_this(),
             columns_list,
@@ -138,7 +141,7 @@ void MergeTreeDataPartCompact::calculateEachColumnSizes(ColumnSizeByName & each_
     // Special handling flattened map type
     for (const NameAndTypePair & column : *columns_ptr)
     {
-        if (column.type->isMap() && !column.type->isMapKVStore())
+        if (column.type->isByteMap())
         {
             ColumnSize size = getMapColumnSizeNotKV(checksums, column);
             each_columns_size[column.name] = size;
@@ -163,7 +166,7 @@ void MergeTreeDataPartCompact::loadIndexGranularity()
 
     size_t marks_file_size = volume->getDisk()->getFileSize(marks_file_path);
 
-    auto buffer = volume->getDisk()->readFile(marks_file_path, {.buffer_size = marks_file_size});
+    auto buffer = volume->getDisk()->readFile(marks_file_path, ReadSettings().initializeReadSettings(marks_file_size));
     while (!buffer->eof())
     {
         /// Skip offsets for columns
@@ -208,20 +211,12 @@ bool MergeTreeDataPartCompact::hasColumnFiles(const NameAndTypePair & column) co
         return bin_checksum != checksums->files.end() && mrk_checksum != checksums->files.end();
     };
 
-    if (column.type->isMap() && !column.type->isMapKVStore())
+    if (column.type->isByteMap())
     {
         for (auto & [file, _] : getChecksums()->files)
         {
-            if (versions->enable_compact_map_data)
-            {
-                if (isMapCompactFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
-            else
-            {
-                if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
-                    return true;
-            }
+            if (isMapImplicitFileNameOfSpecialMapName(file, column.name))
+                return true;
         }
         return false;
     }
@@ -238,7 +233,7 @@ void MergeTreeDataPartCompact::setColumnsPtr(const NamesAndTypesListPtr & new_co
     size_t pos_without_map = 0;
     for (const auto & column : *new_columns_ptr)
     {
-        if (!column.type->isMap() || column.type->isMapKVStore())
+        if (!column.type->isByteMap())
         {
             columns_without_bytemap_col_size++;
             column_name_to_position_without_map.emplace(column.name, pos_without_map);
@@ -304,6 +299,11 @@ void MergeTreeDataPartCompact::checkConsistency(bool require_part_metadata) cons
                     ErrorCodes::BAD_SIZE_OF_FILE_IN_DATA_PART);
         }
     }
+}
+
+bool MergeTreeDataPartCompact::isStoredOnRemoteDisk() const
+{
+    return storage.isRemote();
 }
 
 MergeTreeDataPartCompact::~MergeTreeDataPartCompact()

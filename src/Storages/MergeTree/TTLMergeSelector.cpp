@@ -93,6 +93,10 @@ IMergeSelector::PartsRange ITTLMergeSelector::select(
         }
 
         total_size += best_begin->size;
+        // Comparing two iterators that are reachable from each other is valid.
+        // Since best_begin will always be an iterator of the same vector as best_partition
+        // this comparison is valid
+        // coverity[mismatched_comparison]
         if (best_begin == best_partition.begin())
             break;
 
@@ -100,6 +104,9 @@ IMergeSelector::PartsRange ITTLMergeSelector::select(
     }
 
     /// Find end of range with most old TTL.
+    // Similar to above, best_end is best_begin + 1 so best_end will be reachable from best_partition
+    // Hence, this comparison is valid
+    // coverity[mismatched_comparison]
     while (best_end != best_partition.end())
     {
         time_t ttl = getTTLForPart(*best_end);
@@ -133,7 +140,8 @@ bool TTLDeleteMergeSelector::isTTLAlreadySatisfied(const IMergeSelector::Part & 
     if (only_drop_parts)
         return false;
 
-    /// All TTL satisfied
+    /// Part's all ttls expired
+    /// part_finished (expired) -> hasAnyNonFinishedTTLs false -> !: true
     if (!part.ttl_infos->hasAnyNonFinishedTTLs())
         return true;
 

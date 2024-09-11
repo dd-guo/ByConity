@@ -232,7 +232,7 @@ bool areTypesEqual(const DataTypePtr & lhs, const DataTypePtr & rhs)
     return lhs_name == rhs_name;
 }
 
-ColumnPtr wrapInNullable(const ColumnPtr & src, const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count)
+ColumnPtr wrapInNullable(const ColumnPtr & src, const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count, const ColumnPtr & src_map_ptr)
 {
     ColumnPtr result_null_map_column;
 
@@ -284,8 +284,24 @@ ColumnPtr wrapInNullable(const ColumnPtr & src, const ColumnsWithTypeAndName & a
         }
     }
 
-    if (!result_null_map_column)
+    if (!result_null_map_column && !src_map_ptr)
         return makeNullable(src);
+    else if (!result_null_map_column && src_map_ptr)
+        return ColumnNullable::create(src_not_nullable->convertToFullColumnIfConst(), src_map_ptr);
+
+    // Merge result nullmap with input nullmap if any
+    if (src_map_ptr)
+    {
+        MutableColumnPtr mutable_result_null_map_column = IColumn::mutate(std::move(result_null_map_column));
+
+        NullMap & result_null_map = assert_cast<ColumnUInt8 &>(*mutable_result_null_map_column).getData();
+        const NullMap & src_null_map = assert_cast<const ColumnUInt8 &>(*src_map_ptr).getData();
+
+        for (size_t i = 0, size = result_null_map.size(); i < size; ++i)
+            result_null_map[i] |= src_null_map[i];
+
+        result_null_map_column = std::move(mutable_result_null_map_column);
+    }
 
     return ColumnNullable::create(src_not_nullable->convertToFullColumnIfConst(), result_null_map_column);
 }
@@ -301,6 +317,70 @@ NullPresence getNullPresense(const ColumnsWithTypeAndName & args)
     }
 
     return res;
+}
+
+bool isDecimalOrNullableDecimal(const DataTypePtr & type)
+{
+    WhichDataType which(type);
+    if (which.isDecimal())
+        return true;
+    if (!which.isNullable())
+        return false;
+    return isDecimal(assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+}
+
+bool extractNullMapAndNestedCol(const ColumnsWithTypeAndName & args, ColumnPtr * raw_column_maps, const UInt8 ** nullable_args_map)
+{
+    size_t arg_size = args.size();
+    for (size_t arg_idx = 0; arg_idx < arg_size; arg_idx++)
+    {
+        if (args[arg_idx].column->isNullable())
+        {
+            const ColumnNullable * nullable_column = checkAndGetColumn<ColumnNullable>(*args[arg_idx].column);
+            if(!nullable_column)
+            {
+                return false;
+            }
+            nullable_args_map[arg_idx] = nullable_column->getNullMapData().data();
+            raw_column_maps[arg_idx] = nullable_column->getNestedColumnPtr();
+        }
+        else
+        {
+            nullable_args_map[arg_idx] = nullptr;
+            raw_column_maps[arg_idx] = args[arg_idx].column;
+        }
+    }
+    return true;
+}
+
+String getFunctionResultName(const String & function_name, const Strings & arg_result_names)
+{
+    auto result_name = function_name + "(";
+    for (size_t i = 0; i < arg_result_names.size(); ++i)
+    {
+        if (i)
+            result_name += ", ";
+        result_name += arg_result_names[i];
+    }
+    result_name += ")";
+    return result_name;
+}
+
+String argPositionToSequence(size_t pos)
+{
+    if (pos == 1) return "1st";
+    if (pos == 2) return "2nd";
+    if (pos == 3) return "3rd";
+    if (pos >= 4 && pos <= 20) return std::to_string(pos) + "th";
+
+    /// Generally speaking, function arguments number almost never exceed 20
+    int last_digit = pos % 10;
+    switch (last_digit) {
+        case 1: return std::to_string(pos) + "st";
+        case 2: return std::to_string(pos) + "nd";
+        case 3: return std::to_string(pos) + "rd";
+        default: return std::to_string(pos) + "th";
+    }
 }
 
 }

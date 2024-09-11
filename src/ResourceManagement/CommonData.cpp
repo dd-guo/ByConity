@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 
+#include <optional>
 #include <ResourceManagement/CommonData.h>
 
 #include <Interpreters/Context.h>
@@ -22,6 +23,57 @@
 
 namespace DB::ResourceManagement
 {
+
+void QueueRule::fillProto(Protos::QueueRule & queue_rule) const
+{
+    queue_rule.set_rule_name(rule_name);
+    for (const auto & database : databases)
+        queue_rule.add_databases(database);
+    for (const auto & table : tables)
+        queue_rule.add_tables(table);
+    queue_rule.set_query_id(query_id);
+    queue_rule.set_user(user);
+    queue_rule.set_ip(ip);
+    queue_rule.set_fingerprint(fingerprint);
+}
+
+void QueueRule::parseFromProto(const Protos::QueueRule & queue_rule)
+{
+    rule_name = queue_rule.rule_name();
+    for (const auto & database : queue_rule.databases())
+        databases.push_back(database);
+    for (const auto & table : queue_rule.tables())
+        tables.push_back(table);
+    query_id = queue_rule.query_id();
+    user = queue_rule.user();
+    ip = queue_rule.ip();
+    fingerprint = queue_rule.fingerprint();
+}
+
+void QueueData::fillProto(Protos::QueueData & queue_data) const
+{
+    queue_data.set_queue_name(queue_name);
+    queue_data.set_max_concurrency(max_concurrency);
+    queue_data.set_query_queue_size(query_queue_size);
+    for (const auto & queue_rule : queue_rules)
+    {
+        auto queue_rule_iter = queue_data.add_queue_rules();
+        queue_rule.fillProto(*queue_rule_iter);
+    }
+}
+
+void QueueData::parseFromProto(const Protos::QueueData & queue_data)
+{
+    queue_name = queue_data.queue_name();
+    max_concurrency = queue_data.max_concurrency();
+    query_queue_size = queue_data.query_queue_size();
+    queue_rules.reserve(queue_data.queue_rules().size());
+    for (const auto & queue_rule : queue_data.queue_rules())
+    {
+        queue_rules.resize(queue_rules.size() + 1);
+        queue_rules.back().parseFromProto(queue_rule);
+    }
+}
 
 void VirtualWarehouseSettings::fillProto(Protos::VirtualWarehouseSettings & pb_settings) const
 {
@@ -41,27 +93,32 @@ void VirtualWarehouseSettings::fillProto(Protos::VirtualWarehouseSettings & pb_s
         pb_settings.set_max_queued_queries(max_queued_queries);
     if (max_queued_waiting_ms)
         pb_settings.set_max_queued_waiting_ms(max_queued_waiting_ms);
-    pb_settings.set_vw_schedule_algo(int(vw_schedule_algo));
+    pb_settings.set_vw_schedule_algo(static_cast<int>(vw_schedule_algo));
     if (max_auto_borrow_links)
         pb_settings.set_max_auto_borrow_links(max_auto_borrow_links);
     if (max_auto_lend_links)
         pb_settings.set_max_auto_lend_links(max_auto_lend_links);
-    if (cpu_threshold_for_borrow)
-        pb_settings.set_cpu_threshold_for_borrow(cpu_threshold_for_borrow);
-    if (mem_threshold_for_borrow)
-        pb_settings.set_mem_threshold_for_borrow(mem_threshold_for_borrow);
-    if (cpu_threshold_for_lend)
-        pb_settings.set_cpu_threshold_for_lend(cpu_threshold_for_lend);
-    if (mem_threshold_for_lend)
-        pb_settings.set_mem_threshold_for_lend(mem_threshold_for_lend);
+    if (cpu_busy_threshold)
+        pb_settings.set_cpu_busy_threshold(cpu_busy_threshold);
+    if (mem_busy_threshold)
+        pb_settings.set_mem_busy_threshold(mem_busy_threshold);
+    if (cpu_idle_threshold)
+        pb_settings.set_cpu_idle_threshold(cpu_idle_threshold);
+    if (mem_idle_threshold)
+        pb_settings.set_mem_idle_threshold(mem_idle_threshold);
     if (cpu_threshold_for_recall)
         pb_settings.set_cpu_threshold_for_recall(cpu_threshold_for_recall);
     if (mem_threshold_for_recall)
         pb_settings.set_mem_threshold_for_recall(mem_threshold_for_recall);
-    if (cooldown_seconds_after_auto_link)
-        pb_settings.set_cooldown_seconds_after_auto_link(cooldown_seconds_after_auto_link);
-    if (cooldown_seconds_after_auto_unlink)
-        pb_settings.set_cooldown_seconds_after_auto_unlink(cooldown_seconds_after_auto_unlink);
+    if (cooldown_seconds_after_scaleup)
+        pb_settings.set_cooldown_seconds_after_scaleup(cooldown_seconds_after_scaleup);
+    if (cooldown_seconds_after_scaledown)
+        pb_settings.set_cooldown_seconds_after_scaledown(cooldown_seconds_after_scaledown);
+
+    for (auto & queue_data : queue_datas)
+    {
+        queue_data.fillProto(*pb_settings.add_queue_datas());
+    }
 }
 
 void VirtualWarehouseSettings::parseFromProto(const Protos::VirtualWarehouseSettings & pb_settings)
@@ -78,14 +135,20 @@ void VirtualWarehouseSettings::parseFromProto(const Protos::VirtualWarehouseSett
     vw_schedule_algo = VWScheduleAlgo(pb_settings.vw_schedule_algo());
     max_auto_borrow_links = pb_settings.max_auto_borrow_links();
     max_auto_lend_links = pb_settings.max_auto_lend_links();
-    cpu_threshold_for_borrow = pb_settings.cpu_threshold_for_borrow();
-    mem_threshold_for_borrow = pb_settings.mem_threshold_for_borrow();
-    cpu_threshold_for_lend = pb_settings.cpu_threshold_for_lend();
-    mem_threshold_for_lend = pb_settings.mem_threshold_for_lend();
+    cpu_busy_threshold = pb_settings.cpu_busy_threshold();
+    mem_busy_threshold = pb_settings.mem_busy_threshold();
+    cpu_idle_threshold = pb_settings.cpu_idle_threshold();
+    mem_idle_threshold = pb_settings.mem_idle_threshold();
     cpu_threshold_for_recall = pb_settings.cpu_threshold_for_recall();
     mem_threshold_for_recall = pb_settings.mem_threshold_for_recall();
-    cooldown_seconds_after_auto_link = pb_settings.cooldown_seconds_after_auto_link();
-    cooldown_seconds_after_auto_unlink = pb_settings.cooldown_seconds_after_auto_unlink();
+    cooldown_seconds_after_scaleup = pb_settings.cooldown_seconds_after_scaleup();
+    cooldown_seconds_after_scaledown = pb_settings.cooldown_seconds_after_scaledown();
+    queue_datas.reserve(pb_settings.queue_datas_size());
+    for (const auto & pb_queue_data : pb_settings.queue_datas())
+    {
+        queue_datas.resize(queue_datas.size() + 1);
+        queue_datas.back().parseFromProto(pb_queue_data);
+    }
 }
 
 void VirtualWarehouseAlterSettings::fillProto(Protos::VirtualWarehouseAlterSettings & pb_settings) const
@@ -114,22 +177,54 @@ void VirtualWarehouseAlterSettings::fillProto(Protos::VirtualWarehouseAlterSetti
         pb_settings.set_max_auto_borrow_links(*max_auto_borrow_links);
     if (max_auto_lend_links)
         pb_settings.set_max_auto_lend_links(*max_auto_lend_links);
-    if (cpu_threshold_for_borrow)
-        pb_settings.set_cpu_threshold_for_borrow(*cpu_threshold_for_borrow);
-    if (mem_threshold_for_borrow)
-        pb_settings.set_mem_threshold_for_borrow(*mem_threshold_for_borrow);
-    if (cpu_threshold_for_lend)
-        pb_settings.set_cpu_threshold_for_lend(*cpu_threshold_for_lend);
-    if (mem_threshold_for_lend)
-        pb_settings.set_mem_threshold_for_lend(*mem_threshold_for_lend);
+    if (cpu_busy_threshold)
+        pb_settings.set_cpu_busy_threshold(*cpu_busy_threshold);
+    if (mem_busy_threshold)
+        pb_settings.set_mem_busy_threshold(*mem_busy_threshold);
+    if (cpu_idle_threshold)
+        pb_settings.set_cpu_idle_threshold(*cpu_idle_threshold);
+    if (mem_idle_threshold)
+        pb_settings.set_mem_idle_threshold(*mem_idle_threshold);
     if (cpu_threshold_for_recall)
         pb_settings.set_cpu_threshold_for_recall(*cpu_threshold_for_recall);
     if (mem_threshold_for_recall)
         pb_settings.set_mem_threshold_for_recall(*mem_threshold_for_recall);
-    if (cooldown_seconds_after_auto_link)
-        pb_settings.set_cooldown_seconds_after_auto_link(*cooldown_seconds_after_auto_link);
-    if (cooldown_seconds_after_auto_unlink)
-        pb_settings.set_cooldown_seconds_after_auto_unlink(*cooldown_seconds_after_auto_unlink);
+    if (cooldown_seconds_after_scaleup)
+        pb_settings.set_cooldown_seconds_after_scaleup(*cooldown_seconds_after_scaleup);
+    if (cooldown_seconds_after_scaledown)
+        pb_settings.set_cooldown_seconds_after_scaledown(*cooldown_seconds_after_scaledown);
+    if (max_concurrency)
+        pb_settings.set_max_concurrency(*max_concurrency);
+    if (query_queue_size)
+        pb_settings.set_query_queue_size(*query_queue_size);
+    if (query_id)
+        pb_settings.set_query_id(*query_id);
+    if (user)
+        pb_settings.set_user(*user);
+    if (ip)
+        pb_settings.set_ip(*ip);
+    if (rule_name)
+        pb_settings.set_rule_name(*rule_name);
+    if (fingerprint)
+        pb_settings.set_fingerprint(*fingerprint);
+    if (queue_name)
+        pb_settings.set_queue_name(*queue_name);
+    if (has_table)
+    {
+        pb_settings.set_has_table(true);
+        for (const auto & table : tables)
+            pb_settings.add_tables(table);
+    }
+    if (has_database)
+    {
+        pb_settings.set_has_database(true);
+        for (const auto & db : databases)
+            pb_settings.add_databases(db);
+    }
+
+    pb_settings.set_queue_alter_type(queue_alter_type);
+    if (queue_data)
+        queue_data->fillProto(*pb_settings.mutable_queue_data());
 }
 
 void VirtualWarehouseAlterSettings::parseFromProto(const Protos::VirtualWarehouseAlterSettings & pb_settings)
@@ -158,22 +253,57 @@ void VirtualWarehouseAlterSettings::parseFromProto(const Protos::VirtualWarehous
         max_auto_borrow_links = pb_settings.max_auto_borrow_links();
     if (pb_settings.has_max_auto_lend_links())
         max_auto_lend_links = pb_settings.max_auto_lend_links();
-    if (pb_settings.has_cpu_threshold_for_borrow())
-        cpu_threshold_for_borrow = pb_settings.cpu_threshold_for_borrow();
-    if (pb_settings.has_mem_threshold_for_borrow())
-        mem_threshold_for_borrow = pb_settings.mem_threshold_for_borrow();
-    if (pb_settings.has_cpu_threshold_for_lend())
-        cpu_threshold_for_lend = pb_settings.cpu_threshold_for_lend();
-    if (pb_settings.has_mem_threshold_for_lend())
-        mem_threshold_for_lend = pb_settings.mem_threshold_for_lend();
+    if (pb_settings.has_cpu_busy_threshold())
+        cpu_busy_threshold = pb_settings.cpu_busy_threshold();
+    if (pb_settings.has_mem_busy_threshold())
+        mem_busy_threshold = pb_settings.mem_busy_threshold();
+    if (pb_settings.has_cpu_idle_threshold())
+        cpu_idle_threshold = pb_settings.cpu_idle_threshold();
+    if (pb_settings.has_mem_idle_threshold())
+        mem_idle_threshold = pb_settings.mem_idle_threshold();
     if (pb_settings.has_cpu_threshold_for_recall())
         cpu_threshold_for_recall = pb_settings.cpu_threshold_for_recall();
     if (pb_settings.has_mem_threshold_for_recall())
         mem_threshold_for_recall = pb_settings.mem_threshold_for_recall();
-    if (pb_settings.has_cooldown_seconds_after_auto_link())
-        cooldown_seconds_after_auto_link = pb_settings.cooldown_seconds_after_auto_link();
-    if (pb_settings.has_cooldown_seconds_after_auto_unlink())
-        cooldown_seconds_after_auto_unlink = pb_settings.cooldown_seconds_after_auto_unlink();
+    if (pb_settings.has_cooldown_seconds_after_scaleup())
+        cooldown_seconds_after_scaleup = pb_settings.cooldown_seconds_after_scaleup();
+    if (pb_settings.has_cooldown_seconds_after_scaledown())
+        cooldown_seconds_after_scaledown = pb_settings.cooldown_seconds_after_scaledown();
+    if (pb_settings.has_max_concurrency())
+        max_concurrency = pb_settings.max_concurrency();
+    if (pb_settings.has_query_queue_size())
+        query_queue_size = pb_settings.query_queue_size();
+    if (pb_settings.has_query_id())
+        query_id = pb_settings.query_id();
+    if (pb_settings.has_user())
+        user = pb_settings.user();
+    if (pb_settings.has_ip())
+        ip = pb_settings.ip();
+    if (pb_settings.has_rule_name())
+        rule_name = pb_settings.rule_name();
+    if (pb_settings.has_fingerprint())
+        fingerprint = pb_settings.fingerprint();
+    if (pb_settings.has_table())
+    {
+        has_table = true;
+        for (const auto & table : pb_settings.tables())
+            tables.push_back(table);
+    }
+    if (pb_settings.has_database())
+    {
+        has_database = true;
+        for (const auto & db : pb_settings.databases())
+            databases.push_back(db);
+    }
+    if (pb_settings.has_queue_name())
+        queue_name = pb_settings.queue_name();
+
+    queue_alter_type = pb_settings.queue_alter_type();
+    if (pb_settings.has_queue_data())
+    {
+        queue_data = std::make_optional<QueueData>();
+        queue_data->parseFromProto(pb_settings.queue_data());
+    }
 }
 
 void VirtualWarehouseData::fillProto(Protos::VirtualWarehouseData & pb_data) const
@@ -256,6 +386,40 @@ std::string WorkerNodeResourceData::serializeAsString() const
     return pb_data.SerializeAsString();
 }
 
+WorkerNodeResourceData::WorkerNodeResourceData(const Protos::WorkerNodeResourceData & resource_info)
+{
+    id = resource_info.id();
+    host_ports = RPCHelpers::createHostWithPorts(resource_info.host_ports());
+
+    cpu_usage = resource_info.cpu_usage();
+    memory_usage = resource_info.memory_usage();
+    memory_available = resource_info.memory_available();
+    disk_space = resource_info.disk_space();
+    query_num = resource_info.query_num();
+
+    if (resource_info.has_cpu_limit())
+        cpu_limit = resource_info.cpu_limit();
+    if (resource_info.has_memory_limit())
+        memory_limit = resource_info.memory_limit();
+
+    if (resource_info.has_vw_name())
+        vw_name = resource_info.vw_name();
+
+    if (resource_info.has_worker_group_id())
+        worker_group_id = resource_info.worker_group_id();
+
+    if (resource_info.has_last_update_time())
+        last_update_time = resource_info.last_update_time();
+
+    if (resource_info.has_register_time())
+        register_time = resource_info.register_time();
+
+    if (resource_info.has_last_status_create_time())
+        last_status_create_time = resource_info.last_status_create_time();
+    if (resource_info.has_state())
+        state = WorkerState(resource_info.state());
+}
+
 void WorkerNodeResourceData::parseFromString(const std::string & s)
 {
     Protos::WorkerNodeResourceData pb_data;
@@ -267,10 +431,14 @@ void WorkerNodeResourceData::parseFromString(const std::string & s)
     worker_group_id = pb_data.worker_group_id();
 
     cpu_usage = pb_data.cpu_usage();
+    cpu_usage_1min = pb_data.cpu_usage_1min();
     memory_usage = pb_data.memory_usage();
+    memory_usage_1min = pb_data.memory_usage_1min();
     memory_available = pb_data.memory_available();
     disk_space = pb_data.disk_space();
     query_num = pb_data.query_num();
+    manipulation_num = pb_data.manipulation_num();
+    consumer_num = pb_data.consumer_num();
     cpu_limit = pb_data.cpu_limit();
     memory_limit = pb_data.memory_limit();
     last_update_time = pb_data.last_update_time();
@@ -287,10 +455,14 @@ void WorkerNodeResourceData::fillProto(Protos::WorkerNodeResourceData & resource
     RPCHelpers::fillHostWithPorts(host_ports, *resource_info.mutable_host_ports());
 
     resource_info.set_cpu_usage(cpu_usage);
+    resource_info.set_cpu_usage_1min(cpu_usage_1min);
     resource_info.set_memory_usage(memory_usage);
+    resource_info.set_memory_usage_1min(memory_usage_1min);
     resource_info.set_memory_available(memory_available);
     resource_info.set_disk_space(disk_space);
     resource_info.set_query_num(query_num);
+    resource_info.set_manipulation_num(manipulation_num);
+    resource_info.set_consumer_num(consumer_num);
 
     if (cpu_limit && memory_limit)
     {
@@ -323,10 +495,14 @@ WorkerNodeResourceData WorkerNodeResourceData::createFromProto(const Protos::Wor
     res.host_ports = RPCHelpers::createHostWithPorts(resource_info.host_ports());
 
     res.cpu_usage = resource_info.cpu_usage();
+    res.cpu_usage_1min = resource_info.cpu_usage_1min();
     res.memory_usage = resource_info.memory_usage();
+    res.memory_usage_1min = resource_info.memory_usage_1min();
     res.memory_available = resource_info.memory_available();
     res.disk_space = resource_info.disk_space();
     res.query_num = resource_info.query_num();
+    res.manipulation_num = resource_info.manipulation_num();
+    res.consumer_num = resource_info.consumer_num();
 
     if (resource_info.has_cpu_limit())
         res.cpu_limit = resource_info.cpu_limit();
@@ -385,52 +561,48 @@ void ResourceRequirement::parseFromProto(const Protos::ResourceRequirement & pro
     no_repeat = proto.no_repeat();
 }
 
+void WorkerMetrics::fillProto(Protos::WorkerMetrics & proto) const
+{
+    proto.set_id(id);
+
+    proto.set_cpu_1min(cpu_1min);
+    proto.set_mem_1min(mem_1min);
+    proto.set_num_queries(num_queries);
+    proto.set_num_manipulations(num_manipulations);
+    proto.set_num_consumers(num_consumers);
+    proto.set_num_dedups(num_dedups);
+}
+
+void WorkerMetrics::parseFromProto(const Protos::WorkerMetrics & proto)
+{
+    id = proto.id();
+
+    cpu_1min = proto.cpu_1min();
+    mem_1min = proto.mem_1min();
+    num_queries = proto.num_queries();
+    num_manipulations = proto.num_manipulations();
+    num_consumers = proto.num_consumers();
+    num_dedups = proto.num_dedups();
+}
+
+
 void WorkerGroupMetrics::reset()
 {
-    num_workers = 0;
-    max_cpu_usage = 0;
-    avg_cpu_usage = 0;
-    min_cpu_usage = std::numeric_limits<double>::max();
-
-    max_mem_usage = 0;
-    avg_mem_usage = 0;
-    min_mem_usage = std::numeric_limits<double>::max();
-    min_mem_available = std::numeric_limits<uint64_t>::max();
-
-    total_queries = 0;
+    worker_metrics_vec.clear();
 }
 
 void WorkerGroupMetrics::fillProto(Protos::WorkerGroupMetrics & proto) const
 {
     proto.set_id(id);
-    proto.set_num_workers(num_workers);
-
-    proto.set_max_cpu_usage(max_cpu_usage);
-    proto.set_avg_cpu_usage(avg_cpu_usage);
-    proto.set_min_cpu_usage(min_cpu_usage);
-
-    proto.set_max_mem_usage(max_mem_usage);
-    proto.set_avg_mem_usage(avg_mem_usage);
-    proto.set_min_mem_usage(min_mem_usage);
-    proto.set_min_mem_available(min_mem_available);
-
-    proto.set_total_queries(total_queries);
+    for (const auto & worker_metrics : worker_metrics_vec)
+        worker_metrics.fillProto(*proto.add_worker_metrics_vec());
 }
 
 void WorkerGroupMetrics::parseFromProto(const Protos::WorkerGroupMetrics & proto)
 {
     id = proto.id();
-    num_workers = proto.num_workers();
-    max_cpu_usage = proto.max_cpu_usage();
-    min_cpu_usage = proto.min_cpu_usage();
-    avg_cpu_usage = proto.avg_cpu_usage();
-
-    max_mem_usage = proto.max_mem_usage();
-    min_mem_usage = proto.min_mem_usage();
-    avg_mem_usage = proto.avg_mem_usage();
-    min_mem_available = proto.min_mem_available();
-
-    total_queries = proto.total_queries();
+    for (const auto & pb_worker_metrics : proto.worker_metrics_vec())
+        worker_metrics_vec.push_back(WorkerMetrics::createFromProto(pb_worker_metrics));
 }
 
 std::string WorkerGroupData::serializeAsString() const
@@ -473,6 +645,9 @@ void WorkerGroupData::fillProto(Protos::WorkerGroupData & pb_data, const bool wi
     pb_data.set_is_auto_linked(is_auto_linked);
     if (!linked_vw_name.empty())
         pb_data.set_linked_vw_name(linked_vw_name);
+    for (const auto & worker_source : worker_node_resource_vec)
+        worker_source.fillProto(*pb_data.add_worker_node_resource_vec());
+    pb_data.set_priority(priority);
 }
 
 void WorkerGroupData::parseFromProto(const Protos::WorkerGroupData & pb_data)
@@ -501,6 +676,10 @@ void WorkerGroupData::parseFromProto(const Protos::WorkerGroupData & pb_data)
 
     if (pb_data.has_linked_vw_name())
         linked_vw_name = pb_data.linked_vw_name();
+    for (auto & worker_source_pb : pb_data.worker_node_resource_vec())
+        worker_node_resource_vec.emplace_back(worker_source_pb);
+    if (pb_data.has_priority())
+        priority = pb_data.priority();
 }
 
 void QueryQueueInfo::fillProto(Protos::QueryQueueInfo & pb_data) const

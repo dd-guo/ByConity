@@ -22,6 +22,11 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int TSO_OPERATION_ERROR;
+};
+
 namespace TSO
 {
 
@@ -32,7 +37,7 @@ public:
     TSOMetaFDBImpl(const String & cluster_file, const String & key_name_)
         : TSOMetastore(key_name_)
     {
-        fdb_client = std::make_shared<FDB::FDBClient>(cluster_file);
+        fdb_client = FDB::FDBClient::Instance(cluster_file);
     }
 
     ~TSOMetaFDBImpl() override {}
@@ -69,7 +74,7 @@ private:
     void assertStatus(const OperationType & op, const fdb_error_t & error_code)
     {
         if (error_code)
-            throw Exception("Exception whiline executing operation : " + Operation(op) + ", Errormsg : " + String(fdb_get_error(error_code)) , ErrorCodes::TSO_OPERATION_ERROR);
+            throw Exception("Exception while executing operation : " + Operation(op) + ", Errormsg : " + String(fdb_get_error(error_code)) , ErrorCodes::TSO_OPERATION_ERROR);
     }
 };
 

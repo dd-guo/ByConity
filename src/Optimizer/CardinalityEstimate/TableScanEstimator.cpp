@@ -18,6 +18,10 @@
 #include <Statistics/StatsTableBasic.h>
 #include <Poco/Logger.h>
 #include <common/ErrorHandlers.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Optimizer/CardinalityEstimate/LimitEstimator.h>
+#include <Interpreters/convertFieldToType.h>
+#include <DataTypes/DataTypesNumber.h>
 
 namespace DB
 {
@@ -61,6 +65,14 @@ PlanNodeStatisticsPtr TableScanEstimator::estimate(ContextMutablePtr context, co
         }
     }
 
+    auto query_info = step.getQueryInfo();
+    auto *query = query_info.query->as<ASTSelectQuery>();
+    if (step.hasLimit() && query->getLimitLength())
+    {
+        Field converted = convertFieldToType(query->refLimitLength()->as<ASTLiteral>()->value, DataTypeUInt64());
+        return LimitEstimator::getLimitStatistics(plan_node_stats, converted.safeGet<UInt64>());
+    }
+
     return plan_node_stats;
 }
 
@@ -77,7 +89,7 @@ std::optional<PlanNodeStatisticsPtr> TableScanEstimator::estimate(
 
     PlanNodeStatisticsPtr plan_node_stats;
     try {
-        Statistics::StatisticsCollector collector(context, catalog, table_info_opt.value());
+        Statistics::StatisticsCollector collector(context, catalog, table_info_opt.value(), {});
         collector.readFromCatalog(columns);
         auto plan_node_stats_opt = collector.toPlanNodeStatistics();
         if (!plan_node_stats_opt.has_value())

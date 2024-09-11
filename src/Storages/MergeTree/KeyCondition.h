@@ -71,18 +71,14 @@ struct FieldRef : public Field
   */
 struct Range
 {
-private:
+public:
     static bool equals(const Field & lhs, const Field & rhs);
     static bool less(const Field & lhs, const Field & rhs);
 
-public:
-    FieldRef left = NegativeInfinity{};   /// the left border
-    FieldRef right = PositiveInfinity{};  /// the right border
-    bool left_included = false;           /// includes the left border
-    bool right_included = false;          /// includes the right border
-
-    /// The whole universe (not null).
-    Range() {}
+    FieldRef left;        /// the left border
+    FieldRef right;       /// the right border
+    bool left_included;   /// includes the left border
+    bool right_included;  /// includes the right border
 
     /// One point.
     Range(const FieldRef & point)
@@ -98,9 +94,19 @@ public:
         shrinkToIncludedIfPossible();
     }
 
-    static Range createRightBounded(const FieldRef & right_point, bool right_included)
+    static Range createWholeUniverse()
     {
-        Range r;
+        return Range(NegativeInfinity{}, true, PositiveInfinity{}, true);
+    }
+
+    static Range createWholeUniverseWithoutNull()
+    {
+        return Range(NegativeInfinity{}, false, PositiveInfinity{}, false);
+    }
+
+    static Range createRightBounded(const FieldRef & right_point, bool right_included, bool with_null = false)
+    {
+        Range r = with_null ? createWholeUniverse() : createWholeUniverseWithoutNull();
         r.right = right_point;
         r.right_included = right_included;
         r.shrinkToIncludedIfPossible();
@@ -110,9 +116,9 @@ public:
         return r;
     }
 
-    static Range createLeftBounded(const FieldRef & left_point, bool left_included)
+    static Range createLeftBounded(const FieldRef & left_point, bool left_included, bool with_null = false)
     {
-        Range r;
+        Range r = with_null ? createWholeUniverse() : createWholeUniverseWithoutNull();
         r.left = left_point;
         r.left_included = left_included;
         r.shrinkToIncludedIfPossible();
@@ -312,7 +318,9 @@ public:
 
     bool matchesExactContinuousRange(const DataTypes & data_types) const;
 
-private:
+    using ColumnIndices = std::map<String, size_t>;
+    const ColumnIndices & getKeyColumns() const { return key_columns; }
+
     /// The expression is stored as Reverse Polish Notation.
     struct RPNElement
     {
@@ -347,7 +355,7 @@ private:
         Function function = FUNCTION_UNKNOWN;
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
-        Range range;
+        Range range = Range::createWholeUniverse();
         size_t key_column = 0;
         /// For FUNCTION_IN_SET, FUNCTION_NOT_IN_SET
         using MergeTreeSetIndexPtr = std::shared_ptr<const MergeTreeSetIndex>;
@@ -357,12 +365,15 @@ private:
     };
 
     using RPN = std::vector<RPNElement>;
-    using ColumnIndices = std::map<String, size_t>;
 
     using AtomMap = std::unordered_map<std::string, bool(*)(RPNElement & out, const Field & value)>;
+    using FunctionWithEscape = bool(*)(RPNElement & out, const Field & value, const Field & escape_value);
+    const RPN & getRPN() const { return rpn; }
 
 public:
     static const AtomMap atom_map;
+    static FunctionWithEscape like_with_escape;
+    static FunctionWithEscape not_like_with_escape;
 
 private:
     BoolMask checkInRange(

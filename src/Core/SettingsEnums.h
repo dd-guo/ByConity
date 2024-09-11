@@ -24,6 +24,8 @@
 #include <Core/SettingsFields.h>
 #include <DataStreams/SizeLimits.h>
 #include <Formats/FormatSettings.h>
+#include <Protos/EnumMacros.h>
+#include <Protos/enum.pb.h>
 
 
 namespace DB
@@ -43,6 +45,8 @@ enum class LoadBalancing
     FIRST_OR_RANDOM,
     // round robin across replicas with the same number of errors.
     ROUND_ROBIN,
+    // pick replica in reverse order.
+    REVERSE_ORDER,
 };
 
 DECLARE_SETTING_ENUM(LoadBalancing)
@@ -57,29 +61,30 @@ enum class JoinStrictness
 
 DECLARE_SETTING_ENUM(JoinStrictness)
 
-enum class JoinAlgorithm
-{
-    AUTO = 0,
-    HASH,
-    PARTIAL_MERGE,
-    PREFER_PARTIAL_MERGE,
-    NESTED_LOOP_JOIN,
-};
+ENUM_WITH_PROTO_CONVERTER(
+    JoinAlgorithm, // enum name
+    Protos::JoinAlgorithm, // proto enum message
+    (AUTO, 0),
+    (HASH),
+    (PARTIAL_MERGE),
+    (PREFER_PARTIAL_MERGE),
+    (NESTED_LOOP_JOIN),
+    (PARALLEL_HASH),
+    (GRACE_HASH));
 
 DECLARE_SETTING_ENUM(JoinAlgorithm)
 
-
 /// Which rows should be included in TOTALS.
-enum class TotalsMode
-{
-    BEFORE_HAVING            = 0, /// Count HAVING for all read rows;
-                                  ///  including those not in max_rows_to_group_by
-                                  ///  and have not passed HAVING after grouping.
-    AFTER_HAVING_INCLUSIVE    = 1, /// Count on all rows except those that have not passed HAVING;
-                                   ///  that is, to include in TOTALS all the rows that did not pass max_rows_to_group_by.
-    AFTER_HAVING_EXCLUSIVE    = 2, /// Include only the rows that passed and max_rows_to_group_by, and HAVING.
-    AFTER_HAVING_AUTO         = 3, /// Automatically select between INCLUSIVE and EXCLUSIVE,
-};
+ENUM_WITH_PROTO_CONVERTER(
+    TotalsMode, // enum name
+    Protos::TotalsMode, // proto enum message
+    (BEFORE_HAVING, 0), /// Count HAVING for all read rows;
+    ///  including those not in max_rows_to_group_by
+    ///  and have not passed HAVING after grouping.
+    (AFTER_HAVING_INCLUSIVE, 1), /// Count on all rows except those that have not passed HAVING;
+    ///  that is, to include in TOTALS all the rows that did not pass max_rows_to_group_by.
+    (AFTER_HAVING_EXCLUSIVE, 2), /// Include only the rows that passed and max_rows_to_group_by, and HAVING.
+    (AFTER_HAVING_AUTO, 3)); /// Automatically select between INCLUSIVE and EXCLUSIVE,
 
 DECLARE_SETTING_ENUM(TotalsMode)
 
@@ -153,14 +158,14 @@ enum class MySQLDataTypesSupport
 
 DECLARE_SETTING_MULTI_ENUM(MySQLDataTypesSupport)
 
-enum class UnionMode
+enum class SetOperationMode
 {
-    Unspecified = 0, // Query UNION without UnionMode will throw exception
-    ALL, // Query UNION without UnionMode -> SELECT ... UNION ALL SELECT ...
-    DISTINCT // Query UNION without UnionMode -> SELECT ... UNION DISTINCT SELECT ...
+    Unspecified = 0, // Query UNION / EXCEPT / INTERSECT without SetOperationMode will throw exception
+    ALL, // Query UNION / EXCEPT / INTERSECT without SetOperationMode -> SELECT ... UNION / EXCEPT / INTERSECT ALL SELECT ...
+    DISTINCT // Query UNION / EXCEPT / INTERSECT without SetOperationMode -> SELECT ... UNION / EXCEPT / INTERSECT DISTINCT SELECT ...
 };
 
-DECLARE_SETTING_ENUM(UnionMode)
+DECLARE_SETTING_ENUM(SetOperationMode)
 
 enum class DistributedDDLOutputMode
 {
@@ -185,6 +190,7 @@ DECLARE_SETTING_ENUM(HandleKafkaErrorMode)
 enum class DialectType {
     CLICKHOUSE,
     ANSI,
+    MYSQL,
 };
 
 struct SettingFieldDialectTypeTraits
@@ -221,7 +227,8 @@ struct SettingFieldDialectType
     explicit operator Field() const { return toString(); }
 
     String toString() const { return Traits::toString(value); }
-    void parseFromString(const String & str) {
+    void parseFromString(const String & str)
+    {
         *this = Traits::fromString(str);
     }
 
@@ -239,9 +246,27 @@ enum class CTEMode
     INLINED,
     SHARED,
     AUTO,
+    ENFORCED,
 };
 
 DECLARE_SETTING_ENUM(CTEMode)
+
+enum class ExpandMode
+{
+    EXPAND,
+    UNION,
+    CTE,
+};
+
+DECLARE_SETTING_ENUM(ExpandMode)
+
+enum class SpillMode
+{
+    MANUAL,
+    AUTO,
+};
+
+DECLARE_SETTING_ENUM(SpillMode)
 
 enum class StatisticsAccurateSampleNdvMode
 {
@@ -255,11 +280,148 @@ DECLARE_SETTING_ENUM(StatisticsAccurateSampleNdvMode)
 /// The setting for controlling usage of local disk cache
 enum class DiskCacheMode
 {
+    /// use disk cache
     AUTO = 0,          /// depends on storage settings
     USE_DISK_CACHE,    /// use disk cache if cache is available
-    SKIP_DISK_CACHE,   /// use no disk cache
-    FORCE_CHECKSUMS_DISK_CACHE,  /// if disk cache is not hit, throw an exception
+    FORCE_DISK_CACHE,  /// if disk cache is not hit, throw an exception
+    FORCE_STEAL_DISK_CACHE,
+
+    /// no disk cache
+    SKIP_DISK_CACHE,
 };
 
-DECLARE_SETTING_ENUM(DiskCacheMode);
+DECLARE_SETTING_ENUM(DiskCacheMode)
+
+enum class StatisticsCachePolicy
+{
+    Default,
+    Cache,
+    Catalog,
+};
+DECLARE_SETTING_ENUM(StatisticsCachePolicy)
+
+enum class HiveMoveToPrewhereMethod
+{
+    NEVER,
+    COLUMN_SIZE,
+    STATS,
+    ALL,
+};
+DECLARE_SETTING_ENUM(HiveMoveToPrewhereMethod)
+
+enum class MaterializedViewConsistencyCheckMethod
+{
+    NONE,
+    PARTITION,
+};
+
+DECLARE_SETTING_ENUM(MaterializedViewConsistencyCheckMethod);
+
+enum class BackupVWMode
+{
+    BACKUP = 0,
+    ROUND_ROBIN,
+    BACKUP_ONLY,
+};
+
+DECLARE_SETTING_ENUM(BackupVWMode)
+
+enum class QueueName : uint32_t
+{
+    Highest = 0,
+    High,
+    Normal,
+    Low,
+    Lowest,
+    Count,
+    Auto
+};
+
+DECLARE_SETTING_ENUM(QueueName);
+
+enum class VWQueueMode : uint32_t
+{
+    Skip = 0,
+    Match,
+    Force
+};
+
+DECLARE_SETTING_ENUM(VWQueueMode);
+
+enum class VWLoadBalancing
+{
+    RANDOM = 0,
+    IN_ORDER,
+    REVERSE_ORDER,
+};
+
+DECLARE_SETTING_ENUM(VWLoadBalancing);
+
+enum class SpanHierarchy : int
+{
+    TRACE = 0,
+    DEBUG = 1,
+    INFO = 2
+};
+
+
+DECLARE_SETTING_ENUM(SpanHierarchy)
+
+enum class TextCaseOption
+{
+    MIXED,
+    LOWERCASE,
+    UPPERCASE,
+};
+
+DECLARE_SETTING_ENUM(TextCaseOption)
+
+enum class ShortCircuitFunctionEvaluation
+{
+    ENABLE, // Use short-circuit function evaluation for functions that are suitable for it.
+    FORCE_ENABLE, // Use short-circuit function evaluation for all functions.
+    DISABLE, // Disable short-circuit function evaluation.
+};
+
+DECLARE_SETTING_ENUM(ShortCircuitFunctionEvaluation)
+
+enum class DedupKeyMode
+{
+    REPLACE,
+    THROW,
+    APPEND,
+    IGNORE,
+};
+
+DECLARE_SETTING_ENUM(DedupKeyMode)
+
+enum class RefreshViewTaskStatus : int8_t
+{
+    START = 1,
+    FINISH = 2,
+    EXCEPTION_EXECUTE_TASK = 3,
+    EXCEPTION_BEFORE_START = 4,
+};
+
+DECLARE_SETTING_ENUM(RefreshViewTaskStatus);
+
+enum class RefreshViewTaskType : int8_t
+{
+    NONE = 1,
+    PARTITION_BASED_REFRESH = 2,
+    FULL_REFRESH = 3,
+};
+
+DECLARE_SETTING_ENUM(RefreshViewTaskType);
+
+enum class SchemaInferenceMode
+{
+    DEFAULT,
+    UNION,
+};
+
+DECLARE_SETTING_ENUM(SchemaInferenceMode)
+
+DECLARE_SETTING_ENUM_WITH_RENAME(DateTimeOverflowBehavior, FormatSettings::DateTimeOverflowBehavior)
+
 }

@@ -13,22 +13,37 @@
  * limitations under the License.
  */
 
-#include <DataTypes/FieldToDataType.h>
-#include <Functions/InternalFunctionsDynamicFilter.h>
 #include <Optimizer/CardinalityEstimate/FilterEstimator.h>
+
+#include <algorithm>
+#include <optional>
+#include <DataTypes/FieldToDataType.h>
+#include <Functions/InternalFunctionRuntimeFilter.h>
 #include <Optimizer/PredicateUtils.h>
 #include <Parsers/ASTFunction.h>
+#include <Statistics/StringHash.h>
+#include <common/types.h>
 
 namespace DB
 {
 PlanNodeStatisticsPtr FilterEstimator::estimate(
-    PlanNodeStatisticsPtr & opt_child_stats, const FilterStep & step, ContextMutablePtr & context, bool is_on_base_table)
+    PlanNodeStatisticsPtr & opt_child_stats,
+    const ConstASTPtr & predicate,
+    NameToType types,
+    ContextMutablePtr & context,
+    bool is_on_base_table)
 {
     if (!opt_child_stats)
     {
         return nullptr;
     }
 
+    if (PredicateUtils::isTruePredicate(predicate))
+    {
+        return opt_child_stats;
+    }
+
+    double default_selectivity = context->getSettingsRef().stats_estimator_unknown_filter_selectivity;
     PlanNodeStatisticsPtr filter_stats = opt_child_stats->copy();
 
     // if the child of filter step is table scan, or projection + table scan, e.g.
@@ -38,39 +53,43 @@ PlanNodeStatisticsPtr FilterEstimator::estimate(
     if (!is_on_base_table)
     {
         // Prefer default selectivity when is_on_base_table flag is false.
-        UInt64 row_count = filter_stats->getRowCount() * DEFAULT_SELECTIVITY;
+        UInt64 row_count = filter_stats->getRowCount() * default_selectivity;
 
         // make row count at least 1.
         row_count = row_count > 1 ? row_count : 1;
         filter_stats->updateRowCount(row_count);
         for (auto & symbol_stats : filter_stats->getSymbolStatistics())
         {
-            symbol_stats.second = symbol_stats.second->applySelectivity(DEFAULT_SELECTIVITY);
+            symbol_stats.second = symbol_stats.second->applySelectivity(default_selectivity);
             // NDV must less or equals to row count
             symbol_stats.second->setNdv(std::min(filter_stats->getRowCount(), symbol_stats.second->getNdv()));
         }
         return filter_stats;
     }
 
-    auto predicate = step.getFilter();
-    auto interpreter = ExpressionInterpreter::basicInterpreter(step.getInputStreams()[0].header.getNamesToTypes(), context);
-    FilterEstimatorContext estimator_context{.context = context, .interpreter = interpreter};
+    auto interpreter = ExpressionInterpreter::basicInterpreter(std::move(types), context);
+    FilterEstimatorContext estimator_context{
+        .context = context,
+        .interpreter = interpreter,
+        .default_selectivity = default_selectivity,
+        .like_selectivity = context->getSettingsRef().stats_estimator_like_selectivity};
     FilterEstimateResult result = estimateFilter(*filter_stats, predicate, estimator_context);
 
-    double selectivity = result.first;
+    double selectivity = result.first.value_or(default_selectivity);
 
-    if (selectivity <= 0.0)
-    {
-        return std::make_shared<PlanNodeStatistics>(0);
-    }
     if (selectivity >= 1.0)
     {
         return filter_stats;
     }
 
+    if (selectivity < 0.0)
+    {
+        selectivity = 0;
+    }
+
     UInt64 filtered_row_count = filter_stats->getRowCount() * selectivity;
     // make row count at least 1.
-    filter_stats->updateRowCount(filtered_row_count > 1 ? filtered_row_count : 1);
+    filter_stats->updateRowCount(filtered_row_count > 0 ? filtered_row_count : std::min(UInt64(1), opt_child_stats->getRowCount()));
     std::unordered_map<String, SymbolStatisticsPtr> & symbol_statistics_in_filter = result.second;
     for (auto & symbol_statistics : filter_stats->getSymbolStatistics())
     {
@@ -84,6 +103,7 @@ PlanNodeStatisticsPtr FilterEstimator::estimate(
             symbol_statistics.second = symbol_statistics.second->applySelectivity(selectivity);
             // NDV must less or equals to row count
             symbol_statistics.second->setNdv(std::min(filter_stats->getRowCount(), symbol_statistics.second->getNdv()));
+            symbol_statistics.second->getHistogram().clear();
         }
     }
 
@@ -107,14 +127,18 @@ std::optional<Field> castStringType(SymbolStatistics & symbol_statistics, Field 
 }
 
 double FilterEstimator::estimateFilterSelectivity(
-    PlanNodeStatisticsPtr & child_stats, ConstASTPtr & predicate, const NamesAndTypes & column_types, ContextMutablePtr & context)
+    PlanNodeStatisticsPtr & child_stats, const ConstASTPtr & predicate, const NamesAndTypes & column_types, ContextPtr context)
 {
     NameToType name_to_type;
     for (const auto & item : column_types)
         name_to_type.emplace(item.name, item.type);
     auto interpreter = ExpressionInterpreter::basicInterpreter(name_to_type, context);
-    FilterEstimatorContext estimator_context{.context = context, .interpreter = interpreter};
-    return estimateFilter(*child_stats, predicate, estimator_context).first;
+    FilterEstimatorContext estimator_context{
+        .context = context,
+        .interpreter = interpreter,
+        .default_selectivity = context->getSettingsRef().stats_estimator_unknown_filter_selectivity,
+        .like_selectivity = context->getSettingsRef().stats_estimator_like_selectivity};
+    return estimateFilter(*child_stats, predicate, estimator_context).first.value_or(estimator_context.default_selectivity);
 }
 
 ConstASTPtr tryGetIdentifier(ConstASTPtr node)
@@ -129,56 +153,67 @@ ConstASTPtr tryGetIdentifier(ConstASTPtr node)
     return node;
 }
 
-FilterEstimateResult FilterEstimator::estimateFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimateResult
+FilterEstimator::estimateFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
-    if (predicate->as<ASTLiteral>())
+    try
     {
-        if (PredicateUtils::isTruePredicate(predicate))
+        if (predicate->as<ASTLiteral>())
+        {
+            if (PredicateUtils::isTruePredicate(predicate))
+            {
+                return {1.0, {}};
+            }
+            if (PredicateUtils::isFalsePredicate(predicate))
+            {
+                return {0.0, {}};
+            }
+            std::optional<Field> result = context.calculateConstantExpression(predicate);
+            if (result.has_value() && result->isNull())
+            {
+                return {0.0, {}};
+            }
+        }
+        if (!predicate->as<const ASTFunction>())
         {
             return {1.0, {}};
         }
-        if (PredicateUtils::isFalsePredicate(predicate))
+        const auto & function = predicate->as<const ASTFunction &>();
+        if (function.name == "and")
         {
-            return {0.0, {}};
+            return estimateAndFilter(stats, predicate, context);
         }
-        std::optional<Field> result = context.calculateConstantExpression(predicate);
-        if (result.has_value() && result->isNull())
+        if (function.name == "or")
         {
-            return {0.0, {}};
+            return estimateOrFilter(stats, predicate, context);
         }
+        if (function.name == "not")
+        {
+            return estimateNotFilter(stats, predicate, context);
+        }
+        return estimateSingleFilter(stats, predicate, context);
     }
-    if (!predicate->as<const ASTFunction>())
+    catch (...)
     {
-        return {1.0, {}};
     }
-    const auto & function = predicate->as<const ASTFunction &>();
-    if (function.name == "and")
-    {
-        return estimateAndFilter(stats, predicate, context);
-    }
-    if (function.name == "or")
-    {
-        return estimateOrFilter(stats, predicate, context);
-    }
-    if (function.name == "not")
-    {
-        return estimateNotFilter(stats, predicate, context);
-    }
-    return estimateSingleFilter(stats, predicate, context);
+    return {std::nullopt, {}};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateAndFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateAndFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     std::vector<ConstASTPtr> conjuncts = PredicateUtils::extractConjuncts(predicate);
 
     FilterEstimateResults results;
     double selectivity = 1.0;
+    bool all_empty = true;
     for (auto & conjunct : conjuncts)
     {
         FilterEstimateResult result = estimateFilter(stats, conjunct, context);
-        results.emplace_back(result);
-        selectivity = selectivity * result.first;
+        if (!results.empty() && all_empty && result.first.has_value())
+            selectivity = context.default_selectivity;
+        selectivity = selectivity * result.first.value_or(context.default_selectivity);
+        all_empty &= !result.first.has_value();
         // for AND predicate, must update statistics.
         // for example, a > 1 and a < 10, if we don't update statistics after apply predicate 'a > 1',
         // then the estimate of a < 10 will base on the origin statistics. the result will expand.
@@ -186,6 +221,7 @@ FilterEstimator::estimateAndFilter(PlanNodeStatistics & stats, ConstASTPtr & pre
         {
             stats.updateSymbolStatistics(entry.first, entry.second);
         }
+        results.emplace_back(std::move(result));
     }
 
     std::unordered_map<String, SymbolStatisticsPtr> and_symbol_statistics;
@@ -200,30 +236,44 @@ FilterEstimator::estimateAndFilter(PlanNodeStatistics & stats, ConstASTPtr & pre
         }
     }
 
-    return {selectivity, std::move(and_symbol_statistics)};
+    return {all_empty ? std::nullopt : std::make_optional(selectivity), and_symbol_statistics};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateOrFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateOrFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     std::vector<ConstASTPtr> disjuncts = PredicateUtils::extractDisjuncts(predicate);
     FilterEstimateResults results;
-    double selectivity;
+    double selectivity = -1;
     double sum_selectivity = 0.0;
     double multiply_selectivity = 1.0;
-
+    bool all_empty = true;
     for (auto & disjunct : disjuncts)
     {
         // for each or predicate, use origin statistics to estimate.
         PlanNodeStatisticsPtr or_stats = stats.copy();
         FilterEstimateResult result = estimateFilter(*or_stats, disjunct, context);
+        if (!results.empty() && all_empty && result.first.has_value())
+        {
+            sum_selectivity = context.default_selectivity;
+            multiply_selectivity = context.default_selectivity;
+        }
+
         results.emplace_back(result);
-        sum_selectivity = sum_selectivity + result.first;
-        multiply_selectivity = multiply_selectivity * result.first;
+        sum_selectivity = sum_selectivity + result.first.value_or(context.default_selectivity);
+        multiply_selectivity = multiply_selectivity * result.first.value_or(context.default_selectivity);
+        all_empty &= !result.first.has_value();
     }
     selectivity = sum_selectivity - multiply_selectivity;
 
+
     std::unordered_map<String, std::vector<SymbolStatisticsPtr>> combined_symbol_statistics = combineSymbolStatistics(results);
+    if (combined_symbol_statistics.size() > 1)
+    {
+        // if we have more than one symbol statistics, we can't estimate the symbol statistics.
+        return {selectivity, {}};
+    }
+
     std::unordered_map<String, SymbolStatisticsPtr> symbol_statistics;
     for (auto & result : combined_symbol_statistics)
     {
@@ -245,11 +295,11 @@ FilterEstimator::estimateOrFilter(PlanNodeStatistics & stats, ConstASTPtr & pred
             symbol_statistics[symbol] = first_value;
         }
     }
-    return {selectivity, std::move(symbol_statistics)};
+    return {all_empty ? std::nullopt : std::make_optional(selectivity), symbol_statistics};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateNotFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateNotFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     auto function = predicate->as<const ASTFunction &>();
     ConstASTPtr sub = function.arguments->getChildren()[0];
@@ -262,7 +312,7 @@ FilterEstimator::estimateNotFilter(PlanNodeStatistics & stats, ConstASTPtr & pre
         SymbolStatisticsPtr origin = stats.getSymbolStatistics(symbol);
         not_symbol_statistics[symbol] = symbol_statistics.second->createNot(origin);
     }
-    return {1.0 - result.first, std::move(not_symbol_statistics)};
+    return {result.first.has_value() ? std::make_optional(1.0 - result.first.value()) : std::nullopt, not_symbol_statistics};
 }
 
 std::unordered_map<String, std::vector<SymbolStatisticsPtr>> FilterEstimator::combineSymbolStatistics(FilterEstimateResults & results)
@@ -291,7 +341,7 @@ std::unordered_map<String, std::vector<SymbolStatisticsPtr>> FilterEstimator::co
 }
 
 FilterEstimateResult
-FilterEstimator::estimateSingleFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateSingleFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     const auto & function = predicate->as<const ASTFunction &>();
     if (function.name == "equals")
@@ -343,16 +393,16 @@ FilterEstimator::estimateSingleFilter(PlanNodeStatistics & stats, ConstASTPtr & 
         return estimateNotLikeFilter(stats, predicate, context);
     }
 
-    if (function.name == InternalFunctionDynamicFilter::name)
+    if (function.name == InternalFunctionRuntimeFilter::name)
     {
         return {1.0, {}};
     }
     // For not-supported condition, set filter selectivity to a conservative estimate 100%
-    return {1.0, {}};
+    return {std::nullopt, {}};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateEqualityFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateEqualityFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     const auto & function = predicate->as<const ASTFunction &>();
 
@@ -363,7 +413,7 @@ FilterEstimator::estimateEqualityFilter(PlanNodeStatistics & stats, ConstASTPtr 
     // please modify rule std::make_shared<IterativeRewriter>(Rules::normalizeExpressionRules(), "NormalizeExpression")
     if (!left->as<ASTIdentifier>() || !field.has_value())
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     const auto & identifier = left->as<ASTIdentifier &>();
@@ -375,11 +425,11 @@ FilterEstimator::estimateEqualityFilter(PlanNodeStatistics & stats, ConstASTPtr 
     // No statistics for symbol
     if (symbol_statistics.isUnknown())
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     // symbol == null, or symbol != null will be convert to NULL literal.
-    double selectivity = 1.0;
+    double selectivity = double(stats.getRowCount() - symbol_statistics.getNullsCount()) / std::max(stats.getRowCount(), 1lu);
     if (symbol_statistics.isNumber())
     {
         try
@@ -394,7 +444,7 @@ FilterEstimator::estimateEqualityFilter(PlanNodeStatistics & stats, ConstASTPtr 
             // decide if the value is in [min, max] of the column.
             if (symbol_statistics.contains(value))
             {
-                selectivity = symbol_statistics.estimateEqualFilter(value);
+                selectivity *= symbol_statistics.estimateEqualFilter(value);
                 std::unordered_map<std::string, SymbolStatisticsPtr> filtered_symbol_statistics
                     = {{symbol, symbol_statistics.createEqualFilter(value)}};
                 return {selectivity, std::move(filtered_symbol_statistics)};
@@ -415,17 +465,17 @@ FilterEstimator::estimateEqualityFilter(PlanNodeStatistics & stats, ConstASTPtr 
     else if (symbol_statistics.isString())
     {
         String str = symbol_statistics.toString(literal);
-        double value = CityHash_v1_0_2::CityHash64(str.data(), str.size());
-        selectivity = symbol_statistics.estimateEqualFilter(value);
+        double value = Statistics::stringHash64(str);
+        selectivity *= symbol_statistics.estimateEqualFilter(value);
         std::unordered_map<std::string, SymbolStatisticsPtr> filtered_symbol_statistics
             = {{symbol, symbol_statistics.createEqualFilter(value)}};
         return {selectivity, std::move(filtered_symbol_statistics)};
     }
-    return {1.0, {}};
+    return {std::nullopt, {}};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateNotEqualityFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateNotEqualityFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     const auto & function = predicate->as<ASTFunction &>();
 
@@ -436,7 +486,7 @@ FilterEstimator::estimateNotEqualityFilter(PlanNodeStatistics & stats, ConstASTP
     // please modify rule std::make_shared<IterativeRewriter>(Rules::normalizeExpressionRules(), "NormalizeExpression")
     if (!left->as<ASTIdentifier>() || !field.has_value())
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     const auto & identifier = left->as<ASTIdentifier &>();
@@ -448,10 +498,10 @@ FilterEstimator::estimateNotEqualityFilter(PlanNodeStatistics & stats, ConstASTP
     // No statistics for symbol
     if (symbol_statistics.isUnknown())
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
-    double selectivity = 1.0;
+    double selectivity = double(stats.getRowCount() - symbol_statistics.getNullsCount()) / std::max(stats.getRowCount(), 1lu);
     if (symbol_statistics.isNumber())
     {
         try
@@ -466,7 +516,7 @@ FilterEstimator::estimateNotEqualityFilter(PlanNodeStatistics & stats, ConstASTP
             // decide if the value is in [min, max] of the column.
             if (symbol_statistics.contains(value))
             {
-                selectivity = symbol_statistics.estimateNotEqualFilter(value);
+                selectivity *= symbol_statistics.estimateNotEqualFilter(value);
                 std::unordered_map<std::string, SymbolStatisticsPtr> filtered_symbol_statistics
                     = {{symbol, symbol_statistics.createNotEqualFilter(value)}};
                 return {selectivity, std::move(filtered_symbol_statistics)};
@@ -478,23 +528,23 @@ FilterEstimator::estimateNotEqualityFilter(PlanNodeStatistics & stats, ConstASTP
         }
         catch (...)
         {
-            return {symbol_statistics.getNdv() == 0 ? selectivity : 1 - 1.0 / symbol_statistics.getNdv(), {}};
+            return {symbol_statistics.getNdv() == 0 ? selectivity : selectivity - 1.0 / symbol_statistics.getNdv(), {}};
         }
     }
     else if (symbol_statistics.isString())
     {
         String str = symbol_statistics.toString(literal);
-        double value = CityHash_v1_0_2::CityHash64(str.data(), str.size());
-        selectivity = symbol_statistics.estimateNotEqualFilter(value);
+        double value = Statistics::stringHash64(str);
+        selectivity *= symbol_statistics.estimateNotEqualFilter(value);
         std::unordered_map<std::string, SymbolStatisticsPtr> filtered_symbol_statistics
             = {{symbol, symbol_statistics.createNotEqualFilter(value)}};
         return {selectivity, std::move(filtered_symbol_statistics)};
     }
-    return {1.0, {}};
+    return {std::nullopt, {}};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateRangeFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateRangeFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     const auto & function = predicate->as<ASTFunction &>();
 
@@ -505,7 +555,7 @@ FilterEstimator::estimateRangeFilter(PlanNodeStatistics & stats, ConstASTPtr & p
     // please modify rule std::make_shared<IterativeRewriter>(Rules::normalizeExpressionRules(), "NormalizeExpression")
     if (!left->as<ASTIdentifier>() || !field.has_value())
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     const auto & identifier = left->as<ASTIdentifier &>();
@@ -516,10 +566,10 @@ FilterEstimator::estimateRangeFilter(PlanNodeStatistics & stats, ConstASTPtr & p
     if (symbol_statistics.isUnknown())
     {
         // No statistics for symbol
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
-    double selectivity = 1.0;
+    double selectivity = double(stats.getRowCount() - symbol_statistics.getNullsCount()) / std::max(stats.getRowCount(), 1lu);
     SymbolStatisticsPtr filtered_statistics;
     if (symbol_statistics.isNumber())
     {
@@ -536,28 +586,32 @@ FilterEstimator::estimateRangeFilter(PlanNodeStatistics & stats, ConstASTPtr & p
 
             if (function.name == "less")
             {
-                selectivity = symbol_statistics.estimateLessThanOrLessThanEqualFilter(value, false, min, true);
+                double selectivity_estiamte = symbol_statistics.estimateLessThanOrLessThanEqualFilter(value, false, min, true);
+                selectivity *= selectivity_estiamte == -1 ? context.default_selectivity : selectivity_estiamte;
                 filtered_statistics = symbol_statistics.createLessThanOrLessThanEqualFilter(selectivity, min, value, false);
             }
             if (function.name == "lessOrEquals")
             {
-                selectivity = symbol_statistics.estimateLessThanOrLessThanEqualFilter(value, true, min, true);
+                double selectivity_estiamte = symbol_statistics.estimateLessThanOrLessThanEqualFilter(value, true, min, true);
+                selectivity *= selectivity_estiamte == -1 ? context.default_selectivity : selectivity_estiamte;
                 filtered_statistics = symbol_statistics.createLessThanOrLessThanEqualFilter(selectivity, min, value, true);
             }
             if (function.name == "greater")
             {
-                selectivity = symbol_statistics.estimateGreaterThanOrGreaterThanEqualFilter(max, true, value, false);
+                double selectivity_estiamte = symbol_statistics.estimateGreaterThanOrGreaterThanEqualFilter(max, true, value, false);
+                selectivity *= selectivity_estiamte == -1 ? context.default_selectivity : selectivity_estiamte;
                 filtered_statistics = symbol_statistics.createGreaterThanOrGreaterThanEqualFilter(selectivity, value, max, false);
             }
             if (function.name == "greaterOrEquals")
             {
-                selectivity = symbol_statistics.estimateGreaterThanOrGreaterThanEqualFilter(max, true, value, true);
+                double selectivity_estiamte = symbol_statistics.estimateGreaterThanOrGreaterThanEqualFilter(max, true, value, true);
+                selectivity *= selectivity_estiamte == -1 ? context.default_selectivity : selectivity_estiamte;
                 filtered_statistics = symbol_statistics.createGreaterThanOrGreaterThanEqualFilter(selectivity, value, max, true);
             }
         }
         catch (...)
         {
-            return {1.0, {}};
+            return {std::nullopt, {}};
         }
 
         std::unordered_map<std::string, SymbolStatisticsPtr> filtered_symbol_statistics = {{symbol, std::move(filtered_statistics)}};
@@ -566,19 +620,19 @@ FilterEstimator::estimateRangeFilter(PlanNodeStatistics & stats, ConstASTPtr & p
     else if (symbol_statistics.isString())
     {
         // string type does not support range filter.
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
-    return {1.0, {}};
+    return {std::nullopt, {}};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateInFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateInFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     const auto & function = predicate->as<ASTFunction &>();
     bool match = function.arguments->getChildren()[0]->as<ASTIdentifier>() && function.arguments->getChildren()[1]->as<ASTFunction>();
     if (!match)
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     ASTIdentifier & identifier = function.arguments->getChildren()[0]->as<ASTIdentifier &>();
@@ -591,9 +645,8 @@ FilterEstimator::estimateInFilter(PlanNodeStatistics & stats, ConstASTPtr & pred
     // No statistics for symbol
     if (symbol_statistics.isUnknown())
     {
-        return {1.0, {}};
+        return {context.context->getSettingsRef().stats_estimator_unknown_in_filter_selectivity, {}};
     }
-
     if (symbol_statistics.isNumber())
     {
         std::set<double> values;
@@ -648,7 +701,7 @@ FilterEstimator::estimateInFilter(PlanNodeStatistics & stats, ConstASTPtr & pred
             if (auto eval_res = context.calculateConstantExpression(child))
             {
                 String str = symbol_statistics.toString(*eval_res);
-                double value = CityHash_v1_0_2::CityHash64(str.data(), str.size());
+                double value = Statistics::stringHash64(str);
                 str_values.insert(value);
             }
             else
@@ -661,17 +714,17 @@ FilterEstimator::estimateInFilter(PlanNodeStatistics & stats, ConstASTPtr & pred
             = {{symbol, symbol_statistics.createInFilter(str_values, has_null_value)}};
         return {in_values_selectivity, std::move(filtered_symbol_statistics)};
     }
-    return {1.0, {}};
+    return {std::nullopt, {}};
 }
 
 FilterEstimateResult
-FilterEstimator::estimateNotInFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext & context)
+FilterEstimator::estimateNotInFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext & context)
 {
     const auto & function = predicate->as<ASTFunction &>();
     bool match = function.arguments->getChildren()[0]->as<ASTIdentifier>() && function.arguments->getChildren()[1]->as<ASTFunction>();
     if (!match)
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     ASTIdentifier & identifier = function.arguments->getChildren()[0]->as<ASTIdentifier &>();
@@ -683,7 +736,7 @@ FilterEstimator::estimateNotInFilter(PlanNodeStatistics & stats, ConstASTPtr & p
     // No statistics for symbol
     if (symbol_statistics.isUnknown())
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     if (symbol_statistics.isNumber())
@@ -742,7 +795,7 @@ FilterEstimator::estimateNotInFilter(PlanNodeStatistics & stats, ConstASTPtr & p
                 if (!eval_res->isNull())
                 {
                     String str = symbol_statistics.toString(*eval_res);
-                    double value = CityHash_v1_0_2::CityHash64(str.data(), str.size());
+                    double value = Statistics::stringHash64(str);
                     str_values.insert(value);
                 }
                 else
@@ -756,10 +809,11 @@ FilterEstimator::estimateNotInFilter(PlanNodeStatistics & stats, ConstASTPtr & p
             = {{symbol, symbol_statistics.createNotInFilter(str_values, has_null_value)}};
         return {not_in_values_selectivity, std::move(filtered_symbol_statistics)};
     }
-    return {1.0, {}};
+    return {std::nullopt, {}};
 }
 
-FilterEstimateResult FilterEstimator::estimateNullFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext &)
+FilterEstimateResult
+FilterEstimator::estimateNullFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext &)
 {
     const auto & function = predicate->as<ASTFunction &>();
     ConstASTPtr left = tryGetIdentifier(function.arguments->getChildren()[0]);
@@ -767,7 +821,7 @@ FilterEstimateResult FilterEstimator::estimateNullFilter(PlanNodeStatistics & st
 
     if (!match)
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     const auto & identifier = left->as<ASTIdentifier &>();
@@ -777,7 +831,7 @@ FilterEstimateResult FilterEstimator::estimateNullFilter(PlanNodeStatistics & st
     if (symbol_statistics.isUnknown())
     {
         // No statistics for symbol
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     double selectivity = 1.0;
@@ -794,7 +848,8 @@ FilterEstimateResult FilterEstimator::estimateNullFilter(PlanNodeStatistics & st
     return {selectivity, std::move(symbol_stats)};
 }
 
-FilterEstimateResult FilterEstimator::estimateNotNullFilter(PlanNodeStatistics & stats, ConstASTPtr & predicate, FilterEstimatorContext &)
+FilterEstimateResult
+FilterEstimator::estimateNotNullFilter(PlanNodeStatistics & stats, const ConstASTPtr & predicate, FilterEstimatorContext &)
 {
     const auto & function = predicate->as<ASTFunction &>();
 
@@ -803,7 +858,7 @@ FilterEstimateResult FilterEstimator::estimateNotNullFilter(PlanNodeStatistics &
 
     if (!match)
     {
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     const auto & identifier = left->as<ASTIdentifier &>();
@@ -813,7 +868,7 @@ FilterEstimateResult FilterEstimator::estimateNotNullFilter(PlanNodeStatistics &
     if (symbol_statistics.isUnknown())
     {
         // No statistics for symbol
-        return {1.0, {}};
+        return {std::nullopt, {}};
     }
 
     double selectivity = 1.0;
@@ -828,15 +883,15 @@ FilterEstimateResult FilterEstimator::estimateNotNullFilter(PlanNodeStatistics &
 }
 
 // TODO support dynamic sample for complex predicate @gouguiling
-FilterEstimateResult FilterEstimator::estimateLikeFilter(PlanNodeStatistics &, ConstASTPtr &, FilterEstimatorContext &)
+FilterEstimateResult FilterEstimator::estimateLikeFilter(PlanNodeStatistics &, const ConstASTPtr &, FilterEstimatorContext & context)
 {
-    return {DEFAULT_SELECTIVITY, {}};
+    return {context.like_selectivity, {}};
 }
 
 // TODO support dynamic sample for complex predicate @gouguiling
-FilterEstimateResult FilterEstimator::estimateNotLikeFilter(PlanNodeStatistics &, ConstASTPtr &, FilterEstimatorContext &)
+FilterEstimateResult FilterEstimator::estimateNotLikeFilter(PlanNodeStatistics &, const ConstASTPtr &, FilterEstimatorContext & context)
 {
-    return {DEFAULT_SELECTIVITY, {}};
+    return {1 - context.like_selectivity, {}};
 }
 
 }

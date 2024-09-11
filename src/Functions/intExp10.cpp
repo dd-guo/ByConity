@@ -18,6 +18,8 @@ struct IntExp10Impl
 {
     using ResultType = UInt64;
     static constexpr const bool allow_fixed_string = false;
+    static const constexpr bool allow_string_integer = false;
+    static const constexpr ArgType default_arg_type = ArgType::NUMBERS;
 
     static inline ResultType apply([[maybe_unused]] A a)
     {
@@ -58,7 +60,7 @@ template <> struct FunctionUnaryArithmeticMonotonicity<NameIntExp10>
     }
 };
 
-void registerFunctionIntExp10(FunctionFactory & factory)
+REGISTER_FUNCTION(IntExp10)
 {
     factory.registerFunction<FunctionIntExp10>();
 }

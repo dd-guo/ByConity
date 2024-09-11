@@ -20,6 +20,8 @@
  */
 
 #include <Common/typeid_cast.h>
+#include <Parsers/ASTSelectIntersectExceptQuery.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -83,28 +85,46 @@ ASTPtr ASTSelectQuery::clone() const
     return res;
 }
 
-void ASTSelectQuery::collectAllTables(std::vector<ASTPtr>& all_tables, bool & has_table_functions) const
+void ASTSelectQuery::collectAllTables(const IAST * ast, std::vector<ASTPtr>& all_tables, bool & has_table_functions)
 {
+    if (!ast) return;
     // BFS ASTSelectQuery and get all Tables;
     std::queue<const IAST*> q;
-    q.push(this);
-    while (!q.empty())
+    if (const auto * select = ast->as<ASTSelectQuery>())
     {
-        auto & n = q.front();
-        for (const auto& c : n->children)
+        q.push(select);
+        while (!q.empty())
         {
-            q.push(c.get());
-        }
+            auto & n = q.front();
+            for (const auto& c : n->children)
+            {
+                q.push(c.get());
+            }
 
-        if (const ASTTableExpression* tbl = typeid_cast<const ASTTableExpression *>(n))
+            if (const ASTTableExpression* tbl = typeid_cast<const ASTTableExpression *>(n))
+            {
+                if (tbl->database_and_table_name)
+                    all_tables.push_back(tbl->database_and_table_name);
+                else if (tbl->table_function)
+                    has_table_functions = true;
+            }
+
+            q.pop();
+        }
+    }
+    else if (const auto * select_union = ast->as<ASTSelectWithUnionQuery>())
+    {
+        for (const auto & child : select_union->list_of_selects->children)
         {
-            if (tbl->database_and_table_name)
-                all_tables.push_back(tbl->database_and_table_name);
-            else if (tbl->table_function)
-                has_table_functions = true;
+            collectAllTables(child.get(), all_tables, has_table_functions);
         }
-
-        q.pop();
+    }
+    else if (const auto * intersect_or_except = ast->as<ASTSelectIntersectExceptQuery>())
+    {
+        for (const auto & child : intersect_or_except->getListOfSelects())
+        {
+            collectAllTables(child.get(), all_tables, has_table_functions);
+        }
     }
 }
 
@@ -161,7 +181,13 @@ void ASTSelectQuery::formatImpl(const FormatSettings & s, FormatState & state, F
         where()->formatImpl(s, state, frame);
     }
 
-    if (groupBy())
+    if (escape())
+    {
+        s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "ESCAPE " << (s.hilite ? hilite_none : "");
+        escape()->formatImpl(s, state, frame);
+    }
+
+    if (!group_by_all && groupBy())
     {
         s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "GROUP BY" << (s.hilite ? hilite_none : "");
         if (!group_by_with_grouping_sets)
@@ -171,6 +197,9 @@ void ASTSelectQuery::formatImpl(const FormatSettings & s, FormatState & state, F
             : groupBy()->as<ASTExpressionList &>().formatImplMultiline(s, state, frame);
         }
     }
+
+    if (group_by_all)
+        s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << "GROUP BY ALL" << (s.hilite ? hilite_none : "");
 
     if (group_by_with_rollup)
         s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << indent_str << (s.one_line ? "" : "    ") << "WITH ROLLUP" << (s.hilite ? hilite_none : "");
@@ -419,6 +448,7 @@ static String getTableExpressionAlias(const ASTTableExpression * table_expressio
     return String();
 }
 
+// NOTE(renming):: we should avoid using this function since it didn't handle catalog correctly.
 void ASTSelectQuery::replaceDatabaseAndTable(const String & database_name, const String & table_name)
 {
     assert(database_name != "_temporary_and_external_tables");
@@ -526,6 +556,7 @@ void ASTSelectQuery::serialize(WriteBuffer & buf) const
     writeBinary(group_by_with_cube, buf);
     writeBinary(group_by_with_constant_keys, buf);
     writeBinary(limit_with_ties, buf);
+    hints.serialize(buf);
 
     ASTPtr ast = nullptr;
 #define SERIALIZE_EXPRESSION(expr) \
@@ -562,6 +593,7 @@ void ASTSelectQuery::deserializeImpl(ReadBuffer & buf)
     readBinary(group_by_with_cube, buf);
     readBinary(group_by_with_constant_keys, buf);
     readBinary(limit_with_ties, buf);
+    hints.deserialize(buf);
 
 
 #define DESERIALIZE_EXPRESSION(expr) \
@@ -606,4 +638,8 @@ std::vector<ASTSelectQuery::Expression> ASTSelectQuery::getExpressionTypes() con
     return expression_types;
 }
 
+void ASTSelectQuery::removeSettingsAndOutputFormat()
+{
+    positions.erase(Expression::SETTINGS);
+}
 }

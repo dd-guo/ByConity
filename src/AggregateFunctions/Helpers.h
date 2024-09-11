@@ -63,6 +63,14 @@
     M(Int32) \
     M(Int64)
 
+// added for advertising algorithms platform
+#define FOR_AD_NUMERIC_TYPES(M) \
+    M(Int16) \
+    M(Int32) \
+    M(Int64) \
+    M(Float32) \
+    M(Float64)
+
 namespace DB
 {
 struct Settings;
@@ -160,6 +168,30 @@ static IAggregateFunction * createWithUnsignedIntegerType(const IDataType & argu
     return nullptr;
 }
 
+template <template <typename, typename> class AggregateFunctionTemplate, template <typename> class Data, typename ... TArgs>
+static IAggregateFunction * createWithIntegerType(const IDataType & argument_type, TArgs && ... args)
+{
+    WhichDataType which(argument_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return new AggregateFunctionTemplate<TYPE, Data<TYPE>>(std::forward<TArgs>(args)...);
+    FOR_INTEGER_TYPES_DATA(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
+template <template <typename> class AggregateFunctionTemplate, typename ... TArgs>
+static IAggregateFunction * createWithIntegerType(const IDataType & argument_type, TArgs && ... args)
+{
+    WhichDataType which(argument_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return new AggregateFunctionTemplate<TYPE>(std::forward<TArgs>(args)...);
+    FOR_INTEGER_TYPES_DATA(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
 template <template <typename, typename> class AggregateFunctionTemplate, template <typename> class Data, typename... TArgs>
 static IAggregateFunction * createWithBasicNumberOrDateOrDateTime(const IDataType & argument_type, TArgs &&... args)
 {
@@ -249,6 +281,57 @@ static IAggregateFunction * createWithTwoNumericTypes(const IDataType & first_ty
         return createWithTwoNumericTypesSecond<Int8, AggregateFunctionTemplate>(second_type, std::forward<TArgs>(args)...);
     if (which.idx == TypeIndex::Enum16)
         return createWithTwoNumericTypesSecond<Int16, AggregateFunctionTemplate>(second_type, std::forward<TArgs>(args)...);
+    return nullptr;
+}
+
+/**
+ * For template with four arguments. Added for advertising algorithms platform.
+ */
+template <typename FirstType, typename SecondType, typename ThirdType, template <typename, typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithFourNumericTypesFourth(const IDataType & fourth_type, TArgs && ... args)
+{
+    WhichDataType which(fourth_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return new AggregateFunctionTemplate<FirstType, SecondType, ThirdType, TYPE>(std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
+template <typename FirstType, typename SecondType, template <typename, typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithFourNumericTypesThird(const IDataType & third_type, const IDataType & fourth_type, TArgs && ... args)
+{
+    WhichDataType which(third_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return createWithFourNumericTypesFourth<FirstType, SecondType, TYPE, AggregateFunctionTemplate>(fourth_type, std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
+template <typename FirstType, template <typename, typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithFourNumericTypesSecond(const IDataType & second_type, const IDataType & third_type, const IDataType & fourth_type, TArgs && ... args)
+{
+    WhichDataType which(second_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return createWithFourNumericTypesThird<FirstType, TYPE, AggregateFunctionTemplate>(third_type, fourth_type, std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
+template <template <typename, typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithFourNumericTypes(const IDataType & first_type, const IDataType & second_type, const IDataType & third_type, const IDataType & fourth_type, TArgs && ... args)
+{
+    WhichDataType which(first_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return createWithFourNumericTypesSecond<TYPE, AggregateFunctionTemplate>(second_type, third_type, fourth_type, std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
     return nullptr;
 }
 
@@ -349,6 +432,43 @@ static IAggregateFunction * createWithTwoTypesSecond(const IDataType & second_ty
     return nullptr;
 }
 
+template <template <typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithTimeAttrTypeSingle(const IDataType & type, TArgs && ... args)
+{
+    WhichDataType which(type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) return new AggregateFunctionTemplate<TYPE>(std::forward<TArgs>(args)...);
+    FOR_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    if (which.idx == TypeIndex::String) return new AggregateFunctionTemplate<String>(std::forward<TArgs>(args)...);
+    return nullptr;
+}
+
+
+template <typename FirstType, template <typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithTimeAttrTypeSecond(const IDataType & second_type, TArgs && ... args)
+{
+    WhichDataType which(second_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) return new AggregateFunctionTemplate<FirstType, TYPE>(std::forward<TArgs>(args)...);
+    FOR_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    if (which.idx == TypeIndex::String) return new AggregateFunctionTemplate<FirstType, String>(std::forward<TArgs>(args)...);
+    return nullptr;
+}
+
+template <template <typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithTimeAttrTypes(const IDataType & first_type, const IDataType & second_type, TArgs && ... args)
+{
+    WhichDataType which(first_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return createWithTimeAttrTypeSecond<TYPE, AggregateFunctionTemplate>(second_type, std::forward<TArgs>(args)...);
+    FOR_INTEGER_TYPES_DATA(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
 template <template <typename, typename> class AggregateFunctionTemplate, typename... TArgs>
 static IAggregateFunction * createWithTwoTypes(const IDataType & first_type, const IDataType & second_type, TArgs && ... args)
 {
@@ -362,18 +482,6 @@ static IAggregateFunction * createWithTwoTypes(const IDataType & first_type, con
         return createWithTwoTypesSecond<Int8, AggregateFunctionTemplate>(second_type, std::forward<TArgs>(args)...);
     if (which.idx == TypeIndex::Enum16)
         return createWithTwoTypesSecond<UInt16, AggregateFunctionTemplate>(second_type, std::forward<TArgs>(args)...);
-    return nullptr;
-}
-
-template <template <typename> class AggregateFunctionTemplate, typename ... TArgs>
-static IAggregateFunction * createWithIntegerType(const IDataType & argument_type, TArgs && ... args)
-{
-    WhichDataType which(argument_type);
-#define DISPATCH(TYPE) \
-    if (which.idx == TypeIndex::TYPE) \
-        return new AggregateFunctionTemplate<TYPE>(std::forward<TArgs>(args)...);
-    FOR_INTEGER_TYPES_DATA(DISPATCH)
-#undef DISPATCH
     return nullptr;
 }
 
@@ -414,4 +522,44 @@ static IAggregateFunction * createWithTypesAndIntegerType(const IDataType & firs
 #undef DISPATCH
     return nullptr;
 }
+
+/**
+ * For template with three arguments. Added for advertising algorithms platform.
+ */
+template <typename FirstType, typename SecondType, template <typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithThreeNumericTypesThird(const IDataType & third_type, TArgs && ... args)
+{
+    WhichDataType which(third_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return new AggregateFunctionTemplate<FirstType, SecondType, TYPE>(std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
+template <typename FirstType, template <typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithThreeNumericTypesSecond(const IDataType & second_type, const IDataType & third_type, TArgs && ... args)
+{
+    WhichDataType which(second_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return createWithThreeNumericTypesThird<FirstType, TYPE, AggregateFunctionTemplate>(third_type, std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
+template <template <typename, typename, typename> class AggregateFunctionTemplate, typename... TArgs>
+static IAggregateFunction * createWithThreeNumericTypes(const IDataType & first_type, const IDataType & second_type, const IDataType & third_type, TArgs && ... args)
+{
+    WhichDataType which(first_type);
+#define DISPATCH(TYPE) \
+    if (which.idx == TypeIndex::TYPE) \
+        return createWithThreeNumericTypesSecond<TYPE, AggregateFunctionTemplate>(second_type, third_type, std::forward<TArgs>(args)...);
+    FOR_AD_NUMERIC_TYPES(DISPATCH)
+#undef DISPATCH
+    return nullptr;
+}
+
 }

@@ -38,15 +38,19 @@
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTConstraintDeclaration.h>
 #include <Parsers/ASTExpressionList.h>
+#include <Parsers/ASTForeignKeyDeclaration.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTIndexDeclaration.h>
 #include <Parsers/ASTProjectionDeclaration.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTUniqueNotEnforcedDeclaration.h>
 #include <Parsers/queryToString.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/IStorage.h>
+#include <Storages/MergeTree/Index/MergeTreeBitmapIndex.h>
+#include <Storages/MergeTree/Index/MergeTreeSegmentBitmapIndex.h>
 #include <Common/typeid_cast.h>
 #include <Common/randomSeed.h>
 
@@ -62,6 +66,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int DUPLICATE_COLUMN;
     extern const int NOT_IMPLEMENTED;
+    extern const int TYPE_MISMATCH;
 }
 
 namespace
@@ -89,9 +94,11 @@ AlterCommand::RemoveProperty removePropertyFromString(const String & property)
 
 }
 
-std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_ast)
+std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_ast, ContextPtr context)
 {
     const DataTypeFactory & data_type_factory = DataTypeFactory::instance();
+
+    bool make_columns_nullable = context ? context->getSettingsRef().data_type_default_nullable : false;
 
     if (command_ast->type == ASTAlterCommand::ADD_COLUMN)
     {
@@ -105,6 +112,8 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
         if (ast_col_decl.type)
         {
             command.data_type = data_type_factory.get(ast_col_decl.type, ast_col_decl.flags);
+            if ((ast_col_decl.null_modifier && *ast_col_decl.null_modifier) || (!ast_col_decl.null_modifier && make_columns_nullable))
+                command.data_type = JoinCommon::convertTypeToNullable(command.data_type);
         }
         if (ast_col_decl.default_expression)
         {
@@ -124,6 +133,10 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
                 throw Exception{"Cannot specify codec for column type ALIAS", ErrorCodes::BAD_ARGUMENTS};
             command.codec = ast_col_decl.codec;
         }
+
+        if (ast_col_decl.mysql_primary_key)
+            command.mysql_primary_key = ast_col_decl.mysql_primary_key;
+
         if (command_ast->column)
             command.after_column = getIdentifierName(command_ast->column);
 
@@ -164,6 +177,8 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
         if (ast_col_decl.type)
         {
             command.data_type = data_type_factory.get(ast_col_decl.type, ast_col_decl.flags);
+            if ((ast_col_decl.null_modifier && *ast_col_decl.null_modifier) || (!ast_col_decl.null_modifier && make_columns_nullable))
+                command.data_type = JoinCommon::convertTypeToNullable(command.data_type);
         }
 
         if (ast_col_decl.default_expression)
@@ -268,6 +283,36 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
 
         return command;
     }
+    else if (command_ast->type == ASTAlterCommand::ADD_FOREIGN_KEY)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.foreign_key_decl = command_ast->foreign_key_decl;
+        command.type = AlterCommand::ADD_FOREIGN_KEY;
+
+        const auto & ast_foreign_key_decl = command_ast->foreign_key_decl->as<ASTForeignKeyDeclaration &>();
+
+        command.foreign_key_name = ast_foreign_key_decl.fk_name;
+
+        command.if_not_exists = command_ast->if_not_exists;
+
+        return command;
+    }
+    else if (command_ast->type == ASTAlterCommand::ADD_UNIQUE_NOT_ENFORCED)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.unique_not_enforced_decl = command_ast->unique_not_enforced_decl;
+        command.type = AlterCommand::ADD_UNIQUE_NOT_ENFORCED;
+
+        const auto & ast_unique_not_enforced_decl = command_ast->unique_not_enforced_decl->as<ASTUniqueNotEnforcedDeclaration &>();
+
+        command.unique_not_enforced_name = ast_unique_not_enforced_decl.name;
+
+        command.if_not_exists = command_ast->if_not_exists;
+
+        return command;
+    }
     else if (command_ast->type == ASTAlterCommand::ADD_PROJECTION)
     {
         AlterCommand command;
@@ -287,6 +332,17 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
 
         return command;
     }
+    else if (command_ast->type == ASTAlterCommand::MATERIALIZE_PROJECTION)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.type = AlterCommand::MATERIALIZE_PROJECTION;
+        command.projection_name = command_ast->projection->as<ASTIdentifier &>().name();
+        if (command_ast->partition)
+            command.partition = command_ast->partition;
+
+        return command;
+    }
     else if (command_ast->type == ASTAlterCommand::DROP_CONSTRAINT)
     {
         AlterCommand command;
@@ -294,6 +350,26 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
         command.if_exists = command_ast->if_exists;
         command.type = AlterCommand::DROP_CONSTRAINT;
         command.constraint_name = command_ast->constraint->as<ASTIdentifier &>().name();
+
+        return command;
+    }
+    else if (command_ast->type == ASTAlterCommand::DROP_FOREIGN_KEY)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.if_exists = command_ast->if_exists;
+        command.type = AlterCommand::DROP_FOREIGN_KEY;
+        command.foreign_key_name = command_ast->foreign_key->as<ASTIdentifier &>().name();
+
+        return command;
+    }
+    else if (command_ast->type == ASTAlterCommand::DROP_UNIQUE_NOT_ENFORCED)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.if_exists = command_ast->if_exists;
+        command.type = AlterCommand::DROP_UNIQUE_NOT_ENFORCED;
+        command.unique_not_enforced_name = command_ast->unique_not_enforced->as<ASTIdentifier &>().name();
 
         return command;
     }
@@ -392,12 +468,36 @@ std::optional<AlterCommand> AlterCommand::parse(const ASTAlterCommand * command_
         command.map_keys = command_ast->map_keys;
         return command;
     }
+    else if (command_ast->type == ASTAlterCommand::CHANGE_ENGINE)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.type = AlterCommand::CHANGE_ENGINE;
+        command.engine = command_ast->engine;
+        return command;
+    }
+    else if (command_ast->type == ASTAlterCommand::MODIFY_DATABASE_SETTING)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.type = AlterCommand::MODIFY_DATABASE_SETTING;
+        command.settings_changes = command_ast->settings_changes->as<ASTSetQuery &>().changes;
+        return command;
+    }
+    else if (command_ast->type == ASTAlterCommand::RENAME_TABLE)
+    {
+        AlterCommand command;
+        command.ast = command_ast->clone();
+        command.type = AlterCommand::RENAME_TABLE;
+        command.rename_to = command_ast->rename_table_to->as<ASTTableIdentifier &>().name();
+        return command;
+    }
     else
         return {};
 }
 
 
-void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context) const
+void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context, bool allow_nullable_key) const
 {
     if (type == ADD_COLUMN)
     {
@@ -613,6 +713,87 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context)
         }
         metadata.constraints.constraints.erase(erase_it);
     }
+    else if (type == ADD_FOREIGN_KEY)
+    {
+        String new_foreign_key_name = foreign_key_decl->as<ASTForeignKeyDeclaration &>().fk_name;
+
+        if (std::any_of(
+                metadata.foreign_keys.foreign_keys.cbegin(),
+                metadata.foreign_keys.foreign_keys.cend(),
+                [new_foreign_key_name](const ASTPtr & foreign_key_ast) {
+                    return foreign_key_ast->as<ASTForeignKeyDeclaration &>().fk_name == new_foreign_key_name;
+                }))
+        {
+            if (if_not_exists)
+                return;
+            throw Exception(
+                "Cannot add foreign key " + new_foreign_key_name + ": foreign key with this name already exists",
+                ErrorCodes::ILLEGAL_COLUMN);
+        }
+
+        auto insert_it = metadata.foreign_keys.foreign_keys.end();
+
+        metadata.foreign_keys.foreign_keys.emplace(insert_it, std::dynamic_pointer_cast<ASTForeignKeyDeclaration>(foreign_key_decl));
+    }
+    else if (type == DROP_FOREIGN_KEY)
+    {
+        auto erase_it = std::find_if(
+            metadata.foreign_keys.foreign_keys.begin(), metadata.foreign_keys.foreign_keys.end(), [this](const ASTPtr & foreign_key_ast) {
+                return foreign_key_ast->as<ASTForeignKeyDeclaration &>().fk_name == foreign_key_name;
+            });
+
+        if (erase_it == metadata.foreign_keys.foreign_keys.end())
+        {
+            if (if_exists)
+                return;
+            throw Exception(
+                "Wrong foreign key name. Cannot find foreign key `" + foreign_key_name + "` to drop.", ErrorCodes::BAD_ARGUMENTS);
+        }
+        metadata.foreign_keys.foreign_keys.erase(erase_it);
+    }
+
+    else if (type == ADD_UNIQUE_NOT_ENFORCED)
+    {
+        String new_unique_not_enforced_name = unique_not_enforced_decl->as<ASTUniqueNotEnforcedDeclaration &>().name;
+
+        if (std::any_of(
+                metadata.unique_not_enforced.unique.cbegin(),
+                metadata.unique_not_enforced.unique.cend(),
+                [new_unique_not_enforced_name](const ASTPtr & unique_not_enforced_ast) {
+                    return unique_not_enforced_ast->as<ASTUniqueNotEnforcedDeclaration &>().name == new_unique_not_enforced_name;
+                }))
+        {
+            if (if_not_exists)
+                return;
+            throw Exception(
+                "Cannot add unique_not_enforced " + new_unique_not_enforced_name + ": this name already exists",
+                ErrorCodes::ILLEGAL_COLUMN);
+        }
+
+        auto insert_it = metadata.unique_not_enforced.unique.end();
+
+        metadata.unique_not_enforced.unique.emplace(
+            insert_it, std::dynamic_pointer_cast<ASTUniqueNotEnforcedDeclaration>(unique_not_enforced_decl));
+    }
+    else if (type == DROP_UNIQUE_NOT_ENFORCED)
+    {
+        auto erase_it = std::find_if(
+            metadata.unique_not_enforced.unique.begin(),
+            metadata.unique_not_enforced.unique.end(),
+            [this](const ASTPtr & unique_not_enforced_ast) {
+                return unique_not_enforced_ast->as<ASTUniqueNotEnforcedDeclaration &>().name == unique_not_enforced_name;
+            });
+
+        if (erase_it == metadata.unique_not_enforced.unique.end())
+        {
+            if (if_exists)
+                return;
+            throw Exception(
+                "Wrong unique_not_enforced name. Cannot find unique_not_enforced `" + unique_not_enforced_name + "` to drop.",
+                ErrorCodes::BAD_ARGUMENTS);
+        }
+        metadata.unique_not_enforced.unique.erase(erase_it);
+    }
     else if (type == ADD_PROJECTION)
     {
         auto projection = ProjectionDescription::getProjectionFromAST(projection_decl, metadata.columns, context);
@@ -623,9 +804,14 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context)
         if (!partition && !clear)
             metadata.projections.remove(projection_name, if_exists);
     }
+    else if (type == MATERIALIZE_PROJECTION)
+    {
+        if (!metadata.projections.has(projection_name))
+            throw Exception{"Cannot materialize projection " + projection_name + ": projection with this name is not exists", ErrorCodes::ILLEGAL_COLUMN};
+    }
     else if (type == MODIFY_TTL)
     {
-        metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(ttl, metadata.columns, context, metadata.primary_key);
+        metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(ttl, metadata.columns, context, metadata.primary_key, allow_nullable_key);
     }
     else if (type == REMOVE_TTL)
     {
@@ -684,6 +870,12 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context)
         for (auto & constraint : metadata.constraints.constraints)
             rename_visitor.visit(constraint);
 
+        for (auto & foreign_key : metadata.foreign_keys.foreign_keys)
+            rename_visitor.visit(foreign_key);
+
+        for (auto & unique_key : metadata.unique_not_enforced.unique)
+            rename_visitor.visit(unique_key);
+
         if (metadata.isSortingKeyDefined())
             rename_visitor.visit(metadata.sorting_key.definition_ast);
 
@@ -701,6 +893,10 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context)
 
         for (auto & index : metadata.secondary_indices)
             rename_visitor.visit(index.definition_ast);
+    }
+    else if (type == CHANGE_ENGINE)
+    {
+        throw Exception("CHANGE_ENGINE command is only supported in StorageMySQL", ErrorCodes::NOT_IMPLEMENTED);
     }
     else
         throw Exception("Wrong parameter type in ALTER query", ErrorCodes::LOGICAL_ERROR);
@@ -796,6 +992,8 @@ bool AlterCommand::isRequireMutationStage(const StorageInMemoryMetadata & metada
     if (type == MODIFY_CLUSTER_BY)
         return true;
 
+    if (type == MATERIALIZE_PROJECTION)
+        return true;
 
     if (type != MODIFY_COLUMN || data_type == nullptr)
         return false;
@@ -897,6 +1095,17 @@ std::optional<MutationCommand> AlterCommand::tryConvertToMutationCommand(Storage
 
         result.predicate = nullptr;
     }
+    else if (type == MATERIALIZE_PROJECTION)
+    {
+        result.type = MutationCommand::Type::MATERIALIZE_PROJECTION;
+        result.column_name = projection_name;
+        if (clear)
+            result.clear = true;
+        if (partition)
+            result.partition = partition;
+
+        result.predicate = nullptr;
+    }
     else if (type == RENAME_COLUMN)
     {
         result.type = MutationCommand::Type::RENAME_COLUMN;
@@ -911,7 +1120,7 @@ std::optional<MutationCommand> AlterCommand::tryConvertToMutationCommand(Storage
     }
     else if (type == MODIFY_CLUSTER_BY)
     {
-        result.type = MutationCommand::Type::RECLUSTER;
+        result.type = MutationCommand::Type::MODIFY_CLUSTER_BY;
     }
 
     result.ast = ast->clone();
@@ -928,6 +1137,10 @@ String alterTypeToString(const AlterCommand::Type type)
         return "ADD COLUMN";
     case AlterCommand::Type::ADD_CONSTRAINT:
         return "ADD CONSTRAINT";
+    case AlterCommand::Type::ADD_FOREIGN_KEY:
+        return "ADD FOREIGN KEY";
+    case AlterCommand::Type::ADD_UNIQUE_NOT_ENFORCED:
+        return "ADD UNIQUE NOT ENFORCED";
     case AlterCommand::Type::ADD_INDEX:
         return "ADD INDEX";
     case AlterCommand::Type::ADD_PROJECTION:
@@ -938,6 +1151,10 @@ String alterTypeToString(const AlterCommand::Type type)
         return "DROP COLUMN";
     case AlterCommand::Type::DROP_CONSTRAINT:
         return "DROP CONSTRAINT";
+    case AlterCommand::Type::DROP_FOREIGN_KEY:
+        return "DROP FOREIGN KEY";
+    case AlterCommand::Type::DROP_UNIQUE_NOT_ENFORCED:
+        return "DROP UNIQUE NOT ENFORCED";
     case AlterCommand::Type::DROP_INDEX:
         return "DROP INDEX";
     case AlterCommand::Type::DROP_PROJECTION:
@@ -962,6 +1179,10 @@ String alterTypeToString(const AlterCommand::Type type)
         return "RENAME COLUMN";
     case AlterCommand::Type::REMOVE_TTL:
         return "REMOVE TTL";
+    case AlterCommand::Type::CLEAR_MAP_KEY:
+        return "CLEAR MAP KEY";
+    case AlterCommand::Type::RENAME_TABLE:
+        return "RENAME TABLE";
     default:
         throw Exception("Uninitialized ALTER command", ErrorCodes::LOGICAL_ERROR);
     }
@@ -975,9 +1196,18 @@ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context
 
     auto metadata_copy = metadata;
 
+    bool allow_nullable_key = false;
+    if (metadata_copy.hasSettingsChanges())
+    {
+        auto settings_changes = metadata_copy.getSettingsChanges()->as<const ASTSetQuery &>().changes;
+        auto * field = settings_changes.tryGet("allow_nullable_key");
+        if (field && field->get<bool>())
+            allow_nullable_key = true;
+    }
+
     for (const AlterCommand & command : *this)
         if (!command.ignore)
-            command.apply(metadata_copy, context);
+            command.apply(metadata_copy, context, allow_nullable_key);
 
     /// Changes in columns may lead to changes in keys expression.
     metadata_copy.sorting_key.recalculateWithNewAST(metadata_copy.sorting_key.definition_ast, metadata_copy.columns, context);
@@ -1041,9 +1271,10 @@ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context
         metadata_copy.column_ttls_by_name[name] = new_ttl_entry;
     }
 
+
     if (metadata_copy.table_ttl.definition_ast != nullptr)
         metadata_copy.table_ttl = TTLTableDescription::getTTLForTableFromAST(
-            metadata_copy.table_ttl.definition_ast, metadata_copy.columns, context, metadata_copy.primary_key);
+            metadata_copy.table_ttl.definition_ast, metadata_copy.columns, context, metadata_copy.primary_key, allow_nullable_key);
 
     metadata = std::move(metadata_copy);
 }
@@ -1201,6 +1432,18 @@ void AlterCommands::validate(const StorageInMemoryMetadata & metadata, ContextPt
                         backQuote(column_name));
             }
 
+            const auto & column = all_columns.get(column_name);
+
+            if (command.data_type && command.data_type->isBitmapIndex() && !MergeTreeBitmapIndex::isValidBitmapIndexColumnType(command.data_type))
+                throw Exception("Unsupported type of bitmap index: " + command.data_type->getName() + ". Need: Array(String/Int/UInt/Float)", ErrorCodes::BAD_TYPE_OF_FIELD);
+
+            // if (command.data_type && command.data_type->isSegmentBitmapIndex() && !MergeTreeSegmentBitmapIndex::isValidSegmentBitmapIndexColumnType(column.type))
+            //     throw Exception("Unsupported type of segment bitmap index: " + column.type->getName() + ". Need: [Array | Nullable] String/Int/UInt/Float", ErrorCodes::BAD_TYPE_OF_FIELD);
+
+            if (command.data_type && command.data_type->isMap() && column.type->isMap()
+                && command.data_type->isKVMap() != column.type->isKVMap())
+                throw Exception("Not support modifying map column between KV Map and Byte Map", ErrorCodes::TYPE_MISMATCH);
+
             modified_columns.emplace(column_name);
         }
         else if (command.type == AlterCommand::DROP_COLUMN)
@@ -1288,6 +1531,10 @@ void AlterCommands::validate(const StorageInMemoryMetadata & metadata, ContextPt
                 throw Exception{"Cannot rename and modify the same column " + backQuote(column_name) + " in a single ALTER query",
                                 ErrorCodes::NOT_IMPLEMENTED};
 
+            const auto & column = all_columns.get(command.column_name);
+            if (column.type->isBitmapIndex())
+                throw Exception{"Cannot rename column with bitmap index, please drop the index first", ErrorCodes::BAD_ARGUMENTS};
+
             String from_nested_table_name = Nested::extractTableName(command.column_name);
             String to_nested_table_name = Nested::extractTableName(command.rename_to);
             bool from_nested = from_nested_table_name != command.column_name;
@@ -1323,15 +1570,12 @@ void AlterCommands::validate(const StorageInMemoryMetadata & metadata, ContextPt
             else
             {
                 const auto & column = all_columns.get(command.column_name);
-                if (!column.type->isMap())
+                if (!column.type->isByteMap())
                 {
-                    throw Exception("Not support clear keys on column " + command.column_name + " with type " + column.type->getName(),
-                            ErrorCodes::ILLEGAL_COLUMN);
-                }
-                else if (column.type->isMapKVStore())
-                {
-                    throw Exception("Not support clear keys on column " + command.column_name + " with type " + column.type->getName() + " KV store",
-                                    ErrorCodes::ILLEGAL_COLUMN);
+                    throw Exception(
+                        "Not support clear keys on column " + command.column_name + " with type " + column.type->getName()
+                            + (column.type->isKVMap() ? " KV store" : ""),
+                        ErrorCodes::ILLEGAL_COLUMN);
                 }
             }
         }

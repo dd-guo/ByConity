@@ -70,6 +70,7 @@ private:
 
     void restartReplicas(ContextMutablePtr system_context);
     void syncReplica(ASTSystemQuery & query);
+    void recalculateMetrics(ASTSystemQuery & query);
 
     void restoreReplica();
 
@@ -80,15 +81,22 @@ private:
 
     AccessRightsElements getRequiredAccessForDDLOnCluster() const;
     void startStopAction(StorageActionBlockType action_type, bool start);
-    void startOrStopConsume(ASTSystemQuery::Type type);
+    void controlConsume(ASTSystemQuery::Type type);
+    void resetConsumeOffset(ASTSystemQuery & query, ContextMutablePtr & system_context);
+
+    void executeMaterializedMyQLInCnchServer(const ASTSystemQuery & query);
 
     void executeMetastoreCmd(ASTSystemQuery & query) const;
-
+    void executeCleanTrashTable(const ASTSystemQuery & query);
+    void executeGc(const ASTSystemQuery & query);
+    void executeCheckpoint(const ASTSystemQuery & query);
+    /// dedup staging parts within the specific partition with high priority
+    void dedupWithHighPriority(const ASTSystemQuery & query);
     void executeDedup(const ASTSystemQuery & query);
 
-    void dumpCnchServerManagerStatus();
+    void dumpCnchServerStatus();
 
-    void dropCnchPartCache(ASTSystemQuery & query);
+    void dropCnchMetaCache(bool skip_part_cache = false, bool skip_delete_bitmap_cache = false);
 
     void dropChecksumsCache(const StorageID & table_id) const;
 
@@ -99,6 +107,8 @@ private:
 
     void executeSyncDedupWorker(ContextMutablePtr & system_context) const;
 
+    void executeSyncRepairTask(ContextMutablePtr & system_context) const;
+
     // clear Broken Table infos
     void clearBrokenTables(ContextMutablePtr & system_context) const;
 
@@ -108,6 +118,19 @@ private:
     void fetchParts(const ASTSystemQuery & query, const StorageID & table_id, ContextPtr local_context);
 
     void executeActionOnCNCHLog(const String & table, ASTSystemQuery::Type type);
+
+    void cleanTransaction(UInt64 txn_id);
+
+    void cleanFilesystemLock();
+
+    /// a command to test MemoryLock
+    void lockMemoryLock(const ASTSystemQuery & query, const StorageID & table_id, ContextPtr local_context);
+
+    void releaseMemoryLock(const ASTSystemQuery & query, const StorageID & table_id, ContextPtr local_context);
+
+    /// drop materialized view previous meta
+    void dropMvMeta(ASTSystemQuery & query);
+
 };
 
 

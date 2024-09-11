@@ -22,7 +22,8 @@
 #pragma once
 
 #include <Parsers/IAST.h>
-
+#include <Protos/EnumMacros.h>
+#include <Protos/enum.pb.h>
 
 namespace DB
 {
@@ -81,6 +82,26 @@ struct ASTTableExpression : public IAST
 
     ASTType getType() const override { return ASTType::ASTTableExpression; }
 
+    void toLowerCase() override
+    {
+        if (database_and_table_name)
+            database_and_table_name->toLowerCase();
+        else if (table_function)
+            table_function->toLowerCase();
+        else
+            subquery->toLowerCase();
+    }
+
+    void toUpperCase() override
+    {
+        if (database_and_table_name)
+            database_and_table_name->toUpperCase();
+        else if (table_function)
+            table_function->toUpperCase();
+        else
+            subquery->toUpperCase();
+    }
+
     void serialize(WriteBuffer & buf) const override;
     void deserializeImpl(ReadBuffer & buf) override;
     static ASTPtr deserialize(ReadBuffer & buf);
@@ -99,27 +120,30 @@ struct ASTTableJoin : public IAST
     };
 
     /// Allows more optimal JOIN for typical cases.
-    enum class Strictness
-    {
-        Unspecified,
-        RightAny, /// Old ANY JOIN. If there are many suitable rows in right table, use any from them to join.
-        Any,    /// Semi Join with any value from filtering table. For LEFT JOIN with Any and RightAny are the same.
-        All,    /// If there are many suitable rows to join, use all of them and replicate rows of "left" table (usual semantic of JOIN).
-        Asof,   /// For the last JOIN column, pick the latest value
-        Semi,   /// LEFT or RIGHT. SEMI LEFT JOIN filters left table by values exists in right table. SEMI RIGHT - otherwise.
-        Anti,   /// LEFT or RIGHT. Same as SEMI JOIN but filter values that are NOT exists in other table.
-    };
+    ENUM_WITH_PROTO_CONVERTER(
+        Strictness, // enum name
+        Protos::ASTTableJoin::Strictness, // proto enum message
+        (Unspecified),
+        (RightAny), /// Old ANY JOIN. If there are many suitable rows in right table, use any from them to join.
+        (Any), /// Semi Join with any value from filtering table. For LEFT JOIN with Any and RightAny are the same.
+        (All), /// If there are many suitable rows to join, use all of them and replicate rows of "left" table (usual semantic of JOIN).
+        (Asof), /// For the last JOIN column, pick the latest value
+        (Semi), /// LEFT or RIGHT. SEMI LEFT JOIN filters left table by values exists in right table. SEMI RIGHT - otherwise.
+        (Anti) /// LEFT or RIGHT. Same as SEMI JOIN but filter values that are NOT exists in other table.
+    );
 
     /// Join method.
-    enum class Kind
-    {
-        Inner, /// Leave only rows that was JOINed.
-        Left, /// If in "right" table there is no corresponding rows, use default values instead.
-        Right,
-        Full,
-        Cross, /// Direct product. Strictness and condition doesn't matter.
-        Comma /// Same as direct product. Intended to be converted to INNER JOIN with conditions from WHERE.
-    };
+    ENUM_WITH_PROTO_CONVERTER(
+        Kind, // enum name
+        Protos::ASTTableJoin::Kind, // proto enum message
+        (Inner), /// Leave only rows that was JOINed.
+        (Left), /// If in "right" table there is no corresponding rows, use default values instead.
+        (Right),
+        (Full),
+        (Cross), /// Direct product. Strictness and condition doesn't matter.
+        (Comma) /// Same as direct product. Intended to be converted to INNER JOIN with conditions from WHERE.
+    );
+
 
     Locality locality = Locality::Unspecified;
     Strictness strictness = Strictness::Unspecified;
@@ -153,6 +177,7 @@ inline bool isCross(ASTTableJoin::Kind kind)        { return kind == ASTTableJoi
 inline bool isComma(ASTTableJoin::Kind kind)        { return kind == ASTTableJoin::Kind::Comma; }
 inline bool isRightOrFull(ASTTableJoin::Kind kind)  { return kind == ASTTableJoin::Kind::Right || kind == ASTTableJoin::Kind::Full; }
 inline bool isLeftOrFull(ASTTableJoin::Kind kind)   { return kind == ASTTableJoin::Kind::Left  || kind == ASTTableJoin::Kind::Full; }
+inline bool isInnerOrLeft(ASTTableJoin::Kind kind)  { return kind == ASTTableJoin::Kind::Inner || kind == ASTTableJoin::Kind::Left; }
 inline bool isInnerOrRight(ASTTableJoin::Kind kind) { return kind == ASTTableJoin::Kind::Inner || kind == ASTTableJoin::Kind::Right; }
 
 inline bool isAll(ASTTableJoin::Strictness strictness)  { return strictness == ASTTableJoin::Strictness::All; }
@@ -160,6 +185,11 @@ inline bool isAny(ASTTableJoin::Strictness strictness)  { return strictness == A
 inline bool isSemi(ASTTableJoin::Strictness strictness) { return strictness == ASTTableJoin::Strictness::Semi; }
 inline bool isAnti(ASTTableJoin::Strictness strictness) { return strictness == ASTTableJoin::Strictness::Anti; }
 inline bool isAsof(ASTTableJoin::Strictness strictness) { return strictness == ASTTableJoin::Strictness::Asof; }
+inline bool isUnspecified(ASTTableJoin::Strictness strictness) { return strictness == ASTTableJoin::Strictness::Unspecified; }
+
+String kindToString(ASTTableJoin::Kind kind);
+
+String strictnessToString(ASTTableJoin::Strictness strictness);
 
 /// Specification of ARRAY JOIN.
 struct ASTArrayJoin : public IAST

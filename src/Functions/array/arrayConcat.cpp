@@ -1,4 +1,5 @@
 #include <Functions/IFunction.h>
+#include <Functions/IFunctionMySql.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/GatherUtils/GatherUtils.h>
 #include <DataTypes/DataTypeArray.h>
@@ -26,12 +27,20 @@ class FunctionArrayConcat : public IFunction
 {
 public:
     static constexpr auto name = "arrayConcat";
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayConcat>(); }
+
+    static FunctionPtr create(ContextPtr context) {
+        if (context && context->getSettingsRef().enable_implicit_arg_type_convert)
+            return std::make_shared<IFunctionMySql>(std::make_unique<FunctionArrayConcat>());
+        return std::make_shared<FunctionArrayConcat>();
+    }
+
+    ArgType getArgumentsType() const override { return ArgType::ARRAY_COMMON; }
 
     String getName() const override { return name; }
 
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -97,7 +106,7 @@ public:
 };
 
 
-void registerFunctionArrayConcat(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayConcat)
 {
     factory.registerFunction<FunctionArrayConcat>();
 }

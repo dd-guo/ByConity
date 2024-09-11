@@ -34,6 +34,8 @@ namespace DB
 namespace FDB
 {
 
+#define FDB_DEFAULT_MAX_RETRY 3
+
 struct PutRequest
 {
     StringRef key;
@@ -53,7 +55,7 @@ struct ScanRequest
     std::string start_key;
     std::string end_key;
 
-    uint32_t row_limit = 20000;
+    uint32_t row_limit = 0;
     fdb_bool_t reverse_order = 0;
 };
 
@@ -83,13 +85,15 @@ public:
 using FDBTransactionPtr = std::shared_ptr<FDBTransactionRAII>;
 using FDBFuturePtr = std::shared_ptr<FDBFutureRAII>;
 
+class FDBClient;
 class Iterator {
 public:
-    Iterator(FDBTransactionPtr tr_, const ScanRequest & req_);
+    Iterator(FDBClient * client_, FDBTransactionPtr tr_, const ScanRequest & req_);
     bool Next(fdb_error_t & code);
     std::string Key();
     std::string Value();
 private:
+    FDBClient * client = nullptr;
     FDBTransactionPtr tr = nullptr;
     ScanRequest req;
     FDBFuturePtr batch_future = nullptr;
@@ -99,13 +103,21 @@ private:
     fdb_bool_t has_more = false;
     const FDBKeyValue *batch_kvs = nullptr;
     int batch_read_index = 0;
+    uint read_count = 0;
 };
 
+class FDBClient;
+using FDBClientPtr = std::shared_ptr<FDBClient>;
 class FDBClient
 {
     friend Iterator;
+
+protected:
+    explicit FDBClient(const std::string & cluster_file);
+
 public:
-    FDBClient(const std::string & cluster_file);
+    // There is an undesired restriction on FDB. Each process could only init one fdb client otherwise it will panic.
+    static FDBClientPtr Instance(const std::string & cluster_file);
     ~FDBClient();
     fdb_error_t CreateTransaction(FDBTransactionPtr tr);
     fdb_error_t Get(FDBTransactionPtr tr, const std::string & key, GetResponse & res);
@@ -122,7 +134,6 @@ private:
     FDBDatabase * fdb = nullptr;
 };
 
-using FDBClientPtr = std::shared_ptr<FDBClient>;
 
 }
 

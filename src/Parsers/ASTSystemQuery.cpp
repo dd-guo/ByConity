@@ -19,16 +19,14 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Parsers/IAST.h>
-#include <Parsers/ASTSystemQuery.h>
-#include <Common/quoteString.h>
 #include <IO/Operators.h>
+#include <Parsers/ASTSystemQuery.h>
+#include <Parsers/IAST.h>
+#include <Common/quoteString.h>
 
 
 namespace DB
 {
-
-
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
@@ -70,12 +68,20 @@ const char * ASTSystemQuery::typeToString(Type type)
             return "DROP MARK CACHE";
         case Type::DROP_UNCOMPRESSED_CACHE:
             return "DROP UNCOMPRESSED CACHE";
+        case Type::DROP_NVM_CACHE:
+            return "DROP NVM CACHE";
         case Type::DROP_MMAP_CACHE:
             return "DROP MMAP CACHE";
+        case Type::DROP_QUERY_CACHE:
+            return "DROP QUERY CACHE";
         case Type::DROP_CHECKSUMS_CACHE:
             return "DROP CHECKSUMS CACHE";
+        case Type::DROP_CNCH_META_CACHE:
+            return "DROP CNCH CACHE";
         case Type::DROP_CNCH_PART_CACHE:
             return "DROP CNCH PART CACHE";
+        case Type::DROP_CNCH_DELETE_BITMAP_CACHE:
+            return "DROP CNCH DELETE BITMAP CACHE";
 #if USE_EMBEDDED_COMPILER
         case Type::DROP_COMPILED_EXPRESSION_CACHE:
             return "DROP COMPILED EXPRESSION CACHE";
@@ -122,12 +128,24 @@ const char * ASTSystemQuery::typeToString(Type type)
             return "START MERGES";
         case Type::REMOVE_MERGES:
             return "REMOVE MERGES";
+        case Type::RESUME_ALL_MERGES:
+            return "RESUME_ALL MERGES";
+        case Type::SUSPEND_ALL_MERGES:
+            return "SUSPEND_ALL MERGES";
+        case Type::GC:
+            return "GC";
+        case Type::MANIFEST_CHECKPOINT:
+            return "MANIFEST CHECKPOINT";
         case Type::START_GC:
             return "START GC";
         case Type::STOP_GC:
             return "STOP GC";
         case Type::FORCE_GC:
             return "FORCE GC";
+        case Type::RESUME_ALL_GC:
+            return "RESUME_ALL GC";
+        case Type::SUSPEND_ALL_GC:
+            return "SUSPEND_ALL GC";
         case Type::STOP_TTL_MERGES:
             return "STOP TTL MERGES";
         case Type::START_TTL_MERGES:
@@ -166,24 +184,64 @@ const char * ASTSystemQuery::typeToString(Type type)
             return "START CONSUME";
         case Type::STOP_CONSUME:
             return "STOP CONSUME";
+        case Type::DROP_CONSUME:
+            return "DROP CONSUME";
         case Type::RESTART_CONSUME:
             return "RESTART CONSUME";
+        case Type::RESET_CONSUME_OFFSET:
+            return "RESET CONSUME OFFSET";
         case Type::FETCH_PARTS:
             return "FETCH PARTS INTO";
         case Type::METASTORE:
             return "METASTORE";
         case Type::CLEAR_BROKEN_TABLES:
             return "CLEAR BROKEN TABLES";
+        case Type::DEDUP_WITH_HIGH_PRIORITY:
+            return "DEDUP WITH HIGH PRIORITY";
         case Type::DEDUP:
             return "DEDUP";
         case Type::SYNC_DEDUP_WORKER:
             return "SYNC DEDUP WORKER";
+        case Type::SYNC_REPAIR_TASK:
+            return "SYNC REPAIR TASK";
         case Type::START_DEDUP_WORKER:
             return "START DEDUP WORKER";
         case Type::STOP_DEDUP_WORKER:
             return "STOP DEDUP WORKER";
+        case Type::START_CLUSTER:
+            return "START CLUSTER";
+        case Type::STOP_CLUSTER:
+            return "STOP CLUSTER";
         case Type::DUMP_SERVER_STATUS:
             return "DUMP SERVER STATUS";
+        case Type::CLEAN_TRANSACTION:
+            return "CLEAN TRANSACTION";
+        case Type::CLEAN_TRASH_TABLE:
+            return "CLEAN TRASH TABLE";
+        case Type::CLEAN_FILESYSTEM_LOCK:
+            return "CLEAN FILESYSTEM LOCK";
+        case Type::JEPROF_DUMP:
+            return "JEPROF DUMP";
+        case Type::LOCK_MEMORY_LOCK:
+            return "LOCK MEMORY LOCK";
+        case Type::START_MATERIALIZEDMYSQL:
+            return "START MATERIALIZEDMYSQL";
+        case Type::STOP_MATERIALIZEDMYSQL:
+            return "STOP MATERIALIZEDMYSQL";
+        case Type::RESYNC_MATERIALIZEDMYSQL_TABLE:
+            return "RESYNC MATERIALIZEDMYSQL TABLE";
+        case Type::RECALCULATE_METRICS:
+            return "RECALCULATE METRICS FOR";
+        case Type::START_VIEW:
+            return "START VIEW";
+        case Type::STOP_VIEW:
+            return "STOP VIEW";
+        case Type::DROP_VIEW_META:
+            return "DROP VIEW META";
+        case Type::RELEASE_MEMORY_LOCK:
+            return "RELEASE MEMORY LOCK";
+        case Type::DROP_SCHEMA_CACHE:
+            return "DROP SCHEMA CACHE";
         case Type::UNKNOWN:
         case Type::END:
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown SYSTEM query command");
@@ -197,16 +255,25 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
     settings.ostr << (settings.hilite ? hilite_keyword : "") << "SYSTEM ";
     settings.ostr << typeToString(type) << (settings.hilite ? hilite_none : "");
 
-    auto print_database_table = [&]
-    {
+    auto print_database_table = [&] {
         settings.ostr << " ";
         if (!database.empty())
         {
-            settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(database)
-                          << (settings.hilite ? hilite_none : "") << ".";
+            settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(database) << (settings.hilite ? hilite_none : "")
+                          << ".";
         }
-        settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(table)
-                      << (settings.hilite ? hilite_none : "");
+        settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(table) << (settings.hilite ? hilite_none : "");
+    };
+
+    auto print_database = [&] ()
+    {
+        settings.ostr << " ";
+
+        if (!database.empty())
+        {
+            settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(database)
+                          << (settings.hilite ? hilite_none : "");
+        }
     };
 
     auto print_drop_replica = [&]
@@ -214,36 +281,29 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
         settings.ostr << " " << quoteString(replica);
         if (!table.empty())
         {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FROM TABLE"
-                          << (settings.hilite ? hilite_none : "");
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FROM TABLE" << (settings.hilite ? hilite_none : "");
             print_database_table();
         }
         else if (!replica_zk_path.empty())
         {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FROM ZKPATH "
-                          << (settings.hilite ? hilite_none : "") << quoteString(replica_zk_path);
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FROM ZKPATH " << (settings.hilite ? hilite_none : "")
+                          << quoteString(replica_zk_path);
         }
         else if (!database.empty())
         {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FROM DATABASE "
-                          << (settings.hilite ? hilite_none : "");
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FROM DATABASE " << (settings.hilite ? hilite_none : "");
             settings.ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(database)
                           << (settings.hilite ? hilite_none : "");
         }
     };
 
-    auto print_on_volume = [&]
-    {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << " ON VOLUME "
-                      << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(storage_policy)
-                      << (settings.hilite ? hilite_none : "")
-                      << "."
-                      << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(volume)
-                      << (settings.hilite ? hilite_none : "");
+    auto print_on_volume = [&] {
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << " ON VOLUME " << (settings.hilite ? hilite_identifier : "")
+                      << backQuoteIfNeed(storage_policy) << (settings.hilite ? hilite_none : "") << "."
+                      << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(volume) << (settings.hilite ? hilite_none : "");
     };
 
-    auto print_metastore_options = [&]
-    {
+    auto print_metastore_options = [&] {
         settings.ostr << " " << (settings.hilite ? hilite_keyword : "") << metaOpsToString(meta_ops.operation);
         if (!meta_ops.drop_key.empty())
         {
@@ -256,6 +316,8 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
 
     if (   type == Type::STOP_MERGES
         || type == Type::START_MERGES
+        || type == Type::STOP_GC
+        || type == Type::START_GC
         || type == Type::STOP_TTL_MERGES
         || type == Type::START_TTL_MERGES
         || type == Type::STOP_MOVES
@@ -282,8 +344,17 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
             || type == Type::RELOAD_DICTIONARY
             || type == Type::START_CONSUME
             || type == Type::STOP_CONSUME
+            || type == Type::DROP_CONSUME
             || type == Type::RESTART_CONSUME
-            || type == Type::DROP_CNCH_PART_CACHE)
+            || type == Type::RESYNC_MATERIALIZEDMYSQL_TABLE
+            || type == Type::SYNC_DEDUP_WORKER
+            || type == Type::SYNC_REPAIR_TASK
+            || type == Type::DROP_CNCH_META_CACHE
+            || type == Type::DROP_CNCH_PART_CACHE
+            || type == Type::DROP_CNCH_DELETE_BITMAP_CACHE
+            || type == Type::START_CLUSTER
+            || type == Type::STOP_CLUSTER
+            || type == Type::MANIFEST_CHECKPOINT)
     {
         print_database_table();
     }
@@ -293,10 +364,8 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
     }
     else if (type == Type::SUSPEND)
     {
-         settings.ostr << (settings.hilite ? hilite_keyword : "") << " FOR "
-            << (settings.hilite ? hilite_none : "") << seconds
-            << (settings.hilite ? hilite_keyword : "") << " SECOND"
-            << (settings.hilite ? hilite_none : "");
+        settings.ostr << (settings.hilite ? hilite_keyword : "") << " FOR " << (settings.hilite ? hilite_none : "") << seconds
+                      << (settings.hilite ? hilite_keyword : "") << " SECOND" << (settings.hilite ? hilite_none : "");
     }
     else if (type == Type::FETCH_PARTS)
     {
@@ -310,7 +379,7 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
         if (meta_ops.operation > MetastoreOperation::STOP_AUTO_SYNC)
             print_database_table();
     }
-    else if (type == Type::DEDUP)
+    else if (type == Type::GC)
     {
         print_database_table();
         if (partition)
@@ -318,7 +387,55 @@ void ASTSystemQuery::formatImpl(const FormatSettings & settings, FormatState & s
             settings.ostr << (settings.hilite ? hilite_keyword : "") << " PARTITION " << (settings.hilite ? hilite_none : "");
             partition->formatImpl(settings, state, frame);
         }
+    }
+    else if (type == Type::DEDUP_WITH_HIGH_PRIORITY)
+    {
+        print_database_table();
+        if (partition)
+        {
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " PARTITION " << (settings.hilite ? hilite_none : "");
+            partition->formatImpl(settings, state, frame);
+        }
+    }
+    else if (type == Type::DEDUP)
+    {
+        print_database_table();
+        if (partition)
+        {
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " PARTITION " << (settings.hilite ? hilite_none : "");
+            partition->formatImpl(settings, state, frame);
+
+            if (specify_bucket)
+                settings.ostr << " BUCKET " << bucket_number;
+        }
         settings.ostr << " FOR REPAIR";
+    }
+    else if (type == Type::CLEAN_TRANSACTION)
+    {
+        settings.ostr << " " << txn_id;
+    }
+    else if (type == Type::CLEAN_TRASH_TABLE)
+    {
+        print_database_table();
+        if (table_uuid != UUIDHelpers::Nil)
+            settings.ostr << (settings.hilite ? hilite_keyword : "") << " UUID " << (settings.hilite ? hilite_none : "")
+                          << quoteString(toString(table_uuid));
+    }
+    else if(type == Type::START_MATERIALIZEDMYSQL || type == Type::STOP_MATERIALIZEDMYSQL)
+    {
+        print_database();
+    }
+    else if (type == Type::RELEASE_MEMORY_LOCK)
+    {
+        if (specify_txn)
+            settings.ostr << " OF TXN " << txn_id;
+        else
+            print_database_table();
+    }
+    else if (type == Type::DROP_SCHEMA_CACHE)
+    {
+        if (!schema_cache_storage.empty())
+            settings.ostr << " FOR " << schema_cache_storage;
     }
 }
 

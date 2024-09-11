@@ -17,21 +17,29 @@
 
 #include <Parsers/IAST.h>
 
-class WriteBuffer;
-class ReadBuffer;
 
 namespace DB
 {
 
+namespace Protos
+{
+    class AST;
+}
+
+
 ASTPtr createByASTType(ASTType type, ReadBuffer & buf);
 
-void serializeAST(const ASTPtr & ast, WriteBuffer & buf);
+void serializeAST(const ConstASTPtr & ast, WriteBuffer & buf);
 
 void serializeAST(const IAST & ast, WriteBuffer & buf);
 
 void serializeAST(const ConstASTPtr & ast, WriteBuffer & buf);
 
 ASTPtr deserializeAST(ReadBuffer & buf);
+
+void serializeASTToProto(const ConstASTPtr & ast, Protos::AST & proto);
+void serializeASTToProto(const IAST & ast, Protos::AST & proto);
+ASTPtr deserializeASTFromProto(const Protos::AST & proto);
 
 void serializeASTs(const ASTs & asts, WriteBuffer & buf);
 

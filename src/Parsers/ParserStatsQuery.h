@@ -43,7 +43,7 @@ class ParserStatsQueryBase : public IParserBase
 {
 public:
     [[nodiscard]] const char * getName() const override { return ParserName::Name; }
-    using SampleType = ASTCreateStatsQuery::SampleType;
+    using QueryAst = QueryAstClass;
 
 protected:
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override
@@ -71,25 +71,20 @@ protected:
                 query->if_not_exists = true;
         }
 
-        query->target_all = s_all.ignore(pos, expected);
-
-        if (!query->target_all)
+        if (s_all.ignore(pos, expected))
         {
-            bool any_database = false;
-            bool any_table = false;
+            // only for compatibility
+            query->any_database = false;
+            query->any_table = true;
+        }
+        else if (!parseDatabaseAndTableNameOrAsterisks(pos, expected, query->database, query->any_database, query->table, query->any_table))
+        {
+            return false;
+        }
 
-            if (!parseDatabaseAndTableNameOrAsterisks(pos, expected, query->database, any_database, query->table, any_table))
-                return false;
-            
-            // collect on any database is not implemented
-            if (any_database)
-                return false;
-
-            if (any_table)
-            {
-                query->target_all = true;
-            }
-            else if (open.ignore(pos, expected))
+        if (!query->any_table)
+        {
+            if (open.ignore(pos, expected))
             {
                 // parse columns when given table
                 auto parse_id = [&query, &pos, &expected] {
@@ -115,14 +110,40 @@ protected:
                 return false;
         }
 
-        if (!parseSuffix(pos, expected, *query))
+        if (!parseSuffix(pos, *query, expected))
             return false;
 
         node = query;
         return true;
     }
 
-    virtual bool parseSuffix(Pos &, Expected &, IAST &) { return true; }
+    // only for show/drop stats
+    virtual bool parseSuffix(Pos & pos, QueryAst & node, Expected & expected)
+    {
+        ParserKeyword s_in("IN");
+        ParserKeyword s_catalog("CATALOG");
+        ParserKeyword s_cache("CACHE");
+
+        auto query = &node;
+        if (s_in.ignore(pos, expected))
+        {
+            if (s_catalog.ignore(pos, expected))
+            {
+                query->cache_policy = StatisticsCachePolicy::Catalog;
+                return true;
+            }
+            else if (s_cache.ignore(pos, expected))
+            {
+                query->cache_policy = StatisticsCachePolicy::Cache;
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 
 struct CreateStatsParserName
@@ -146,7 +167,6 @@ using ParserDropStatsQuery = ParserStatsQueryBase<DropStatsParserName, ASTDropSt
 class ParserCreateStatsQuery : public ParserStatsQueryBase<CreateStatsParserName, ASTCreateStatsQuery, CreateStatsQueryInfo>
 {
 protected:
-    bool parseSuffix(Pos &, Expected &, IAST &) override;
+    bool parseSuffix(Pos & pos, QueryAst & node, Expected & expected) override;
 };
-
 }

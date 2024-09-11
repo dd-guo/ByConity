@@ -18,6 +18,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DistributedStages/DistributedPipelineSettings.h>
 #include <Interpreters/ExpressionActionsSettings.h>
+#include "Interpreters/DistributedStages/PlanSegmentInstance.h"
 
 #include <cstddef>
 
@@ -26,18 +27,20 @@ namespace DB
 
 struct Settings;
 class PlanSegment;
+struct PlanSegmentExecutionInfo;
 
 struct BuildQueryPipelineSettings
 {
     ExpressionActionsSettings actions_settings;
     DistributedPipelineSettings distributed_settings;
     ContextPtr context;
+    bool is_expand = false;
 
     const ExpressionActionsSettings & getActionsSettings() const { return actions_settings; }
 
     static BuildQueryPipelineSettings fromSettings(const Settings & from);
     static BuildQueryPipelineSettings fromContext(ContextPtr from);
-    static BuildQueryPipelineSettings fromPlanSegment(PlanSegment * plan_segment, ContextPtr context);
+    static BuildQueryPipelineSettings
+    fromPlanSegment(PlanSegment * plan_segment, const PlanSegmentExecutionInfo & info, ContextPtr context, bool is_explain = false);
 };
-
 }

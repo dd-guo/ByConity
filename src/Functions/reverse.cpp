@@ -4,6 +4,7 @@
 #include <Columns/ColumnArray.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/IFunctionMySql.h>
 #include <common/map.h>
 
 
@@ -57,10 +58,14 @@ class FunctionReverse : public IFunction
 {
 public:
     static constexpr auto name = "reverse";
-    static FunctionPtr create(ContextPtr)
+    static FunctionPtr create(ContextPtr context)
     {
+        if (context && context->getSettingsRef().enable_implicit_arg_type_convert)
+            return std::make_shared<IFunctionMySql>(std::make_unique<FunctionReverse>());
         return std::make_shared<FunctionReverse>();
     }
+
+    ArgType getArgumentsType() const override { return ArgType::STRINGS; }
 
     String getName() const override
     {
@@ -76,6 +81,8 @@ public:
     {
         return true;
     }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -126,7 +133,7 @@ public:
 
     FunctionBasePtr buildImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & return_type) const override
     {
-        if (isArray(arguments.at(0).type))
+        if (isArray(removeNullable(arguments.at(0).type)))
             return FunctionFactory::instance().getImpl("arrayReverse", context)->build(arguments);
         else
             return std::make_unique<FunctionToFunctionBaseAdaptor>(
@@ -137,7 +144,10 @@ public:
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
-        return arguments.at(0);
+        if (isArray(removeNullable(arguments.at(0))))
+            return arguments.at(0);
+        else
+            return FunctionReverse::create(context)->getReturnTypeImpl(arguments);
     }
 
 private:
@@ -146,7 +156,7 @@ private:
 
 }
 
-void registerFunctionReverse(FunctionFactory & factory)
+REGISTER_FUNCTION(Reverse)
 {
     factory.registerFunction<ReverseOverloadResolver>(FunctionFactory::CaseInsensitive);
 }

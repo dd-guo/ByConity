@@ -40,8 +40,9 @@ namespace ErrorCodes
 }
 
 SinglePartitionExchangeSink::SinglePartitionExchangeSink(
-    Block header_, BroadcastSenderPtr sender_, size_t partition_id_, ExchangeOptions options_)
+    Block header_, BroadcastSenderPtr sender_, size_t partition_id_, ExchangeOptions options_, const String &name_)
     : IExchangeSink(std::move(header_))
+    , name(name_)
     , header(getPort().getHeader())
     , sender(sender_)
     , partition_id(partition_id_)
@@ -54,6 +55,12 @@ SinglePartitionExchangeSink::SinglePartitionExchangeSink(
 
 void SinglePartitionExchangeSink::consume(Chunk chunk)
 {
+    if (!has_input)
+    {
+        buffered_sender.flush(true, current_chunk_info);
+        finish();
+        return;
+    }
     const ChunkInfoPtr & info = chunk.getChunkInfo();
     if (!info)
         throw Exception("Chunk info was not set for chunk.", ErrorCodes::LOGICAL_ERROR);
@@ -61,8 +68,14 @@ void SinglePartitionExchangeSink::consume(Chunk chunk)
     if (!repartition_info)
         throw Exception("Chunk should have RepartitionChunkInfo .", ErrorCodes::LOGICAL_ERROR);
 
-    if (!buffered_sender.compareBufferChunkInfo(repartition_info->origin_chunk_info))
-        buffered_sender.updateBufferChunkInfo(std::move(repartition_info->origin_chunk_info));
+    const auto & chunk_info = repartition_info->origin_chunk_info;
+    bool chunk_info_matched
+        = ((current_chunk_info && chunk_info && *current_chunk_info == *chunk_info) || (!current_chunk_info && !chunk_info));
+    if (!chunk_info_matched)
+    {
+        buffered_sender.flush(true, current_chunk_info);
+        current_chunk_info = chunk_info;
+    }
 
     const IColumn::Selector & partition_selector = repartition_info->selector;
 
@@ -76,7 +89,7 @@ void SinglePartitionExchangeSink::consume(Chunk chunk)
     {
         buffered_sender.appendSelective(i, *columns[i]->convertToFullColumnIfConst(), partition_selector, from, length);
     }
-    auto status = buffered_sender.flush(false);
+    auto status = buffered_sender.flush(false, current_chunk_info);
     if (status.code != BroadcastStatusCode::RUNNING)
         finish();
 }
@@ -84,7 +97,7 @@ void SinglePartitionExchangeSink::consume(Chunk chunk)
 void SinglePartitionExchangeSink::onFinish()
 {
     LOG_TRACE(logger, "SinglePartitionExchangeSink finish");
-    buffered_sender.flush(true);
+    buffered_sender.flush(true, current_chunk_info);
 }
 
 void SinglePartitionExchangeSink::onCancel()

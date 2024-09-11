@@ -33,6 +33,7 @@
 #include <Parsers/IAST_fwd.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Storages/MergeTree/Index/BitmapIndexHelper.h>
 
 namespace DB
 {
@@ -63,6 +64,9 @@ using ArrayJoinActionPtr = std::shared_ptr<ArrayJoinAction>;
 class ActionsDAG;
 using ActionsDAGPtr = std::shared_ptr<ActionsDAG>;
 
+class MergeTreeIndexContext;
+using MergeTreeIndexContextPtr = std::shared_ptr<MergeTreeIndexContext>;
+
 /// Create columns in block or return false if not possible
 bool sanitizeBlock(Block & block, bool throw_if_cannot_create_column = false);
 
@@ -76,6 +80,8 @@ struct ExpressionAnalyzerData
 
     std::unique_ptr<QueryPlan> joined_plan;
 
+    /// Columns after add bitmap index result column and remove bitmap index source column
+    NamesAndTypesList columns_after_bitmap_index;
     /// Columns after ARRAY JOIN. If there is no ARRAY JOIN, it's source_columns.
     NamesAndTypesList columns_after_array_join;
     /// Columns after Columns after ARRAY JOIN and JOIN. If there is no JOIN, it's columns_after_array_join.
@@ -87,6 +93,7 @@ struct ExpressionAnalyzerData
 
     bool has_aggregation = false;
     NamesAndTypesList aggregation_keys;
+    ASTs aggregation_key_asts;
     NamesAndTypesLists aggregation_keys_list;
     ColumnNumbersList aggregation_keys_indexes_list;
     bool has_const_aggregation_keys = false;
@@ -124,7 +131,7 @@ public:
     /// Ctor for non-select queries. Generally its usage is:
     /// auto actions = ExpressionAnalyzer(query, syntax, context).getActions();
     ExpressionAnalyzer(const ASTPtr & query_, const TreeRewriterResultPtr & syntax_analyzer_result_, ContextPtr context_)
-        : ExpressionAnalyzer(query_, syntax_analyzer_result_, context_, 0, false, {}, {})
+        : ExpressionAnalyzer(query_, syntax_analyzer_result_, context_, 0, false, {}, {}, std::make_shared<BitmapIndexInfo>())
     {
     }
 
@@ -139,8 +146,9 @@ public:
     ActionsDAGPtr getActionsDAG(bool add_aliases, bool project_result = true);
     ExpressionActionsPtr getActions(bool add_aliases, bool project_result = true, CompileExpressions compile_expressions = CompileExpressions::no);
 
-    /// Actions that can be performed on an empty block: adding constants and applying functions that depend only on constants.
+    /// Get actions to evaluate a constant expression. The function adds constants and applies functions that depend only on constants.
     /// Does not execute subqueries.
+    ActionsDAGPtr getConstActionsDAG(const ColumnsWithTypeAndName & constant_inputs = {});
     ExpressionActionsPtr getConstActions(const ColumnsWithTypeAndName & constant_inputs = {});
 
     /** Sets that require a subquery to be create.
@@ -173,6 +181,10 @@ public:
       */
     SetPtr isPlainStorageSetInSubquery(const ASTPtr & subquery_or_table_name);
 
+    bool hasByteMapColumn() const;
+
+    MergeTreeIndexContextPtr getIndexContext() { return index_context; }
+
 protected:
     ExpressionAnalyzer(
         const ASTPtr & query_,
@@ -181,11 +193,16 @@ protected:
         size_t subquery_depth_,
         bool do_global_,
         SubqueriesForSets subqueries_for_sets_,
-        PreparedSets prepared_sets_);
+        PreparedSets prepared_sets_,
+        BitmapIndexInfoPtr bitmap_index_info_,
+        const StorageMetadataPtr & metadata_snapshot_ = nullptr);
 
     ASTPtr query;
     const ExtractedSettings settings;
     size_t subquery_depth;
+
+    MergeTreeIndexContextPtr index_context;
+    StorageMetadataPtr metadata_snapshot;
 
     TreeRewriterResultPtr syntax;
 
@@ -210,6 +227,12 @@ protected:
     void getRootActionsNoMakeSet(const ASTPtr & ast, bool no_subqueries, ActionsDAGPtr & actions, bool only_consts = false);
 
     void getRootActionsForHaving(const ASTPtr & ast, bool no_subqueries, ActionsDAGPtr & actions, bool only_consts = false);
+
+    void getRootActionsForWindowFunctions(const ASTPtr & ast, bool no_makeset_for_subqueries, ActionsDAGPtr & actions);
+
+    void analyzeBitmapIndex();
+
+    void getRootActionsWithOwnBitmapInfo(const ASTPtr & ast, bool no_subqueries, ActionsDAGPtr & actions, MergeTreeIndexContextPtr & own_index_context, bool only_consts = false);
 
     /** Add aggregation keys to aggregation_keys, aggregate functions to aggregate_descriptions,
       * Create a set of columns aggregated_columns resulting after the aggregation, if any,
@@ -283,6 +306,9 @@ struct ExpressionAnalysisResult
     /// Actions by every element of ORDER BY
     ManyExpressionActions order_by_elements_actions;
     ManyExpressionActions group_by_elements_actions;
+    /// Columns with predicates using in early materilization
+    std::deque<AtomicPredicatePtr> atomic_predicates;
+    ConstantFilterDescription em_constant_filter_description;
 
     ExpressionAnalysisResult() = default;
 
@@ -293,7 +319,8 @@ struct ExpressionAnalysisResult
         bool second_stage,
         bool only_types,
         const FilterDAGInfoPtr & filter_info,
-        const Block & source_header);
+        const Block & source_header,
+        const std::vector<ASTPtr> & additional_predicates = {});
 
     /// Filter for row-level security.
     bool hasFilter() const { return filter_info.get(); }
@@ -320,11 +347,12 @@ public:
         const TreeRewriterResultPtr & syntax_analyzer_result_,
         ContextPtr context_,
         const StorageMetadataPtr & metadata_snapshot_,
-        const NameSet & required_result_columns_ = {},
+        const Names & required_result_columns_ = {},
         bool do_global_ = false,
         const SelectQueryOptions & options_ = {},
         SubqueriesForSets subqueries_for_sets_ = {},
-        PreparedSets prepared_sets_ = {})
+        PreparedSets prepared_sets_ = {},
+        BitmapIndexInfoPtr bitmap_index_info_ = std::make_shared<BitmapIndexInfo>())
         : ExpressionAnalyzer(
             query_,
             syntax_analyzer_result_,
@@ -332,8 +360,9 @@ public:
             options_.subquery_depth,
             do_global_,
             std::move(subqueries_for_sets_),
-            std::move(prepared_sets_))
-        , metadata_snapshot(metadata_snapshot_)
+            std::move(prepared_sets_),
+            bitmap_index_info_,
+            metadata_snapshot_)
         , required_result_columns(required_result_columns_)
         , query_options(options_)
     {
@@ -356,9 +385,12 @@ public:
     bool useGroupingSetKey() const { return aggregation_keys_list.size() > 1; }
 
     const NamesAndTypesList & aggregationKeys() const { return aggregation_keys; }
+    const ASTs & aggregationKeyAsts() const { return aggregation_key_asts; }
     bool hasConstAggregationKeys() const { return has_const_aggregation_keys; }
     const NamesAndTypesLists & aggregationKeysList() const { return aggregation_keys_list; }
     const AggregateDescriptions & aggregates() const { return aggregate_descriptions; }
+
+    const std::vector<const ASTFunction *> & aggregateAsts() const { return ExpressionAnalyzer::aggregates(); }
 
     const PreparedSets & getPreparedSets() const { return prepared_sets; }
     std::unique_ptr<QueryPlan> getJoinedPlan();
@@ -373,14 +405,13 @@ public:
     /// Deletes all columns except mentioned by SELECT, arranges the remaining columns and renames them to aliases.
     ActionsDAGPtr appendProjectResult(ExpressionActionsChain & chain) const;
 
-private:
-    StorageMetadataPtr metadata_snapshot;
-    /// If non-empty, ignore all expressions not from this list.
-    NameSet required_result_columns;
-    SelectQueryOptions query_options;
-
     /// Create Set-s that we make from IN section to use index on them.
     void makeSetsForIndex(const ASTPtr & node);
+
+private:
+    /// If non-empty, ignore all expressions not from this list.
+    Names required_result_columns;
+    SelectQueryOptions query_options;
 
     JoinPtr makeTableJoin(
         const ASTTablesInSelectQueryElement & join_element,
@@ -409,10 +440,14 @@ private:
     /// remove_filter is set in ExpressionActionsChain::finalize();
     /// Columns in `additional_required_columns` will not be removed (they can be used for e.g. sampling or FINAL modifier).
     ActionsDAGPtr appendPrewhere(ExpressionActionsChain & chain, bool only_types, const Names & additional_required_columns);
+    ActionsDAGPtr appendMaterializeStep(ExpressionActionsChain & chain, const ASTPtr & predicate, bool only_types, const Names & additional_required_columns);
     bool appendWhere(ExpressionActionsChain & chain, bool only_types);
     bool appendGroupBy(ExpressionActionsChain & chain, bool only_types, bool optimize_aggregation_in_order, ManyExpressionActions &);
     void appendAggregateFunctionsArguments(ExpressionActionsChain & chain, bool only_types);
     void appendWindowFunctionsArguments(ExpressionActionsChain & chain, bool only_types);
+
+    void appendExpressionsAfterWindowFunctions(ExpressionActionsChain & chain, bool only_types);
+    void appendSelectSkipWindowExpressions(ExpressionActionsChain::Step & step, ASTPtr const & node);
 
     /// After aggregation:
     bool appendHaving(ExpressionActionsChain & chain, bool only_types);

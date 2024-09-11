@@ -6,6 +6,7 @@
 #include <IO/LZMAInflatingReadBuffer.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
+#include <IO/SnappyReadBuffer.h>
 #include <IO/ZlibDeflatingWriteBuffer.h>
 #include <IO/ZlibInflatingReadBuffer.h>
 #include <IO/ZstdDeflatingWriteBuffer.h>
@@ -40,10 +41,33 @@ std::string toContentEncodingName(CompressionMethod method)
             return "xz";
         case CompressionMethod::Zstd:
             return "zstd";
+        case CompressionMethod::Snappy:
+            return "snappy";
         case CompressionMethod::None:
             return "";
     }
     __builtin_unreachable();
+}
+
+std::string getFileSuffix(CompressionMethod method)
+{
+    switch (method)
+    {
+        case CompressionMethod::Gzip:
+            return "gz";
+        case CompressionMethod::Zlib:
+            return "deflate";
+        case CompressionMethod::Brotli:
+            return "br";
+        case CompressionMethod::Xz:
+            return "xz";
+        case CompressionMethod::Zstd:
+            return "zstd";
+        case CompressionMethod::Snappy:
+            return "snappy";
+        case CompressionMethod::None:
+            return "";
+    }
 }
 
 CompressionMethod chooseCompressionMethod(const std::string & path, const std::string & hint)
@@ -69,6 +93,8 @@ CompressionMethod chooseCompressionMethod(const std::string & path, const std::s
         return CompressionMethod::Xz;
     if (method_str == "zstd" || method_str == "zst")
         return CompressionMethod::Zstd;
+    if (method_str == "snappy")
+        return CompressionMethod::Snappy;
     if (hint.empty() || hint == "auto" || hint == "none")
         return CompressionMethod::None;
 
@@ -79,7 +105,7 @@ CompressionMethod chooseCompressionMethod(const std::string & path, const std::s
 
 
 std::unique_ptr<ReadBuffer> wrapReadBufferWithCompressionMethod(
-    std::unique_ptr<ReadBuffer> nested, CompressionMethod method, size_t buf_size, char * existing_memory, size_t alignment)
+    std::unique_ptr<ReadBuffer> nested, CompressionMethod method, const bool snappy_format_blocked, size_t buf_size, char * existing_memory, size_t alignment)
 {
     if (method == CompressionMethod::Gzip || method == CompressionMethod::Zlib)
         return std::make_unique<ZlibInflatingReadBuffer>(std::move(nested), method, buf_size, existing_memory, alignment);
@@ -91,6 +117,13 @@ std::unique_ptr<ReadBuffer> wrapReadBufferWithCompressionMethod(
         return std::make_unique<LZMAInflatingReadBuffer>(std::move(nested), buf_size, existing_memory, alignment);
     if (method == CompressionMethod::Zstd)
         return std::make_unique<ZstdInflatingReadBuffer>(std::move(nested), buf_size, existing_memory, alignment);
+    if (method == CompressionMethod::Snappy)
+    {
+        if (snappy_format_blocked)
+            return std::make_unique<SnappyReadBuffer<true>>(std::move(nested));
+        else
+            return std::make_unique<SnappyReadBuffer<false>>(std::move(nested));
+    }
 
     if (method == CompressionMethod::None)
         return nested;

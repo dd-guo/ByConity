@@ -53,6 +53,10 @@ struct ExprAnalyzerOptions
     AggregateSupport aggregate_support = AggregateSupport::DISALLOWED;
     WindowSupport window_support = WindowSupport::DISALLOWED;
     SubquerySupport subquery_support = SubquerySupport::DISALLOWED;
+    bool expand_untuple_and_asterisk = true;
+    bool record_used_object = true; // whether record used_columns, used_functions
+    bool subquery_to_semi_anti = false;
+    bool evaluate_constant_expression = true;
 
     // constructor
     ExprAnalyzerOptions(String statement_name_ = ""): statement_name(std::move(statement_name_)) // NOLINT(google-explicit-constructor)
@@ -82,6 +86,30 @@ struct ExprAnalyzerOptions
         subquery_support = arg;
         return *this;
     }
+
+    ExprAnalyzerOptions & expandUntuple(bool arg)
+    {
+        expand_untuple_and_asterisk = arg;
+        return *this;
+    }
+
+    ExprAnalyzerOptions & recordUsedObject(bool arg)
+    {
+        record_used_object = arg;
+        return *this;
+    }
+
+    ExprAnalyzerOptions & subqueryToSemiAnti(bool arg)
+    {
+        subquery_to_semi_anti = arg;
+        return *this;
+    }
+
+    ExprAnalyzerOptions & evaluateConstantExpression(bool arg)
+    {
+        evaluate_constant_expression = arg;
+        return *this;
+    }
 };
 
 class ExprAnalyzer
@@ -104,12 +132,11 @@ public:
      * 5. Register subquery expressions.
      * 6. Register aggregate functions.
      * 7. Register window functions.
+     *
+     * !! Caution: expression will be modified in these cases: `untuple` function
      */
-    static DataTypePtr analyze(ASTPtr expression,
-                               ScopePtr scope,
-                               ContextMutablePtr context,
-                               Analysis & analysis,
-                               ExprAnalyzerOptions options = ExprAnalyzerOptions {});
+    static DataTypePtr analyze(
+        ASTPtr expression, ScopePtr scope, ContextPtr context, Analysis & analysis, ExprAnalyzerOptions options = ExprAnalyzerOptions{});
 };
 
 }

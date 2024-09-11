@@ -16,6 +16,7 @@ struct BitXorImpl
 {
     using ResultType = typename NumberTraits::ResultOfBit<A, B>::Type;
     static constexpr bool allow_fixed_string = true;
+    static const constexpr bool allow_string_integer = false;
 
     template <typename Result = ResultType>
     static inline Result apply(A a, B b)
@@ -36,11 +37,11 @@ struct BitXorImpl
 };
 
 struct NameBitXor { static constexpr auto name = "bitXor"; };
-using FunctionBitXor = BinaryArithmeticOverloadResolver<BitXorImpl, NameBitXor, true, false>;
+using FunctionBitXor = BinaryArithmeticOverloadResolver<BitXorImpl, NameBitXor, true, true>;
 
 }
 
-void registerFunctionBitXor(FunctionFactory & factory)
+REGISTER_FUNCTION(BitXor)
 {
     factory.registerFunction<FunctionBitXor>();
 }

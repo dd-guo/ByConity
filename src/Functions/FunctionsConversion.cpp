@@ -26,9 +26,7 @@
 namespace DB
 {
 
-void registerFunctionFixedString(FunctionFactory & factory);
-
-void registerFunctionsConversion(FunctionFactory & factory)
+REGISTER_FUNCTION(Conversion)
 {
     factory.registerFunction<FunctionToUInt8>();
     factory.registerFunction<FunctionToUInt16>();
@@ -51,19 +49,25 @@ void registerFunctionsConversion(FunctionFactory & factory)
     factory.registerFunction<FunctionToDecimal256>();
 
     factory.registerFunction<FunctionToDate>();
+    /// Hive compatibility alias.
+    factory.registerFunction<FunctionToDate>("to_date", FunctionFactory::CaseInsensitive);
     /// MysQL compatibility alias.
     factory.registerFunction<FunctionToDate>("DATE", FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionToDate32>();
     factory.registerFunction<FunctionToTime>();
+    /// MysQL compatibility alias.
+    factory.registerFunction<FunctionToTime>("TIME", FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionToDateTime>();
     factory.registerFunction<FunctionToDateTime32>();
     factory.registerFunction<FunctionToDateTime64>();
     factory.registerFunction<FunctionToUUID>();
+    factory.registerFunction<FunctionToIPv4>();
+    factory.registerFunction<FunctionToIPv6>();
     factory.registerFunction<FunctionToString>();
 
-    registerFunctionFixedString(factory);
 
     factory.registerFunction<FunctionToUnixTimestamp>();
+    factory.registerAlias("unix_timestamp", NameToUnixTimestamp::name, FunctionFactory::CaseInsensitive);
 
     factory.registerFunction<CastOverloadResolver<CastType::nonAccurate>>(FunctionFactory::CaseInsensitive);
     factory.registerFunction<CastOverloadResolver<CastType::accurate>>();
@@ -83,6 +87,7 @@ void registerFunctionsConversion(FunctionFactory & factory)
     factory.registerFunction<FunctionToInt256OrZero>();
     factory.registerFunction<FunctionToFloat32OrZero>();
     factory.registerFunction<FunctionToFloat64OrZero>();
+    factory.registerFunction<FunctionToFloat64OrZeroMySql>();
     factory.registerFunction<FunctionToDateOrZero>();
     factory.registerFunction<FunctionToDate32OrZero>();
     factory.registerFunction<FunctionToDateTimeOrZero>();
@@ -95,6 +100,8 @@ void registerFunctionsConversion(FunctionFactory & factory)
 
     factory.registerFunction<FunctionToUUIDOrZero>();
     factory.registerFunction<FunctionToFixedStringOrZero>();
+    factory.registerFunction<FunctionToIPv4OrZero>();
+    factory.registerFunction<FunctionToIPv6OrZero>();
 
     factory.registerFunction<FunctionToUInt8OrNull>();
     factory.registerFunction<FunctionToUInt16OrNull>();
@@ -122,6 +129,8 @@ void registerFunctionsConversion(FunctionFactory & factory)
 
     factory.registerFunction<FunctionToUUIDOrNull>();
     factory.registerFunction<FunctionToFixedStringOrNull>();
+    factory.registerFunction<FunctionToIPv4OrNull>();
+    factory.registerFunction<FunctionToIPv6OrNull>();
 
     factory.registerFunction<FunctionParseDateTimeBestEffort>();
     factory.registerFunction<FunctionParseDateTimeBestEffortOrZero>();
@@ -135,7 +144,14 @@ void registerFunctionsConversion(FunctionFactory & factory)
     factory.registerFunction<FunctionParseDateTime64BestEffort>();
     factory.registerFunction<FunctionParseDateTime64BestEffortOrZero>();
     factory.registerFunction<FunctionParseDateTime64BestEffortOrNull>();
+    factory.registerFunction<FunctionParseDateTime64BestEffortUS>();
+    factory.registerFunction<FunctionParseDateTime64BestEffortUSOrZero>();
+    factory.registerFunction<FunctionParseDateTime64BestEffortUSOrNull>();
 
+
+    factory.registerFunction<FunctionConvert<DataTypeInterval, NameToIntervalNanosecond, PositiveMonotonicity>>(FunctionFactory::CaseInsensitive);
+    factory.registerFunction<FunctionConvert<DataTypeInterval, NameToIntervalMicrosecond, PositiveMonotonicity>>(FunctionFactory::CaseInsensitive);
+    factory.registerFunction<FunctionConvert<DataTypeInterval, NameToIntervalMillisecond, PositiveMonotonicity>>(FunctionFactory::CaseInsensitive);
     factory.registerFunction<FunctionConvert<DataTypeInterval, NameToIntervalSecond, PositiveMonotonicity>>();
     factory.registerFunction<FunctionConvert<DataTypeInterval, NameToIntervalMinute, PositiveMonotonicity>>();
     factory.registerFunction<FunctionConvert<DataTypeInterval, NameToIntervalHour, PositiveMonotonicity>>();

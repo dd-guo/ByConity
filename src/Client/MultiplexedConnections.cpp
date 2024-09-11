@@ -23,6 +23,7 @@
 #include <IO/ConnectionTimeouts.h>
 #include <IO/Operators.h>
 #include <Common/thread_local_rng.h>
+#include "Transaction/ICnchTransaction.h"
 #include <Interpreters/Context.h>
 #include <CloudServices/CnchServerResource.h>
 
@@ -128,6 +129,7 @@ void MultiplexedConnections::sendResource()
 
     auto host_ports = replica_states[0].connection->getHostWithPorts();
 
+    server_resource->setSendMutations(true);
     server_resource->sendResource(getContext(), host_ports);
 }
 
@@ -163,6 +165,17 @@ void MultiplexedConnections::sendQuery(
     size_t num_replicas = replica_states.size();
     bool is_cnch_query = (nullptr != current_context->getCurrentTransaction());
 
+    if (CurrentThread::isInitialized())
+    {
+        auto context = CurrentThread::get().getQueryContext();
+        if (context && !context->getTenantId().empty())
+            modified_settings.tenant_id = context->getTenantId();
+    }
+
+    /// DefaultDatabaseEngine::CNCH is invalid outside Byconity
+    if (!replica_states[0].connection->isByConityServer())
+        modified_settings.default_database_engine = DefaultDatabaseEngine::Atomic;
+
     if (num_replicas > 1)
     {
         if (is_cnch_query)
@@ -179,9 +192,11 @@ void MultiplexedConnections::sendQuery(
     }
     else
     {
-        if (is_cnch_query)
+        if (is_cnch_query && (replica_states[0].connection->isByConityServer()))
         {
-            auto txn_id = current_context->getCurrentTransactionID();
+            auto txn = current_context->getCurrentTransaction();
+            auto primary_txn_id = txn->isSecondary() ? txn->getPrimaryTransactionID().toUInt64() : 0;
+            auto txn_id = txn->getTransactionID().toUInt64();
             auto client_type = (current_context->getServerType() == ServerType::cnch_server) ?
                 ClientInfo::ClientType::CNCH_SERVER : ClientInfo::ClientType::CNCH_WORKER;
             auto rpc_port = (current_context->getServerType() == ServerType::cnch_worker)
@@ -189,7 +204,7 @@ void MultiplexedConnections::sendQuery(
                 : current_context->getRPCPort();
 
             replica_states[0].connection->sendCnchQuery(
-                txn_id, timeouts, query, query_id, stage, &modified_settings, &client_info, with_pending_data, client_type, rpc_port);
+                primary_txn_id, txn_id, timeouts, query, query_id, stage, &modified_settings, &client_info, with_pending_data, client_type, rpc_port);
         }
         else
         {
@@ -272,8 +287,12 @@ Packet MultiplexedConnections::drain()
     if (!cancelled)
         throw Exception("Cannot drain connections: cancel first.", ErrorCodes::LOGICAL_ERROR);
 
+
     Packet res;
     res.type = Protocol::Server::EndOfStream;
+
+    if (!hasActiveConnections())
+        return res;
 
     Packet packet = receivePacketUnlocked({});
 
@@ -336,24 +355,21 @@ Packet MultiplexedConnections::receivePacketUnlocked(AsyncCallback async_callbac
         throw Exception("Logical error: no available replica", ErrorCodes::NO_AVAILABLE_REPLICA);
 
     Packet packet;
+    try
     {
         AsyncCallbackSetter async_setter(current_connection, std::move(async_callback));
-
-        try
+        packet = current_connection->receivePacket();
+    }
+    catch (Exception & e)
+    {
+        if (e.code() == ErrorCodes::UNKNOWN_PACKET_FROM_SERVER)
         {
-            packet = current_connection->receivePacket();
+            /// Exception may happen when packet is received, e.g. when got unknown packet.
+            /// In this case, invalidate replica, so that we would not read from it anymore.
+            current_connection->disconnect();
+            invalidateReplica(state);
         }
-        catch (Exception & e)
-        {
-            if (e.code() == ErrorCodes::UNKNOWN_PACKET_FROM_SERVER)
-            {
-                /// Exception may happen when packet is received, e.g. when got unknown packet.
-                /// In this case, invalidate replica, so that we would not read from it anymore.
-                current_connection->disconnect();
-                invalidateReplica(state);
-            }
-            throw;
-        }
+        throw;
     }
 
     switch (packet.type)

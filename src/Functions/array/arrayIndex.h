@@ -1,5 +1,6 @@
 #pragma once
 #include <Functions/IFunction.h>
+#include <Functions/IFunctionMySql.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
@@ -362,19 +363,33 @@ class FunctionArrayIndex : public IFunction
 {
 public:
     static constexpr auto name = Name::name;
-    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayIndex>(); }
+    static FunctionPtr create(ContextPtr context)
+    {
+        bool return_nullable_array = !context || context->getSettingsRef().allow_return_nullable_array;
+        if (context && context->getSettingsRef().enable_implicit_arg_type_convert)
+            return std::make_shared<IFunctionMySql>(std::make_unique<FunctionArrayIndex>(context, return_nullable_array));
+        return std::make_shared<FunctionArrayIndex>(context, return_nullable_array);
+    }
+
+    explicit FunctionArrayIndex(ContextPtr context_, bool return_nullable_array_ = true) : context(context_), allow_return_nullable_array(return_nullable_array_) {}
+
+    ArgType getArgumentsType() const override { return ArgType::ARRAY_FIRST; }
 
     /// Get function name.
     String getName() const override { return name; }
 
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 2; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
-        const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
+        const auto * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
+        const auto * nullable_type = checkAndGetDataType<DataTypeNullable>(arguments[0].get());
+        if (nullable_type)
+            array_type = checkAndGetDataType<DataTypeArray>(nullable_type->getNestedType().get());
 
         if (!array_type)
             throw Exception("First argument for function " + getName() + " must be an array.",
@@ -386,7 +401,31 @@ public:
                 "numeric types, or Enum and numeric type. Passed: {} and {}.",
                 getName(), arguments[0]->getName(), arguments[1]->getName());
 
+        if (allow_return_nullable_array && (nullable_type || (context && context->getSettingsRef().enable_implicit_arg_type_convert && arguments[1]->isNullable())))
+            return std::make_shared<DataTypeNullable>(std::make_shared<DataTypeNumber<ResultType>>());
+
         return std::make_shared<DataTypeNumber<ResultType>>();
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+    {
+        if (context && context->getSettingsRef().enable_implicit_arg_type_convert && arguments[1].column->onlyNull())
+            return result_type->createColumnConstWithDefaultValue(input_rows_count);
+        /// Execute on nested columns and wrap results with nullable
+        auto * nullable_col = checkAndGetColumn<ColumnNullable>(arguments[0].column.get());
+        auto * const_col = checkAndGetColumn<ColumnConst>(arguments[0].column.get());
+        if (const_col)
+            nullable_col = checkAndGetColumn<ColumnNullable>(const_col->getDataColumn());
+
+        if (nullable_col)
+        {
+            ColumnsWithTypeAndName tmp_args = {{nullable_col->getNestedColumnPtr(), removeNullable(arguments[0].type), arguments[0].name}, arguments[1]};
+            auto res = executeInternalImpl(tmp_args, removeNullable(result_type), input_rows_count);
+            return allow_return_nullable_array ? wrapInNullable(res, arguments, result_type, input_rows_count)
+                                               : res;
+        }
+
+        return executeInternalImpl(arguments, result_type, input_rows_count);
     }
 
     /**
@@ -403,7 +442,7 @@ public:
       * (they are vectors of Fields, which may represent the NULL value),
       * they do not require any preprocessing.
       */
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t /*input_rows_count*/) const override
+    ColumnPtr executeInternalImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t /*input_rows_count*/) const
     {
         const ColumnPtr & ptr = arguments[0].column;
 
@@ -483,6 +522,8 @@ public:
     }
 
 private:
+    ContextPtr context;
+    bool allow_return_nullable_array;
     using ResultType = typename ConcreteAction::ResultType;
     using ResultColumnType = ColumnVector<ResultType>;
     using ResultColumnPtr = decltype(ResultColumnType::create());
@@ -501,13 +542,13 @@ private:
         inline void moveResult() { result_column = std::move(result); }
     };
 
-    static inline bool allowArguments(const DataTypePtr & array_inner_type, const DataTypePtr & arg)
+    inline bool allowArguments(const DataTypePtr & array_inner_type, const DataTypePtr & arg) const
     {
         auto inner_type_decayed = removeNullable(removeLowCardinality(array_inner_type));
         auto arg_decayed = removeNullable(removeLowCardinality(arg));
 
         return ((isNativeNumber(inner_type_decayed) || isEnum(inner_type_decayed)) && isNativeNumber(arg_decayed))
-            || getLeastSupertype({inner_type_decayed, arg_decayed});
+            || getLeastSupertype(DataTypes{inner_type_decayed, arg_decayed});
     }
 
 #define INTEGRAL_TPL_PACK UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64, Float32, Float64
@@ -981,7 +1022,7 @@ private:
         DataTypePtr array_elements_type = assert_cast<const DataTypeArray &>(*arguments[0].type).getNestedType();
         const DataTypePtr & index_type = arguments[1].type;
 
-        DataTypePtr common_type = getLeastSupertype({array_elements_type, index_type});
+        DataTypePtr common_type = getLeastSupertype(DataTypes{array_elements_type, index_type});
 
         ColumnPtr col_nested = castColumn({ col->getDataPtr(), array_elements_type, "" }, common_type);
 

@@ -22,12 +22,16 @@
 #pragma once
 #include <Disks/IDisk.h>
 #include <Storages/MarkCache.h>
+#include "IO/ReadSettings.h"
+#include "Storages/MergeTree/IMergeTreeDataPart.h"
+#include "Storages/MergeTree/MergeTreeIOSettings.h"
 
 namespace DB
 {
 
 struct MergeTreeIndexGranularityInfo;
 class IDiskCache;
+struct PartHostInfo;
 
 class MergeTreeMarksLoader
 {
@@ -44,8 +48,10 @@ public:
         bool save_marks_in_cache_,
         off_t mark_file_offset_,
         size_t mark_file_size_,
+        const MergeTreeReaderSettings & read_settings_,
         size_t columns_in_mark_ = 1,
         IDiskCache * disk_cache_ = nullptr,
+        const PartHostInfo & part_host_ = {},
         UUID storage_uuid_ = {},
         const String & part_name_ = {});
 
@@ -70,7 +76,10 @@ private:
     size_t columns_in_mark;
     MarkCache::MappedPtr marks;
 
+    MergeTreeReaderSettings settings;
+
     IDiskCache * disk_cache;
+    PartHostInfo part_host;
     UUID storage_uuid;
     String part_name;
 

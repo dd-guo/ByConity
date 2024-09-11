@@ -43,7 +43,6 @@ public:
         SELECT,
         TABLES,
         PREWHERE,
-        IMPLICITWHERE,  /// only used in CnchHive
         WHERE,
         GROUP_BY,
         HAVING,
@@ -54,8 +53,49 @@ public:
         LIMIT_BY,
         LIMIT_OFFSET,
         LIMIT_LENGTH,
-        SETTINGS
+        SETTINGS,
+        ESCAPE
     };
+
+    static String expressionToString(Expression expr)
+    {
+        switch (expr)
+        {
+            case Expression::WITH:
+                return "WITH";
+            case Expression::SELECT:
+                return "SELECT";
+            case Expression::TABLES:
+                return "TABLES";
+            case Expression::PREWHERE:
+                return "PREWHERE";
+            case Expression::WHERE:
+                return "WHERE";
+            case Expression::GROUP_BY:
+                return "GROUP BY";
+            case Expression::HAVING:
+                return "HAVING";
+            case Expression::WINDOW:
+                return "WINDOW";
+            case Expression::ORDER_BY:
+                return "ORDER BY";
+            case Expression::LIMIT_BY_OFFSET:
+                return "LIMIT BY OFFSET";
+            case Expression::LIMIT_BY_LENGTH:
+                return "LIMIT BY LENGTH";
+            case Expression::LIMIT_BY:
+                return "LIMIT BY";
+            case Expression::LIMIT_OFFSET:
+                return "LIMIT OFFSET";
+            case Expression::LIMIT_LENGTH:
+                return "LIMIT LENGTH";
+            case Expression::SETTINGS:
+                return "SETTINGS";
+            case Expression::ESCAPE:
+                return "ESCAPE";
+        }
+        return "";
+    }
 
     /** Get the text that identifies this element. */
     String getID(char) const override { return "SelectQuery"; }
@@ -64,9 +104,10 @@ public:
 
     ASTPtr clone() const override;
 
-    void collectAllTables(std::vector<ASTPtr> &, bool &) const;
+    static void collectAllTables(const IAST * ast, std::vector<ASTPtr> &, bool &);
 
     bool distinct = false;
+    bool group_by_all = false;
     bool group_by_with_totals = false;
     bool group_by_with_rollup = false;
     bool group_by_with_cube = false;
@@ -77,16 +118,17 @@ public:
     ASTPtr & refSelect()    { return getExpression(Expression::SELECT); }
     ASTPtr & refTables()    { return getExpression(Expression::TABLES); }
     ASTPtr & refPrewhere()  { return getExpression(Expression::PREWHERE); }
-    ASTPtr & refImplicitWhere() { return getExpression(Expression::IMPLICITWHERE); }
     ASTPtr & refWhere()     { return getExpression(Expression::WHERE); }
+    ASTPtr & refGroupBy() { return getExpression(Expression::GROUP_BY); }
     ASTPtr & refHaving()    { return getExpression(Expression::HAVING); }
+    ASTPtr & refWindow() { return getExpression(Expression::WINDOW); }
+    ASTPtr & refOrderBy() { return getExpression(Expression::ORDER_BY); }
     ASTPtr & refLimitLength()   { return getExpression(Expression::LIMIT_LENGTH); }
 
     const ASTPtr with()           const { return getExpression(Expression::WITH); }
     const ASTPtr select()         const { return getExpression(Expression::SELECT); }
     const ASTPtr tables()         const { return getExpression(Expression::TABLES); }
     const ASTPtr prewhere()       const { return getExpression(Expression::PREWHERE); }
-    const ASTPtr implicitWhere()  const { return getExpression(Expression::IMPLICITWHERE); }
     const ASTPtr where()          const { return getExpression(Expression::WHERE); }
     const ASTPtr groupBy()        const { return getExpression(Expression::GROUP_BY); }
     const ASTPtr having()         const { return getExpression(Expression::HAVING); }
@@ -98,6 +140,7 @@ public:
     const ASTPtr limitOffset()    const { return getExpression(Expression::LIMIT_OFFSET); }
     const ASTPtr limitLength()    const { return getExpression(Expression::LIMIT_LENGTH); }
     const ASTPtr settings()       const { return getExpression(Expression::SETTINGS); }
+    const ASTPtr escape()       const { return getExpression(Expression::ESCAPE); }
 
     ASTPtr getWith()            { return getExpression(Expression::WITH, true); }
     ASTPtr getSelect()          { return getExpression(Expression::SELECT, true); }
@@ -146,6 +189,8 @@ public:
     static ASTPtr deserialize(ReadBuffer & buf);
 
     std::vector<Expression> getExpressionTypes() const;
+    void removeSettingsAndOutputFormat();
+
 protected:
     void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 

@@ -20,13 +20,10 @@
  */
 
 #pragma once
-
 #include <DataTypes/IDataType.h>
-
 
 namespace DB
 {
-
 template <typename T,
 typename = std::enable_if_t<std::is_same_v<T, DataTypeDateTime64> || std::is_same_v<T, DataTypeTime>, T>>
 size_t getMaxScaleIndex(const DataTypes &types)
@@ -51,12 +48,36 @@ size_t getMaxScaleIndex(const DataTypes &types)
     return max_scale_date_time_index;
 }
 
+enum class LeastSupertypeOnError
+{
+    Throw,
+    String,
+    Null,
+};
+
 /** Get data type that covers all possible values of passed data types.
   * If there is no such data type, throws an exception.
   *
   * Examples: least common supertype for UInt8, Int8 - Int16.
   * Examples: there is no least common supertype for Array(UInt8), Int8.
   */
-DataTypePtr getLeastSupertype(const DataTypes & types, bool allow_extended_conversion = false);
+template <LeastSupertypeOnError on_error = LeastSupertypeOnError::Throw>
+DataTypePtr getLeastSupertype(const DataTypes & types, bool allow_extended_conversio = false);
+
+/// Same as above but return String type instead of throwing exception.
+/// All types can be casted to String, because they can be serialized to String.
+DataTypePtr getLeastSupertypeOrString(const DataTypes & types, bool allow_extended_conversio = false);
+
+/// Same as above but return nullptr instead of throwing exception.
+DataTypePtr tryGetLeastSupertype(const DataTypes & types, bool allow_extended_conversion=false);
+
+using TypeIndexSet = std::unordered_set<TypeIndex>;
+
+template <LeastSupertypeOnError on_error = LeastSupertypeOnError::Throw>
+DataTypePtr getLeastSupertype(const TypeIndexSet & types, bool allow_extended_conversion=false);
+
+DataTypePtr getLeastSupertypeOrString(const TypeIndexSet & types, bool allow_extended_conversion=false);
+
+DataTypePtr tryGetLeastSupertype(const TypeIndexSet & types, bool allow_extended_conversion=false);
 
 }

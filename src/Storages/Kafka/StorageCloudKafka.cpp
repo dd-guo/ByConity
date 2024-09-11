@@ -20,6 +20,7 @@
 
 #include <Common/Exception.h>
 #include <Common/Configurations.h>
+#include <Common/CurrentMetrics.h>
 #include <Common/Macros.h>
 #include <Common/escapeForFileName.h>
 #include <Common/SettingsChanges.h>
@@ -39,11 +40,18 @@
 #include <Storages/StorageMaterializedView.h>
 #include <Transaction/CnchWorkerTransaction.h>
 
+
+namespace CurrentMetrics
+{
+    extern const Metric Consumer;
+}
+
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int BRPC_TIMEOUT;
     extern const int CNCH_KAFKA_TASK_NEED_STOP;
     extern const int RDKAFKA_EXCEPTION;
 }
@@ -76,12 +84,14 @@ StorageCloudKafka::StorageCloudKafka
     if (server_client_address.getHost().empty() || server_client_address.rpc_port == 0)
         throw Exception("Invalid server client " + server_client_address.getRPCAddress()
                         + " for kafka consumer " + getStorageID().getNameForLogs(), ErrorCodes::BAD_ARGUMENTS);
+    CurrentMetrics::add(CurrentMetrics::Consumer);
 }
 
 StorageCloudKafka::~StorageCloudKafka()
 {
     try
     {
+        CurrentMetrics::sub(CurrentMetrics::Consumer);
         auto & schema_path = settings.format_schema_path.value;
         if (!schema_path.empty() && !Kafka::startsWithHDFSOrCFS(schema_path) && Poco::File(schema_path).exists())
         {
@@ -145,7 +155,7 @@ void StorageCloudKafka::tryLoadFormatSchemaFileFromHDFS()
             }
 
             LOG_DEBUG(log, "Loading format schema files from remote path: {} to local path: {}", path, local_format_path);
-            reloadFormatSchema(path, local_format_path, log);
+            reloadFormatSchema(getContext(), path, local_format_path, log);
 
             /// Check the existence of the file to ensure loading successfully
             if (!Poco::File(local_format_path + "/" + target_path.getFileName()).exists())
@@ -202,20 +212,62 @@ void StorageCloudKafka::subscribeBuffer(BufferPtr &buffer)
 {
     auto *consumer_buf = buffer->subBufferAs<CnchReadBufferFromKafkaConsumer>();
     consumer_buf->assign(consumer_context.assignment);
+    if (unlikely(!consumer_context.sample_partitions.empty()))
+        consumer_buf->setSampleConsumingPartitionList(consumer_context.sample_partitions);
 
     consumer_buf->reset();
 }
 
 void StorageCloudKafka::unsubscribeBuffer(BufferPtr &buffer)
 {
-    if (buffer)
-        buffer->subBufferAs<CnchReadBufferFromKafkaConsumer>()->unassign();
+    if (!buffer)
+        return;
+
+    buffer->subBufferAs<CnchReadBufferFromKafkaConsumer>()->unassign();
+    buffer->resetDelimiterStatus();
 }
 
 cppkafka::Configuration StorageCloudKafka::createConsumerConfiguration()
 {
     /// Create consumer conf
     cppkafka::Configuration conf = Kafka::createConsumerConfiguration(getContext(), getStorageID(), topics, settings);
+
+    /// Set error callback
+    conf.set_error_callback([this] (cppkafka::KafkaHandleBase &, int error, const std::string & reason)
+    {
+        String error_msg;
+        if (error == RD_KAFKA_RESP_ERR__ALL_BROKERS_DOWN)
+        {
+            error_msg = "All brokers are down and we will destroy the consumer and recreate it: " + reason;
+            consumer_context.error_event = true;
+        }
+
+        if (error_msg.empty())
+            error_msg = ("[RDKAFKA Exception] error code: " + std::to_string(error) + ", reason: " + reason);
+
+        LOG_ERROR(log, error_msg);
+
+        if (auto kafka_log = getContext()->getKafkaLog())
+        {
+            try
+            {
+                auto kafka_error_log = createKafkaLog(KafkaLogElement::EXCEPTION, assigned_consumer_index);
+                kafka_error_log.has_error = true;
+                kafka_error_log.last_exception = error_msg;
+                kafka_log->add(kafka_error_log);
+                if (auto cloud_kafka_log = getContext()->getCloudKafkaLog())
+                    cloud_kafka_log->add(kafka_error_log);
+
+                std::lock_guard lock(last_exception_mutex);
+                last_exception = kafka_error_log.last_exception;
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log);
+            }
+        }
+    }); /// End conf.set_error_callback
+
     return conf;
 }
 
@@ -235,11 +287,12 @@ BufferPtr StorageCloudKafka::createBuffer()
 
     return std::make_shared<DelimitedReadBuffer>(
             std::make_unique<CnchReadBufferFromKafkaConsumer>(
-                    consumer, logger_name.str(), batch_size, poll_timeout, expire_timeout, &stream_run),
+                    consumer, logger_name.str(), batch_size, poll_timeout, expire_timeout, &stream_run, settings.enable_skip_offsets_hole),
             settings.row_delimiter);
 }
 
-void StorageCloudKafka::createStreamThread(const cppkafka::TopicPartitionList & assignment)
+void StorageCloudKafka::createStreamThread(const cppkafka::TopicPartitionList & assignment,
+                                           const std::set<cppkafka::TopicPartition> & sample_partitions)
 {
     if (consumer_context.initialized)
     {
@@ -250,6 +303,7 @@ void StorageCloudKafka::createStreamThread(const cppkafka::TopicPartitionList & 
     LOG_TRACE(log, "Creating stream thread and buffer");
     consumer_context.mutex = std::make_unique<std::timed_mutex>();
     consumer_context.assignment = assignment;
+    consumer_context.sample_partitions = sample_partitions;
     auto task = getContext()->getConsumeSchedulePool().createTask(
             log->name(),[this] { streamThread(); });
     task->deactivate();
@@ -261,9 +315,13 @@ void StorageCloudKafka::createStreamThread(const cppkafka::TopicPartitionList & 
 
 void StorageCloudKafka::checkStagedArea()
 {
+    if (!settings.enable_check_staging_area_status)
+        return;
+
     try
     {
-        if (!checkDependencies(getDatabaseName(), getTableName(), /**check staged area**/true))
+        size_t num_tables_to_write{0};
+        if (!checkDependencies(getDatabaseName(), getTableName(), /**check staged area**/true, num_tables_to_write))
             LOG_ERROR(log, "Check dependencies failed when checking for staged area.");
     }
     catch(...)
@@ -281,12 +339,13 @@ void StorageCloudKafka::checkStagedArea()
     }
 }
 
-void StorageCloudKafka::startConsume(size_t consumer_index, const cppkafka::TopicPartitionList & tpl)
+void StorageCloudKafka::startConsume(size_t consumer_index, const cppkafka::TopicPartitionList & tpl,
+                                    const std::set<cppkafka::TopicPartition> & sample_partitions)
 {
     std::lock_guard lock_thread(table_status_mutex);
 
     assigned_consumer_index = consumer_index;
-    createStreamThread(tpl);
+    createStreamThread(tpl, sample_partitions);
 
     LOG_TRACE(log, "Activating stream thread");
     stream_run = true;
@@ -328,7 +387,6 @@ void StorageCloudKafka::stopStreamThread()
     /// Second, stop task: do not add lock here
     /// If exception occurs when stopping task, it needs to add lock to update some info,
     /// so if locked here, the dead lock would happen
-    unsubscribeBuffer(consumer_context.buffer);
     consumer_context.task->deactivate();
 
     /// Then reset `consumer_context`
@@ -349,19 +407,19 @@ void StorageCloudKafka::stopConsume()
 
 void StorageCloudKafka::streamThread()
 {
-    auto process_exception = [this] () {
+    auto process_exception = [this] (String message = "") {
         LOG_ERROR(this->log, "Stream thread failed: {}", getCurrentExceptionMessage(true));
 
         if (auto kafka_log = getContext()->getKafkaLog())
         {
             auto kafka_error_log = createKafkaLog(KafkaLogElement::EXCEPTION, assigned_consumer_index);
             kafka_error_log.has_error = true;
-            kafka_error_log.last_exception = getCurrentExceptionMessage(false);
+            kafka_error_log.last_exception = message.empty() ? getCurrentExceptionMessage(false): message;
             kafka_log->add(kafka_error_log);
             if (auto cloud_kafka_log = getContext()->getCloudKafkaLog())
                 cloud_kafka_log->add(kafka_error_log);
 
-            std::lock_guard lock(table_status_mutex);
+            std::lock_guard lock(last_exception_mutex);
             last_exception = kafka_error_log.last_exception;
         }
     };
@@ -373,12 +431,17 @@ void StorageCloudKafka::streamThread()
 
         while (!dependencies.empty())
         {
-            if (!checkDependencies(getDatabaseName(), getTableName(), false))
+            /// Use a passed reference parameter instead of member variable
+            /// due to `checkDependencies` will be called by `checkStagedArea` as well
+            /// though `checkStagedArea` is currently unused
+            number_tables_to_write = 0;
+            if (!checkDependencies(getDatabaseName(), getTableName(), false, number_tables_to_write))
                 throw Exception("Check dependencies failed, just restart consumer task", ErrorCodes::CNCH_KAFKA_TASK_NEED_STOP);
 
             if (wait_for_staged_parts_to_publish)
             {
-                LOG_DEBUG(log, "Target table has some parts too old, skip this consume action. ");
+                LOG_DEBUG(log, "Target table has some parts too old, skip this consume action.");
+                process_exception("Target table has some parts too old, skip this consume action.");
                 break;
             }
 
@@ -457,6 +520,11 @@ bool StorageCloudKafka::streamToViews(/* required_column_names */)
     //consume_context.setSetting("min_insert_block_size_rows", UInt64(1));
     consume_context->applySettingsChanges(settings_adjustments);
 
+    /// XXX: may should add it into `settings_adjustments`;
+    /// but it will be updated after tryLoadFormatSchemaFileFromHDFS while `settings_adjustments` is initialized during construction
+    if (!settings.format_schema_path.value.empty())
+        consume_context->setSetting("format_custom_schema_path", settings.format_schema_path.value);
+
     consume_context->setSessionContext(consume_context);
 
     auto server_client = consume_context->getCnchServerClient(server_client_address);
@@ -468,6 +536,12 @@ bool StorageCloudKafka::streamToViews(/* required_column_names */)
         auto table_id = getStorageID();
         table_id.uuid = cnch_storage_id.uuid;
         auto txn = std::make_shared<CnchWorkerTransaction>(consume_context, server_client, table_id, assigned_consumer_index);
+        if (number_tables_to_write > 1)
+        {
+            LOG_DEBUG(&Poco::Logger::get("CnchKafkaWorker"), "Enable explicit commit txn while consumer needs to write {} tables", number_tables_to_write);
+            txn->enableExplicitCommit();
+            txn->setExplicitCommitStorageID(getStorageID());
+        }
         consume_context->setCurrentTransaction(txn);
     }
     catch (...)
@@ -492,8 +566,8 @@ bool StorageCloudKafka::streamToViews(/* required_column_names */)
     auto block_io = interpreter.execute();
 
     BlockInputStreamPtr in = std::make_shared<CnchKafkaBlockInputStream>(*this, getInMemoryMetadataPtr(),
-                             consume_context, block_io.out->getHeader().getNames(), block_size, assigned_consumer_index);
-
+                             consume_context, block_io.out->getHeader().getNames(), block_size, assigned_consumer_index,
+                             getInMemoryMetadataPtr()->getColumns().hasDefaults());
 
     streamCopyData(*in, *block_io.out, consume_context);
 
@@ -502,10 +576,10 @@ bool StorageCloudKafka::streamToViews(/* required_column_names */)
         if (const auto *counting_stream = dynamic_cast<const CountingBlockOutputStream *>(block_io.out.get()))
         {
             size_t origin_bytes = in->getProfileInfo().bytes;
-            size_t written_bytes = counting_stream->getProgress().written_bytes;
+            size_t written_bytes = counting_stream->getProgress().read_bytes;
 
             size_t origin_rows = in->getProfileInfo().rows;
-            size_t written_rows = counting_stream->getProgress().written_rows;
+            size_t written_rows = counting_stream->getProgress().read_rows;
             if (origin_rows != written_rows)
             {
                 KafkaLogElement kafka_filter_log = createKafkaLog(KafkaLogElement::FILTER, assigned_consumer_index);
@@ -528,6 +602,30 @@ bool StorageCloudKafka::streamToViews(/* required_column_names */)
         try
         {
             auto *consumer_buf = consumer_context.buffer->subBufferAs<CnchReadBufferFromKafkaConsumer>();
+
+            if (settings.enable_skip_offsets_hole)
+            {
+                String str;
+                for (const String & skipped_offset : consumer_buf->getSkippedOffsetsHole())
+                    str += (" {" + skipped_offset + "}");
+                size_t skipped_msgs = consumer_buf->getSkippedMsgsInHoles();
+
+                if (!str.empty())
+                {
+                    str = ("Poll skipped messges but we skipped these holes as `enable_skip_offsets_hole` enabled. The holes are:" + str);
+
+                    /// Record skipped holes in kafka_log to make it easy to trace
+                    auto kafka_error_log = createKafkaLog(KafkaLogElement::EXCEPTION, assigned_consumer_index);
+                    kafka_error_log.has_error = true;
+                    kafka_error_log.last_exception = str;
+                    kafka_error_log.metric = skipped_msgs;
+                    if (auto kafka_log = getContext()->getKafkaLog())
+                        kafka_log->add(kafka_error_log);
+                    if (auto cloud_kafka_log = getContext()->getCloudKafkaLog())
+                        cloud_kafka_log->add(kafka_error_log);
+                }
+            }
+
             consumer_buf->commit();
         }
         catch (...)
@@ -584,7 +682,29 @@ void StorageCloudKafka::streamCopyData(IBlockInputStream &from, IBlockOutputStre
     kafka_commit_log.bytes = commit_bytes;
     Stopwatch watch;
 
-    to.writeSuffix();
+    /// The API `commitTransaction` may get timeout error, while it actually commit successfully;
+    /// if so, we should restart consumer task to check the latest transaction status
+    /// and get the last committed offsets to avoid duplicate consumption
+    try
+    {
+        to.writeSuffix();
+    }
+    catch (const Exception & e)
+    {
+        LOG_ERROR(log, "Failed to commit kafka txn: {}", current_txn->getTransactionID());
+        if (e.code() == ErrorCodes::BRPC_TIMEOUT)
+        {
+            throw Exception("Restart consumer task as commit transaction timedout, due to: " + getCurrentExceptionMessage(false),
+                    ErrorCodes::CNCH_KAFKA_TASK_NEED_STOP);
+        }
+
+        throw;
+    }
+    catch (...)
+    {
+        LOG_ERROR(log, "Failed to commit kafka txn: {}, we will just retry to consume again", current_txn->getTransactionID());
+        throw;
+    }
 
     kafka_commit_log.duration_ms = watch.elapsedMilliseconds();
     if (auto kafka_log = getContext()->getKafkaLog())
@@ -595,7 +715,8 @@ void StorageCloudKafka::streamCopyData(IBlockInputStream &from, IBlockOutputStre
     from.readSuffix();
 }
 
-bool StorageCloudKafka::checkDependencies(const String &database_name, const String &table_name, bool check_staged_area)
+bool StorageCloudKafka::checkDependencies(const String &database_name, const String &table_name,
+                                          bool check_staged_area, size_t & num_tables_to_write)
 {
     /// check if all dependencies are attached
     auto dependencies = DatabaseCatalog::instance().getDependencies({database_name, table_name});
@@ -622,20 +743,20 @@ bool StorageCloudKafka::checkDependencies(const String &database_name, const Str
             auto * cloud = dynamic_cast<StorageCloudMergeTree *> (target_table.get());
             if (!cloud)
                 return false;
+
+            /// Add number of tables to write here
+            ++num_tables_to_write;
+
             if (table_name == getTableName() && database_name == getDatabaseName())
             {
-                /* FIXME: unique table
-                cloud_table_has_unique_key = cloud->hasUniqueKey();
+                cloud_table_has_unique_key = cloud->getInMemoryMetadataPtr()->hasUniqueKey();
                 if (cloud_table_has_unique_key && check_staged_area)
-                {
                     wait_for_staged_parts_to_publish = !cloud->checkStagedParts();
-                } */
             }
+            /// check its dependencies
+            if (!checkDependencies(target_table->getDatabaseName(), target_table->getTableName(), check_staged_area, num_tables_to_write))
+                return false;
         }
-
-        /// check its dependencies
-        if (!checkDependencies(db_tab.database_name, db_tab.table_name, check_staged_area))
-            return false;
     }
 
     return true;
@@ -661,16 +782,20 @@ SettingsChanges StorageCloudKafka::createSettingsAdjustments()
     if (!settings.schema.value.empty())
         result.emplace_back("format_schema", settings.schema.value);
 
-    if (!settings.format_schema_path.value.empty())
-        result.emplace_back("format_schema_path", settings.format_schema_path.value);
+    if (!settings.avro_schema_registry_url.value.empty())
+        result.emplace_back("format_avro_schema_registry_url", settings.avro_schema_registry_url.value);
+
+    /// enable to read JSON object as Strings if you required by changing the setting of CnchKafka
+    if (settings.input_format_json_read_objects_as_strings.changed)
+        result.emplace_back("input_format_json_read_objects_as_strings", settings.input_format_json_read_objects_as_strings.value);
 
     /// Forbidden parallel parsing for Kafka in case of global setting.
     /// Kafka cannot support parallel parsing due to virtual column
     result.emplace_back("input_format_parallel_parsing", false);
 
     result.emplace_back("input_format_json_aggregate_function_type_base64_encode", settings.json_aggregate_function_type_base64_encode.value);
-    result.emplace_back("format_protobuf_enable_multiple_message", settings.protobuf_enable_multiple_message.value);
-    result.emplace_back("format_protobuf_default_length_parser", settings.protobuf_default_length_parser.value);
+    result.emplace_back("input_format_protobuf_enable_multiple_message", settings.protobuf_enable_multiple_message.value);
+    result.emplace_back("input_format_protobuf_default_length_parser", settings.protobuf_default_length_parser.value);
 
     return result;
 }
@@ -719,7 +844,10 @@ void StorageCloudKafka::getConsumersStatus(CnchConsumerStatus &status) const
     }
     else
     {
-        status.last_exception = last_exception;
+        {
+            std::lock_guard lock_exception(last_exception_mutex);
+            status.last_exception = last_exception;
+        }
 
         std::ostringstream oss;
         for (const auto &tpl : consumer_context.assignment)
@@ -772,6 +900,32 @@ cppkafka::TopicPartitionList StorageCloudKafka::getConsumerAssignment() const
     return consumer_context.assignment;
 }
 
+static void getTablesToDropByDependence(const StorageID & db_tb, const ContextMutablePtr & context, std::unordered_set<String> & tables_to_drop)
+{
+    auto table = DatabaseCatalog::instance().tryGetTable({db_tb.database_name, db_tb.table_name}, context);
+    if (!table)
+        return;
+
+    if (auto *mv = dynamic_cast<StorageMaterializedView*>(table.get()))
+    {
+        tables_to_drop.emplace(backQuoteIfNeed(mv->getDatabaseName()) + "." + backQuoteIfNeed(mv->getTableName()));
+
+        auto target_table = mv->tryGetTargetTable();
+        if (!target_table)
+            return;
+
+        if (auto * cloud_table = dynamic_cast<StorageCloudMergeTree*>(target_table.get()))
+        {
+            tables_to_drop.emplace(backQuoteIfNeed(mv->getTargetDatabaseName()) + "." + backQuoteIfNeed(mv->getTargetTableName()));
+        }
+
+        /// Get dependencies of target table (if has
+        auto dependencies = DatabaseCatalog::instance().getDependencies({target_table->getDatabaseName(), target_table->getTableName()});
+        for (const auto & db : dependencies)
+            getTablesToDropByDependence(db, context, tables_to_drop);
+    }
+}
+
 void dropConsumerTables(ContextMutablePtr context, const String & db_name, const String & tb_name)
 {
     std::unordered_set<String> tables_to_drop;
@@ -787,26 +941,7 @@ void dropConsumerTables(ContextMutablePtr context, const String & db_name, const
     {
         for (auto & db_tb : dependencies)
         {
-            auto table = DatabaseCatalog::instance().getTable({db_tb.database_name, db_tb.table_name}, context);
-            if (auto *mv = dynamic_cast<StorageMaterializedView*>(table.get()))
-            {
-                tables_to_drop.emplace(backQuoteIfNeed(mv->getDatabaseName()) + "." + backQuoteIfNeed(mv->getTableName()));
-                ///tables_to_drop.emplace(backQuoteIfNeed(mv->getSelectDatabaseName()) + "." + backQuoteIfNeed(mv->getSelectTableName()));
-
-                try
-                {
-                    auto target_table = mv->getTargetTable();
-                    if (auto * cloud_table = dynamic_cast<StorageCloudMergeTree *>(target_table.get()))
-                    {
-                        tables_to_drop.emplace(backQuoteIfNeed(mv->getTargetDatabaseName()) + "." + backQuoteIfNeed(mv->getTargetTableName()));
-                    }
-                }
-                catch (...)
-                {
-                    LOG_WARNING(&Poco::Logger::get("CnchKafkaWorker"), "Get local target table failed");
-                }
-
-            }
+            getTablesToDropByDependence(db_tb, context, tables_to_drop);
         }
         tables_to_drop.emplace(backQuoteIfNeed(db_name)  + "." + backQuoteIfNeed(tb_name));
     }
@@ -869,7 +1004,7 @@ void executeKafkaConsumeTaskImpl(const KafkaTaskCommand & command, ContextMutabl
     {
         case KafkaTaskCommand::Type::START_CONSUME:
             storage->setCnchStorageID(command.cnch_storage_id);
-            storage->startConsume(command.assigned_consumer, command.tpl);
+            storage->startConsume(command.assigned_consumer, command.tpl, command.sample_partitions);
             break;
         case KafkaTaskCommand::Type::STOP_CONSUME:
             storage->stopConsume();
@@ -889,6 +1024,46 @@ void executeKafkaConsumeTask(const KafkaTaskCommand & command, ContextMutablePtr
     catch (...)
     {
         tryLogCurrentException(__func__, "Failed to execute Kafka consume task");
+
+        /// 1. Record the error log in system.kafka_log to help debug
+        try
+        {
+            if (auto kafka_log = context->getGlobalContext()->getKafkaLog())
+            {
+                KafkaLogElement elem;
+                elem.event_type = KafkaLogElement::EXCEPTION;
+                elem.event_time = time(nullptr);
+                elem.cnch_database = command.cnch_storage_id.getDatabaseName();
+                elem.cnch_table = command.cnch_storage_id.getTableName();
+                elem.database = command.local_database_name;
+                elem.table = command.local_table_name;
+                elem.consumer = "KafkaConsumerTaskExecutor";
+
+                elem.has_error = true;
+                elem.last_exception = getCurrentExceptionMessage(false);
+                kafka_log->add(elem);
+                if (auto cloud_kafka_log = context->getGlobalContext()->getCloudKafkaLog())
+                    cloud_kafka_log->add(elem);
+            }
+        }
+        catch (...)
+        {
+            tryLogCurrentException( __func__, "Failed to record error log for consumer task. Ignore it now");
+        }
+
+        /// 2. Try to drop created local tables which can help trigger re-scheduling of ConsumeManager faster
+        if (command.type == KafkaTaskCommand::Type::START_CONSUME)
+        {
+            LOG_INFO(&Poco::Logger::get("KafkaConsumerTaskExecutor"), "Failed to execute START_CONSUME task, try to drop local tables");
+            try
+            {
+                dropConsumerTables(context, command.local_database_name, command.local_table_name);
+            }
+            catch (...)
+            {
+                tryLogCurrentException( __func__, "Failed to clear unused local tables for consumer task. Ignore it now");
+            }
+        }
     }
 }
 

@@ -14,7 +14,18 @@
  */
 
 #include <Storages/MergeTree/MergeTreeCloudData.h>
+#include <MergeTreeCommon/GlobalDataManager.h>
+#include <CloudServices/CnchPartsHelper.h>
 #include "Processors/QueryPipeline.h"
+#include <common/scope_guard_safe.h>
+#include <Protos/DataModelHelpers.h>
+
+namespace ProfileEvents
+{
+    extern const Event PrunedPartitions;
+    extern const Event PreparePartsForReadMilliseconds;
+    extern const Event LoadServerPartsMilliseconds;
+}
 
 namespace DB
 {
@@ -43,7 +54,6 @@ namespace ErrorCodes
 
 MergeTreeCloudData::MergeTreeCloudData(
     const StorageID & table_id_,
-    const String & relative_data_path_,
     const StorageInMemoryMetadata & metadata_,
     ContextMutablePtr context_,
     const String & date_column_name_,
@@ -51,12 +61,17 @@ MergeTreeCloudData::MergeTreeCloudData(
     std::unique_ptr<MergeTreeSettings> settings_)
     : MergeTreeMetaBase(
         table_id_,
-        relative_data_path_,
+        "", // relative_data_path will be set later
         metadata_,
         context_,
         date_column_name_,
         merging_params_,
         std::move(settings_),
+        /// notice: cardinality of cloud merge tree table name is very high (including xids)
+        /// so if it's used in logger name, can lead to memleak;
+        /// specially, kafka tasks won't create local tables with uuid, and they are always resident tasks,
+        /// thus we still use db-table name as logger name for them
+        (table_id_.hasUUID() ? UUIDHelpers::UUIDToString(table_id_.uuid) : table_id_.getFullTableName()) + " (CloudMergeTree)",
         false, /// require_part_metadata
         false  /// attach
     )
@@ -194,6 +209,13 @@ void MergeTreeCloudData::loadDataParts(MutableDataPartsVector & parts, UInt64)
 
     loadDataPartsInParallel(parts);
 
+    // iterate visible data parts, collect the projections from their previous parts
+    for (auto & part : parts)
+    {
+        if (part->state == DataPartState::Committed)
+            part->gatherProjections();
+    }
+
     calculateColumnSizesImpl();
 
     // check bitmap index; reuse cnch_parallel_prefetching to check in parallel.
@@ -205,7 +227,123 @@ void MergeTreeCloudData::loadDataParts(MutableDataPartsVector & parts, UInt64)
     // else
     //     std::for_each(parts.begin(), parts.end(), [](auto & part) { part->checkBitmapIndex(); });
 
-    LOG_DEBUG(log, "Loaded data parts ({} items)", data_parts_indexes.size());
+    LOG_DEBUG(log, "Loaded {} data parts in {} ms", data_parts_indexes.size(), stopwatch.elapsedMilliseconds());
+}
+
+void MergeTreeCloudData::receiveDataParts(MutableDataPartsVector && parts, UInt64)
+{
+    std::lock_guard<std::mutex> lock(load_data_parts_mutex);
+    received_data_parts = std::move(parts);
+}
+
+void MergeTreeCloudData::receiveVirtualDataParts(MutableDataPartsVector && parts, UInt64)
+{
+    std::lock_guard<std::mutex> lock(load_data_parts_mutex);
+    received_virtual_data_parts = std::move(parts);
+}
+
+void MergeTreeCloudData::prepareDataPartsForRead()
+{
+    Stopwatch watch;
+
+    std::lock_guard<std::mutex> lock(load_data_parts_mutex);
+    if (data_parts_loaded)
+        return;
+
+    auto data_parts_size = received_data_parts.size();
+    auto virtual_parts_size = received_virtual_data_parts.size();
+
+    if (data_parts_size)
+        loadDataParts(received_data_parts);
+
+    if (virtual_parts_size)
+        loadDataParts(received_virtual_data_parts);
+
+    data_parts_loaded = true;
+
+    LOG_DEBUG(log, "Loaded {} data_parts, {} virtual_data_parts in {} microseconds",
+        data_parts_size, virtual_parts_size, watch.elapsedMicroseconds());
+}
+
+void MergeTreeCloudData::setDataDescription(WGWorkerInfoPtr && worker_info_, UInt64 data_version_)
+{
+    // resuse load parts lock
+    std::lock_guard<std::mutex> lock(load_data_parts_mutex);
+    if (data_version == 0)
+    {
+        worker_info = std::move(worker_info_);
+        data_version = data_version_;
+    }
+}
+
+void MergeTreeCloudData::prepareVersionedPartsForRead(ContextPtr local_context, SelectQueryInfo & query_info, const Names & column_names)
+{
+    Stopwatch watch;
+
+    std::lock_guard<std::mutex> lock(load_data_parts_mutex);
+    if (data_parts_loaded)
+        return;
+
+    SCOPE_EXIT_SAFE(data_parts_loaded=true);
+
+    std::unordered_map<String, ServerDataPartsWithDBM> server_parts_by_partition;
+    std::vector<std::shared_ptr<MergeTreePartition>> partition_list;
+    //load server parts by data version
+    local_context->getGlobalDataManager()->loadDataPartsWithDBM(*this, getStorageUUID(), data_version, worker_info, server_parts_by_partition, partition_list);
+    ProfileEvents::increment(ProfileEvents::LoadServerPartsMilliseconds, watch.elapsedMilliseconds());
+
+    if (server_parts_by_partition.empty())
+        return;
+
+    watch.restart();
+
+    // load data parts for read
+    Strings required_partitions = selectPartitionsByPredicate(query_info, partition_list, column_names, local_context);
+
+    size_t loaded_parts_count = loadFromServerPartsInPartition(required_partitions, server_parts_by_partition);
+
+    LOG_DEBUG(log, "Loaded {} server data parts in {} partitions, elapsed: {}ms.",
+        loaded_parts_count,
+        required_partitions.size(),
+        watch.elapsedMilliseconds());
+
+    ProfileEvents::increment(ProfileEvents::PrunedPartitions, required_partitions.size());
+    ProfileEvents::increment(ProfileEvents::PreparePartsForReadMilliseconds, watch.elapsedMilliseconds());
+}
+
+size_t MergeTreeCloudData::loadFromServerPartsInPartition(const Strings & required_partitions, std::unordered_map<String, ServerDataPartsWithDBM> & server_parts_by_partition)
+{
+    if (required_partitions.empty())
+        return 0;
+
+    ServerDataPartsVector server_parts;
+    DeleteBitmapMetaPtrVector delete_bitmaps;
+    {
+        for (const String & partition_id : required_partitions)
+        {
+            const auto & parts_with_dbm = server_parts_by_partition[partition_id];
+            server_parts.insert(server_parts.end(), parts_with_dbm.first.begin(), parts_with_dbm.first.end());
+            delete_bitmaps.insert(delete_bitmaps.end(), parts_with_dbm.second.begin(), parts_with_dbm.second.end());
+        }
+    }
+
+    auto visible_server_parts = CnchPartsHelper::calcVisibleParts(server_parts, false, CnchPartsHelper::LoggingOption::DisableLogging, true);
+
+    if (getInMemoryMetadataPtr()->hasUniqueKey() && !visible_server_parts.empty())
+        getDeleteBitmapMetaForServerParts(visible_server_parts, delete_bitmaps);
+
+    MergeTreeMutableDataPartsVector data_parts;
+    for (const auto & server_part : visible_server_parts)
+    {
+        auto part = createPartFromModelCommon(*this, *(server_part->part_model_wrapper->part_model));
+        if (getInMemoryMetadataPtr()->hasUniqueKey())
+            part->delete_bitmap_metas = std::move(server_part->delete_bitmap_metas);
+        data_parts.push_back(std::move(part));
+    }
+
+    loadDataParts(data_parts);
+
+    return data_parts.size();
 }
 
 void MergeTreeCloudData::unloadOldPartsByTimestamp(Int64 expired_ts)
@@ -243,7 +381,7 @@ void MergeTreeCloudData::unloadOldPartsByTimestamp(Int64 expired_ts)
 
 void MergeTreeCloudData::loadDataPartsInParallel(MutableDataPartsVector & parts)
 {
-    if (parts.empty())
+    if (parts.empty() || !getSettings()->enable_prefetch_checksums)
         return;
 
     auto cnch_parallel_prefetching = getSettings()->cnch_parallel_prefetching ? getSettings()->cnch_parallel_prefetching : 16;
@@ -295,9 +433,16 @@ void MergeTreeCloudData::runOverPartsInParallel(
     }
 
     ThreadPool thread_pool(threads_num);
+    auto thread_group = CurrentThread::getGroup();
     for (auto & part : parts)
     {
-        thread_pool.scheduleOrThrowOnError([&part, &op] {
+        thread_pool.scheduleOrThrowOnError([&part, &op, thread_group] {
+            if (thread_group)
+                CurrentThread::attachToIfDetached(thread_group);
+            SCOPE_EXIT_SAFE(
+                if (thread_group)
+                    CurrentThread::detachQueryIfNotDetached();
+            );
             op(part);
         });
     }
@@ -378,7 +523,7 @@ void MergeTreeCloudData::deactivateOutdatedParts()
 
         if (curr_part->isPartial() && curr_part->containsExactly(*prev_part))
         {
-            if (const auto & p = curr_part->tryGetPreviousPart())
+            if (const auto & p = curr_part->tryGetPreviousPart(); p && p != prev_part)
                 throw Exception("Part " + curr_part->name + " has already owned prev_part: " + p->name, ErrorCodes::LOGICAL_ERROR);
             curr_part->setPreviousPart(prev_part);
             deactivate_part(prev_jt);

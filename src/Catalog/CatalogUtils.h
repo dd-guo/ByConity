@@ -18,6 +18,7 @@
 #include <Storages/CnchPartitionInfo.h>
 #include <Storages/MergeTree/MergeTreeDataPartCNCH_fwd.h>
 #include <Storages/MergeTree/DeleteBitmapMeta.h>
+#include <Catalog/DataModelPartWrapper_fwd.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -46,6 +47,24 @@ struct CommitItems
     }
 };
 
+/**
+ * @class TrashItems
+ * @brief Contains all types of trashed data.
+ */
+struct TrashItems
+{
+    ServerDataPartsVector data_parts;
+    DeleteBitmapMetaPtrVector delete_bitmaps;
+    ServerDataPartsVector staged_parts;
+
+    bool empty() const
+    {
+        return data_parts.empty() && delete_bitmaps.empty() && staged_parts.empty();
+    }
+
+    size_t size() const { return data_parts.size() + delete_bitmaps.size() + staged_parts.size(); }
+};
+
 /// keep partitions sorted as bytekv manner;
 struct partition_comparator
 {
@@ -57,7 +76,8 @@ struct partition_comparator
     }
 };
 
-using PartitionMap = std::map<String, PartitionInfoPtr, partition_comparator>;
+using PartitionMap = std::map<String, PartitionInfoPtr>;
+using PartitionWithGCStatus = std::map<String, UInt32>;
 
 inline String normalizePath(const String & path)
 {
@@ -111,6 +131,11 @@ struct BatchedCommitIndex
     size_t expected_staged_begin;
     size_t expected_staged_end;
 };
+
+size_t getMaxThreads();
+size_t getMinParts();
+
+bool parseTxnIdFromUndoBufferKey(const String & key, UInt64 & txn_id);
 
 }
 }

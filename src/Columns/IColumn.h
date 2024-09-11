@@ -88,8 +88,17 @@ public:
     virtual Ptr convertToFullColumnIfConst() const { return getPtr(); }
 
     /// If column isn't ColumnLowCardinality, return itself.
-    /// If column is ColumnLowCardinality, transforms is to full column.
-    virtual Ptr convertToFullColumnIfLowCardinality() const { return getPtr(); }
+    /// If column is ColumnLowCardinality, transforms it to full column.
+    [[nodiscard]] virtual Ptr convertToFullColumnIfLowCardinality() const { return getPtr(); }
+
+    /// If column isn't ColumnSparse, return itself.
+    /// If column is ColumnSparse, transforms it to full column.
+    [[nodiscard]] virtual Ptr convertToFullColumnIfSparse() const { return getPtr(); }
+
+    [[nodiscard]] Ptr convertToFullIfNeeded() const
+    {
+        return convertToFullColumnIfSparse()->convertToFullColumnIfConst()->convertToFullColumnIfLowCardinality();
+    }
 
     /// Creates empty column with the same type.
     virtual MutablePtr cloneEmpty() const { return cloneResized(0); }
@@ -97,7 +106,7 @@ public:
     /// Creates column with the same type and specified size.
     /// If size is less current size, then data is cut.
     /// If size is greater, than default values are appended.
-    virtual MutablePtr cloneResized(size_t /*size*/) const { throw Exception("Cannot cloneResized() column " + getName(), ErrorCodes::NOT_IMPLEMENTED); }
+    [[nodiscard]] virtual MutablePtr cloneResized(size_t /*size*/) const { throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot cloneResized() column {}", getName()); }
 
     /// Returns number of values in column.
     virtual size_t size() const = 0;
@@ -157,7 +166,7 @@ public:
         throw Exception("Method getInt is not supported for " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
 
-    virtual bool isDefaultAt(size_t n) const { return get64(n) == 0; }
+    virtual bool isDefaultAt(size_t n) const = 0;
     virtual bool isNullAt(size_t /*n*/) const { return false; }
 
     /** If column is numeric, return value of n-th element, casted to bool.
@@ -169,6 +178,8 @@ public:
         throw Exception("Method getBool is not supported for " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
 
+    virtual void tryToFlushZeroCopyBuffer() const {}
+
     /// Removes all elements outside of specified range.
     /// Is used in LIMIT operation, for example.
     virtual Ptr cut(size_t start, size_t length) const
@@ -176,6 +187,14 @@ public:
         MutablePtr res = cloneEmpty();
         res->insertRangeFrom(*this, start, length);
         return res;
+    }
+
+    virtual void shrink(size_t to_size)
+    {
+        if (to_size >= size())
+            return;
+
+        throw Exception("shrink() is not implemented yet!", ErrorCodes::NOT_IMPLEMENTED);
     }
 
     /// This function will get row index from selector and append the data to this column.
@@ -207,6 +226,13 @@ public:
     {
         for (size_t i = 0; i < length; ++i)
             insertFrom(src, position);
+    }
+
+    /// Appends one field multiple times. Can be optimized in inherited classes.
+    virtual void insertMany(const Field & field, size_t length)
+    {
+        for (size_t i = 0; i < length; ++i)
+            insert(field);
     }
 
     /// Appends data located in specified memory chunk if it is possible (throws an exception if it cannot be implemented).
@@ -266,11 +292,19 @@ public:
     /** Removes elements that don't match the filter.
       * Is used in WHERE and HAVING operations.
       * If result_size_hint > 0, then makes advance reserve(result_size_hint) for the result column;
-      *  if 0, then don't makes reserve(),
-      *  otherwise (i.e. < 0), makes reserve() using size of source column.
+      * if 0, then don't makes reserve(),
+      * otherwise (i.e. < 0), makes reserve() using size of source column.
       */
     using Filter = PaddedPODArray<UInt8>;
     virtual Ptr filter(const Filter & filt, ssize_t result_size_hint) const = 0;
+
+    /** Expand column by mask inplace. After expanding column will
+      * satisfy the following: if we filter it by given mask, we will
+      * get initial column. Values with indexes i: mask[i] = 0
+      * shouldn't be used after expanding.
+      * If inverted is true, inverted mask will be used.
+      */
+    virtual void expand(const Filter & /*mask*/, bool /*inverted*/) = 0;
 
     /// Permutes elements using specified permutation. Is used in sorting.
     /// limit - if it isn't 0, puts only first limit elements in the result.
@@ -312,13 +346,27 @@ public:
     /// Check if all elements in the column have equal values. Return true if column is empty.
     virtual bool hasEqualValues() const = 0;
 
+    enum class PermutationSortDirection : uint8_t
+    {
+        Ascending = 0,
+        Descending
+    };
+
+    enum class PermutationSortStability : uint8_t
+    {
+        Unstable = 0,
+        Stable
+    };
+
     /** Returns a permutation that sorts elements of this column,
       *  i.e. perm[i]-th element of source column should be i-th element of sorted column.
-      * reverse - reverse ordering (acsending).
+      * direction - permutation direction.
+      * stability - stability of result permutation.
       * limit - if isn't 0, then only first limit elements of the result column could be sorted.
       * nan_direction_hint - see above.
       */
-    virtual void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const = 0;
+    virtual void getPermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                            size_t limit, int nan_direction_hint, Permutation & res) const = 0;
 
     /*in updatePermutation we pass the current permutation and the intervals at which it should be sorted
      * Then for each interval separately (except for the last one, if there is a limit)
@@ -328,16 +376,20 @@ public:
      * If there is a limit, then for the last interval we do partial sorting and all that is described above,
      * but in addition we still find all the elements equal to the largest sorted, they will also need to be sorted.
      */
-    virtual void updatePermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res, EqualRanges & equal_ranges) const = 0;
+    virtual void updatePermutation(PermutationSortDirection direction, PermutationSortStability stability,
+                            size_t limit, int nan_direction_hint, Permutation & res, EqualRanges & equal_ranges) const = 0;
 
     /** Equivalent to getPermutation and updatePermutation but collator is used to compare values.
       * Supported for String, LowCardinality(String), Nullable(String) and for Array and Tuple, containing them.
       */
-    virtual void getPermutationWithCollation(const Collator &, bool, size_t, int, Permutation &) const
+    virtual void getPermutationWithCollation(const Collator & /*collator*/, PermutationSortDirection /*direction*/, PermutationSortStability /*stability*/,
+                            size_t /*limit*/, int /*nan_direction_hint*/, Permutation & /*res*/) const
     {
         throw Exception("Collations could be specified only for String, LowCardinality(String), Nullable(String) or for Array or Tuple, containing them.", ErrorCodes::BAD_COLLATION);
     }
-    virtual void updatePermutationWithCollation(const Collator &, bool, size_t, int, Permutation &, EqualRanges&) const
+
+    virtual void updatePermutationWithCollation(const Collator & /*collator*/, PermutationSortDirection /*direction*/, PermutationSortStability /*stability*/,
+                            size_t /*limit*/, int /*nan_direction_hint*/, Permutation & /*res*/, EqualRanges & /*equal_ranges*/) const
     {
         throw Exception("Collations could be specified only for String, LowCardinality(String), Nullable(String) or for Array or Tuple, containing them.", ErrorCodes::BAD_COLLATION);
     }
@@ -361,6 +413,11 @@ public:
     /// (descendants should call gatherer_stream.gather(*this) to implement this function.)
     /// TODO: interface decoupled from ColumnGathererStream that allows non-generic specializations.
     virtual void gather(ColumnGathererStream & gatherer_stream) = 0;
+
+    /**
+     * Replace values with specific position with default value.
+     */
+    virtual Ptr replaceWithDefaultValue(Filter & set_to_null_rows);
 
     /** Computes minimum and maximum element of the column.
       * In addition to numeric types, the function is completely implemented for Date and DateTime.
@@ -391,8 +448,21 @@ public:
 
     /// If the column contains subcolumns (such as Array, Nullable, etc), do callback on them.
     /// Shallow: doesn't do recursive calls; don't do call for itself.
-    using ColumnCallback = std::function<void(WrappedPtr&)>;
-    virtual void forEachSubcolumn(ColumnCallback) {}
+
+    using ColumnCallback = std::function<void(const WrappedPtr &)>;
+    virtual void forEachSubcolumn(ColumnCallback) const;
+
+    using MutableColumnCallback = std::function<void(WrappedPtr &)>;
+    virtual void forEachSubcolumn(MutableColumnCallback) {}
+
+    using RecursiveColumnCallback = std::function<void(const IColumn &)>;
+    virtual void forEachSubcolumnRecursively(RecursiveColumnCallback) const;
+
+    using RecursiveMutableColumnCallback = std::function<void(IColumn &)>;
+    virtual void forEachSubcolumnRecursively(RecursiveMutableColumnCallback) {}
+
+    /// Similar to forEachSubcolumn but it also do recursive calls.
+    virtual void forEachSubcolumnRecursively(ColumnCallback) {}
 
     /// Columns have equal structure.
     /// If true - you can use "compareAt", "insertFrom", etc. methods.
@@ -400,6 +470,23 @@ public:
     {
         throw Exception("Method structureEquals is not supported for " + getName(), ErrorCodes::NOT_IMPLEMENTED);
     }
+
+    /// Returns ratio of values in column, that are equal to default value of column.
+    /// Checks only @sample_ratio ratio of rows.
+    [[nodiscard]] virtual double getRatioOfDefaultRows(double sample_ratio = 1.0) const = 0; /// NOLINT
+
+    /// Returns number of values in column, that are equal to default value of column.
+    [[nodiscard]] virtual UInt64 getNumberOfDefaultRows() const = 0;
+
+    /// Returns indices of values in column, that not equal to default value of column.
+    virtual void getIndicesOfNonDefaultRows(Offsets & indices, size_t from, size_t limit) const = 0;
+
+     /// Returns column with @total_size elements.
+    /// In result column values from current column are at positions from @offsets.
+    /// Other values are filled by @default_value.
+    /// @shift means how much rows to skip from the beginning of current column.
+    /// Used to create full column from sparse.
+    [[nodiscard]] virtual Ptr createWithOffsets(const Offsets & offsets, const Field & default_field, size_t total_rows, size_t shift) const;
 
     /// Compress column in memory to some representation that allows to decompress it back.
     /// Return itself if compression is not applicable for this column type.
@@ -416,6 +503,16 @@ public:
         return getPtr();
     }
 
+    /// Some columns may require finalization before using of other operations.
+    virtual void finalize() {}
+    virtual bool isFinalized() const { return true; }
+
+    MutablePtr cloneFinalized() const
+    {
+        auto finalized = IColumn::mutate(getPtr());
+        finalized->finalize();
+        return finalized;
+    }
 
     static MutablePtr mutate(Ptr ptr)
     {
@@ -483,6 +580,8 @@ public:
 
     virtual bool lowCardinality() const { return false; }
 
+    [[nodiscard]] virtual bool isSparse() const { return false; }
+
     virtual bool isCollationSupported() const { return false; }
 
     virtual ~IColumn() = default;
@@ -514,6 +613,24 @@ protected:
 
     template <typename Derived>
     bool hasEqualValuesImpl() const;
+
+    /// Template is to devirtualize calls to 'isDefaultAt' method.
+    template <typename Derived>
+    double getRatioOfDefaultRowsImpl(double sample_ratio) const;
+
+    template <typename Derived>
+    UInt64 getNumberOfDefaultRowsImpl() const;
+
+    template <typename Derived>
+    void getIndicesOfNonDefaultRowsImpl(Offsets & indices, size_t from, size_t limit) const;
+
+    template <typename Compare, typename Sort, typename PartialSort>
+    void getPermutationImpl(size_t limit, Permutation & res, Compare compare,
+                        Sort full_sort, PartialSort partial_sort) const;
+
+    template <typename Compare, typename Equals, typename Sort, typename PartialSort>
+    void updatePermutationImpl(size_t limit, Permutation & res, EqualRanges & equal_ranges, Compare compare, Equals equals,
+                        Sort full_sort, PartialSort partial_sort) const;
 };
 
 using ColumnPtr = IColumn::Ptr;

@@ -32,6 +32,8 @@
 #include <Common/FieldVisitorHash.h>
 #include <Common/typeid_cast.h>
 #include <Common/hex.h>
+#include "DataTypes/DataTypeNullable.h"
+#include "IO/ReadSettings.h"
 #include <Core/Block.h>
 
 
@@ -62,27 +64,37 @@ namespace
         void operator() (const Null &) const
         {
             UInt8 type = Field::Types::Null;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
         }
         void operator() (const NegativeInfinity &) const
         {
             UInt8 type = Field::Types::NegativeInfinity;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
         }
         void operator() (const PositiveInfinity &) const
         {
             UInt8 type = Field::Types::PositiveInfinity;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
         }
         void operator() (const UInt64 & x) const
         {
             UInt8 type = Field::Types::UInt64;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x);
         }
         void operator() (const UInt128 & x) const
         {
             UInt8 type = Field::Types::UInt128;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x);
         }
@@ -95,12 +107,16 @@ namespace
         void operator() (const Int64 & x) const
         {
             UInt8 type = Field::Types::Int64;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x);
         }
         void operator() (const Int128 & x) const
         {
             UInt8 type = Field::Types::Int128;
+            // checked update implementation, no apparent out of bounds
+            // coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x);
         }
@@ -114,15 +130,29 @@ namespace
         {
             operator()(x.toUnderType());
         }
+        void operator() (const IPv4 & x) const
+        {
+            UInt8 type = Field::Types::IPv4;
+            hash.update(type);
+            hash.update(x);
+        }
+        void operator() (const IPv6 & x) const
+        {
+            return operator()(String(reinterpret_cast<const char *>(&x), 16));
+        }
         void operator() (const Float64 & x) const
         {
             UInt8 type = Field::Types::Float64;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x);
         }
         void operator() (const String & x) const
         {
             UInt8 type = Field::Types::String;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.size());
             hash.update(x.data(), x.size());
@@ -130,6 +160,8 @@ namespace
         void operator() (const Array & x) const
         {
             UInt8 type = Field::Types::Array;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.size());
 
@@ -139,6 +171,8 @@ namespace
         void operator() (const Tuple & x) const
         {
             UInt8 type = Field::Types::Tuple;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.size());
 
@@ -148,22 +182,26 @@ namespace
         void operator() (const Map & x) const
         {
             UInt8 type = Field::Types::Map;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.size());
 
             for (const auto & elem : x)
-                applyVisitor(*this, elem);
-        }
-
-        [[ noreturn ]] void operator() (const ByteMap & ) const
-        {
-            throw Exception("Map hash not implemented", ErrorCodes::NOT_IMPLEMENTED);
+            {
+                applyVisitor(*this, elem.first);
+                applyVisitor(*this, elem.second);
+            }
         }
 
         void operator() (const DecimalField<Decimal32> & x) const
         {
             UInt8 type = Field::Types::Decimal32;
+            // checked update implementation, no apparent out of bounds
+            // coverity[overrun-buffer-val]
             hash.update(type);
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(x.getValue().value);
         }
         void operator() (const DecimalField<Decimal64> & x) const
@@ -181,12 +219,16 @@ namespace
         void operator() (const DecimalField<Decimal256> & x) const
         {
             UInt8 type = Field::Types::Decimal256;
+            // checked update implementation, no apparent out of bounds
+            // coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.getValue().value);
         }
         void operator() (const AggregateFunctionStateData & x) const
         {
             UInt8 type = Field::Types::AggregateFunctionState;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.name.size());
             hash.update(x.name.data(), x.name.size());
@@ -196,28 +238,42 @@ namespace
         void operator() (const BitMap64 & x) const
         {
             UInt8 type = Field::Types::BitMap64;
+            //Bit access will be bounded by its size so it won't overrun
+            //coverity[overrun-buffer-val]
             hash.update(type);
             hash.update(x.cardinality());
 
             for (roaring::Roaring64MapSetBitForwardIterator it(x); it != x.end(); ++it)
                 applyVisitor(*this, Field(*it));
         }
+        void operator() (const Object & x) const
+        {
+            UInt8 type = Field::Types::Object;
+            hash.update(type);
+            hash.update(x.size());
+
+            for (const auto & [key, value]: x)
+            {
+                hash.update(key);
+                applyVisitor(*this, value);
+            }
+        }
     };
 }
 
 static std::unique_ptr<ReadBufferFromFileBase> openForReading(const DiskPtr & disk, const String & path)
 {
-    return disk->readFile(path, {.buffer_size = std::min(size_t(DBMS_DEFAULT_BUFFER_SIZE), disk->getFileSize(path))});
+    return disk->readFile(path, ReadSettings().initializeReadSettings(disk->getFileSize(path)));
 }
 
 String MergeTreePartition::getID(const MergeTreeMetaBase & storage) const
 {
-    return getID(storage.getInMemoryMetadataPtr()->getPartitionKey().sample_block);
+    return getID(storage.getInMemoryMetadataPtr()->getPartitionKey().sample_block, storage.extractNullableForPartitionID());
 }
 
 /// NOTE: This ID is used to create part names which are then persisted in ZK and as directory names on the file system.
 /// So if you want to change this method, be sure to guarantee compatibility with existing table data.
-String MergeTreePartition::getID(const Block & partition_key_sample) const
+String MergeTreePartition::getID(const Block & partition_key_sample, bool extract_nullable_date_value) const
 {
     if (value.size() != partition_key_sample.columns())
         throw Exception("Invalid partition key size: " + toString(value.size()), ErrorCodes::LOGICAL_ERROR);
@@ -246,8 +302,21 @@ String MergeTreePartition::getID(const Block & partition_key_sample) const
         {
             if (i > 0)
                 result += '-';
+                
+            const auto & col = partition_key_sample.getByPosition(i);
+            auto type = col.type;
+            
+            /// As we already support nullable key, user may create a PARTITION BY with Nullable(Date) column.
+            /// For such scenario, we need to try to format the nested date value if possible. 
+            /// It's disabled by default as it would break the compatibility.
+            /// It's safe and good to enable the feature for new (or empty) tables, by setting allow_nullable_key = 1 and extract_partition_nullable_date = 1.
+            if (extract_nullable_date_value)
+            {
+                if (type->isNullable())
+                    type = static_cast<const DataTypeNullable *>(col.type.get())->getNestedType();
+            }
 
-            if (typeid_cast<const DataTypeDate *>(partition_key_sample.getByPosition(i).type.get()))
+            if (typeid_cast<const DataTypeDate *>(type.get()))
                 result += toString(DateLUT::instance().toNumYYYYMMDD(DayNum(value[i].safeGet<UInt64>())));
             else
                 result += applyVisitor(to_string_visitor, value[i]);
@@ -278,6 +347,13 @@ void MergeTreePartition::serializeText(const MergeTreeMetaBase & storage, WriteB
     auto metadata_snapshot = storage.getInMemoryMetadataPtr();
     const auto & partition_key_sample = metadata_snapshot->getPartitionKey().sample_block;
     size_t key_size = partition_key_sample.columns();
+
+    // In some cases we create empty parts and then value is empty.
+    if (value.empty())
+    {
+        writeString("tuple()", out);
+        return;
+    }
 
     if (key_size == 0)
     {

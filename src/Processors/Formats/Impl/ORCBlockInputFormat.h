@@ -2,34 +2,41 @@
 #include "config_formats.h"
 #if USE_ORC
 
-#include <Processors/Formats/IInputFormat.h>
-#include <Formats/FormatSettings.h>
+#    include <Formats/FormatSettings.h>
+#    include <Processors/Formats/IInputFormat.h>
 
-namespace arrow::adapters::orc { class ORCFileReader; }
+namespace arrow::adapters::orc
+{
+class ORCFileReader;
+}
+namespace arrow
+{
+class Schema;
+}
 
 namespace DB
 {
-
 class ArrowColumnToCHColumn;
-
 class ORCBlockInputFormat : public IInputFormat
 {
 public:
-    ORCBlockInputFormat(
-        ReadBuffer & in_,
-        Block header_,
-        const FormatSettings & format_settings_,
-        const std::map<String, String> & partition_kv_ = {});
+    ORCBlockInputFormat(ReadBuffer & in_, Block header_, const FormatSettings & format_settings_);
 
     String getName() const override { return "ORCBlockInputFormat"; }
 
     void resetParser() override;
 
+    void setQueryInfo(const SelectQueryInfo &, ContextPtr) override;
+
+    IStorage::ColumnSizeByName getColumnSizes() override;
+
+    const BlockMissingValues & getMissingValues() const override;
+
+    static std::vector<int> getColumnIndices(const std::shared_ptr<arrow::Schema> & schema, const Block & header, const bool & ignore_case, const bool & import_nested);
 protected:
     Chunk generate() override;
 
 private:
-
     // TODO: check that this class implements every part of its parent
 
     std::unique_ptr<arrow::adapters::orc::ORCFileReader> file_reader;
@@ -45,7 +52,7 @@ private:
 
     const FormatSettings format_settings;
 
-    std::map<String, String> partition_kv;
+    BlockMissingValues block_missing_values;
 
     void prepareReader();
 };

@@ -17,9 +17,14 @@
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterDropStatsQuery.h>
 #include <Parsers/ASTStatsQuery.h>
-#include <Statistics/CachedStatsProxy.h>
+#include <Statistics/ASTHelpers.h>
 #include <Statistics/CatalogAdaptor.h>
+#include <Statistics/CatalogAdaptorProxy.h>
+#include <Statistics/DropHelper.h>
+#include <Statistics/OptimizerStatisticsClient.h>
 #include <Statistics/StatsTableBasic.h>
+#include <Statistics/ASTHelpers.h>
+
 namespace DB
 {
 using namespace Statistics;
@@ -37,50 +42,53 @@ BlockIO InterpreterDropStatsQuery::execute()
     auto query = query_ptr->as<const ASTDropStatsQuery>();
     auto catalog = Statistics::createCatalogAdaptor(context);
 
+    auto cache_policy = query->cache_policy;
+
+    if (cache_policy == StatisticsCachePolicy::Default)
+    {
+        // use context settings
+        cache_policy = context->getSettingsRef().statistics_cache_policy;
+    }
+
+    // when enable_memory_catalog is true, we won't use cache
+    if (catalog->getSettingsRef().enable_memory_catalog)
+    {
+        if (cache_policy != StatisticsCachePolicy::Default)
+            throw Exception("memory catalog don't support cache policy", ErrorCodes::BAD_ARGUMENTS);
+    }
+
+    if (query->table == "__reset")
+    {
+        throw Exception("unsupported", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
     catalog->checkHealth(/*is_write=*/true);
 
-    auto proxy = Statistics::createCachedStatsProxy(catalog);
+    auto proxy = Statistics::createCatalogAdaptorProxy(catalog, cache_policy);
     auto db = context->resolveDatabase(query->database);
-    if (query->target_all)
+
+    if (!DatabaseCatalog::instance().isDatabaseExist(db, context))
     {
-        std::vector<StatsTableIdentifier> tables;
-        if (!DatabaseCatalog::instance().isDatabaseExist(db))
-        {
-            auto msg = fmt::format(FMT_STRING("Unknown database ({})"), db);
-            throw Exception(msg, ErrorCodes::UNKNOWN_DATABASE);
-        }
-        tables = catalog->getAllTablesID(db);
-        for (auto & table : tables)
-        {
-            proxy->drop(table);
-            catalog->invalidateClusterStatsCache(table);
-        }
+        auto msg = fmt::format(FMT_STRING("Unknown database ({})"), db);
+        throw Exception(msg, ErrorCodes::UNKNOWN_DATABASE);
+    }
+
+    auto tables = getTablesFromAST(context, query);
+
+
+    if (tables.size() == 1 && !query->columns.empty())
+    {
+        auto table = tables[0];
+        dropStatsColumns(context, table, query->columns, cache_policy, true);
     }
     else
     {
-        auto table_info_opt = catalog->getTableIdByName(db, query->table);
-        if (!table_info_opt)
+        for (auto table : tables)
         {
-            auto msg = "Unknown Table (" + query->table + ") in database (" + db + ")";
-            throw Exception(msg, ErrorCodes::UNKNOWN_TABLE);
-        }
-        auto table = table_info_opt.value();
-
-        if (!query->columns.empty())
-        {
-            auto cols_desc = filterCollectableColumns(catalog->getCollectableColumns(table), query->columns, true);
-            proxy->dropColumns(table, cols_desc);
-            catalog->invalidateClusterStatsCache(table);
-        }
-        else
-        {
-            proxy->drop(table);
-            catalog->invalidateClusterStatsCache(table);
+            dropStatsTable(context, table, cache_policy, true);
         }
     }
 
-
     return {};
 }
-
 }

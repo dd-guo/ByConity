@@ -28,7 +28,7 @@
 #include <Functions/IFunction.h>
 #include <IO/WriteHelpers.h>
 #include <type_traits>
-
+#include <common/logger_useful.h>
 
 #if USE_EMBEDDED_COMPILER
 #include <DataTypes/Native.h>
@@ -52,6 +52,12 @@
 
 namespace DB
 {
+
+struct NameAnd { static constexpr auto name = "and"; };
+struct NameOr { static constexpr auto name = "or"; };
+struct NameXor { static constexpr auto name = "xor"; };
+struct NameNot { static constexpr auto name = "not"; };
+
 namespace FunctionsLogicalDetail
 {
 namespace Ternary
@@ -108,6 +114,8 @@ struct AndImpl
 
     /// Will use three-valued logic for NULLs (see above) or default implementation (any operation with NULL returns NULL).
     static inline constexpr bool specialImplementationForNulls() { return true; }
+
+    static inline constexpr bool isCompilable() { return true; }
 };
 
 struct OrImpl
@@ -120,6 +128,7 @@ struct OrImpl
     static inline constexpr bool isNeutralValueTernary(UInt8 a) { return a == Ternary::False; }
     static inline constexpr ResultType apply(UInt8 a, UInt8 b) { return a | b; }
     static inline constexpr bool specialImplementationForNulls() { return true; }
+    static inline constexpr bool isCompilable() { return true; }
 };
 
 struct XorImpl
@@ -131,6 +140,7 @@ struct XorImpl
     static inline constexpr bool isSaturatedValueTernary(UInt8) { return false; }
     static inline constexpr ResultType apply(UInt8 a, UInt8 b) { return a != b; }
     static inline constexpr bool specialImplementationForNulls() { return false; }
+    static inline constexpr bool isCompilable() { return true; }
 
 #if USE_EMBEDDED_COMPILER
     static inline llvm::Value * apply(llvm::IRBuilder<> & builder, llvm::Value * a, llvm::Value * b)
@@ -172,6 +182,15 @@ public:
     }
 
     bool isVariadic() const override { return true; }
+    bool isShortCircuit(ShortCircuitSettings & settings, size_t /*number_of_arguments*/) const override
+    {
+        settings.enable_lazy_execution_for_first_argument = false;
+        settings.enable_lazy_execution_for_common_descendants_of_arguments = true;
+        settings.force_enable_lazy_execution = false;
+        return name == NameAnd::name || name == NameOr::name;
+    }
+    ColumnPtr executeShortCircuit(ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const;
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
 
     bool useDefaultImplementationForNulls() const override { return !Impl::specialImplementationForNulls(); }
@@ -179,14 +198,14 @@ public:
     /// Get result types by argument types. If the function does not apply to these arguments, throw an exception.
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override;
 
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override;
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & args, const DataTypePtr & result_type, size_t input_rows_count) const override;
 
     ColumnPtr getConstantResultForNonConstArguments(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const override;
 
 #if USE_EMBEDDED_COMPILER
-    bool isCompilableImpl(const DataTypes &) const override { return useDefaultImplementationForNulls(); }
+    bool isCompilableImpl(const DataTypes &) const override { return Impl::isCompilable(); }
 
-    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values) const override
+    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values, JITContext & ) const override
     {
         assert(!types.empty() && !values.empty());
 
@@ -199,18 +218,123 @@ public:
             return b.CreateSelect(result, b.getInt8(1), b.getInt8(0));
         }
         constexpr bool breakOnTrue = Impl::isSaturatedValue(true);
+        /// check function args has nullable columns
+        bool has_nullable = false;
+        for (const auto & type : types)
+        {
+            has_nullable = type->isNullable();
+            if (has_nullable)
+            {
+                break;
+            }
+        }
         auto * next = b.GetInsertBlock();
         auto * stop = llvm::BasicBlock::Create(next->getContext(), "", next->getParent());
         b.SetInsertPoint(stop);
-        auto * phi = b.CreatePHI(b.getInt8Ty(), values.size());
+        auto * phi = has_nullable ? b.CreatePHI(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}), values.size()) : b.CreatePHI(b.getInt8Ty(), values.size());
+        llvm::Value * has_null = nullptr;
         for (size_t i = 0; i < types.size(); i++)
         {
             b.SetInsertPoint(next);
             auto * value = values[i];
-            auto * truth = nativeBoolCast(b, types[i], value);
-            if (!types[i]->equals(DataTypeUInt8{}))
-                value = b.CreateSelect(truth, b.getInt8(1), b.getInt8(0));
-            phi->addIncoming(value, b.GetInsertBlock());
+            /// handle null value
+            llvm::Value * truth = nullptr;
+            if (types[i]->isNullable())
+            {
+                /// get data and null flag
+                auto * data = nativeBoolCast(b, removeNullable(types[i]), b.CreateExtractValue(value, {0}));
+                auto * is_null = b.CreateExtractValue(value, {1});
+                truth = breakOnTrue ? b.CreateAnd(data, b.CreateNot(is_null)) : b.CreateOr(data, is_null);
+                data = b.CreateSelect(truth, b.getInt8(1), b.getInt8(0));
+
+                /// add a null flag for or function
+                if (has_null == nullptr)
+                    has_null = b.CreateICmpNE(is_null, b.getInt1(false));
+                else
+                    has_null = b.CreateOr(has_null, b.CreateICmpNE(is_null, b.getInt1(false)));
+
+                if (i + 1 == types.size() && has_null != nullptr && has_nullable)
+                {
+                    /// handle or
+                    if (breakOnTrue)
+                    {
+                        auto * nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * tmp_is_null = b.CreateSelect(has_null, b.getInt1(true), b.getInt1(false));
+                        auto * nullable_value_1 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, b.getInt8(0), {0}), tmp_is_null, {1});
+                        nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * nullable_value_2 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, data, {0}), is_null, {1});
+                        /// if current branch is true, return true, else return null or false
+                        auto * final_nullable_vale = b.CreateSelect(truth, nullable_value_2, nullable_value_1);
+                        phi->addIncoming(final_nullable_vale, b.GetInsertBlock());
+                    }
+                    /// handle and
+                    else
+                    {
+                        auto * nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * tmp_is_null = b.CreateSelect(has_null, b.getInt1(true), b.getInt1(false));
+                        auto * tmp_value = b.CreateSelect(has_null, b.getInt8(0), b.getInt8(1));
+                        auto * nullable_value_1 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, tmp_value, {0}), tmp_is_null, {1});
+                        nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * nullable_value_2 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, data, {0}), is_null, {1});
+                        /// if current branch is false, return false, else return null or true
+                        auto * final_nullable_vale = b.CreateSelect(b.CreateNot(truth), nullable_value_2, nullable_value_1);
+                        phi->addIncoming(final_nullable_vale, b.GetInsertBlock());
+                    }
+                }
+                else
+                {
+                    auto * nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                    auto * nullable_value = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, data, {0}), is_null, {1});
+                    phi->addIncoming(nullable_value, b.GetInsertBlock());
+                }
+            }
+            else
+            {
+                truth = nativeBoolCast(b, types[i], value);
+                if (!types[i]->equals(DataTypeUInt8{}))
+                    value = b.CreateSelect(truth, b.getInt8(1), b.getInt8(0));
+                if (i + 1 == types.size() && has_null != nullptr && has_nullable)
+                {
+                    /// handle or
+                    if (breakOnTrue)
+                    {
+                        auto * nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * tmp_is_null = b.CreateSelect(has_null, b.getInt1(true), b.getInt1(false));
+                        auto * nullable_value_1 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, b.getInt8(0), {0}), tmp_is_null, {1});
+                        nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * nullable_value_2 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, value, {0}), b.getInt1(false), {1});
+                        /// if current branch is true, return true, else return null or false
+                        auto * final_nullable_vale = b.CreateSelect(truth, nullable_value_2, nullable_value_1);
+                        phi->addIncoming(final_nullable_vale, b.GetInsertBlock());
+                    }
+                    /// handle and
+                    else
+                    {
+                        auto * nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * tmp_is_null = b.CreateSelect(has_null, b.getInt1(true), b.getInt1(false));
+                        auto * tmp_value = b.CreateSelect(has_null, b.getInt8(0), b.getInt8(1));
+                        auto * nullable_value_1 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, tmp_value, {0}), tmp_is_null, {1});
+                        nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * nullable_value_2 = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, value, {0}), b.getInt1(false), {1});
+                        /// if current branch is false, return false, else return null or true
+                        auto * final_nullable_vale = b.CreateSelect(b.CreateNot(truth), nullable_value_2, nullable_value_1);
+                        phi->addIncoming(final_nullable_vale, b.GetInsertBlock());
+                    }
+                }
+                else
+                {
+                    if (has_nullable)
+                    {
+                        auto * nullable_unitilized = llvm::Constant::getNullValue(toNativeType(b, DataTypeNullable{std::make_shared<DataTypeUInt8>()}));
+                        auto * nullable_value = b.CreateInsertValue(b.CreateInsertValue(nullable_unitilized, value, {0}), b.getInt1(false), {1});
+                        phi->addIncoming(nullable_value, b.GetInsertBlock());
+                    }
+                    else
+                    {
+                        phi->addIncoming(value, b.GetInsertBlock());
+                    }
+                }
+            }
             if (i + 1 < types.size())
             {
                 next = llvm::BasicBlock::Create(next->getContext(), "", next->getParent());
@@ -244,12 +368,14 @@ public:
 
     bool useDefaultImplementationForConstants() const override { return true; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/) const override;
 
 #if USE_EMBEDDED_COMPILER
     bool isCompilableImpl(const DataTypes &) const override { return true; }
 
-    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values) const override
+    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values, JITContext & ) const override
     {
         auto & b = static_cast<llvm::IRBuilder<> &>(builder);
         return b.CreateSelect(Impl<UInt8>::apply(b, nativeBoolCast(b, types[0], values[0])), b.getInt8(1), b.getInt8(0));
@@ -258,11 +384,6 @@ public:
 };
 
 }
-
-struct NameAnd { static constexpr auto name = "and"; };
-struct NameOr { static constexpr auto name = "or"; };
-struct NameXor { static constexpr auto name = "xor"; };
-struct NameNot { static constexpr auto name = "not"; };
 
 using FunctionAnd = FunctionsLogicalDetail::FunctionAnyArityLogical<FunctionsLogicalDetail::AndImpl, NameAnd>;
 using FunctionOr = FunctionsLogicalDetail::FunctionAnyArityLogical<FunctionsLogicalDetail::OrImpl, NameOr>;

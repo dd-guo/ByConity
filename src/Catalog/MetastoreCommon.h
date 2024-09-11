@@ -27,6 +27,7 @@ namespace Catalog
 
 #define MAX_BATCH_SIZE 1024
 #define DEFAULT_SCAN_BATCH_COUNT 10000
+#define DEFAULT_MULTI_GET_BATCH_COUNT 100
 
 enum CatalogCode : int
 {
@@ -35,60 +36,83 @@ enum CatalogCode : int
     CAS_FAILED = -10003,
 };
 
-enum RequestType : int
-{
-    PUT = 0,
-    DELETE = 1,
-};
-
-template <RequestType T>
 struct SingleRequest
 {
     explicit SingleRequest(const std::string & key_)
         : key(key_)
     {
     }
-
-    explicit SingleRequest(const std::string & key_, const std::string & value_, bool if_not_exists_ = false)
+    SingleRequest(const std::string & key_, const std::string & value_, bool if_not_exists_ = false)
         : key(key_), value(value_), if_not_exists(if_not_exists_)
     {
     }
-    explicit SingleRequest(const std::string & key_, const std::string & value_, const std::string & expected_)
-        : key(key_), value(value_)
+    SingleRequest(const std::string & key_, const std::string & value_, const std::string & expected_, const uint64_t & expected_version_ = 0)
+        : key(key_), value(value_), expected_version(expected_version_)
     {
         if (!expected_.empty())
             expected_value = expected_;
     }
-    RequestType type;
+    SingleRequest(const std::string & key_, const std::string & value_, uint64_t ttl_) : key(key_), value(value_), ttl(ttl_)
+    {
+    }
+
+    bool isEmpty() { return key.empty();}
+
+    uint32_t size() const {return (expected_value ? expected_value->size() : 0) + key.size() + value.size(); }
+
     std::string key;
     std::string value;
     bool if_not_exists = false;
     std::optional<std::string> expected_value;
+    uint64_t expected_version = 0;
+    // the inserted key will be expired after n seconds.
+    // no effect when set to 0
+    uint64_t ttl{0};
     /// custom callback when conflict happens. Pass the error code and error message as parameter
     std::function<void(int, const std::string &)> callback;
 };
 
-using SinglePutRequest = SingleRequest<RequestType::PUT> ;
-using SingleDeleteRequest = SingleRequest<RequestType::DELETE>;
-
+using SinglePutRequest = SingleRequest;
+using SingleDeleteRequest = SingleRequest;
 
 struct BatchCommitRequest
 {
-    explicit BatchCommitRequest(const bool with_cas_ = true, const bool allow_cas_fail_ = false)
+    BatchCommitRequest(const bool with_cas_ = true, const bool allow_cas_fail_ = false)
         : with_cas(with_cas_), allow_cas_fail(allow_cas_fail_)
     {
     }
-    
-    void AddPut(const SinglePutRequest & put) { puts.emplace_back(put); }
-    void AddDelete(const SingleDeleteRequest & del) { deletes.emplace_back(del); }
+
+    void AddPut(const SinglePutRequest & put)
+    {
+        puts.emplace_back(put);
+        request_size_in_bytes += put.size();
+    }
+    void AddDelete(const SingleDeleteRequest & del)
+    {
+        deletes.emplace_back(del);
+        request_size_in_bytes += del.size();
+    }
+    void AddDelete(const std::string & del)
+    {
+        deletes.emplace_back(del);
+        request_size_in_bytes += del.size();
+    }
+    void AddDelete(const std::string & delkey, const std::string & expected, const uint64_t & expected_version=0)
+    {
+        deletes.emplace_back(delkey, "", expected, expected_version);
+        request_size_in_bytes += delkey.size() + expected.size();
+    }
     void SetTimeout(uint32_t time_out) { commit_timeout_ms = time_out; }
-    bool isEmpty() { return puts.empty() && deletes.empty(); }
+    bool isEmpty() const { return puts.empty() && deletes.empty(); }
+
+    uint32_t size() const { return request_size_in_bytes; }
 
     std::vector<SinglePutRequest> puts;
     std::vector<SingleDeleteRequest> deletes;
     bool with_cas = true;
     bool allow_cas_fail = true;
     uint32_t commit_timeout_ms = 0;
+    uint32_t request_size_in_bytes = 0;
 };
 
 /// Response for batch commit request.It contains the conflict info for both put requests and delete requests.
@@ -97,6 +121,7 @@ struct BatchCommitResponse
 {
     std::unordered_map<int, std::string> puts;
     std::unordered_map<int, std::string> deletes;
+    void reset() { puts.clear(); deletes.clear(); }
 };
 
 }

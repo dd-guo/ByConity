@@ -14,9 +14,9 @@
  */
 
 #include <Columns/ColumnConst.h>
+#include <DataTypes/Serializations/ISerialization.h>
 #include <Optimizer/Utils.h>
 #include <QueryPlan/SetOperationStep.h>
-#include <DataTypes/Serializations/ISerialization.h>
 
 namespace DB
 {
@@ -62,8 +62,7 @@ ColumnPtr getCommonColumnForUnion(const std::vector<const ColumnWithTypeAndName 
     return column;
 }
 
-SetOperationStep::SetOperationStep(
-    DataStreams input_streams_, DataStream output_stream_, std::unordered_map<String, std::vector<String>> output_to_inputs_)
+SetOperationStep::SetOperationStep(DataStreams input_streams_, DataStream output_stream_, OutputToInputs output_to_inputs_)
     : output_to_inputs(std::move(output_to_inputs_))
 {
     input_streams = std::move(input_streams_);
@@ -79,10 +78,20 @@ SetOperationStep::SetOperationStep(
     std::vector<const ColumnWithTypeAndName *> columns(num_selects);
     for (size_t column_num = 0; column_num < output_stream->header.columns(); ++column_num)
     {
-        for (size_t i = 0; i < num_selects; ++i)
-            columns[i] = &input_streams[i].header.getByPosition(column_num);
-
         ColumnWithTypeAndName & result_elem = output_stream->header.getByPosition(column_num);
+        for (size_t i = 0; i < num_selects; ++i)
+        {
+            if (output_to_inputs.contains(result_elem.name))
+            {
+                for (auto & input_name : output_to_inputs[result_elem.name])
+                {
+                    if (input_streams[i].header.findByName(input_name))
+                        columns[i] = input_streams[i].header.findByName(input_name);
+                }
+            }
+            else
+                columns[i] = &input_streams[i].header.getByPosition(column_num);
+        }
         result_elem.column = getCommonColumnForUnion(columns);
     }
 
@@ -101,7 +110,7 @@ SetOperationStep::SetOperationStep(
         }
     }
 
-    for (const auto & value : output_to_inputs_)
+    for (const auto & value : output_to_inputs)
     {
         Utils::checkArgument(
             value.second.size() == input_streams.size(), "Every source needs to map its symbols to an output operation symbol");
@@ -110,7 +119,7 @@ SetOperationStep::SetOperationStep(
     // Make sure each source positionally corresponds to their Symbol values in the Multimap
     for (size_t i = 0; i < input_streams.size(); i++)
     {
-        for (auto value : output_to_inputs_)
+        for (auto value : output_to_inputs)
         {
             const Names & input_symbols = input_streams[i].header.getNames();
             String symbol = value.second[i];
@@ -126,9 +135,43 @@ void SetOperationStep::setInputStreams(const DataStreams & input_streams_)
     input_streams = input_streams_;
 }
 
-const std::unordered_map<String, std::vector<String>> & SetOperationStep::getOutToInputs() const
+const OutputToInputs & SetOperationStep::getOutToInputs() const
 {
     return output_to_inputs;
 }
 
+void SetOperationStep::serializeToProtoBase(Protos::SetOperationStep & proto) const
+{
+    for (const auto & element : input_streams)
+        element.toProto(*proto.add_input_streams());
+    if (!output_stream.has_value())
+        throw Exception("empty output stream", ErrorCodes::LOGICAL_ERROR);
+    output_stream.value().toProto(*proto.mutable_output_stream());
+    serializeMapToProto(output_to_inputs, *proto.mutable_output_to_inputs());
+}
+
+std::tuple<DataStreams, DataStream, std::unordered_map<String, std::vector<String>>>
+SetOperationStep::deserializeFromProtoBase(const Protos::SetOperationStep & proto)
+{
+    DataStreams input_streams;
+    for (const auto & proto_element : proto.input_streams())
+    {
+        DataStream element;
+        element.fillFromProto(proto_element);
+        input_streams.emplace_back(std::move(element));
+    }
+    DataStream output_stream;
+    output_stream.fillFromProto(proto.output_stream());
+    auto output_to_inputs = deserializeMapFromProto<String, std::vector<String>>(proto.output_to_inputs());
+
+    return std::make_tuple(input_streams, output_stream, output_to_inputs);
+}
+
+NameToNameMap SetOperationStep::getOutToInput(size_t source_idx) const
+{
+    NameToNameMap res;
+    for (const auto & [out, inputs] : output_to_inputs)
+        res.emplace(out, inputs.at(source_idx));
+    return res;
+}
 }

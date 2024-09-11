@@ -2,13 +2,14 @@
 
 #include <Interpreters/IInterpreter.h>
 #include <Parsers/IAST_fwd.h>
+#include "Parsers/ASTShowTablesQuery.h"
 
 
 namespace DB
 {
 
 class Context;
-
+class ASTShowTablesQuery;
 
 /** Return a list of tables or databases meets specified conditions.
   * Interprets a query through replacing it to SELECT query from system.tables or system.databases.
@@ -20,8 +21,7 @@ public:
 
     BlockIO execute() override;
 
-    /// We ignore the quota and limits here because execute() will rewrite a show query as a SELECT query and then
-    /// the SELECT query will checks the quota and limits.
+    /// Ignore quota and limits here because execute() produces a SELECT query which checks quotas/limits by itself.
     bool ignoreQuota() const override { return true; }
     bool ignoreLimits() const override { return true; }
 
@@ -29,6 +29,8 @@ private:
     ASTPtr query_ptr;
 
     String getRewrittenQuery();
+    String getRewrittenQueryImpl();
+    String getRewrittenQueryForExternalCatalogImpl();
 };
 
 

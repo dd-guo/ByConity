@@ -50,8 +50,10 @@ public:
         UncompressedCache * uncompressed_cache,
         MarkCache * mark_cache,
         const MergeTreeReaderSettings & reader_settings_,
+        MergeTreeIndexExecutor * index_executor,
         const ValueSizeMap & avg_value_size_hints,
-        const ReadBufferFromFileBase::ProfileCallback & profile_callback) const override;
+        const ReadBufferFromFileBase::ProfileCallback & profile_callback,
+        const ProgressCallback & internal_progress_cb) const override;
 
     MergeTreeWriterPtr getWriter(
         const NamesAndTypesList & columns_list,
@@ -59,7 +61,8 @@ public:
         const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
         const CompressionCodecPtr & default_codec_,
         const MergeTreeWriterSettings & writer_settings,
-        const MergeTreeIndexGranularity & computed_index_granularity) const override;
+        const MergeTreeIndexGranularity & computed_index_granularity,
+        const BitmapBuildInfo & bitmap_build_info) const override;
 
     bool operator < (const MergeTreeDataPartCNCH & r) const;
     bool operator > (const MergeTreeDataPartCNCH & r) const;
@@ -68,6 +71,8 @@ public:
     void fromLocalPart(const IMergeTreeDataPart & local_part);
 
     bool isStoredOnDisk() const override { return true; }
+
+    bool isStoredOnRemoteDisk() const override { return true; }
 
     bool supportsVerticalMerge() const override { return true; }
 
@@ -83,26 +88,48 @@ public:
 
     UniqueKeyIndexPtr getUniqueKeyIndex() const override;
 
-    /// @param is_unique_new_part whether it's a part of unique table which has not been deduplicated
-    /// For unique table, in normal case, the new part doesn't have delete_bitmap until it executes dedup action.
-    /// But when the part has delete_flag info, delete_bitmap represent the delete_flag info which leads to that new part has delete_bitmap.
-    const ImmutableDeleteBitmapPtr & getDeleteBitmap(bool is_unique_new_part = false) const override;
+    String getFullRelativePath() const override;
 
-    virtual void projectionRemove(const String & parent_to, bool keep_shared_data) const override;
+    String getFullPath() const override;
 
-    void preload(ThreadPool & pool) const;
+    String getRelativePathForDetachedPart(const String & prefix) const override;
+
+    /// @param allow_null whether allow delete bitmap to be nullptr
+    /// @attention make sure this method is thread-safe.
+    /// There are following cases that allow delete bitmap to be nullptr:
+    /// 1. For new part of unique table, it's valid if its delete_bitmap_metas is empty
+    /// 2. Detach commands can force detach parts even if the delete bitmap of part is broken.
+    /// 3. Repair part command
+    /// DELETE mutation is supported by adding a implicit column _row_exists,
+    /// and we combine the original delete bitmap and _row_exists when data processing.
+    ImmutableDeleteBitmapPtr getDeleteBitmap(bool allow_null = false) const override;
+
+    /// it's a no-op because in CNCH, projection parts are uploaded to parent part's data file
+    virtual void projectionRemove(const String &, bool) const override { }
+
+    void preload(UInt64 preload_level, UInt64 submit_ts) const;
+    void dropDiskCache(ThreadPool & pool, bool drop_vw_disk_cache = false) const;
+
+    void setColumnsPtr(const NamesAndTypesListPtr & new_columns_ptr) override {columns_ptr = new_columns_ptr;}
 
 private:
+    /// See #getDeleteBitmap
+    ImmutableDeleteBitmapPtr getCombinedDeleteBitmapForUniqueTable(bool allow_null = false) const;
+    ImmutableDeleteBitmapPtr getCombinedDeleteBitmapForNormalTable(bool allow_null = false) const;
+
+    void combineWithRowExists(DeleteBitmapPtr & bitmap) const;
 
     bool isDeleted() const;
 
     void checkConsistency(bool require_part_metadata) const override;
 
-    IndexPtr loadIndex() override;
+    void loadIndex() override;
+    IndexPtr loadIndexFromStorage() const;
 
-    MergeTreeDataPartChecksums::FileChecksums loadPartDataFooter() const;
+    MergeTreeDataPartChecksums::FileChecksums loadPartDataFooter(size_t & out_file_size) const;
 
     ChecksumsPtr loadChecksums(bool require) override;
+    ChecksumsPtr loadChecksumsFromRemote(bool follow_part_chain);
 
     UniqueKeyIndexPtr loadUniqueKeyIndex() override;
 
@@ -116,9 +143,18 @@ private:
     void loadMetaInfoFromBuffer(ReadBuffer & buffer, bool load_hint_mutation);
 
     void calculateEachColumnSizes(ColumnSizeByName & each_columns_size, ColumnSize & total_size) const override;
-    ColumnSize getColumnSizeImpl(const NameAndTypePair & column, std::unordered_set<String> * processed_substreams) const;
+    ColumnSize getColumnSizeImpl(const NameAndTypePair & column, const ChecksumsPtr & checksums, std::unordered_set<String> * processed_substreams) const;
+
+    void loadProjections(bool require_columns_checksums, bool check_consistency) override;
+
+    // for projection part
+    void updateCommitTimeForProjection();
 
     void removeImpl(bool keep_shared_data) const override;
+
+    void fillProjectionNamesFromChecksums(const MergeTreeDataPartChecksum & checksum_file);
+
+    std::unique_ptr<ReadBufferFromFileBase> openForReading(const DiskPtr & disk, const String & path, size_t file_size, const String & remote_read_context = {}) const;
 };
 
 }

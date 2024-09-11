@@ -5,7 +5,7 @@
 namespace DB
 {
 
-void registerFunctionsExternalDictionaries(FunctionFactory & factory)
+REGISTER_FUNCTION(ExternalDictionaries)
 {
     factory.registerFunction<FunctionDictHas>();
     factory.registerFunction<FunctionDictGetUInt8>();
@@ -39,6 +39,8 @@ void registerFunctionsExternalDictionaries(FunctionFactory & factory)
     factory.registerFunction<FunctionDictGetDateOrDefault>();
     factory.registerFunction<FunctionDictGetDateTimeOrDefault>();
     factory.registerFunction<FunctionDictGetUUIDOrDefault>();
+    factory.registerFunction<FunctionDictGetIPv4OrDefault>();
+    factory.registerFunction<FunctionDictGetIPv6OrDefault>();
     factory.registerFunction<FunctionDictGetStringOrDefault>();
     factory.registerFunction<FunctionDictGetNoType<DictionaryGetFunctionType::get>>();
     factory.registerFunction<FunctionDictGetNoType<DictionaryGetFunctionType::getOrDefault>>();

@@ -15,35 +15,40 @@
 
 #include <iostream>
 #include <string>
+#include <ServiceDiscovery/registerServiceDiscovery.h>
+#include <Dictionaries/registerDictionaries.h>
+#include <Disks/registerDisks.h>
+#include <FormaterTool/PartConverter.h>
+#include <FormaterTool/PartWriter.h>
+#include <Formats/registerFormats.h>
+#include <Functions/registerFunctions.h>
+#include <Parsers/ASTPartToolKit.h>
+#include <Parsers/ParserPartToolkitQuery.h>
+#include <Parsers/parseQuery.h>
+#include <Storages/registerStorages.h>
+#include <loggers/OwnFormattingChannel.h>
+#include <Poco/ConsoleChannel.h>
+#include <Poco/Environment.h>
+#include <Poco/FileChannel.h>
+#include <Poco/FormattingChannel.h>
+#include <Poco/Logger.h>
+#include <Poco/Path.h>
+#include <Poco/PatternFormatter.h>
+#include <Poco/SplitterChannel.h>
+#include <Poco/Util/XMLConfiguration.h>
 #include <Common/StringUtils/StringUtils.h>
 #include <Common/config.h>
 #include <common/logger_useful.h>
-#include <loggers/OwnFormattingChannel.h>
-#include <Parsers/parseQuery.h>
-#include <Parsers/ParserPartToolkitQuery.h>
-#include <Parsers/ASTPartToolKit.h>
-#include <Formats/registerFormats.h>
-#include <Functions/registerFunctions.h>
-#include <Storages/registerStorages.h>
-#include <Dictionaries/registerDictionaries.h>
-#include <Disks/registerDisks.h>
-#include <FormaterTool/PartMerger.h>
-#include <FormaterTool/PartConverter.h>
-#include <FormaterTool/PartWriter.h>
-#include <Poco/Path.h>
-#include <Poco/FileChannel.h>
-#include <Poco/ConsoleChannel.h>
-#include <Poco/SplitterChannel.h>
-#include <Poco/FormattingChannel.h>
-#include <Poco/PatternFormatter.h>
-#include <Poco/Util/XMLConfiguration.h>
-#include <Poco/Logger.h>
 
-int mainHelp(int , char **)
+#include "PartMergerApp.h"
+
+int mainHelp(int, char **)
 {
     /// TODO: make help more clear
     std::cout << "Usage : \n";
     std::cout << "clickhouse [part-writer|part-converter] query" << std::endl;
+    std::cout << PartMergerApp::help_message << std::endl;
+
     return 0;
 }
 
@@ -54,6 +59,7 @@ void run(const std::string & query, Poco::Logger * log)
 
     DB::registerFunctions();
     DB::registerDictionaries();
+    DB::registerServiceDiscovery();
     DB::registerDisks();
     DB::registerStorages();
     DB::registerFormats();
@@ -65,12 +71,13 @@ void run(const std::string & query, Poco::Logger * log)
     mutable_context_ptr->makeGlobalContext();
     mutable_context_ptr->setConfig(configuration);
     mutable_context_ptr->setMarkCache(1000000);
+    mutable_context_ptr->initServiceDiscoveryClient();
 
     const char * begin = query.data();
-    const char * end =  query.data() + query.size();
+    const char * end = query.data() + query.size();
 
     DB::ParserPartToolkitQuery parser(end);
-    auto ast = DB::parseQuery(parser, begin, end, "", 10000, 100);
+    auto ast = DB::parseQuery(parser, begin, end, "", 0, 0);
     const DB::ASTPartToolKit & query_ast = ast->as<DB::ASTPartToolKit &>();
 
     std::shared_ptr<DB::PartToolkitBase> executor = nullptr;
@@ -79,7 +86,7 @@ void run(const std::string & query, Poco::Logger * log)
         executor = std::make_shared<DB::PartWriter>(ast, mutable_context_ptr);
     else if (query_ast.type == DB::PartToolType::MERGER)
     {
-        LOG_ERROR(log, "Part merger is not implmented in cnch. ");
+        LOG_ERROR(log, "Part merger is not implemented in cnch. ");
         return;
     }
     else if (query_ast.type == DB::PartToolType::CONVERTER)
@@ -115,9 +122,22 @@ int mainEntryClickhousePartToolkit(int argc, char ** argv)
     split_channel->addChannel(ff_channel);
 
     Poco::Logger::root().setChannel(split_channel);
-    Poco::Logger::root().setLevel("debug");
+
+    String log_level = "debug";
+
+    try
+    {
+        log_level = Poco::Environment::get("LOG_LEVEL", "debug");
+    }
+    catch (...)
+    {
+    }
 
     Poco::Logger * log = &Poco::Logger::get("part-toolkit");
+
+    LOG_INFO(log, "Logger level: {}", log_level);
+
+    Poco::Logger::root().setLevel(log_level);
 
     if (argc < 2)
     {
@@ -130,19 +150,9 @@ int mainEntryClickhousePartToolkit(int argc, char ** argv)
         std::string sql = argv[1];
         run(sql, log);
     }
-    catch (const Poco::Exception & e)
-    {
-        LOG_ERROR(log, "Interupted by Poco::exception: {}", e.what());
-        return -1;
-    }
-    catch (const std::exception & e)
-    {
-        LOG_ERROR(log, "Interupted by std::exception: {}", e.what());
-        return -1;
-    }
     catch (...)
     {
-        LOG_ERROR(log, "Unknown exception occurs.");
+        DB::tryLogCurrentException(log);
         return -1;
     }
 

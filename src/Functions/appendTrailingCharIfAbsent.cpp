@@ -34,6 +34,8 @@ public:
         return name;
     }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
 
 private:
     size_t getNumberOfArguments() const override
@@ -113,7 +115,7 @@ private:
 
 }
 
-void registerFunctionAppendTrailingCharIfAbsent(FunctionFactory & factory)
+REGISTER_FUNCTION(AppendTrailingCharIfAbsent)
 {
     factory.registerFunction<FunctionAppendTrailingCharIfAbsent>();
 }

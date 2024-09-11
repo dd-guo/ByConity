@@ -14,9 +14,9 @@
  */
 
 #pragma once
-#include <QueryPlan/ITransformingStep.h>
 #include <DataStreams/SizeLimits.h>
 #include <Interpreters/Aggregator.h>
+#include <QueryPlan/ITransformingStep.h>
 
 namespace DB
 {
@@ -36,10 +36,9 @@ public:
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
+    const AggregatingTransformParamsPtr getAggParams() const { return params; }
     const Aggregator::Params & getParams() const;
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 

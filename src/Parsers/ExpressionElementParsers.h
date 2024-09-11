@@ -72,12 +72,13 @@ public:
 class ParserIdentifier : public IParserBase
 {
 public:
-    explicit ParserIdentifier(bool allow_query_parameter_ = false) : allow_query_parameter(allow_query_parameter_) {}
+    explicit ParserIdentifier(bool allow_query_parameter_ = false, bool allow_single_quoted_identifier_ = false) : allow_query_parameter(allow_query_parameter_), allow_single_quoted_identifier(allow_single_quoted_identifier_) {}
 
 protected:
     const char * getName() const override { return "identifier"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
     bool allow_query_parameter;
+    bool allow_single_quoted_identifier;
 };
 
 
@@ -191,7 +192,7 @@ protected:
     bool is_table_function;
 };
 
-// A special function parser for view table function.
+// A special function parser for view and viewIfPermitted table functions.
 // It parses an SELECT query as its argument and doesn't support getColumnName().
 class ParserTableFunctionView : public IParserDialectBase
 {
@@ -279,6 +280,24 @@ public:
     using IParserDialectBase::IParserDialectBase;
 };
 
+class ParserGroupConcatExpression : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "GROUP_CONCAT expression"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserBinaryExpression : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "BINARY expression"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
 class ParserTrimExpression : public IParserDialectBase
 {
 protected:
@@ -342,6 +361,14 @@ protected:
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 };
 
+/** Bool literal.
+  */
+class ParserBool : public IParserBase
+{
+protected:
+    const char * getName() const override { return "Bool"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+};
 
 /** Numeric literal.
   */
@@ -365,12 +392,15 @@ protected:
 
 
 /** String in single quotes.
+  * String in heredoc $here$txt$here$ equivalent to 'txt'.
   */
-class ParserStringLiteral : public IParserBase
+class ParserStringLiteral : public IParserDialectBase
 {
 protected:
     const char * getName() const override { return "string literal"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
 };
 
 
@@ -451,12 +481,14 @@ public:
 class ParserAlias : public IParserBase
 {
 public:
-    explicit ParserAlias(bool allow_alias_without_as_keyword_) : allow_alias_without_as_keyword(allow_alias_without_as_keyword_) { }
+    explicit ParserAlias(bool allow_alias_without_as_keyword_, bool allow_single_quoted_identifier_ = false) : allow_alias_without_as_keyword(allow_alias_without_as_keyword_), allow_single_quoted_identifier(allow_single_quoted_identifier_) { }
 
 private:
     static const char * restricted_keywords[];
 
     bool allow_alias_without_as_keyword;
+    /// default false; set to true for mysql, which allows: select 123 as 'offset'
+    bool allow_single_quoted_identifier;
 
     const char * getName() const override { return "alias"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
@@ -581,7 +613,7 @@ public:
 };
 
 /** Element of TTL expression - same as expression element, but in addition,
- *   TO DISK 'xxx' | TO VOLUME 'xxx' | DELETE could be specified
+ *   TO DISK 'xxx' | TO VOLUME 'xxx' | TO BYTECOOL 'xxx' | DELETE could be specified
   */
 class ParserTTLElement : public IParserDialectBase
 {
@@ -597,6 +629,34 @@ class ParserAssignment : public IParserDialectBase
 {
 protected:
     const char * getName() const  override{ return "column assignment"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserAssignmentWithAlias : public IParserDialectBase
+{
+protected:
+    const char * getName() const  override{ return "column assignment with alias"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+class ParserEscapeExpression : public IParserDialectBase
+{
+    const char * getName() const override { return "ESCAPE clause"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    using IParserDialectBase::IParserDialectBase;
+};
+
+/** The Execute Value is one of: an expression in parentheses, an array of literals, a literal, a function.
+  */
+class ParserExecuteValue : public IParserDialectBase
+{
+protected:
+    const char * getName() const override { return "element of execute value"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 public:
     using IParserDialectBase::IParserDialectBase;

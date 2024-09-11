@@ -1,0 +1,21 @@
+CREATE DATABASE IF NOT EXISTS test_50001;
+DROP TABLE IF EXISTS test_50001.source;
+CREATE TABLE test_50001.source (d Date, id UInt64, a String)
+    ENGINE = CnchMergeTree()
+    PARTITION BY `d`
+    ORDER BY `id`;
+
+INSERT INTO test_50001.source VALUES ('2019-01-01', 1, 'a');
+
+SHOW CREATE TABLE test_50001.source;
+
+DROP TABLE IF EXISTS test_50001.target;
+CREATE TABLE test_50001.target ENGINE = CnchMergeTree()
+PARTITION BY d
+ORDER BY id AS SELECT * FROM test_50001.source;
+SHOW CREATE TABLE test_50001.target;
+SELECT count() FROM test_50001.target;
+
+DROP TABLE IF EXISTS test_50001.source;
+DROP TABLE IF EXISTS test_50001.target;
+DROP DATABASE IF EXISTS test_50001;

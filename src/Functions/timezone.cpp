@@ -1,6 +1,6 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
-#include <common/DateLUT.h>
+#include <Common/DateLUT.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypeString.h>
 
@@ -37,6 +37,8 @@ public:
 
     bool isDeterministic() const override { return false; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
     {
         return DataTypeString().createColumnConst(input_rows_count, DateLUT::instance().getTimeZone());
@@ -45,7 +47,7 @@ public:
 
 }
 
-void registerFunctionTimezone(FunctionFactory & factory)
+REGISTER_FUNCTION(Timezone)
 {
     factory.registerFunction<FunctionTimezone>();
     factory.registerAlias("timeZone", "timezone");

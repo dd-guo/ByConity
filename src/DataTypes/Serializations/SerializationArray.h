@@ -35,9 +35,13 @@ public:
       * This is necessary, because when implementing nested structures, several arrays can have common sizes.
       */
 
-    void enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const override;
+    void enumerateStreams(
+        EnumerateStreamsSettings & settings,
+        const StreamCallback & callback,
+        const SubstreamData & data) const override;
 
     void serializeBinaryBulkStatePrefix(
+            const IColumn & column,
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
@@ -56,12 +60,24 @@ public:
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
-    void deserializeBinaryBulkWithMultipleStreams(
+    size_t deserializeBinaryBulkWithMultipleStreams(
         ColumnPtr & column,
         size_t limit,
         DeserializeBinaryBulkSettings & settings,
         DeserializeBinaryBulkStatePtr & state,
         SubstreamsCache * cache) const override;
+
+private:
+    struct SubcolumnCreator : public ISubcolumnCreator
+    {
+        const ColumnPtr offsets;
+
+        explicit SubcolumnCreator(const ColumnPtr & offsets_) : offsets(offsets_) {}
+
+        DataTypePtr create(const DataTypePtr & prev) const override;
+        SerializationPtr create(const SerializationPtr & prev) const override;
+        ColumnPtr create(const ColumnPtr & prev) const override;
+    };
 };
 
 ColumnPtr arrayOffsetsToSizes(const IColumn & column);

@@ -20,16 +20,21 @@
 #include <set>
 
 #include <Core/UUID.h>
-#include <Common/ThreadPool.h>
+#include <Common/Exception.h>
 #include <Common/HostWithPorts.h>
+#include <Common/ThreadPool.h>
 // #include <Bytepond/core/mapping/BpQueryKey.h>
 // #include <Bytepond/core/storage/BlockHdfsStorageManager.h>
 #include <Interpreters/StorageID.h>
 #include <Interpreters/Context_fwd.h>
 #include <Protos/cnch_common.pb.h>
+#include <Protos/data_models.pb.h>
+#include <Protos/cnch_worker_rpc.pb.h>
 
 #include <brpc/closure_guard.h>
 #include <brpc/controller.h>
+#include <Poco/Logger.h>
+#include <cppkafka/cppkafka.h>
 
 namespace google::protobuf
 {
@@ -50,12 +55,27 @@ namespace DB::RPCHelpers
         pb_uuid.set_high(uuid.toUnderType().items[1]);
     }
 
-    inline StorageID createStorageID(const Protos::StorageID & id) { return StorageID(id.database(), id.table(), createUUID(id.uuid())); }
+    inline StorageID createStorageID(const Protos::StorageID & id)
+    {
+        auto storage_id = StorageID(id.database(), id.table(), createUUID(id.uuid()));
+        if (id.has_server_vw_name())
+            storage_id.server_vw_name = id.server_vw_name();
+        return storage_id;
+    }
     inline void fillStorageID(const StorageID & id, Protos::StorageID & pb_id)
     {
         pb_id.set_database(id.database_name);
         pb_id.set_table(id.table_name);
         fillUUID(id.uuid, *pb_id.mutable_uuid());
+        if (id.server_vw_name != DEFAULT_SERVER_VW_NAME)
+            pb_id.set_server_vw_name(id.server_vw_name);
+    }
+    inline StorageID createStorageID(const Protos::DataModelTable & table)
+    {
+        auto storage_id = StorageID(table.database(), table.name(), createUUID(table.uuid()));
+        if (table.has_server_vw_name())
+            storage_id.server_vw_name = table.server_vw_name();
+        return storage_id;
     }
 
     inline HostWithPorts createHostWithPorts(const Protos::HostWithPorts & hp)
@@ -70,6 +90,7 @@ namespace DB::RPCHelpers
             hp.hostname(),
         };
     }
+
 
     // inline BpQueryKeyPtr createBpQueryKey(const Protos::BpQueryKey & bqk)
     // {
@@ -128,13 +149,31 @@ namespace DB::RPCHelpers
             checkException(r.exception());
     }
 
+    inline void fillKafkaTPL(const cppkafka::TopicPartitionList & tpl_, google::protobuf::RepeatedPtrField<Protos::TopicPartitionModel> & tpl_model)
+    {
+        for (auto & tp : tpl_)
+        {
+            auto * cur_tp = tpl_model.Add();
+            cur_tp->set_topic(tp.get_topic());
+            cur_tp->set_partition(tp.get_partition());
+            cur_tp->set_offset(tp.get_offset());
+        }
+    }
+
+    inline void createKafkaTPL(cppkafka::TopicPartitionList & tpl_, const google::protobuf::RepeatedPtrField<Protos::TopicPartitionModel> & tpl_model)
+    {
+        tpl_.reserve(tpl_model.size());
+        for (const auto & tp : tpl_model)
+            tpl_.emplace_back(cppkafka::TopicPartition(tp.topic(), tp.partition(), tp.offset()));
+    }
+
     ContextMutablePtr createSessionContextForRPC(const ContextPtr & context, google::protobuf::RpcController & cntl_base);
 
     /// throw exception when cntl.Failed
     void assertController(const brpc::Controller & cntl);
 
     template <typename Resp>
-    void onAsyncCallDone(Resp * response, brpc::Controller * cntl, ExceptionHandler * handler)
+    void onAsyncCallDone(Resp * response, brpc::Controller * cntl, ExceptionHandlerPtr handler)
     {
         try
         {
@@ -145,6 +184,40 @@ namespace DB::RPCHelpers
         }
         catch (...)
         {
+            handler->setException(std::current_exception());
+        }
+    }
+
+    template <typename Resp>
+    void onAsyncCallDoneAssertController(Resp * response, brpc::Controller * cntl, Poco::Logger * logger, String message)
+    {
+        try
+        {
+            std::unique_ptr<Resp> response_guard(response);
+            std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+            RPCHelpers::assertController(*cntl);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(logger, message);
+        }
+    }
+
+    template <typename Resp>
+    void onAsyncCallDoneWithFailedInfo(Resp * response, brpc::Controller * cntl, ExceptionHandlerWithFailedInfoPtr handler, const DB::WorkerId worker_id)
+    {
+        int32_t error_code = 0;
+        try
+        {
+            std::unique_ptr<Resp> response_guard(response);
+            std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+            error_code = cntl->ErrorCode();
+            RPCHelpers::assertController(*cntl);
+            RPCHelpers::checkResponse(*response);
+        }
+        catch (...)
+        {
+            handler->addFailedRpc(worker_id, error_code);
             handler->setException(std::current_exception());
         }
     }
@@ -164,5 +237,26 @@ namespace DB::RPCHelpers
             tryLogCurrentException(__PRETTY_FUNCTION__);
             RPCHelpers::handleException(resp->mutable_exception());
         }
+    }
+
+    inline WGWorkerInfoPtr createWorkerInfo(const Protos::WorkerInfo & worekr_info_data)
+    {
+        return std::make_shared<WGWorkerInfo>(worekr_info_data.worker_id(), worekr_info_data.num_workers(), worekr_info_data.index());
+    }
+
+    inline void fillWorkerInfo(Protos::WorkerInfo & worekr_info_data, const String & worker_id, UInt64 num_workers)
+    {
+        /// TODO: Since worker IDs have the same format {commonprefix}-{index}, we can have a specific function to resolve worker index
+        if (auto pos = worker_id.find_last_of('-'); pos != String::npos)
+        {
+            worekr_info_data.set_index(std::stoul(worker_id.substr(pos + 1)));
+        }
+        else
+        {
+            // set an invalid index if cannot parse index from workerID
+            worekr_info_data.set_index(num_workers);
+        }
+        worekr_info_data.set_worker_id(worker_id);
+        worekr_info_data.set_num_workers(num_workers);
     }
 }

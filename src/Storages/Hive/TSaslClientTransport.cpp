@@ -43,7 +43,7 @@ TSaslClientTransport::~TSaslClientTransport()
     resetSaslNegotiationState();
 }
 
-bool TSaslClientTransport::isOpen()
+bool TSaslClientTransport::isOpen() const
 {
     return transport->isOpen();
 }
@@ -236,7 +236,6 @@ void TSaslClientTransport::doSaslNegotiation()
                 ss << "Expected COMPLETE or OK, got " << status;
                 throw TTransportException(ss.str());
             }
-            
             uint32_t challenge_length;
             uint8_t * challenge = sasl_client->evaluateChallengeOrResponse(message, res_length, &challenge_length);
             sendSaslMessage(sasl_client->isComplete() ? TSASL_COMPLETE : TSASL_OK, challenge, challenge_length);
@@ -256,13 +255,13 @@ void TSaslClientTransport::doSaslNegotiation()
             }
         }
     }
-    catch (const TException & e)
+    catch (const TException &)
     {
         // If we hit an exception, that means the Sasl negotiation failed. We explicitly
         // reset the negotiation state here since the caller may retry an open() which would
         // start a new connection negotiation.
         resetSaslNegotiationState();
-        throw e;
+        throw;
     }
 }
 

@@ -29,11 +29,12 @@ constexpr auto COMPRESSION_COLUMN_EXTENSION = "_encoded";
 constexpr auto COMPRESSION_DATA_FILE_EXTENSION = "_encoded.bin";
 constexpr auto COMPRESSION_MARKS_FILE_EXTENSION = "_encoded.mrk";
 
-constexpr auto AB_IDX_EXTENSION = ".adx";
-constexpr auto AB_IRK_EXTENSION = ".ark";
+constexpr auto BITMAP_IDX_EXTENSION = ".adx";
+constexpr auto BITMAP_IRK_EXTENSION = ".ark";
 
-constexpr auto MARK_BITMAP_IDX_EXTENSION = ".m_adx";
-constexpr auto MARK_BITMAP_IRK_EXTENSION = ".m_ark";
+constexpr auto SEGMENT_BITMAP_IDX_EXTENSION = ".bitidx";
+constexpr auto SEGMENT_BITMAP_TABLE_EXTENSION = ".bittab";
+constexpr auto SEGMENT_BITMAP_DIRECTORY_EXTENSION = ".bitdir";
 
 constexpr auto DELETE_BITMAP_FILE_EXTENSION = ".del";
 constexpr auto DELETE_BITMAP_FILE_NAME = "delete.del";
@@ -45,6 +46,21 @@ constexpr auto UKI_FILE_NAME = "unique_key.idx";   /// name of unique key index 
 constexpr auto UNIQUE_ROW_STORE_DATA_NAME = "row_store.data";
 constexpr auto UNIQUE_ROW_STORE_META_NAME = "row_store.meta";
 
+constexpr auto BITENGINE_COLUMN_EXTENSION = "_encoded_bitmap";
+constexpr auto BITENGINE_DATA_FILE_EXTENSION = "_encoded_bitmap.bin";
+constexpr auto BITENGINE_DATA_MARKS_EXTENSION = "_encoded_bitmap.mrk";
+
+constexpr auto COMPRESSED_DATA_INDEX_EXTENSION = ".compress_idx";
+
+constexpr auto GIN_SEGMENT_ID_FILE_EXTENSION = ".gin_sid";
+constexpr auto GIN_SEGMENT_METADATA_FILE_EXTENSION = ".gin_seg";
+constexpr auto GIN_DICTIONARY_FILE_EXTENSION = ".gin_dict";
+constexpr auto GIN_POSTINGS_FILE_EXTENSION = ".gin_post";
+
 bool isEngineReservedWord(const String & column);
 
+/// Type `ONLY_SOURCE` is used in encoding and select, it's **DEFAULT** type
+/// Type `ONLY_ENCODE` used in BitEngine parts merge
+/// Type `BOTH` is used in BitEngineDictionaryManager::checkEncodedPart
+enum class BitEngineReadType : uint8_t { ONLY_SOURCE, ONLY_ENCODE, BOTH, };
 }

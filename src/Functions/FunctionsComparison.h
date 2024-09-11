@@ -31,6 +31,7 @@
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnNullable.h>
 
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -51,6 +52,7 @@
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/IsOperation.h>
+#include <Functions/IFunctionMySql.h>
 
 #include <Core/AccurateComparison.h>
 #include <Core/DecimalComparison.h>
@@ -516,15 +518,78 @@ template <template <typename, typename> typename Op> struct CompileOp;
 
 template <> struct CompileOp<EqualsOp>
 {
-    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool /*is_signed*/)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool /*is_signed*/, const DataTypes & arg_types, DataTypePtr & /*return_type*/, JITContext & jit_context)
     {
-        return x->getType()->isIntegerTy() ? b.CreateICmpEQ(x, y) : b.CreateFCmpOEQ(x, y); /// qNaNs always compare false
+        if (arg_types.size() != 2)
+            throw Exception();
+        auto & left_type = arg_types[0];
+        auto & right_type = arg_types[1];
+
+        auto is_string = [](const DataTypePtr & data_type)
+        {
+            WhichDataType type(data_type);
+            return type.isString();
+        };
+        if (is_string(left_type) && is_string(right_type))
+        {
+            auto * current_module = jit_context.current_module;
+            auto * memcmp_func_type = llvm::FunctionType::get(b.getInt32Ty(), { b.getInt8PtrTy(), b.getInt8PtrTy(), b.getInt64Ty() }, false);
+            auto memcmp_func = current_module->getOrInsertFunction("memcmp", memcmp_func_type);
+            auto * curr = b.GetInsertBlock();
+            llvm::Value * left_value = x;
+            llvm::Value * right_value = y;
+
+            /// return block
+            auto * ret = llvm::BasicBlock::Create(b.getContext(), "", curr->getParent());
+            auto * check_length = llvm::BasicBlock::Create(b.getContext(), "", curr->getParent());
+            auto * check_content = llvm::BasicBlock::Create(b.getContext(), "", curr->getParent());
+            std::vector<std::pair<llvm::BasicBlock *, llvm::Value *>> returns;
+            b.CreateBr(check_length);
+
+            /// check length
+            b.SetInsertPoint(check_length);
+            auto * left_offset = b.CreateExtractValue(left_value, {1});
+            auto * left_next_offset = b.CreateExtractValue(left_value, {2});
+            auto * right_offset = b.CreateExtractValue(right_value, {1});
+            auto * right_next_offset = b.CreateExtractValue(right_value, {2});
+            auto * left_length = b.CreateSub(left_next_offset, left_offset);
+            auto * right_length = b.CreateSub(right_next_offset, right_offset);
+            {
+                auto * res_value = b.CreateICmpEQ(left_length, right_length);
+                returns.emplace_back(b.GetInsertBlock(), res_value);
+                b.CreateCondBr(res_value, check_content, ret);
+            }
+            /// check content
+            b.SetInsertPoint(check_content);
+            auto * left_data = b.CreateExtractValue(left_value, {0});
+            auto * right_data = b.CreateExtractValue(right_value, {0});
+            left_data = b.CreateCast(llvm::Instruction::IntToPtr, b.CreateAdd(b.CreateCast(llvm::Instruction::PtrToInt, left_data, b.getInt64Ty()), left_offset), b.getInt8PtrTy());
+            right_data = b.CreateCast(llvm::Instruction::IntToPtr, b.CreateAdd(b.CreateCast(llvm::Instruction::PtrToInt, right_data, b.getInt64Ty()), right_offset), b.getInt8PtrTy());
+            {
+                auto * res_value = b.CreateICmpEQ(b.CreateCall(memcmp_func, { left_data, right_data, left_length}) , b.getInt32(0));
+                returns.emplace_back(b.GetInsertBlock(), res_value);
+                b.CreateBr(ret);
+            }
+
+            /// ret
+            b.SetInsertPoint(ret);
+            auto * phi = b.CreatePHI(b.getInt1Ty(), returns.size());
+            for (auto & return_ele : returns)
+                phi->addIncoming(return_ele.second, return_ele.first);
+
+            /// reset insert block
+            return phi;
+        }
+        else
+        {
+            return x->getType()->isIntegerTy() ? b.CreateICmpEQ(x, y) : b.CreateFCmpOEQ(x, y); /// qNaNs always compare false
+        }
     }
 };
 
 template <> struct CompileOp<NotEqualsOp>
 {
-    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool /*is_signed*/)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool /*is_signed*/, const DataTypes & /*arg_types*/, DataTypePtr & /*return_type*/, JITContext & /*jit_context*/)
     {
         return x->getType()->isIntegerTy() ? b.CreateICmpNE(x, y) : b.CreateFCmpONE(x, y);
     }
@@ -532,7 +597,7 @@ template <> struct CompileOp<NotEqualsOp>
 
 template <> struct CompileOp<LessOp>
 {
-    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed, const DataTypes & /*arg_types*/, DataTypePtr & /*return_type*/, JITContext & /*jit_context*/)
     {
         return x->getType()->isIntegerTy() ? (is_signed ? b.CreateICmpSLT(x, y) : b.CreateICmpULT(x, y)) : b.CreateFCmpOLT(x, y);
     }
@@ -540,7 +605,7 @@ template <> struct CompileOp<LessOp>
 
 template <> struct CompileOp<GreaterOp>
 {
-    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed, const DataTypes & /*arg_types*/, DataTypePtr & /*return_type*/, JITContext & /*jit_context*/)
     {
         return x->getType()->isIntegerTy() ? (is_signed ? b.CreateICmpSGT(x, y) : b.CreateICmpUGT(x, y)) : b.CreateFCmpOGT(x, y);
     }
@@ -548,7 +613,7 @@ template <> struct CompileOp<GreaterOp>
 
 template <> struct CompileOp<LessOrEqualsOp>
 {
-    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed, const DataTypes & /*arg_types*/, DataTypePtr & /*return_type*/, JITContext & /*jit_context*/)
     {
         return x->getType()->isIntegerTy() ? (is_signed ? b.CreateICmpSLE(x, y) : b.CreateICmpULE(x, y)) : b.CreateFCmpOLE(x, y);
     }
@@ -556,7 +621,7 @@ template <> struct CompileOp<LessOrEqualsOp>
 
 template <> struct CompileOp<GreaterOrEqualsOp>
 {
-    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * x, llvm::Value * y, bool is_signed, const DataTypes & /*arg_types*/, DataTypePtr & /*return_type*/, JITContext & /*jit_context*/)
     {
         return x->getType()->isIntegerTy() ? (is_signed ? b.CreateICmpSGE(x, y) : b.CreateICmpUGE(x, y)) : b.CreateFCmpOGE(x, y);
     }
@@ -566,6 +631,8 @@ template <> struct CompileOp<GreaterOrEqualsOp>
 
 
 struct NameEquals          { static constexpr auto name = "equals"; };
+struct NameBitEquals       { static constexpr auto name = "bitEquals"; };
+struct NameBitNotEquals    { static constexpr auto name = "bitNotEquals"; };
 struct NameNotEquals       { static constexpr auto name = "notEquals"; };
 struct NameLess            { static constexpr auto name = "less"; };
 struct NameGreater         { static constexpr auto name = "greater"; };
@@ -573,15 +640,24 @@ struct NameLessOrEquals    { static constexpr auto name = "lessOrEquals"; };
 struct NameGreaterOrEquals { static constexpr auto name = "greaterOrEquals"; };
 
 
-template <template <typename, typename> class Op, typename Name>
+template <template <typename, typename> class Op, typename Name, bool comp_null = false>
 class FunctionComparison : public IFunction
 {
 public:
     static constexpr auto name = Name::name;
-    static FunctionPtr create(ContextPtr context) { return std::make_shared<FunctionComparison>(context); }
+    static FunctionPtr create(ContextPtr context)
+    {
+        if (context && context->getSettingsRef().enable_implicit_arg_type_convert)
+            return std::make_shared<IFunctionMySql>(std::make_unique<FunctionComparison>(context));
+        return std::make_shared<FunctionComparison>(context);
+    }
+
+    ArgType getArgumentsType() const override { return ArgType::SAME_TYPE; }
 
     explicit FunctionComparison(ContextPtr context_)
         : context(context_), check_decimal_overflow(decimalCheckComparisonOverflow(context)) {}
+
+    bool useDefaultImplementationForNulls() const override { return !comp_null; }
 
 private:
     ContextPtr context;
@@ -1076,7 +1152,7 @@ private:
 
     ColumnPtr executeGeneric(const ColumnWithTypeAndName & c0, const ColumnWithTypeAndName & c1) const
     {
-        DataTypePtr common_type = getLeastSupertype({c0.type, c1.type});
+        DataTypePtr common_type = getLeastSupertype(DataTypes{c0.type, c1.type});
 
         ColumnPtr c0_converted = castColumn(c0, common_type);
         ColumnPtr c1_converted = castColumn(c1, common_type);
@@ -1091,6 +1167,8 @@ public:
     }
 
     size_t getNumberOfArguments() const override { return 2; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     /// Get result types by argument types. If the function does not apply to these arguments, throw an exception.
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
@@ -1109,6 +1187,8 @@ public:
             /// You can compare the date, datetime, or datatime64 and an enumeration with a constant string.
             || ((left.isDateOrDate32() || left.isDateTime() || left.isDateTime64()) && (right.isDateOrDate32() || right.isDateTime() || right.isDateTime64()) && left.idx == right.idx) /// only date vs date, or datetime vs datetime
             || (left.isUUID() && right.isUUID())
+            || (left.isIPv4() && right.isIPv4())
+            || (left.isIPv6() && right.isIPv6())
             || (left.isEnum() && right.isEnum() && arguments[0]->getName() == arguments[1]->getName()) /// only equivalent enum type values can be compared against
             || (left_tuple && right_tuple && left_tuple->getElements().size() == right_tuple->getElements().size())
             || (arguments[0]->equals(*arguments[1]))))
@@ -1123,6 +1203,9 @@ public:
                     " of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
             }
         }
+
+        if constexpr (comp_null)
+            return std::make_shared<DataTypeUInt8>();
 
         if (left_tuple && right_tuple)
         {
@@ -1152,7 +1235,94 @@ public:
         return std::make_shared<DataTypeUInt8>();
     }
 
+    static const NullMap &getNullMapFromColumn(const IColumn &c)
+    {
+        const auto & input_col = checkAndGetColumn<ColumnNullable>(c)->getNullMapColumnPtr();
+        return assert_cast<const ColumnUInt8 &>(*input_col).getData();
+    }
+
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+    {
+        if constexpr (!comp_null)
+            return executeImplWithoutNullable(arguments, result_type, input_rows_count);
+
+        ColumnsWithTypeAndName temporary_columns = createBlockWithNestedColumns(arguments);
+        ColumnPtr res = executeImplWithoutNullable(temporary_columns, result_type, input_rows_count);
+        bool lhs_is_nullable = arguments[0].type->isNullable();
+        ColumnPtr lhs = arguments[0].column;
+        ColumnPtr rhs = arguments[1].column;
+
+        /* both arguments' nullable status are the same */
+        if (lhs_is_nullable == arguments[1].type->isNullable()) {
+            /* both arguments are not nullable */
+            if (!lhs_is_nullable)
+                return res;
+
+            /* onlyNull op onlyNull */
+            if (lhs->onlyNull() && rhs->onlyNull())
+                return res;
+
+            /* onlyNull op Nullable */
+            if (lhs->onlyNull() || rhs->onlyNull()) {
+                if (isColumnConst(*res))
+                    res = res->convertToFullColumnIfConst();
+
+                const NullMap &input_map = getNullMapFromColumn(lhs->onlyNull() ? *rhs : *lhs);
+                /* NULL vs Nullable(val), if nullable is not NULL */
+                NullMap &output_map = const_cast<ColumnUInt8 &>(assert_cast<const ColumnUInt8 &>(*res)).getData();
+                for (size_t i = 0, size = output_map.size(); i < size; ++i) {
+                    /* change result for NULL vs non-NULL */
+                    if (!input_map[i])
+                        output_map[i] = IsOperation<Op>::not_equals;
+                }
+
+                return res;
+            }
+
+            /* Nullable op Nullable */
+            if (isColumnConst(*res))
+                res = res->convertToFullColumnIfConst();
+
+            if (isColumnConst(*lhs))
+                lhs = lhs->convertToFullColumnIfConst();
+
+            if (isColumnConst(*rhs))
+                rhs = rhs->convertToFullColumnIfConst();
+
+            const NullMap &lhs_nullmap = getNullMapFromColumn(*lhs);
+            const NullMap &rhs_nullmap = getNullMapFromColumn(*rhs);
+            NullMap &output_map = const_cast<ColumnUInt8 &>(assert_cast<const ColumnUInt8 &>(*res)).getData();
+            for (size_t i = 0, size = output_map.size(); i < size; ++i) {
+                if (lhs_nullmap[i] != rhs_nullmap[i])
+                    output_map[i] = IsOperation<Op>::not_equals;
+            }
+
+            return res;
+        }
+
+        /* take care of 0 <=> NULL when only one input is nullable */
+        ColumnPtr input = lhs_is_nullable ? lhs : rhs;
+
+        if (input->onlyNull())
+            return DataTypeUInt8().createColumnConst(input_rows_count, IsOperation<Op>::not_equals);
+
+        input = input->convertToFullColumnIfConst();
+        res = res->convertToFullColumnIfConst();
+
+        const NullMap &input_map = getNullMapFromColumn(*input);
+
+        NullMap &output_map = const_cast<ColumnUInt8 &>(assert_cast<const ColumnUInt8 &>(*res)).getData();
+        for (size_t i = 0, size = output_map.size(); i < size; ++i) {
+            // TODO: use SIMD to fill the output
+            /* change result for NULL vs non-NULL */
+            if (input_map[i])
+                output_map[i] = IsOperation<Op>::not_equals;
+        }
+
+        return res;
+    }
+
+    ColumnPtr executeImplWithoutNullable(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
     {
         const auto & col_with_type_and_name_left = arguments[0];
         const auto & col_with_type_and_name_right = arguments[1];
@@ -1200,6 +1370,15 @@ public:
         const bool left_is_float = which_left.isFloat();
         const bool right_is_float = which_right.isFloat();
 
+        const bool left_is_ipv6 = which_left.isIPv6();
+        const bool right_is_ipv6 = which_right.isIPv6();
+        const bool left_is_fixed_string = which_left.isFixedString();
+        const bool right_is_fixed_string = which_right.isFixedString();
+        size_t fixed_string_size =
+            left_is_fixed_string ?
+                assert_cast<const DataTypeFixedString &>(*left_type).getN() :
+                (right_is_fixed_string ? assert_cast<const DataTypeFixedString &>(*right_type).getN() : 0);
+
         bool date_and_datetime = (which_left.idx != which_right.idx) && (which_left.isDateOrDate32() || which_left.isDateTime() || which_left.isDateTime64())
             && (which_right.isDateOrDate32() || which_right.isDateTime() || which_right.isDateTime64());
 
@@ -1241,6 +1420,17 @@ public:
                 input_rows_count)))
         {
             return res;
+        }
+        else if (((left_is_ipv6 && right_is_fixed_string) || (right_is_ipv6 && left_is_fixed_string)) && fixed_string_size == IPV6_BINARY_LENGTH)
+        {
+            /// Special treatment for FixedString(16) as a binary representation of IPv6 -
+            /// CAST is customized for this case
+            ColumnPtr left_column = left_is_ipv6 ?
+                col_with_type_and_name_left.column : castColumn(col_with_type_and_name_left, right_type);
+            ColumnPtr right_column = right_is_ipv6 ?
+                col_with_type_and_name_right.column : castColumn(col_with_type_and_name_right, left_type);
+
+            return executeGenericIdenticalTypes(left_column.get(), right_column.get());
         }
         else if ((isColumnedAsDecimal(left_type) || isColumnedAsDecimal(right_type))
                  // Comparing Date and DateTime64 requires implicit conversion,
@@ -1294,16 +1484,39 @@ public:
             || (data_type_rhs.isDate() && data_type_lhs.isDateTime()))
             return false; /// TODO: implement (double, int_N where N > double's mantissa width)
 
+        if (NameEquals::name == name && data_type_lhs.isString() && data_type_rhs.isString())
+        {
+            return true;
+        }
+
         return isCompilableType(types[0]) && isCompilableType(types[1]);
     }
 
-    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values) const override
+    llvm::Value * compileImpl(llvm::IRBuilderBase & builder, const DataTypes & types, Values values, JITContext & jit_context) const override
     {
         assert(2 == types.size() && 2 == values.size());
+        auto return_type = getReturnTypeImpl(types);
 
         auto & b = static_cast<llvm::IRBuilder<> &>(builder);
-        auto [x, y] = nativeCastToCommon(b, types[0], values[0], types[1], values[1]);
-        auto * result = CompileOp<Op>::compile(b, x, y, typeIsSigned(*types[0]) || typeIsSigned(*types[1]));
+        auto is_string = [](const DataTypePtr & data_type)
+        {
+            WhichDataType type(data_type);
+            return type.isString();
+        };
+        llvm::Value * x = nullptr;
+        llvm::Value * y = nullptr;
+        if (is_string(types[0]) && is_string(types[1]))
+        {
+            x = values[0];
+            y = values[1];
+        }
+        else
+        {
+            auto [tmp_x, tmp_y] = nativeCastToCommon(b, types[0], values[0], types[1], values[1]);
+            x = tmp_x;
+            y = tmp_y;
+        }
+        auto * result = CompileOp<Op>::compile(b, x, y, typeIsSigned(*types[0]) || typeIsSigned(*types[1]), types, return_type, jit_context);
         return b.CreateSelect(result, b.getInt8(1), b.getInt8(0));
     }
 #endif

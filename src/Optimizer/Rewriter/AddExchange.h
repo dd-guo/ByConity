@@ -30,8 +30,11 @@ namespace DB
 class AddExchange : public Rewriter
 {
 public:
-    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
     String name() const override { return "AddExchange"; }
+
+private:
+    bool isEnabled(ContextMutablePtr context) const override { return context->getSettingsRef().enable_add_exchange; }
+    void rewrite(QueryPlan & plan, ContextMutablePtr context) const override;
 };
 
 class ExchangeResult
@@ -53,7 +56,7 @@ class ExchangeContext
 {
 public:
     ExchangeContext(ContextMutablePtr context_, Property & required_) : context(context_), required(required_) { }
-    ContextMutablePtr getContext() { return context; }
+    ContextMutablePtr & getContext() { return context; }
     Property & getRequired() { return required; }
 
 private:
@@ -70,14 +73,19 @@ public:
     ExchangeResult visitFilterNode(FilterNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitJoinNode(JoinNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitAggregatingNode(AggregatingNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitMarkDistinctNode(MarkDistinctNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitMergingAggregatedNode(MergingAggregatedNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitUnionNode(UnionNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitExchangeNode(ExchangeNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitExplainAnalyzeNode(ExplainAnalyzeNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitFillingNode(FillingNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitRemoteExchangeSourceNode(RemoteExchangeSourceNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitTableScanNode(TableScanNode & node, ExchangeContext &) override;
     ExchangeResult visitReadNothingNode(ReadNothingNode & node, ExchangeContext &) override;
     ExchangeResult visitValuesNode(ValuesNode & node, ExchangeContext &) override;
     ExchangeResult visitLimitNode(LimitNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitTotalsHavingNode(TotalsHavingNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitOffsetNode(OffsetNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitLimitByNode(LimitByNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitSortingNode(SortingNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitMergeSortingNode(MergeSortingNode & node, ExchangeContext & cxt) override;
@@ -92,7 +100,11 @@ public:
     ExchangeResult visitEnforceSingleRowNode(EnforceSingleRowNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitAssignUniqueIdNode(AssignUniqueIdNode & node, ExchangeContext & cxt) override;
     ExchangeResult visitCTERefNode(CTERefNode & node, ExchangeContext &) override;
-
+    ExchangeResult visitTopNFilteringNode(TopNFilteringNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitTableWriteNode(TableWriteNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitTableFinishNode(TableFinishNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitOutfileWriteNode(OutfileWriteNode & node, ExchangeContext & cxt) override;
+    ExchangeResult visitOutfileFinishNode(OutfileFinishNode & node, ExchangeContext & cxt) override;
 
 private:
     /**
@@ -111,7 +123,8 @@ private:
      * @param result child with it's output property.
      * @return node with it's output property.
      */
-    static ExchangeResult rebaseAndDeriveProperties(const PlanNodePtr & node, ExchangeResult & result, Context & cxt);
+    static ExchangeResult
+    rebaseAndDeriveProperties(const PlanNodePtr & node, ExchangeResult & result, Property & require, ContextMutablePtr & cxt);
 
     /**
      * Replace children first, then derive the output property.
@@ -120,7 +133,8 @@ private:
      * @param results children with it's output property.
      * @return node with it's output property.
      */
-    static ExchangeResult rebaseAndDeriveProperties(const PlanNodePtr & node, std::vector<ExchangeResult> & results, Context & cxt);
+    static ExchangeResult
+    rebaseAndDeriveProperties(const PlanNodePtr & node, std::vector<ExchangeResult> & results, Property & require, ContextMutablePtr & cxt);
 
     /**
      * Derive the actual property of node.
@@ -129,7 +143,7 @@ private:
      * @param inputProperty the actual property of child node.
      * @return node with it's actual property.
      */
-    static ExchangeResult deriveProperties(const PlanNodePtr & node, Property & inputProperty, Context & cxt);
+    static ExchangeResult deriveProperties(const PlanNodePtr & node, Property & inputProperty, Property & require, ContextMutablePtr & cxt);
 
     /**
      * Derive the actual property of node.
@@ -138,7 +152,8 @@ private:
      * @param inputProperties the actual property of child node.
      * @return node with it's actual property.
      */
-    static ExchangeResult deriveProperties(const PlanNodePtr & node, PropertySet & inputProperties, Context & cxt);
+    static ExchangeResult
+    deriveProperties(const PlanNodePtr & node, PropertySet & inputProperties, Property & require, ContextMutablePtr & cxt);
 
     ExchangeResult enforceNodeAndStream(PlanNodeBase & node, ExchangeContext & cxt);
     ExchangeResult enforceNode(PlanNodeBase & node, ExchangeContext & cxt);

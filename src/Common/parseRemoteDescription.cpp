@@ -1,5 +1,8 @@
 #include "parseRemoteDescription.h"
+#include <Common/parseAddress.h>
+#include <Common/HostWithPorts.h>
 #include <Common/Exception.h>
+#include <Common/HostWithPorts.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
 #include <common/logger_useful.h>
@@ -182,11 +185,13 @@ std::vector<std::pair<String, uint16_t>> parseRemoteDescriptionForExternalDataba
         if (colon == String::npos)
         {
             LOG_WARNING(&Poco::Logger::get("ParseRemoteDescription"), "Port is not found for host: {}. Using default port {}", address, default_port);
-            result.emplace_back(std::make_pair(address, default_port));
+            result.emplace_back(removeBracketsIfIpv6(address), default_port);
         }
         else
         {
-            result.emplace_back(std::make_pair(address.substr(0, colon), DB::parseFromString<UInt16>(address.substr(colon + 1))));
+            /// support both ipv4 and ipv6 format
+            auto [remote_host_name, remote_port] = parseAddress(address, default_port);
+            result.emplace_back(std::make_pair(removeBracketsIfIpv6(remote_host_name), remote_port));
         }
     }
 

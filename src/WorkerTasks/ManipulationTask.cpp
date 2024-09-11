@@ -17,7 +17,7 @@
 
 #include <CloudServices/CnchPartsHelper.h>
 #include <Interpreters/Context.h>
-#include <Storages/IStorage.h>
+#include <Storages/StorageCloudMergeTree.h>
 #include <WorkerTasks/ManipulationList.h>
 
 
@@ -29,58 +29,49 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-ManipulationTask::ManipulationTask(ManipulationTaskParams params_, ContextPtr context_) :
-    WithContext(context_),
-    params(std::move(params_))
+ManipulationTask::ManipulationTask(ManipulationTaskParams params_, ContextPtr context_)
+    : params(std::move(params_))
+    , context(std::move(context_))
 {
-    if (/*params.source_parts.empty() && */params.source_data_parts.empty())
-        throw Exception("Expected non-empty source parts in ManipulationTaskParams", ErrorCodes::BAD_ARGUMENTS);
-
-    if (params.new_part_names.empty())
-        throw Exception("Expected non-empty new part names in ManipulationTaskParams", ErrorCodes::BAD_ARGUMENTS);
 }
 
 void ManipulationTask::setManipulationEntry()
 {
-    auto global_context = getContext()->getGlobalContext();
-    manipulation_entry = global_context->getManipulationList().insert(params, false);
+    auto global_context = context->getGlobalContext();
+    manipulation_entry = global_context->getManipulationList().insert(params, false, global_context);
 
     auto * element = manipulation_entry->get();
-    element->related_node = getContext()->getClientInfo().current_address.toString() + ":" + toString(params.rpc_port);
+    element->related_node = context->getClientInfo().current_address.toString() + ":" + toString(params.rpc_port);
 }
 
 void ManipulationTask::execute()
 {
-    try
+    /// Make out memory tracker a parent of current thread memory tracker
+    std::optional<ThreadGroupSwitcher> switcher;
+    if (manipulation_entry)
     {
-        /// Mutation is visible in system.manipulations
-        setManipulationEntry();
+        switcher.emplace((*manipulation_entry)->thread_group);
+    }
 
-        executeImpl();
-    }
-    catch (...)
-    {
-        tryLogCurrentException(__PRETTY_FUNCTION__);
-    }
+    executeImpl();
 }
 
-void executeManipulationTask(ManipulationTaskParams params, ContextPtr context)
+void executeManipulationTask(ManipulationTaskPtr task, MergeTreeMutableDataPartsVector all_parts)
 {
     auto * log = &Poco::Logger::get(__func__);
 
     try
     {
-        if (!params.storage)
-            throw Exception("No storage in manipulate task parameters", ErrorCodes::LOGICAL_ERROR);
-
-        auto task = params.storage->manipulate(params, context);
+        auto storage = task->getStorage();
+        auto & data = dynamic_cast<StorageCloudMergeTree &>(*storage);
+        data.loadDataParts(all_parts);
         task->execute();
 
-        LOG_DEBUG(log, "Finished manipulate {}", params.task_id);
+        LOG_DEBUG(log, "Finished manipulate {}", task->getTaskID());
     }
     catch (...)
     {
-        tryLogCurrentException(log, "Failed to execute " + params.toDebugString());
+        tryLogCurrentException(log, "Failed to execute " + task->getParams().toDebugString());
     }
 }
 

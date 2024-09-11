@@ -21,10 +21,15 @@
 #include <MergeTreeCommon/CnchTopologyMaster.h>
 #include <Storages/StorageCnchMergeTree.h>
 #include <Storages/Kafka/StorageCnchKafka.h>
+#include <Storages/StorageMaterializedView.h>
 #include <CloudServices/CnchServerClientPool.h>
+#include <Databases/MySQL/DatabaseCnchMaterializedMySQL.h>
+#include <Parsers/ASTCreateQuery.h>
 
 namespace DB::DaemonManager
 {
+
+StorageTrait constructStorageTrait(StoragePtr storage);
 
 DaemonJobServerBGThread::DaemonJobServerBGThread(
     ContextMutablePtr global_context_,
@@ -43,78 +48,105 @@ void DaemonJobServerBGThread::init()
 {
     if (getType() == CnchBGThreadType::Consumer)
         fixKafkaActiveStatuses(this);
-    background_jobs = fetchCnchBGThreadStatus();
     status_persistent_store =
-        std::make_unique<BGJobStatusInCatalog::CatalogBGJobStatusPersistentStoreProxy>(getContext()->getCnchCatalog(), type);
+        std::make_unique<BGJobStatusInCatalog::CatalogBGJobStatusPersistentStoreProxy>(getContext()->getCnchCatalog(), type, getLog());
     bg_job_executor = std::make_unique<BackgroundJobExecutor>(*getContext(), getType());
     target_server_calculator = std::make_unique<TargetServerCalculator>(*getContext(), getType(), getLog());
+    /// fetchCnchBGThreadStatus must be called after initialisation of status_persistent_store and etc
+    background_jobs = fetchCnchBGThreadStatus();
     DaemonJob::init();
 }
 
 std::unordered_map<UUID, StorageID> getUUIDsFromCatalog(DaemonJobServerBGThread & daemon_job)
 {
     const Context & context = *daemon_job.getContext();
-    auto data_models = context.getCnchCatalog()->getAllTables();
     std::unordered_map<UUID, StorageID> ret;
     Poco::Logger * log = daemon_job.getLog();
-    for (const auto & data_model : data_models)
+
+    if (daemon_job.getType() == CnchBGThreadType::MaterializedMySQL)
     {
-        auto uuid = RPCHelpers::createUUID(data_model.uuid());
-
-        if (Status::isDetached(data_model.status()) || Status::isDeleted(data_model.status()))
-            continue;
-
-        try
+        auto data_models = context.getCnchCatalog()->getAllDataBases();
+        for (const auto & data_model : data_models)
         {
-            StoragePtr storage = nullptr;
-            if (auto cache = daemon_job.getStorageCache(); cache)
-            {
-                auto res = cache->getOrSet(data_model.definition(), [&]()
-                {
-                    return Catalog::CatalogFactory::getTableByDefinition(
-                        daemon_job.getContext(),
-                        data_model.database(),
-                        data_model.name(),
-                        data_model.definition());
-                });
-                storage = std::move(res.first);
-            }
-            else
-            {
-                storage = Catalog::CatalogFactory::getTableByDefinition(
-                        daemon_job.getContext(),
-                        data_model.database(),
-                        data_model.name(),
-                        data_model.definition());
-            }
-
-            if (!storage)
-            {
-                LOG_WARNING(log, "Fail to get storagePtr for {}.{}", data_model.database(), data_model.name());
+            if (Status::isDetached(data_model.status()) || Status::isDeleted(data_model.status()))
                 continue;
+
+            if (data_model.has_type() && data_model.type() == DB::Protos::CnchDatabaseType::MaterializedMySQL)
+            {
+                auto uuid = RPCHelpers::createUUID(data_model.uuid());
+                StorageID storage_id(data_model.name(), uuid);
+
+                try
+                {
+                    /// For MaterializedMySQL, using nullptr for StoragePtr param
+                    if (daemon_job.ifNeedDaemonJob(StorageTrait{}, storage_id))
+                        ret.insert(std::make_pair(uuid, storage_id));
+                }
+                catch(...)
+                {
+                    LOG_WARNING(log, "Fail to schedule for " + storage_id.getFullTableName() + ". Error: " + getCurrentExceptionMessage(true));
+                }
             }
-            if (daemon_job.isTargetTable(storage))
-                ret.insert(std::make_pair(uuid, storage->getStorageID()));
         }
-        catch (Exception & e)
+    }
+    else    /// For Table daemon job
+    {
+        auto data_models = context.getCnchCatalog()->getAllTables();
+        for (const auto & data_model : data_models)
         {
-            LOG_WARNING(log, "Fail to schedule for {}.{}. Error: ", data_model.database(), data_model.name(), e.message());
-            tryLogCurrentException(log, __PRETTY_FUNCTION__);
+            if (Status::isDetached(data_model.status()) || Status::isDeleted(data_model.status()))
+                continue;
+
+            auto uuid = RPCHelpers::createUUID(data_model.uuid());
+            StorageID storage_id(data_model.database(), data_model.name(), uuid);
+            if (!data_model.server_vw_name().empty())
+                storage_id.server_vw_name = data_model.server_vw_name();
+
+            try
+            {
+                StorageTrait storage_trait;
+                if (auto cache = daemon_job.getStorageTraitCache(); cache)
+                {
+                    auto res = cache->getOrSet(data_model.definition(), [&]()
+                    {
+                        StorageTrait s = constructStorageTrait(
+                            daemon_job.getContext(),
+                            data_model.database(),
+                            data_model.name(),
+                            data_model.definition()
+                        );
+                        return std::make_shared<StorageTrait>(s);
+                    });
+                    storage_trait = *res.first;
+                }
+                else
+                {
+                    storage_trait = constructStorageTrait(
+                        daemon_job.getContext(),
+                        data_model.database(),
+                        data_model.name(),
+                        data_model.definition());
+                }
+
+                if (daemon_job.ifNeedDaemonJob(storage_trait, storage_id))
+                    ret.insert(std::make_pair(uuid, storage_id));
+            }
+            catch (Exception & e)
+            {
+                LOG_WARNING(log, "Fail to schedule for {}.{}. Error: ", data_model.database(), data_model.name(), e.message());
+                tryLogCurrentException(log, __PRETTY_FUNCTION__);
+            }
+            catch (...)
+            {
+                LOG_WARNING(log, "Fail to construct storage for {}.{}", data_model.database(), data_model.name());
+                tryLogCurrentException(log, __PRETTY_FUNCTION__);
+            }
         }
     }
 
     return ret;
 }
 
-std::set<UUID> getUUIDsFromBackgroundJobs(const BackgroundJobs & background_jobs)
-{
-    std::set<UUID> ret;
-    std::transform(background_jobs.begin(), background_jobs.end()
-        , std::inserter(ret, ret.end()),
-        [] (const auto & p) { return p.first;}
-    );
-    return ret;
-}
 
 const std::vector<String> getServersInTopology(Context & context, Poco::Logger * log)
 {
@@ -178,7 +210,10 @@ std::map<String, UInt64> fetchServerStartTimes(Context & context, CnchTopologyMa
         String rpc_address = host_port.getRPCAddress();
         CnchServerClientPtr client_ptr = context.getCnchServerClientPool().get(host_port);
         if (!client_ptr)
+        {
+            LOG_WARNING(log, "Not able to connect to server with rpc address {}", rpc_address);
             continue;
+        }
 
         try
         {
@@ -187,7 +222,7 @@ std::map<String, UInt64> fetchServerStartTimes(Context & context, CnchTopologyMa
         }
         catch (...)
         {
-            LOG_INFO(log, "Failed to reach server: {}", rpc_address);
+            LOG_INFO(log, "Failed to reach server with rpc address: {}", rpc_address);
         }
     }
 
@@ -226,7 +261,7 @@ std::unordered_map<UUID, String> getAllTargetServerForBGJob(
     std::unordered_map<UUID, String> ret;
     for (const auto & p : bg_jobs)
     {
-        StorageID storage_id({}, TABLE_WITH_UUID_NAME_PLACEHOLDER, p.first);
+        StorageID storage_id = p.second->getStorageID();
         CnchServerClientPtr client_ptr = nullptr;
         try
         {
@@ -276,28 +311,50 @@ UpdateResult getUpdateBGJobs(
     const std::vector<String> & alive_servers
 )
 {
-    std::set<UUID> new_uuids;
-    std::transform(new_uuid_map.begin(), new_uuid_map.end()
-        , std::inserter(new_uuids, new_uuids.end()),
-        [] (const auto & p) { return p.first;}
-    );
+    /// using tuple because StorageID less than operator and equal isn't appropriate
+    using StorageIDData = std::tuple<UUID, String, String, String>;
+    std::set<StorageIDData> new_storage_id_set;
+    std::transform(new_uuid_map.begin(), new_uuid_map.end(),
+        std::inserter(new_storage_id_set, new_storage_id_set.end()),
+        [] (const auto & p) {
+            return std::make_tuple(
+                p.second.uuid,
+                p.second.database_name,
+                p.second.table_name,
+                p.second.server_vw_name);
+        });
 
-    std::set<UUID> current_uuids = getUUIDsFromBackgroundJobs(background_jobs);
+    std::set<StorageIDData> current_storage_id_set;
+    std::transform(background_jobs.begin(), background_jobs.end(),
+        std::inserter(current_storage_id_set, current_storage_id_set.end()),
+        [] (const auto & p) {
+            return std::make_tuple(
+                p.second->getStorageID().uuid,
+                p.second->getStorageID().database_name,
+                p.second->getStorageID().table_name,
+                p.second->getStorageID().server_vw_name);
+        });
+
+    std::vector<StorageIDData> add_storage_ids;
+    std::vector<StorageIDData> remove_storage_id_candidates;
+    std::set_difference(current_storage_id_set.begin(), current_storage_id_set.end(),
+        new_storage_id_set.begin(), new_storage_id_set.end(),
+        std::back_inserter(remove_storage_id_candidates));
+
+    std::set_difference(new_storage_id_set.begin(), new_storage_id_set.end(),
+        current_storage_id_set.begin(), current_storage_id_set.end(),
+        std::back_inserter(add_storage_ids));
 
     UUIDs add_uuids;
     UUIDs remove_uuid_candidates;
 
-    std::set_difference(
-        new_uuids.begin(), new_uuids.end(),
-        current_uuids.begin(), current_uuids.end(),
-        std::inserter(add_uuids, add_uuids.begin())
-    );
+    std::transform(add_storage_ids.begin(), add_storage_ids.end(),
+        std::inserter(add_uuids, add_uuids.end()),
+        [] (const StorageIDData & s) { return std::get<0>(s); });
 
-    std::set_difference(
-        current_uuids.begin(), current_uuids.end(),
-        new_uuids.begin(), new_uuids.end(),
-        std::inserter(remove_uuid_candidates, remove_uuid_candidates.begin())
-    );
+    std::transform(remove_storage_id_candidates.begin(), remove_storage_id_candidates.end(),
+        std::inserter(remove_uuid_candidates, remove_uuid_candidates.end()),
+        [] (const StorageIDData & s) { return std::get<0>(s); });
 
     UUIDs remove_uuids;
     std::for_each(background_jobs.begin(), background_jobs.end(),
@@ -451,6 +508,41 @@ void runMissingAndRemoveDuplicateJob(
         });
 }
 
+std::vector<BGJobInfoFromServer> findZombieJobsInServer(
+    const std::set<UUID> & new_bg_jobs_uuids,
+    BackgroundJobs & managed_job_exclude_new_job,
+    const std::unordered_multimap<UUID, BGJobInfoFromServer> & jobs_from_server)
+{
+    std::vector<BGJobInfoFromServer> zombie_jobs;
+
+    std::for_each(jobs_from_server.begin(), jobs_from_server.end(),
+        [&] (const std::pair<UUID, BGJobInfoFromServer> & job_from_server)
+        {
+            UUID job_from_server_uuid = job_from_server.first;
+            if ((new_bg_jobs_uuids.contains(job_from_server_uuid)) ||
+                (managed_job_exclude_new_job.contains(job_from_server_uuid)))
+                return;
+            zombie_jobs.push_back(job_from_server.second);
+        });
+
+    return zombie_jobs;
+}
+
+void removeZombieJobsInServer(
+    const Context & context,
+    DaemonJobServerBGThread & daemon_job,
+    const std::vector<BGJobInfoFromServer> & zombie_jobs
+)
+{
+    Poco::Logger * log = daemon_job.getLog();
+    std::for_each(zombie_jobs.begin(), zombie_jobs.end(), [&] (const BGJobInfoFromServer & j)
+        {
+            LOG_INFO(log, "Will drop zombie thread for job type {}, table {} on host {}", toString(daemon_job.getType()), j.storage_id.getNameForLogs(), j.host_port);
+            context.getCnchServerClientPool().get(j.host_port)->controlCnchBGThread(j.storage_id, daemon_job.getType(), CnchBGThreadAction::Drop);
+            LOG_INFO(log, "Droped zombie thread for job type {}, table {} on host {}", toString(daemon_job.getType()), j.storage_id.getNameForLogs(), j.host_port);
+        });
+}
+
 std::optional<std::unordered_multimap<UUID, BGJobInfoFromServer>> fetchBGThreadFromServer(
     Context & context,
     CnchBGThreadType type,
@@ -465,8 +557,12 @@ std::optional<std::unordered_multimap<UUID, BGJobInfoFromServer>> fetchBGThreadF
         {
             CnchServerClientPtr client_ptr = context.getCnchServerClientPool().get(server);
             if (!client_ptr)
+            {
+                LOG_ERROR(log, "Not able to connect to server with address {}", server);
                 return {};
+            }
             auto tasks = client_ptr->getBackGroundStatus(type);
+            LOG_DEBUG(log, "Get {} jobs from server with address {}", tasks.size(), server);
             for (const auto & task : tasks)
             {
                 StorageID storage_id = RPCHelpers::createStorageID(task.storage_id());
@@ -492,6 +588,7 @@ size_t checkLivenessIfNeed(
     Context & context,
     DaemonJobServerBGThread & daemon_job,
     BackgroundJobs & check_bg_jobs,
+    const std::set<UUID> & new_bg_jobs_uuids,
     const std::vector<String> & servers,
     BGJobsFromServersFetcher fetch_bg_jobs_from_server /*fetchBGThreadFromServer*/
 )
@@ -512,12 +609,24 @@ size_t checkLivenessIfNeed(
     if (!bg_jobs_from_server)
         return counter;
     runMissingAndRemoveDuplicateJob(daemon_job, check_bg_jobs, bg_jobs_from_server.value());
+    removeZombieJobsInServer(
+        context,
+        daemon_job,
+        findZombieJobsInServer(new_bg_jobs_uuids, check_bg_jobs, bg_jobs_from_server.value()));
     return counter + 1;
 }
 
 /// every failed call on BackgroundJob in this function will be retried on next time
 bool DaemonJobServerBGThread::executeImpl()
 {
+    if (suspended())
+    {
+        LOG_DEBUG(log, "thread suspended");
+        std::unique_lock lock(bg_jobs_mutex);
+        background_jobs.clear();
+        return true;
+    }
+
     Context & context = *getContext();
     std::shared_ptr<CnchTopologyMaster> topology_master = context.getCnchTopologyMaster();
     if (!topology_master)
@@ -542,7 +651,7 @@ bool DaemonJobServerBGThread::executeImpl()
     std::unordered_map<UUID, StorageID> new_uuid_map = getUUIDsFromCatalog(*this);
     milliseconds = watch.elapsedMilliseconds();
     if (milliseconds >= SLOW_EXECUTION_THRESHOLD_MS)
-        LOG_DEBUG(log, "getUUIDsFromCatalog took {} ms.", milliseconds);
+        LOG_DEBUG(log, "getUUIDsFromCatalog with size {} took {} ms.", new_uuid_map.size(), milliseconds);
 
     std::map<String, UInt64> new_server_start_times = fetchServerStartTimes(context, *topology_master, log);
     if (new_server_start_times.empty())
@@ -563,20 +672,34 @@ bool DaemonJobServerBGThread::executeImpl()
         LOG_DEBUG(log, "UUID: {} will be removed from background jobs", UUIDHelpers::UUIDToString(uuid));
 
     const UUIDs & add_uuids = update_res.add_uuids;
+    for (auto uuid : add_uuids)
+        LOG_DEBUG(log, "UUID: {} will be added into background jobs", UUIDHelpers::UUIDToString(uuid));
+
     std::vector<BackgroundJobPtr> new_bg_jobs;
 
     watch.restart();
     if ((!remove_uuids.empty()) || (!add_uuids.empty()))
     {
-        std::unique_lock lock(bg_jobs_mutex);
-        std::for_each(remove_uuids.begin(), remove_uuids.end(), [this] (UUID uuid)
-            {
-                background_jobs.erase(uuid);
-            });
+        {
+            std::unique_lock lock(bg_jobs_mutex);
+            std::for_each(remove_uuids.begin(), remove_uuids.end(), [this] (UUID uuid)
+                {
+                    background_jobs.erase(uuid);
+                });
+        }
 
-        std::for_each(add_uuids.begin(), add_uuids.end(), [this, & new_uuid_map, &new_bg_jobs] (UUID uuid)
+        /// never hold a bg_jobs_mutex while call BackgroundJob ctor
+        /// because this mutex is using in the callback of brpc
+        std::map<UUID, BackgroundJobPtr> new_background_jobs;
+        std::for_each(add_uuids.begin(), add_uuids.end(), [this, & new_uuid_map, & new_background_jobs] (UUID uuid)
+        {
+            new_background_jobs.insert(std::make_pair(uuid, std::make_shared<BackgroundJob>(new_uuid_map.at(uuid), *this)));
+        });
+
+        std::unique_lock lock(bg_jobs_mutex);
+        std::for_each(new_background_jobs.begin(), new_background_jobs.end(), [this, &new_bg_jobs] (auto & p)
             {
-                auto ret = background_jobs.insert(std::make_pair(uuid, std::make_shared<BackgroundJob>(new_uuid_map.at(uuid), *this)));
+                auto ret = background_jobs.insert(p);
                 if (ret.second)
                     new_bg_jobs.push_back(ret.first->second);
             });
@@ -590,6 +713,12 @@ bool DaemonJobServerBGThread::executeImpl()
         {
             background_jobs_clone.erase(uuid);
         });
+
+    std::for_each(new_bg_jobs.begin(), new_bg_jobs.end(), [& background_jobs_clone] (const BackgroundJobPtr & j)
+        {
+            background_jobs_clone.insert(std::make_pair(j->getUUID(), j));
+        });
+
 
     if (background_jobs_clone.empty())
     {
@@ -631,14 +760,26 @@ bool DaemonJobServerBGThread::executeImpl()
             LOG_DEBUG(log, "fetch bg job statuses took {} ms.", milliseconds);
 
         watch.restart();
+        const size_t max_thread_pool_size =
+            context.getConfigRef().getInt("daemon_job_for_bg_thread_max_thread_pool_size", 10);
+        const size_t thread_pool_size = std::min(server_info.alive_servers.size() * 3, max_thread_pool_size);
+        ThreadPool thread_pool{thread_pool_size, thread_pool_size, thread_pool_size * 4, false};
+
         std::for_each(
             background_jobs_clone.begin(),
             background_jobs_clone.end(),
-            [&server_info] (const auto & p)
+            [& server_info, & thread_pool] (const auto & p)
             {
-                p.second->sync(server_info);
+                const BackgroundJobPtr & bg_job = p.second;
+                thread_pool.scheduleOrThrowOnError(
+                    [& bg_job, & server_info] ()
+                    {
+                        bg_job->sync(server_info);
+                    });
             }
         );
+
+        thread_pool.wait();
     }
 
     milliseconds = watch.elapsedMilliseconds();
@@ -646,12 +787,20 @@ bool DaemonJobServerBGThread::executeImpl()
         LOG_DEBUG(log, "sync bg jobs took {} ms.", milliseconds);
 
     watch.restart();
+    std::set<UUID> new_bg_job_uuids;
+    std::transform(new_bg_jobs.begin(), new_bg_jobs.end(),
+        std::inserter(new_bg_job_uuids, new_bg_job_uuids.end()),
+        [] (const BackgroundJobPtr & j)
+        {
+            return j->getUUID();
+        });
     counter_for_liveness_check = checkLivenessIfNeed(
         counter_for_liveness_check,
         liveness_check_interval,
         context,
         *this,
         background_jobs_clone,
+        new_bg_job_uuids,
         server_info.alive_servers,
         fetchBGThreadFromServer
     );
@@ -703,8 +852,48 @@ BackgroundJobPtr DaemonJobServerBGThread::getBackgroundJob(const UUID & uuid) co
 Result DaemonJobServerBGThread::executeJobAction(const StorageID & storage_id, CnchBGThreadAction action)
 {
     Context & context = *getContext();
-    LOG_DEBUG(log, "Executing a job action for uuid: {} {}", storage_id.getNameForLogs(), toString(action));
+    LOG_DEBUG(log, "Executing a job action for storage id: {} {}", storage_id.empty() ? "empty storage" : storage_id.getNameForLogs(), toString(action));
     UUID uuid = storage_id.uuid;
+    if (storage_id.empty())
+    {
+        switch (action)
+        {
+            case CnchBGThreadAction::Remove:
+            {
+                {
+                    std::lock_guard<std::mutex> lock(suspended_mutex);
+                    is_suspended = true;
+                }
+                const std::vector<String> servers = getServersInTopology(context, log);
+                if (servers.empty())
+                {
+                    String error_msg = fmt::format("Failed to {} for all storage id because failed to get servers in topology", toString(action));
+                    LOG_WARNING(log, error_msg);
+                    return {error_msg, false};
+                }
+
+                for (auto & host_port : servers)
+                {
+                    CnchServerClientPtr server_client = context.getCnchServerClient(host_port);
+                    server_client->controlCnchBGThread(StorageID::createEmpty(), type, action);
+                    LOG_DEBUG(&Poco::Logger::get(__func__), "Succeed to {} all threads on {}",
+                        toString(action), host_port);
+                }
+
+                break;
+            }
+            case CnchBGThreadAction::Start:
+                {
+                    std::lock_guard<std::mutex> lock(suspended_mutex);
+                    is_suspended = false;
+                }
+                break;
+            default:
+                String error_msg = fmt::format("With empty storage_id, action {} is invalid", toString(action));
+                return {error_msg, false};
+        }
+        return {"", true};
+    }
 
     switch (action)
     {
@@ -830,7 +1019,7 @@ void DaemonJobForMergeMutate::executeOptimize(const StorageID & storage_id, cons
 
     auto info = bg_ptr->getBGJobInfo();
 
-    if (info.status != CnchBGThreadStatus::Running)
+    if (info.status != CnchBGThreadStatus::Running && info.status != CnchBGThreadStatus::Stopped)
     {
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
@@ -844,22 +1033,34 @@ void DaemonJobForMergeMutate::executeOptimize(const StorageID & storage_id, cons
 
 BackgroundJobs DaemonJobServerBGThread::fetchCnchBGThreadStatus()
 {
+    Stopwatch watch;
+    watch.restart();
+    // fetch statuses in batch
+    auto cache_clearer = status_persistent_store->fetchStatusesIntoCache();
+    UInt64 milliseconds = watch.elapsedMilliseconds();
+    if (milliseconds >= SLOW_EXECUTION_THRESHOLD_MS)
+        LOG_DEBUG(log, "fetch bg job statuses took {} ms", milliseconds);
+
     BackgroundJobs ret;
     CnchServerClientPtrs cnch_servers = getContext()->getCnchServerClientPool().getAll();
 
     for (const auto & cnch_server : cnch_servers)
     {
         if (!cnch_server)
+        {
+            LOG_WARNING(log, "Not able to connect to server with address {}", cnch_server->getRPCAddress());
             continue;
+        }
 
         server_start_times[cnch_server->getRPCAddress()] = cnch_server->getServerStartTime();
         auto tasks = cnch_server->getBackGroundStatus(type);
+        LOG_DEBUG(log, "Get {} jobs from server with address {}", tasks.size(), cnch_server->getRPCAddress());
         for (const auto & task : tasks)
         {
             StorageID storage_id = RPCHelpers::createStorageID(task.storage_id());
 
             auto task_status = CnchBGThreadStatus(task.status());
-            LOG_TRACE(log, "{} is {} on {}", storage_id.getNameForLogs(), toString(task_status), cnch_server->getRPCAddress());
+            LOG_DEBUG(log, "bg thread {} is {} on {}", storage_id.getNameForLogs(), toString(task_status), cnch_server->getRPCAddress());
 
             if (auto it = ret.find(storage_id.uuid); it != ret.end())
             {
@@ -906,23 +1107,50 @@ BackgroundJobs DaemonJobServerBGThread::fetchCnchBGThreadStatus()
             }
         }
     }
+
+    milliseconds = watch.elapsedMilliseconds();
+    if (milliseconds >= SLOW_EXECUTION_THRESHOLD_MS)
+        LOG_DEBUG(log, "fetchBackgroundJobsFromServer took {} ms.", milliseconds);
     return ret;
 }
 
-bool isCnchMergeTree(const StoragePtr & storage)
+bool DaemonJobServerBGThread::suspended() const
 {
-    return dynamic_cast<StorageCnchMergeTree *>(storage.get()) != nullptr;
+    std::lock_guard<std::mutex> lock(suspended_mutex);
+    return is_suspended;
 }
 
-bool isCnchKafka(const StoragePtr & storage)
+bool isCnchMergeTree(const StorageTrait & storage_trait, const StorageID &, const ContextPtr &)
 {
-    return dynamic_cast<StorageCnchKafka *>(storage.get()) != nullptr;
+    return storage_trait.isCnchMergeTree();
 }
 
-bool isCnchUniqueTableAndNeedDedup(const StoragePtr & storage)
+bool isCnchTableWithManifest(const StorageTrait & storage_trait, const StorageID &, const ContextPtr &)
 {
-    auto t = dynamic_cast<StorageCnchMergeTree *>(storage.get());
-    return t && t->getInMemoryMetadataPtr()->hasUniqueKey();
+    return storage_trait.isCnchTableWithManifest();
+}
+
+bool isCnchKafka(const StorageTrait & storage_trait, const StorageID &, const ContextPtr &)
+{
+    return storage_trait.isCnchKafka();
+}
+
+bool isMaterializedMySQL(const StorageTrait &, const StorageID & storage_id, const ContextPtr & context)
+{
+    if (!storage_id.isDatabase())
+        return false;
+    auto database = context->getCnchCatalog()->getDatabase(storage_id.getDatabaseName(), context, TxnTimestamp::maxTS());
+    return dynamic_cast<DatabaseCnchMaterializedMySQL *>(database.get()) != nullptr;
+};
+
+bool isCnchUniqueTableAndNeedDedup(const StorageTrait & storage_trait, const StorageID &, const ContextPtr &)
+{
+    return storage_trait.isCnchUniqueAndNeedDedup();
+}
+
+bool isCnchRefreshMaterializedView(const StorageTrait & storage_trait, const StorageID &, const ContextPtr & )
+{
+    return storage_trait.isCnchRefreshMaterializedView();
 }
 
 void registerServerBGThreads(DaemonFactory & factory)
@@ -932,6 +1160,11 @@ void registerServerBGThreads(DaemonFactory & factory)
     factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::Clustering, isCnchMergeTree>>("PART_CLUSTERING");
     factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::Consumer, isCnchKafka>>("CONSUMER");
     factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::DedupWorker, isCnchUniqueTableAndNeedDedup>>("DEDUP_WORKER");
+    factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::ObjectSchemaAssemble, isCnchMergeTree>>("OBJECT_SCHEMA_ASSEMBLE");
+    factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::MaterializedMySQL, isMaterializedMySQL>>("MATERIALIZED_MYSQL");
+    factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::CnchRefreshMaterializedView, isCnchRefreshMaterializedView>>("CNCH_REFRESH_MATERIALIZED_VIEW");
+    factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::PartMover, isCnchMergeTree>>("PART_MOVER");
+    factory.registerDaemonJobForBGThreadInServer<DaemonJobForCnch<CnchBGThreadType::ManifestCheckpoint, isCnchTableWithManifest>>("MANIFEST_CHECKPOINT");
 }
 
 void fixKafkaActiveStatuses(DaemonJobServerBGThread * daemon_job)
@@ -947,6 +1180,14 @@ void fixKafkaActiveStatuses(DaemonJobServerBGThread * daemon_job)
 
         try
         {
+            /// make shortcut to avoid Hive/S3 Storage ctor
+            auto ast = getASTCreateQueryFromString(data_model.definition(), daemon_job->getContext());
+            if (ast->storage &&
+                ast->storage->engine &&
+                (!isCnchMergeTreeOrKafka(ast->storage->engine->name))
+            )
+                continue;
+
             StoragePtr storage = Catalog::CatalogFactory::getTableByDefinition(
                         daemon_job->getContext(),
                         data_model.database(),
@@ -959,7 +1200,7 @@ void fixKafkaActiveStatuses(DaemonJobServerBGThread * daemon_job)
                 continue;
             }
 
-            if (daemon_job->isTargetTable(storage))
+            if (daemon_job->ifNeedDaemonJob(constructStorageTrait(storage), storage->getStorageID()))
             {
                 if (!catalog->getTableActiveness(storage, TxnTimestamp::maxTS()))
                 {
@@ -971,10 +1212,98 @@ void fixKafkaActiveStatuses(DaemonJobServerBGThread * daemon_job)
         }
         catch (Exception & e)
         {
-            LOG_WARNING(log, "Fail to construct storage for {}.{}. Error: ", data_model.database(), data_model.name(), e.message());
+            LOG_WARNING(log, "Fail to construct storage for {}.{}. Error: {}", data_model.database(), data_model.name(), e.message());
+            tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        }
+        catch (...)
+        {
+            LOG_WARNING(log, "Fail to construct storage for {}.{}", data_model.database(), data_model.name());
             tryLogCurrentException(log, __PRETTY_FUNCTION__);
         }
     }
+}
+
+StorageTrait::StorageTrait(StorageTrait::Param param)
+{
+    std::bitset<8> bs;
+    if (param.is_cnch_merge_tree)
+        bs.set(0);
+    if (param.is_cnch_kafka)
+        bs.set(1);
+    if (param.is_cnch_unique)
+        bs.set(2);
+    if (param.is_cnch_refresh_materialized_view)
+        bs.set(3);
+    if (param.is_cnch_table_with_manifest)
+        bs.set(4);
+    data = bs;
+}
+
+StorageTrait constructStorageTrait(StoragePtr storage)
+{
+    StorageTrait::Param param;
+
+    if (dynamic_cast<StorageCnchKafka *>(storage.get()) != nullptr)
+    {
+        param.is_cnch_kafka = true;
+    }
+    else if (StorageCnchMergeTree * cnch_storage = dynamic_cast<StorageCnchMergeTree *>(storage.get()))
+    {
+        if (cnch_storage->getInMemoryMetadataPtr()->hasUniqueKey())
+            param.is_cnch_unique = true;
+
+        if (cnch_storage->getSettings()->enable_publish_version_on_commit)
+            param.is_cnch_table_with_manifest = true;
+
+        param.is_cnch_merge_tree = true;
+    }
+    else if (StorageMaterializedView * materialized_view = dynamic_cast<StorageMaterializedView *>(storage.get()))
+    {
+        if (materialized_view->async())
+            param.is_cnch_refresh_materialized_view = true;
+    }
+
+    return StorageTrait{param};
+}
+
+StorageTrait constructStorageTrait(ContextMutablePtr context, const String & db, const String & table, const String & create_query)
+{
+    auto ast = getASTCreateQueryFromString(create_query, context);
+    /// make shortcut because CnchHive and other remote table contructor could take long time
+    if (ast->storage &&
+        ast->storage->engine &&
+        (!isCnchMergeTreeOrKafka(ast->storage->engine->name))
+    )
+        return StorageTrait{StorageTrait::Param {
+                .is_cnch_merge_tree = false,
+                .is_cnch_kafka = false,
+                .is_cnch_unique = false,
+                .is_cnch_refresh_materialized_view = false
+            }};
+
+    StoragePtr storage_ptr = Catalog::CatalogFactory::getTableByDefinition(
+                            context,
+                            db,
+                            table,
+                            create_query);
+
+    return constructStorageTrait(std::move(storage_ptr));
+}
+
+bool operator == (const StorageTrait & lhs, const StorageTrait & rhs)
+{
+    return lhs.getData() == rhs.getData();
+}
+
+bool isCnchMergeTreeOrKafka(const std::string & engine_name)
+{
+    bool found_cnch = (engine_name.find("Cnch") != std::string::npos);
+    bool found_merge_tree = (engine_name.find("MergeTree") != std::string::npos);
+    bool found_kafka = (engine_name.find("Kafka") != std::string::npos);
+    if ((!found_cnch) ||
+        (!found_merge_tree && !found_kafka))
+        return false;
+    return true;
 }
 
 }

@@ -58,7 +58,7 @@ struct RelationPlan
     {
     }
 
-    RelationPlan withNewRoot(PlanNodePtr new_root) const;
+    void withNewRoot(PlanNodePtr new_root) { root = std::move(new_root); }
     PlanNodePtr getRoot() const { return root; }
     const FieldSymbolInfos & getFieldSymbolInfos() const { return field_symbol_infos; }
     const String & getFirstPrimarySymbol() const;
@@ -67,4 +67,17 @@ struct RelationPlan
 using RelationPlans = std::vector<RelationPlan>;
 
 using CTERelationPlans = std::unordered_map<CTEId, RelationPlan>;
+
+struct PlanWithSymbolMappings
+{
+    PlanNodePtr plan;
+    NameToNameMap mappings;
+};
+
+struct PlanWithSymbols
+{
+    PlanNodePtr plan;
+    Names symbols;
+};
+
 }

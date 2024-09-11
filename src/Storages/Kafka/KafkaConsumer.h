@@ -26,14 +26,13 @@ class KafkaConsumer : public cppkafka::Consumer
 public:
     using cppkafka::Consumer::Consumer;
 
-    cppkafka::Message poll(std::chrono::milliseconds timeout);
-
     void subscribe(const std::vector<std::string>& topics);
     void unsubscribe();
     void assign(const cppkafka::TopicPartitionList& topic_partitions);
     void unassign();
     void commit(const cppkafka::TopicPartitionList& topic_partitions);
     cppkafka::TopicPartitionList get_offsets_committed(const cppkafka::TopicPartitionList& topic_partitions) const;
+    cppkafka::TopicPartitionList get_offsets_for_times(const TopicPartitionsTimestampsMap& queries) const;
 
     std::vector<std::string> get_subscription() const;
     cppkafka::TopicPartitionList get_assignment() const;
@@ -46,6 +45,9 @@ public:
     const std::vector<std::string> & get_cached_subscription() const { return cached_subscription; }
     const cppkafka::TopicPartitionList & get_cached_assignment() const { return cached_assignment; }
     bool check_destroyed() const { return is_destroyed; }
+    void setDestroyed() const { is_destroyed = true; }
+
+    bool is_serious_err(cppkafka::Error error) const;
 
 private:
     std::vector<std::string> cached_subscription;

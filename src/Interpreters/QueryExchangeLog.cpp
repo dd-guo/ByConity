@@ -17,7 +17,7 @@
 #include <array>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
-#include <DataTypes/DataTypeByteMap.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -33,9 +33,9 @@ NamesAndTypesList QueryExchangeLogElement::getNamesAndTypes()
         {"event_date", std::make_shared<DataTypeDate>()},
         {"event_time", std::make_shared<DataTypeDateTime>()},
         {"type", std::make_shared<DataTypeString>()},
-        {"write_segment_id", std::make_shared<DataTypeString>()},
-        {"read_segment_id", std::make_shared<DataTypeString>()},
-        {"partition_id", std::make_shared<DataTypeString>()},
+        {"exchange_id", std::make_shared<DataTypeUInt64>()},
+        {"partition_id", std::make_shared<DataTypeUInt64>()},
+        {"parallel_index", std::make_shared<DataTypeUInt64>()},
         {"coordinator_address", std::make_shared<DataTypeString>()},
 
         {"finish_code", std::make_shared<DataTypeInt32>()},
@@ -52,16 +52,23 @@ NamesAndTypesList QueryExchangeLogElement::getNamesAndTypes()
         {"send_retry_ms", std::make_shared<DataTypeInt64>()},
         {"overcrowded_retry", std::make_shared<DataTypeInt64>()},
 
+        {"recv_counts", std::make_shared<DataTypeUInt64>()},
+        {"recv_rows", std::make_shared<DataTypeUInt64>()},
         {"recv_time_ms", std::make_shared<DataTypeUInt64>()},
         {"register_time_ms", std::make_shared<DataTypeUInt64>()},
         {"recv_bytes", std::make_shared<DataTypeUInt64>()},
+        {"recv_uncompressed_bytes", std::make_shared<DataTypeUInt64>()},
         {"dser_time_ms", std::make_shared<DataTypeInt64>()},
 
-#ifdef USE_COMMUNITY_MAP
+        {"disk_partition_writer_create_file_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_pop_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_write_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_write_num", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_commit_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_sync_ms", std::make_shared<DataTypeUInt64>()},
+        {"disk_partition_writer_wait_done_ms", std::make_shared<DataTypeUInt64>()},
+
         {"ProfileEvents", std::make_shared<DataTypeMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
-#else
-        {"ProfileEvents", std::make_shared<DataTypeByteMap>(std::make_shared<DataTypeString>(), std::make_shared<DataTypeUInt64>())},
-#endif
     };
 }
 
@@ -81,9 +88,9 @@ void QueryExchangeLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(DateLUT::instance().toDayNum(event_time).toUnderType());
     columns[i++]->insert(event_time);
     columns[i++]->insertData(type.data(), type.size());
-    columns[i++]->insert(write_segment_id);
-    columns[i++]->insert(read_segment_id);
+    columns[i++]->insert(exchange_id);
     columns[i++]->insert(partition_id);
+    columns[i++]->insert(parallel_index);
     columns[i++]->insert(coordinator_address);
 
     columns[i++]->insert(finish_code);
@@ -100,10 +107,21 @@ void QueryExchangeLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(send_retry_ms);
     columns[i++]->insert(overcrowded_retry);
 
+    columns[i++]->insert(recv_counts);
+    columns[i++]->insert(recv_rows);
     columns[i++]->insert(recv_time_ms);
     columns[i++]->insert(register_time_ms);
     columns[i++]->insert(recv_bytes);
+    columns[i++]->insert(recv_uncompressed_bytes);
     columns[i++]->insert(dser_time_ms);
+
+    columns[i++]->insert(disk_partition_writer_create_file_ms);
+    columns[i++]->insert(disk_partition_writer_pop_ms);
+    columns[i++]->insert(disk_partition_writer_write_ms);
+    columns[i++]->insert(disk_partition_writer_write_num);
+    columns[i++]->insert(disk_partition_writer_commit_ms);
+    columns[i++]->insert(disk_partition_writer_sync_ms);
+    columns[i++]->insert(disk_partition_writer_wait_done_ms);
 
 
     if (profile_counters)

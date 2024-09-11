@@ -36,6 +36,7 @@ public:
     String getName() const override { return name; }
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
@@ -146,7 +147,7 @@ private:
 
 }
 
-void registerFunctionIsDecimalOverflow(FunctionFactory & factory)
+REGISTER_FUNCTION(IsDecimalOverflow)
 {
     factory.registerFunction<FunctionIsDecimalOverflow>();
 }

@@ -14,14 +14,18 @@
  */
 
 #include <Catalog/Catalog.h>
+#include <CloudServices/CnchDedupHelper.h>
 #include <CloudServices/CnchPartsHelper.h>
-#include <CloudServices/commitCnchParts.h>
+#include <CloudServices/CnchDataWriter.h>
+#include <Interpreters/CnchSystemLog.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/StorageCloudMergeTree.h>
+#include <Transaction/Actions/MergeMutateAction.h>
 #include <Transaction/ICnchTransaction.h>
 #include <Transaction/CnchLock.h>
 #include <WorkerTasks/CloudUniqueMergeTreeMergeTask.h>
 #include <WorkerTasks/MergeTreeDataMerger.h>
+#include <Storages/StorageCnchMergeTree.h>
 
 namespace DB
 {
@@ -38,7 +42,7 @@ CloudUniqueMergeTreeMergeTask::CloudUniqueMergeTreeMergeTask(
     , storage(storage_)
     , log_name(storage.getLogName() + "(MergeTask)")
     , log(&Poco::Logger::get(log_name))
-    , cnch_writer(storage, getContext(), ManipulationType::Merge)
+    , cnch_writer(storage, getContext(), ManipulationType::Merge, getTaskID())
 {
     if (params.source_data_parts.empty())
         throw Exception("Empty source data parts for merge task " + params.task_id, ErrorCodes::LOGICAL_ERROR);
@@ -49,7 +53,7 @@ CloudUniqueMergeTreeMergeTask::CloudUniqueMergeTreeMergeTask(
 DeleteBitmapMetaPtrVector
 CloudUniqueMergeTreeMergeTask::getDeleteBitmapMetas(Catalog::Catalog & catalog, const IMergeTreeDataPartsVector & parts, TxnTimestamp ts)
 {
-    DeleteBitmapMetaPtrVector all_bitmaps = catalog.getDeleteBitmapsInPartitions(params.storage, {partition_id}, ts);
+    DeleteBitmapMetaPtrVector all_bitmaps = catalog.getDeleteBitmapsInPartitionsFromMetastore(params.storage, {partition_id}, ts);
 
     /// construct bitmap version chain, remove invisible ones
     DeleteBitmapMetaPtrVector bitmaps;
@@ -67,7 +71,16 @@ CloudUniqueMergeTreeMergeTask::getDeleteBitmapMetas(Catalog::Catalog & catalog, 
             bitmap_it++;
 
         if (bitmap_it == bitmaps.end())
+        {
+            if (auto unique_table_log = getContext()->getCloudUniqueTableLog())
+            {
+                auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, params.storage->getCnchStorageID());
+                current_log.metric = ErrorCodes::LOGICAL_ERROR;
+                current_log.event_msg = "Missing delete bitmap metadata for part " + part->name;
+                unique_table_log->add(current_log);
+            }
             throw Exception("Missing delete bitmap metadata for part " + part->name, ErrorCodes::LOGICAL_ERROR);
+        }
 
         res.push_back(*bitmap_it);
         bitmap_it++;
@@ -220,9 +233,18 @@ void CloudUniqueMergeTreeMergeTask::executeImpl()
         drop_part->partition.assign(part->partition);
         drop_part->deleted = true;
 
+        /// rows_count and bytes_on_disk is required for parts info statistics.
+        drop_part->covered_parts_rows = part->rows_count;
+        drop_part->covered_parts_size = part->bytes_on_disk;
+
         parts_to_dump.push_back(std::move(drop_part));
-        bitmaps_to_dump.push_back(LocalDeleteBitmap::createTombstone(drop_part_info, txn_id.toUInt64()));
+        bitmaps_to_dump.push_back(LocalDeleteBitmap::createTombstone(drop_part_info, txn_id.toUInt64(), part->bucket_number));
     }
+
+    /// 0 rows part may come from unique table or DELETE mutation, and we can safely mark it as deleted.
+    if (merged_part->rows_count == 0)
+        merged_part->deleted = true;
+
     parts_to_dump.push_back(merged_part);
 
     if (isCancelled())
@@ -232,22 +254,72 @@ void CloudUniqueMergeTreeMergeTask::executeImpl()
     auto dumped_data = cnch_writer.dumpCnchParts(parts_to_dump, bitmaps_to_dump, /*staged parts*/ {});
 
     /// enter commit phase
+    auto settings = storage.getSettings();
+    bool force_normal_dedup = false;
+    bool lock_success = false;
+    int num_try = std::max(static_cast<int>(1), static_cast<int>(settings->unique_merge_acquire_lock_retry_time.value));
     Stopwatch lock_watch;
-    LockInfoPtr partition_lock = std::make_shared<LockInfo>(txn_id);
-    partition_lock->setMode(LockMode::X);
-    partition_lock->setTimeout(10000); // 10s
-    partition_lock->setUUID(storage.getStorageUUID());
-    /// need to lock table instead of partition for table-level uniqueness
-    if (storage.getSettings()->partition_level_unique_keys)
+    CnchLockHolderPtr cnch_lock;
+    do
     {
-        partition_lock->setPartition(partition_id);
-    }
-    auto ctx = getContext();
-    CnchLockHolder cnch_lock(*ctx, {std::move(partition_lock)});
+        if (num_try <= 0)
+            break;
+        CnchDedupHelper::DedupScope scope = CnchDedupHelper::getDedupScope(storage, params.source_data_parts, force_normal_dedup);
 
-    /// TODO: better msg
-    if (!cnch_lock.tryLock())
+        std::vector<LockInfoPtr> locks_to_acquire = CnchDedupHelper::getLocksToAcquire(
+            scope, txn->getTransactionID(), storage, settings->unique_acquire_write_lock_timeout.value.totalMilliseconds());
+
+        if (locks_to_acquire.size() != 1)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Merge task {} acquires more than one lock.", params.task_id);
+        String lock_debug_info = locks_to_acquire[0]->toDebugString();
+        cnch_lock = std::make_shared<CnchLockHolder>(getContext(), std::move(locks_to_acquire));
+        while (num_try--)
+        {
+            LOG_TRACE(log, "Try lock: {}", lock_debug_info);
+            if (cnch_lock->tryLock())
+            {
+                lock_success = true;
+                LOG_DEBUG(log, "Merge task {} acquired lock in {} ms", params.task_id, lock_watch.elapsedMilliseconds());
+                break;
+            }
+        }
+        if (!lock_success)
+            break;
+
+        /// In some case, visible parts or staged parts doesn't have same bucket definition or not a bucket part, we need to convert bucket lock to normal lock.
+        /// Otherwise, it may lead to duplicated data.
+        if (scope.isBucketLock() && !settings->enable_bucket_level_unique_keys)
+        {
+            /// Get cnch table.
+            TxnTimestamp ts = context->getTimestamp(); /// must get a new ts after locks are acquired
+            auto table = catalog->tryGetTableByUUID(*context, UUIDHelpers::UUIDToString(params.storage->getStorageUUID()), ts);
+            if (!table)
+                throw Exception("Table " + params.storage->getStorageID().getNameForLogs() + " has been dropped", ErrorCodes::ABORTED);
+            StorageCnchMergeTreePtr cnch_table = dynamic_pointer_cast<StorageCnchMergeTree>(table);
+            if (!cnch_table)
+                throw Exception(
+                    "Table " + params.storage->getStorageID().getNameForLogs() + " is not cnch merge tree", ErrorCodes::LOGICAL_ERROR);
+
+            MergeTreeDataPartsCNCHVector visible_parts = CnchDedupHelper::getVisiblePartsToDedup(scope, *cnch_table, ts);
+            MergeTreeDataPartsCNCHVector staged_parts = CnchDedupHelper::getStagedPartsToDedup(scope, *cnch_table, ts);
+            if (!CnchDedupHelper::checkBucketParts(*cnch_table, visible_parts, staged_parts))
+            {
+                force_normal_dedup = true;
+                cnch_lock->unlock();
+                LOG_TRACE(log, "Check bucket parts failed, switch to normal lock to acquire lock for merge task.");
+                continue;
+            }
+            else
+                break;
+        }
+        else
+            break;
+    } while (true);
+
+    if (!lock_success)
         throw Exception("Failed to acquire lock for merge task " + params.task_id, ErrorCodes::ABORTED);
+
+    txn->appendLockHolder(cnch_lock);
 
     lock_watch.restart();
 
@@ -255,11 +327,27 @@ void CloudUniqueMergeTreeMergeTask::executeImpl()
     updateDeleteBitmap(*catalog, merger, merged_part_bitmap);
 
     /// dump merged part's bitmap
-    auto final_bitmap_to_dump = LocalDeleteBitmap::createBase(merged_part->info, merged_part_bitmap, txn_id.toUInt64());
-    auto new_dumped_data = cnch_writer.dumpCnchParts(/*parts*/ {}, {final_bitmap_to_dump}, /*staged parts*/ {});
-    dumped_data.bitmaps.push_back(new_dumped_data.bitmaps.front());
+    /// if merged_part is already marked as deleted, we can skip dumping the final bitmap (it must be empty and will never be touched by queries).
+    if (!merged_part->deleted)
+    {
+        auto final_bitmap_to_dump = LocalDeleteBitmap::createBase(merged_part->info, merged_part_bitmap, txn_id.toUInt64(), merged_part->bucket_number);
+        auto new_dumped_data = cnch_writer.dumpCnchParts(/*parts*/ {}, {final_bitmap_to_dump}, /*staged parts*/ {});
+        dumped_data.bitmaps.push_back(new_dumped_data.bitmaps.front());
+    }
+
+    ManipulationListElement * manipulation_list_element = getManipulationListElement();
+    if (manipulation_list_element)
+    {
+        cnch_writer.setPeakMemoryUsage(manipulation_list_element->getMemoryTracker().getPeak());
+    }
 
     cnch_writer.commitDumpedParts(dumped_data);
+    auto commit_time = getContext()->getCurrentTransaction()->commitV2();
+    for (const auto & part : dumped_data.parts)
+    {
+        MergeMutateAction::updatePartData(part, commit_time);
+        part->relative_path = part->info.getPartNameWithHintMutation();
+    }
     /// TODO: make sure txn is rollbacked and lock is released
 
     LOG_INFO(
@@ -268,7 +356,7 @@ void CloudUniqueMergeTreeMergeTask::executeImpl()
         params.task_id,
         watch.elapsedMilliseconds(),
         lock_watch.elapsedMilliseconds());
-    /// preload can be done outside the lock
+    /// preload can be done outside the lock todo(jiashuo): support unique merge tree?
     // preload(context, storage, dumped_data.parts, ManipulationType::Merge);
 }
 

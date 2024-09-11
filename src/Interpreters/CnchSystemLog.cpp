@@ -15,8 +15,10 @@
 
 #include <Interpreters/CnchSystemLog.h>
 #include <Interpreters/CnchSystemLogHelper.h>
-#include <Interpreters/CnchQueryMetrics/QueryMetricLog.h>
-#include <Interpreters/CnchQueryMetrics/QueryWorkerMetricLog.h>
+#include <Interpreters/KafkaLog.h>
+#include <Interpreters/IInterpreter.h>
+#include <Interpreters/MaterializedMySQLLog.h>
+#include <Interpreters/UniqueTableLog.h>
 #include <algorithm>
 
 namespace DB
@@ -77,6 +79,128 @@ std::shared_ptr<CloudLog> createCnchLog(
 }
 
 template <typename LogElement>
+String prepareEngineClause(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+{
+    String engine = "ENGINE = CnchMergeTree() ";
+    if (std::is_same_v<LogElement, QueryLogElement>)
+        engine += " ORDER BY (`query_id`, `event_time`) ";
+
+    String partition_by = config.getString(config_prefix + ".partition_by", "toStartOfDay(event_time)");
+    if (!partition_by.empty())
+        engine += " PARTITION BY (" + partition_by + ")";
+
+    /// be consistent with cnch1.4, in which ttl field just configures the duration, e.g., 31 DAY, instead of the full ttl expression
+    String ttl = config.getString(config_prefix + ".ttl", "31 DAY");
+    if (!ttl.empty())
+        engine += " TTL toStartOfDay(event_time) + INTERVAL " + ttl;
+
+    engine += " SETTINGS index_granularity = 8192, enable_addition_bg_task = 1";
+    return engine;
+}
+
+template String prepareEngineClause<QueryLogElement>(const Poco::Util::AbstractConfiguration &, const String &);
+
+template <>
+String prepareEngineClause<ViewRefreshTaskLogElement>(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+{
+    String engine = "ENGINE = CnchMergeTree() ";
+    engine += " ORDER BY (database, view, query_id)";
+
+    String partition_by = config.getString(config_prefix + ".partition_by", "event_date");
+    if (!partition_by.empty())
+        engine += " PARTITION BY (" + partition_by + ")";
+
+    /// be consistent with cnch1.4, in which ttl field just configures the duration, e.g., 31 DAY, instead of the full ttl expression
+    String ttl = config.getString(config_prefix + ".ttl", "31 DAY");
+    if (!ttl.empty())
+        engine += " TTL event_date + INTERVAL " + ttl;
+
+    engine += " SETTINGS index_granularity = 8192";
+
+    return engine;
+}
+
+template <>
+String prepareEngineClause<KafkaLogElement>(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+{
+    String engine = "ENGINE = CnchMergeTree() ";
+    engine += " ORDER BY (event_date, event_time)";
+
+    String partition_by = config.getString(config_prefix + ".partition_by", "event_date");
+    if (!partition_by.empty())
+        engine += " PARTITION BY (" + partition_by + ")";
+
+    /// be consistent with cnch1.4, in which ttl field just configures the duration, e.g., 31 DAY, instead of the full ttl expression
+    String ttl = config.getString(config_prefix + ".ttl", "31 DAY");
+    if (!ttl.empty())
+        engine += " TTL event_date + INTERVAL " + ttl;
+
+    engine += " SETTINGS index_granularity = 8192";
+
+    return engine;
+}
+
+template <>
+String prepareEngineClause<AutoStatsTaskLogElement>(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+{
+    String engine = "ENGINE = CnchMergeTree() ";
+    engine += " ORDER BY (event_date, event_time)";
+
+    String partition_by = config.getString(config_prefix + ".partition_by", "event_date");
+    if (!partition_by.empty())
+        engine += " PARTITION BY (" + partition_by + ")";
+
+    /// be consistent with cnch1.4, in which ttl field just configures the duration, e.g., 31 DAY, instead of the full ttl expression
+    String ttl = config.getString(config_prefix + ".ttl", "90 DAY");
+    if (!ttl.empty())
+        engine += " TTL event_date + INTERVAL " + ttl;
+
+    engine += " SETTINGS index_granularity = 8192";
+
+    return engine;
+}
+
+template <>
+String prepareEngineClause<MaterializedMySQLLogElement>(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+{
+    String engine = "ENGINE = CnchMergeTree() ";
+    engine += " ORDER BY (event_date, event_time)";
+
+    String partition_by = config.getString(config_prefix + ".partition_by", "event_date");
+    if (!partition_by.empty())
+        engine += " PARTITION BY (" + partition_by + ")";
+
+    /// be consistent with cnch1.4, in which ttl field just configures the duration, e.g., 31 DAY, instead of the full ttl expression
+    String ttl = config.getString(config_prefix + ".ttl", "31 DAY");
+    if (!ttl.empty())
+        engine += " TTL event_date + INTERVAL " + ttl;
+
+    engine += " SETTINGS index_granularity = 8192";
+
+    return engine;
+}
+
+template <>
+String prepareEngineClause<UniqueTableLogElement>(const Poco::Util::AbstractConfiguration & config, const String & config_prefix)
+{
+    String engine = "ENGINE = CnchMergeTree() ";
+    engine += " ORDER BY (event_date, event_time)";
+
+    String partition_by = config.getString(config_prefix + ".partition_by", "event_date");
+    if (!partition_by.empty())
+        engine += " PARTITION BY (" + partition_by + ")";
+
+    /// be consistent with cnch1.4, in which ttl field just configures the duration, e.g., 31 DAY, instead of the full ttl expression
+    String ttl = config.getString(config_prefix + ".ttl", "31 DAY");
+    if (!ttl.empty())
+        engine += " TTL event_date + INTERVAL " + ttl;
+
+    engine += " SETTINGS index_granularity = 8192";
+
+    return engine;
+}
+
+template <typename LogElement>
 bool prepareDatabaseAndTable(
     const ContextPtr & context,
     const String & database_name,
@@ -117,14 +241,7 @@ bool prepareDatabaseAndTable(
     }
     else
     {
-        String partition_by = config.getString(config_prefix + ".partition_by", "toYYYYMM(event_date)");
-        engine = "ENGINE = CnchMergeTree";
-        if (!partition_by.empty())
-            engine += " PARTITION BY (" + partition_by + ")";
-        String ttl = config.getString(config_prefix + ".ttl", "event_date + INTERVAL 31 DAY");
-        if (!ttl.empty())
-            engine += " TTL " + ttl;
-        engine += " ORDER BY (event_date, event_time)";
+        engine = prepareEngineClause<LogElement>(config, config_prefix);
     }
 
     ASTPtr create_query = constructCreateTableQuery<LogElement>(database_name, table_name, engine);
@@ -206,7 +323,7 @@ bool CnchSystemLogs::initInServerForSingleLog(ContextPtr & global_context,
     {
         std::lock_guard<std::mutex> g(mutex);
         if (cloud_log)
-            ret = true;
+            return true;
     }
 
     try
@@ -221,19 +338,29 @@ bool CnchSystemLogs::initInServerForSingleLog(ContextPtr & global_context,
         {
             std::shared_ptr<CloudLog> temp_log =
                 createCnchLog<CloudLog>(global_context, db, tb, config, config_prefix);
+            bool actual_init = true;
+            if (temp_log)
             {
                 std::lock_guard<std::mutex> g(mutex);
                 cloud_log = std::move(temp_log);
                 logs.emplace_back(cloud_log.get());
                 cloud_log->startup();
             }
+            else
+                actual_init = false;
 
-            LOG_INFO(log, "Initializing CNCH System log on server for {}.{} successfully", db, tb);
+            if (actual_init)
+                LOG_INFO(log, "Initializing CNCH System log on server for {}.{} successfully", db, tb);
+            else
+                LOG_INFO(log, "Skip initializing CNCH System log on server for {}.{}", db, tb);
         }
     }
     catch (...)
     {
-        cloud_log.reset();
+        {
+            std::lock_guard<std::mutex> g(mutex);
+            cloud_log.reset();
+        }
         ret = false;
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
@@ -249,8 +376,14 @@ bool CnchSystemLogs::initInServer(ContextPtr global_context)
     LOG_INFO(log, "Initializing CNCH System log on server");
 
     bool kafka_ret = true;
+    bool materialized_mysql_ret = true;
+    bool unique_table_ret = true;
     bool query_metrics_ret = true;
     bool query_worker_metrics_ret = true;
+    bool cnch_query_log_ret = true;
+    bool cnch_view_refresh_task_log_ret = true;
+    bool cnch_auto_stats_task_log_ret = true;
+
 
     if (config.has(CNCH_KAFKA_LOG_CONFIG_PREFIX))
         kafka_ret = initInServerForSingleLog<CloudKafkaLog>(global_context,
@@ -260,57 +393,125 @@ bool CnchSystemLogs::initInServer(ContextPtr global_context)
             config,
             cloud_kafka_log);
 
-    if (global_context->getSettingsRef().enable_query_level_profiling)
-    {
-        if (config.has(QUERY_METRICS_CONFIG_PREFIX))
-            query_metrics_ret = initInServerForSingleLog<QueryMetricLog>(global_context,
-                CNCH_SYSTEM_LOG_DB_NAME,
-                CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME,
-                QUERY_METRICS_CONFIG_PREFIX,
-                config,
-                query_metrics);
+    if (config.has(CNCH_MATERIALIZED_MYSQL_LOG_CONFIG_PREFIX))
+        materialized_mysql_ret = initInServerForSingleLog<CloudMaterializedMySQLLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME,
+            CNCH_MATERIALIZED_MYSQL_LOG_CONFIG_PREFIX,
+            config,
+            cloud_materialized_mysql_log);
 
-        if (config.has(QUERY_METRICS_CONFIG_PREFIX))
-            query_worker_metrics_ret = initInServerForSingleLog<QueryWorkerMetricLog>(global_context,
-                CNCH_SYSTEM_LOG_DB_NAME,
-                CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME,
-                QUERY_WORKER_METRICS_CONFIG_PREFIX,
-                config,
-                query_worker_metrics);
-    }
+    if (config.has(CNCH_UNIQUE_TABLE_LOG_CONFIG_PREFIX))
+        unique_table_ret = initInServerForSingleLog<CloudUniqueTableLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_UNIQUE_TABLE_LOG_TABLE_NAME,
+            CNCH_UNIQUE_TABLE_LOG_CONFIG_PREFIX,
+            config,
+            cloud_unique_table_log);
 
-    return (kafka_ret && query_metrics_ret && query_worker_metrics_ret);
+    if (config.has(CNCH_QUERY_LOG_CONFIG_PREFIX))
+        cnch_query_log_ret = initInServerForSingleLog<CnchQueryLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_QUERY_LOG_TABLE_NAME,
+            CNCH_QUERY_LOG_CONFIG_PREFIX,
+            config,
+            cnch_query_log);
+
+    if (config.has(CNCH_VIEW_REFRESH_TASK_PREFIX))
+        cnch_view_refresh_task_log_ret = initInServerForSingleLog<ViewRefreshTaskLog>(
+            global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_VIEW_REFRESH_TASK_LOG_TABLE_NAME,
+            CNCH_VIEW_REFRESH_TASK_PREFIX,
+            config,
+            cnch_view_refresh_task_log);
+
+    if (config.has(CNCH_AUTO_STATS_TASK_LOG_CONFIG_PREFIX))
+        cnch_auto_stats_task_log_ret = initInServerForSingleLog<CnchAutoStatsTaskLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_AUTO_STATS_TASK_LOG_TABLE_NAME,
+            CNCH_AUTO_STATS_TASK_LOG_CONFIG_PREFIX,
+            config,
+            cnch_auto_stats_task_log);
+
+    return (kafka_ret && materialized_mysql_ret && unique_table_ret && query_metrics_ret && query_worker_metrics_ret
+    && cnch_query_log_ret && cnch_view_refresh_task_log_ret && cnch_auto_stats_task_log_ret);
 }
 
-bool CnchSystemLogs::initInWorker(ContextPtr global_context)
+template<typename CloudLog>
+bool CnchSystemLogs::initInWorkerForSingleLog(ContextPtr & global_context,
+    const String & db,
+    const String & tb,
+    const String & config_prefix,
+    const Poco::Util::AbstractConfiguration & config,
+    std::shared_ptr<CloudLog> & cloud_log)
 {
     bool ret = false;
     try
     {
-        auto & config = global_context->getConfigRef();
-        if (!config.has(CNCH_KAFKA_LOG_CONFIG_PREFIX))
+        if (!config.has(config_prefix))
             return true;
 
-        std::shared_ptr<CloudKafkaLog> temp_log = createCnchLog<CloudKafkaLog>(global_context,
-            CNCH_SYSTEM_LOG_DB_NAME, CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME, config, CNCH_KAFKA_LOG_CONFIG_PREFIX);
+        std::shared_ptr<CloudLog> temp_log = createCnchLog<CloudLog>(global_context,
+            db, tb, config, config_prefix);
 
         {
             std::lock_guard<std::mutex> g(mutex);
-            cloud_kafka_log = std::move(temp_log);
-            logs.emplace_back(cloud_kafka_log.get());
-            cloud_kafka_log->startup();
+            cloud_log = std::move(temp_log);
+            logs.emplace_back(cloud_log.get());
+            cloud_log->startup();
         }
 
-        LOG_INFO(log, "Initializing CNCH System log on server for {}.{} successfully", CNCH_SYSTEM_LOG_DB_NAME, CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME);
+        LOG_INFO(log, "Initializing CNCH System log on worker for {}.{} successfully", db, tb);
         ret = true;
     }
     catch (...)
     {
-        cloud_kafka_log.reset();
+        {
+            std::lock_guard<std::mutex> g(mutex);
+            cloud_log.reset();
+        }
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
 
     return ret;
+}
+
+bool CnchSystemLogs::initInWorker(ContextPtr global_context)
+{
+    const auto & config = global_context->getConfigRef();
+
+    LOG_INFO(log, "Initializing CNCH System log on worker");
+
+    bool kafka_ret = true;
+    bool materialized_mysql_ret = true;
+    bool unique_table_ret = true;
+
+    if (config.has(CNCH_KAFKA_LOG_CONFIG_PREFIX))
+        kafka_ret = initInWorkerForSingleLog<CloudKafkaLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME,
+            CNCH_KAFKA_LOG_CONFIG_PREFIX,
+            config,
+            cloud_kafka_log);
+
+    if (config.has(CNCH_MATERIALIZED_MYSQL_LOG_CONFIG_PREFIX))
+        materialized_mysql_ret = initInWorkerForSingleLog<CloudMaterializedMySQLLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME,
+            CNCH_MATERIALIZED_MYSQL_LOG_CONFIG_PREFIX,
+            config,
+            cloud_materialized_mysql_log);
+
+    if (config.has(CNCH_UNIQUE_TABLE_LOG_CONFIG_PREFIX))
+        unique_table_ret = initInWorkerForSingleLog<CloudUniqueTableLog>(global_context,
+            CNCH_SYSTEM_LOG_DB_NAME,
+            CNCH_SYSTEM_LOG_UNIQUE_TABLE_LOG_TABLE_NAME,
+            CNCH_UNIQUE_TABLE_LOG_CONFIG_PREFIX,
+            config,
+            cloud_unique_table_log);
+
+    return (kafka_ret && materialized_mysql_ret && unique_table_ret);
 }
 
 CnchSystemLogs::~CnchSystemLogs()

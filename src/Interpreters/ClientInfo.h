@@ -98,10 +98,13 @@ public:
     // OpenTelemetry trace context we received from client, or which we are going
     // to send to server.
     OpenTelemetryTraceContext client_trace_context;
+    TraceMeta trace_meta;
 
     /// All below are parameters related to initial query.
 
     Interface interface = Interface::TCP;
+    bool is_secure = false;
+    String certificate;
 
     /// For tcp
     String os_user;
@@ -122,7 +125,8 @@ public:
 
     /// For brpc inter server communication protocol
     UInt16 rpc_port = 0;
-    UInt32 brpc_protocol_version = 0;
+    UInt32 brpc_protocol_major_version = 0;
+    UInt32 brpc_protocol_minor_version = 0;
 
     /// Client type
     ClientType client_type = ClientType::UNKNOWN;

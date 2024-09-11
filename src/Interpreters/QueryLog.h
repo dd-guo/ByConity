@@ -39,6 +39,8 @@ struct QueryLogElement
     UInt64 read_rows{};
     UInt64 read_bytes{};
 
+    UInt64 disk_cache_read_bytes{};
+
     /// The data written to DB
     UInt64 written_rows{};
     UInt64 written_bytes{};
@@ -58,6 +60,7 @@ struct QueryLogElement
     std::set<String> query_tables;
     std::set<String> query_columns;
     std::set<String> query_projections;
+    std::set<String> query_materialized_views;
 
     std::unordered_set<String> used_aggregate_functions;
     std::unordered_set<String> used_aggregate_function_combinators;
@@ -68,6 +71,7 @@ struct QueryLogElement
     std::unordered_set<String> used_functions;
     std::unordered_set<String> used_storages;
     std::unordered_set<String> used_table_functions;
+    std::unordered_set<String> partition_ids;
 
     Int32 exception_code{}; // because ErrorCodes are int
     String exception;
@@ -78,8 +82,29 @@ struct QueryLogElement
     String log_comment;
 
     std::vector<UInt64> thread_ids;
-    std::shared_ptr<ProfileEvents::Counters> profile_counters;
+    std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters;
+    String max_io_time_thread_name;
+    uint64_t max_io_time_thread_ms{};
+    std::shared_ptr<ProfileEvents::Counters::Snapshot> max_thread_io_profile_counters;
     std::shared_ptr<Settings> query_settings;
+    /// [name, graphviz format string] for the AST, query plan, pipeline graphs
+    /// available when print_graphviz=1
+    std::shared_ptr<std::vector<std::pair<String, String>>> graphviz;
+
+    /// profile info in json format
+    std::shared_ptr<std::vector<String>> segment_profiles;
+
+    String trace_id;
+    Int64 segment_id{};
+    Int64 segment_parallel{};
+    Int64 segment_parallel_index{};
+
+    // if fallback by optimizer, write the ExceptionMessage to query_log
+    String fallback_reason;
+
+    String virtual_warehouse;
+    String worker_group;
+    String query_plan;
 
     static std::string name() { return "QueryLog"; }
 
@@ -95,6 +120,11 @@ struct QueryLogElement
 class QueryLog : public SystemLog<QueryLogElement>
 {
     using SystemLog<QueryLogElement>::SystemLog;
+};
+
+class CnchQueryLog : public CnchSystemLog<QueryLogElement>
+{
+    using CnchSystemLog<QueryLogElement>::CnchSystemLog;
 };
 
 }

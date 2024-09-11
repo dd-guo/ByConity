@@ -17,13 +17,17 @@
 
 #include <Functions/FunctionsHashing.h>
 #include <IO/Operators.h>
-#include <Parsers/ASTExpressionList.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ActionsVisitor.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Parsers/ASTExpressionList.h>
+#include <Processors/Exchange/ExchangeSource.h>
 #include <Processors/IProcessor.h>
 #include <Processors/QueryPipeline.h>
 #include <Processors/Transforms/ExpressionTransform.h>
+#include <Protos/plan_node_utils.pb.h>
+#include <QueryPlan/Hints/PlanHintFactory.h>
+#include "QueryPlan/PlanSerDerHelper.h"
 
 namespace DB
 {
@@ -31,6 +35,33 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+}
+
+void DataStream::toProto(Protos::DataStream & proto) const
+{
+    serializeHeaderToProto(header, *proto.mutable_header());
+    for (const auto & element : distinct_columns)
+        proto.add_distinct_columns(element);
+    std::sort(proto.mutable_distinct_columns()->begin(), proto.mutable_distinct_columns()->end());
+    proto.set_has_single_port(has_single_port);
+    for (const auto & element : sort_description)
+        element.toProto(*proto.add_sort_description());
+    proto.set_sort_mode(DataStream::SortModeConverter::toProto(sort_mode));
+}
+
+void DataStream::fillFromProto(const Protos::DataStream & proto)
+{
+    header = deserializeHeaderFromProto(proto.header());
+    for (const auto & element : proto.distinct_columns())
+        distinct_columns.emplace(element);
+    has_single_port = proto.has_single_port();
+    for (const auto & proto_element : proto.sort_description())
+    {
+        SortColumnDescription element;
+        element.fillFromProto(proto_element);
+        sort_description.emplace_back(std::move(element));
+    }
+    sort_mode = DataStream::SortModeConverter::fromProto(proto.sort_mode());
 }
 
 const DataStream & IQueryPlanStep::getOutputStream() const
@@ -77,7 +108,12 @@ static void doDescribeHeader(const Block & header, size_t count, IQueryPlanStep:
 
 static void doDescribeProcessor(const IProcessor & processor, size_t count, IQueryPlanStep::FormatSettings & settings)
 {
-    settings.out << String(settings.offset, settings.indent_char) << processor.getName();
+    auto exchange_source = dynamic_cast<const ExchangeSource *>(&processor);
+    if (exchange_source)
+        settings.out << String(settings.offset, settings.indent_char) << exchange_source->getClassName();
+    else
+        settings.out << String(settings.offset, settings.indent_char) << processor.getName();
+
     if (count > 1)
         settings.out << " × " << std::to_string(count);
 
@@ -133,11 +169,15 @@ void IQueryPlanStep::describePipeline(const Processors & processors, FormatSetti
         doDescribeProcessor(*prev, count, settings);
 }
 
-void IQueryPlanStep::serializeImpl(WriteBuffer & buf) const
-{
-    writeBinary(step_description, buf);
 
-    serializeDataStreamFromDataStreams(input_streams, buf);
+ActionsDAGPtr IQueryPlanStep::createFilterExpressionActions(ContextPtr context, const ASTPtr & filter, const Block & header)
+{
+    Names output;
+    for (const auto & item : header)
+        output.emplace_back(item.name);
+    output.push_back(filter->getColumnName());
+
+    return createExpressionActions(context, header.getNamesAndTypesList(), output, filter);
 }
 
 ActionsDAGPtr IQueryPlanStep::createExpressionActions(
@@ -195,7 +235,7 @@ ActionsDAGPtr IQueryPlanStep::createExpressionActions(
 
 void IQueryPlanStep::projection(QueryPipeline & pipeline, const Block & target, const BuildQueryPipelineSettings & settings)
 {
-    if (!isCompatibleHeader(pipeline.getHeader(), target))
+    if (!blocksHaveEqualStructure(pipeline.getHeader(), target))
     {
         auto convert_actions_dag = ActionsDAG::makeConvertingActions(
             pipeline.getHeader().getColumnsWithTypeAndName(), target.getColumnsWithTypeAndName(), ActionsDAG::MatchColumnsMode::Name);
@@ -214,6 +254,21 @@ void IQueryPlanStep::aliases(QueryPipeline & pipeline, const Block & target, con
     pipeline.addSimpleTransform([&](const Block & header) { return std::make_shared<ExpressionTransform>(header, convert_actions); });
 }
 
+void IQueryPlanStep::addHints(SqlHints & sql_hints, ContextMutablePtr & context, bool check_type)
+{
+    PlanHintPtr plan_hint;
+    for (auto & hint : sql_hints)
+    {
+        plan_hint = PlanHintFactory::instance().tryGet(hint.getName(), context, hint);
+        if (plan_hint)
+        {
+            if (check_type && !plan_hint->checkStepType(*this))
+                continue;
+            hints.emplace_back(plan_hint);
+        }
+    }
+}
+
 String IQueryPlanStep::toString(Type type)
 {
 #define DISPATCH_DEF(TYPE) \
@@ -227,10 +282,9 @@ String IQueryPlanStep::toString(Type type)
     return "Unknown";
 }
 
-size_t IQueryPlanStep::hash() const
+size_t IQueryPlanStep::hash(bool ignore_output_stream) const
 {
-    auto str = serializeToString();
-    return MurmurHash3Impl64::apply(str.c_str(), str.size());
+    return hashPlanStep(*this, ignore_output_stream);
 }
 
 }

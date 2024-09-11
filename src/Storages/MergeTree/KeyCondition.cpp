@@ -35,6 +35,10 @@
 #include <Common/FieldVisitorsAccurateComparison.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/typeid_cast.h>
+#include <DataTypes/IDataType.h>
+#include <Storages/SelectQueryInfo.h>
+#include <Core/Block.h>
+#include <Parsers/ASTFunction.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/Set.h>
 #include <Parsers/queryToString.h>
@@ -48,7 +52,6 @@
 #include <cassert>
 #include <stack>
 #include <limits>
-
 
 namespace DB
 {
@@ -71,10 +74,15 @@ String Range::toString() const
 }
 
 
-/// Example: for `Hello\_World% ...` string it returns `Hello_World`, and for `%test%` returns an empty string.
-static String extractFixedPrefixFromLikePattern(const String & like_pattern)
+/// Returns the prefix of like_pattern before the first wildcard, e.g. 'Hello\_World% ...' --> 'Hello\_World'
+/// We call a pattern "perfect prefix" if:
+/// - (1) the pattern has a wildcard
+/// - (2) the first wildcard is '%' and is only followed by nothing or other '%'
+/// e.g. 'test%' or 'test%% has perfect prefix 'test', 'test%x', 'test%_' or 'test_' has no perfect prefix.
+String extractFixedPrefixFromLikePattern(std::string_view like_pattern, bool requires_perfect_prefix)
 {
     String fixed_prefix;
+    fixed_prefix.reserve(like_pattern.size());
 
     const char * pos = like_pattern.data();
     const char * end = pos + like_pattern.size();
@@ -83,10 +91,13 @@ static String extractFixedPrefixFromLikePattern(const String & like_pattern)
         switch (*pos)
         {
             case '%':
-                [[fallthrough]];
             case '_':
+                if (requires_perfect_prefix)
+                {
+                    bool is_prefect_prefix = std::all_of(pos, end, [](auto c) { return c == '%'; });
+                    return is_prefect_prefix ? fixed_prefix : "";
+                }
                 return fixed_prefix;
-
             case '\\':
                 ++pos;
                 if (pos == end)
@@ -94,10 +105,132 @@ static String extractFixedPrefixFromLikePattern(const String & like_pattern)
                 [[fallthrough]];
             default:
                 fixed_prefix += *pos;
-                break;
         }
 
         ++pos;
+    }
+    /// If we can reach this code, it means there was no wildcard found in the pattern, so it is not a perfect prefix
+    if (requires_perfect_prefix)
+        return "";
+    return fixed_prefix;
+}
+
+String extractFixedPrefixFromLikePattern(std::string_view like_pattern, bool requires_perfect_prefix, char escape_char)
+{
+    String fixed_prefix;
+    fixed_prefix.reserve(like_pattern.size());
+
+    const char * pos = like_pattern.data();
+    const char * end = pos + like_pattern.size();
+    while (pos < end)
+    {
+        if (*pos == escape_char) {
+            ++pos;
+            if (pos != end)
+                fixed_prefix += *pos;
+        } else {
+            switch (*pos)
+            {
+                case '%':
+                case '_':
+                    if (requires_perfect_prefix)
+                    {
+                        bool is_prefect_prefix = std::all_of(pos, end, [](auto c) { return c == '%'; });
+                        return is_prefect_prefix ? fixed_prefix : "";
+                    }
+                    return fixed_prefix;
+                default:
+                    fixed_prefix += *pos;
+            }
+
+            ++pos;
+        }
+    }
+
+    /// If we can reach this code, it means there was no wildcard found in the pattern, so it is not a perfect prefix
+    if (requires_perfect_prefix)
+        return "";
+    return fixed_prefix;
+}
+
+
+/// for "^prefix..." string it returns "prefix"
+static String extractFixedPrefixFromRegularExpression(const String & regexp)
+{
+    if (regexp.size() <= 1 || regexp[0] != '^')
+        return {};
+
+    String fixed_prefix;
+    const char * begin = regexp.data() + 1;
+    const char * pos = begin;
+    const char * end = regexp.data() + regexp.size();
+
+    while (pos != end)
+    {
+        switch (*pos)
+        {
+            case '\0':
+                pos = end;
+                break;
+
+            case '\\':
+            {
+                ++pos;
+                if (pos == end)
+                    break;
+
+                switch (*pos)
+                {
+                    case '|':
+                    case '(':
+                    case ')':
+                    case '^':
+                    case '$':
+                    case '.':
+                    case '[':
+                    case '?':
+                    case '*':
+                    case '+':
+                    case '{':
+                        fixed_prefix += *pos;
+                        break;
+                    default:
+                        /// all other escape sequences are not supported
+                        pos = end;
+                        break;
+                }
+
+                ++pos;
+                break;
+            }
+
+            /// non-trivial cases
+            case '|':
+                fixed_prefix.clear();
+                [[fallthrough]];
+            case '(':
+            case '[':
+            case '^':
+            case '$':
+            case '.':
+            case '+':
+                pos = end;
+                break;
+
+            /// Quantifiers that allow a zero number of occurrences.
+            case '{':
+            case '?':
+            case '*':
+                if (!fixed_prefix.empty())
+                    fixed_prefix.pop_back();
+
+                pos = end;
+                break;
+            default:
+                fixed_prefix += *pos;
+                pos++;
+                break;
+        }
     }
 
     return fixed_prefix;
@@ -129,6 +262,63 @@ static String firstStringThatIsGreaterThanAllStringsWithPrefix(const String & pr
     return res;
 }
 
+KeyCondition::FunctionWithEscape KeyCondition::like_with_escape = [] (RPNElement & out, const Field & value, const Field & escape_value)->bool
+{
+    if (value.getType() != Field::Types::String)
+        return false;
+
+    std::string escape_seq = escape_value.get<const String &>();
+    if (escape_seq.size() != 1)
+        return false;
+    const char escape_char = escape_seq.front();
+
+    String prefix;
+    if (escape_char == '\\')
+        prefix = extractFixedPrefixFromLikePattern(value.get<const String &>(), false);
+    else
+        prefix = extractFixedPrefixFromLikePattern(value.get<const String &>(), false, escape_char);
+
+    if (prefix.empty())
+        return false;
+
+    String right_bound = firstStringThatIsGreaterThanAllStringsWithPrefix(prefix);
+
+    out.function = RPNElement::FUNCTION_IN_RANGE;
+    out.range = !right_bound.empty()
+        ? Range(prefix, true, right_bound, false)
+        : Range::createLeftBounded(prefix, true);
+
+    return true;
+};
+
+KeyCondition::FunctionWithEscape KeyCondition::not_like_with_escape = [] (RPNElement & out, const Field & value, const Field & escape_value)->bool
+{
+    if (value.getType() != Field::Types::String)
+        return false;
+
+    std::string escape_seq = escape_value.get<const String &>();
+    if (escape_seq.size() != 1)
+        return false;
+    const char escape_char = escape_seq.front();
+
+    String prefix;
+    if (escape_char == '\\')
+        prefix = extractFixedPrefixFromLikePattern(value.get<const String &>(), true);
+    else
+        prefix = extractFixedPrefixFromLikePattern(value.get<const String &>(), true, escape_char);
+
+    if (prefix.empty())
+        return false;
+
+    String right_bound = firstStringThatIsGreaterThanAllStringsWithPrefix(prefix);
+
+    out.function = RPNElement::FUNCTION_IN_RANGE;
+    out.range = !right_bound.empty()
+        ? Range(prefix, true, right_bound, false)
+        : Range::createLeftBounded(prefix, true);
+
+    return true;
+};
 
 /// A dictionary containing actions to the corresponding functions to turn them into `RPNElement`
 const KeyCondition::AtomMap KeyCondition::atom_map
@@ -282,7 +472,7 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             if (value.getType() != Field::Types::String)
                 return false;
 
-            String prefix = extractFixedPrefixFromLikePattern(value.get<const String &>());
+            String prefix = extractFixedPrefixFromLikePattern(value.get<const String &>(), /*requires_perfect_prefix*/ false);
             if (prefix.empty())
                 return false;
 
@@ -303,7 +493,7 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             if (value.getType() != Field::Types::String)
                 return false;
 
-            String prefix = extractFixedPrefixFromLikePattern(value.get<const String &>());
+            String prefix = extractFixedPrefixFromLikePattern(value.get<const String &>(), /*requires_perfect_prefix*/ true);
             if (prefix.empty())
                 return false;
 
@@ -311,8 +501,8 @@ const KeyCondition::AtomMap KeyCondition::atom_map
 
             out.function = RPNElement::FUNCTION_NOT_IN_RANGE;
             out.range = !right_bound.empty()
-                        ? Range(prefix, true, right_bound, false)
-                        : Range::createLeftBounded(prefix, true);
+                ? Range(prefix, true, right_bound, false)
+                : Range::createLeftBounded(prefix, true);
 
             return true;
         }
@@ -339,12 +529,38 @@ const KeyCondition::AtomMap KeyCondition::atom_map
         }
     },
     {
+        "match",
+        [] (RPNElement & out, const Field & value)
+        {
+            if (value.getType() != Field::Types::String)
+                return false;
+
+            const String & expression = value.get<const String &>();
+            // This optimization can't process alternation - this would require a comprehensive parsing of regular expression.
+            if (expression.find('|') != std::string::npos)
+                return false;
+
+            String prefix = extractFixedPrefixFromRegularExpression(expression);
+            if (prefix.empty())
+                return false;
+
+            String right_bound = firstStringThatIsGreaterThanAllStringsWithPrefix(prefix);
+
+            out.function = RPNElement::FUNCTION_IN_RANGE;
+            out.range = !right_bound.empty()
+                ? Range(prefix, true, right_bound, false)
+                : Range::createLeftBounded(prefix, true);
+
+            return true;
+        }
+    },
+    {
         "isNotNull",
         [] (RPNElement & out, const Field &)
         {
             out.function = RPNElement::FUNCTION_IS_NOT_NULL;
-            // isNotNull means (-Inf, +Inf), which is the default Range
-            out.range = Range();
+            // isNotNull means (-Inf, +Inf)
+            out.range = Range::createWholeUniverseWithoutNull();
             return true;
         }
     },
@@ -353,8 +569,10 @@ const KeyCondition::AtomMap KeyCondition::atom_map
         [] (RPNElement & out, const Field &)
         {
             out.function = RPNElement::FUNCTION_IS_NULL;
-            // When using NULL_LAST, isNull means [+Inf, +Inf]
-            out.range = Range(Field(PositiveInfinity{}));
+            // isNull means +Inf (NULLS_LAST) or -Inf (NULLS_FIRST), We don't support discrete
+            // ranges, instead will use the inverse of (-Inf, +Inf). The inversion happens in
+            // checkInHyperrectangle.
+            out.range = Range::createWholeUniverseWithoutNull();
             return true;
         }
     }
@@ -441,8 +659,8 @@ ASTPtr cloneASTWithInversionPushDown(const ASTPtr node, const bool need_inversio
 }
 
 
-inline bool Range::equals(const Field & lhs, const Field & rhs) { return applyVisitor(FieldVisitorAccurateEquals(), lhs, rhs); }
-inline bool Range::less(const Field & lhs, const Field & rhs) { return applyVisitor(FieldVisitorAccurateLess(), lhs, rhs); }
+bool Range::equals(const Field & lhs, const Field & rhs) { return applyVisitor(FieldVisitorAccurateEquals(), lhs, rhs); }
+bool Range::less(const Field & lhs, const Field & rhs) { return applyVisitor(FieldVisitorAccurateLess(), lhs, rhs); }
 
 
 /** Calculate expressions, that depend only on constants.
@@ -456,9 +674,13 @@ Block KeyCondition::getBlockWithConstants(
         { DataTypeUInt8().createColumnConstWithDefaultValue(1), std::make_shared<DataTypeUInt8>(), "_dummy" }
     };
 
-    const auto expr_for_constant_folding = ExpressionAnalyzer(query, syntax_analyzer_result, context).getConstActions();
 
-    expr_for_constant_folding->execute(result);
+    auto actions = ExpressionAnalyzer(query, syntax_analyzer_result, context).getConstActionsDAG();
+    for (const auto & action_node : actions->getOutputs())
+    {
+        if (action_node->column)
+            result.insert(ColumnWithTypeAndName{action_node->column, action_node->result_type, action_node->result_name});
+    }
 
     return result;
 }
@@ -495,19 +717,20 @@ KeyCondition::KeyCondition(
     /** Evaluation of expressions that depend only on constants.
       * For the index to be used, if it is written, for example `WHERE Date = toDate(now())`.
       */
-    Block block_with_constants = getBlockWithConstants(query_info.query, query_info.syntax_analyzer_result, context);
+    // Block block_with_constants = getBlockWithConstants(query_info.query, query_info.syntax_analyzer_result, context);
 
     for (const auto & [name, _] : query_info.syntax_analyzer_result->array_join_result_to_source)
         array_joined_columns.insert(name);
-
-    const ASTSelectQuery & select = query_info.query->as<ASTSelectQuery &>();
-    if (select.where() || select.prewhere())
+    if (auto filter = getFilterFromQueryInfo(query_info); filter != nullptr)
     {
-        ASTPtr filter_query;
-        if (select.where() && select.prewhere())
-            filter_query = makeASTFunction("and", select.where(), select.prewhere());
-        else
-            filter_query = select.where() ? select.where() : select.prewhere();
+        /** Evaluation of expressions that depend only on constants.
+          * For the index to be used, if it is written, for example `WHERE Date = toDate(now())`.
+          */
+        /// TODO @wanghaoyu.0428: fix this, can do without cloning query?
+        auto query_clone = query_info.query->clone();
+        auto & select_clone = query_clone->as<ASTSelectQuery &>();
+        select_clone.setExpression(ASTSelectQuery::Expression::WHERE, filter->clone());
+        Block block_with_constants = getBlockWithConstants(query_clone, query_info.syntax_analyzer_result, context);
 
         /** When non-strictly monotonic functions are employed in functional index (e.g. ORDER BY toStartOfHour(dateTime)),
           * the use of NOT operator in predicate will result in the indexing algorithm leave out some data.
@@ -516,7 +739,7 @@ KeyCondition::KeyCondition(
           * To overcome the problem, before parsing the AST we transform it to its semantically equivalent form where all NOT's
           * are pushed down and applied (when possible) to leaf nodes.
           */
-        traverseAST(cloneASTWithInversionPushDown(filter_query), context, block_with_constants);
+        traverseAST(cloneASTWithInversionPushDown(filter), context, block_with_constants);
     }
     else
     {
@@ -526,7 +749,7 @@ KeyCondition::KeyCondition(
 
 bool KeyCondition::addCondition(const String & column, const Range & range)
 {
-    if (!key_columns.count(column))
+    if (!key_columns.contains(column))
         return false;
     rpn.emplace_back(RPNElement::FUNCTION_IN_RANGE, key_columns[column], range);
     rpn.emplace_back(RPNElement::FUNCTION_AND);
@@ -646,9 +869,9 @@ static FieldRef applyFunction(const FunctionBasePtr & func, const DataTypePtr & 
             result_idx = i;
     }
 
-    ColumnsWithTypeAndName args{(*columns)[field.column_idx]};
     if (result_idx == columns->size())
     {
+        ColumnsWithTypeAndName args{(*columns)[field.column_idx]};
         field.columns->emplace_back(ColumnWithTypeAndName {nullptr, func->getResultType(), result_name});
         (*columns)[result_idx].column = func->execute(args, (*columns)[result_idx].type, columns->front().column->size());
     }
@@ -1010,6 +1233,10 @@ bool KeyCondition::tryPrepareSetIndex(
     if (!prepared_set->hasExplicitSetElements())
         return false;
 
+    if (prepared_set->getSetElements().size() == 1 &&
+        "BitMap64" == String(prepared_set->getSetElements()[0]->getFamilyName()))
+        return false;
+
     prepared_set->checkColumnsNumber(left_args_count);
     for (size_t i = 0; i < indexes_mapping.size(); ++i)
         prepared_set->checkTypesEqual(indexes_mapping[i].tuple_index, data_types[i]);
@@ -1075,6 +1302,8 @@ public:
     bool isDeterministicInScopeOfQuery() const override { return func->isDeterministicInScopeOfQuery(); }
 
     bool hasInformationAboutMonotonicity() const override { return func->hasInformationAboutMonotonicity(); }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & arguments) const override { return func->isSuitableForShortCircuitArgumentsExecution(arguments); }
 
     IFunctionBase::Monotonicity getMonotonicityForRange(const IDataType & type, const Field & left, const Field & right) const override
     {
@@ -1209,19 +1438,21 @@ bool KeyCondition::isKeyPossiblyWrappedByMonotonicFunctionsImpl(
     return false;
 }
 
-
 static void castValueToType(const DataTypePtr & desired_type, Field & src_value, const DataTypePtr & src_type, const ASTPtr & node)
 {
     try
     {
         src_value = convertFieldToType(src_value, *desired_type, src_type.get());
     }
-    catch (...)
+    catch (Exception & e)
     {
         throw Exception("Key expression contains comparison between inconvertible types: " +
             desired_type->getName() + " and " + src_type->getName() +
-            " inside " + queryToString(node),
+            " inside " + queryToString(node) + ". Error message : " + e.what(),
             ErrorCodes::BAD_TYPE_OF_FIELD);
+    }
+    catch (...) {
+        throw;
     }
 }
 
@@ -1234,6 +1465,9 @@ bool KeyCondition::tryParseAtomFromAST(const ASTPtr & node, ContextPtr context, 
       */
     Field const_value;
     DataTypePtr const_type;
+    Field const_escape_value = "\\";
+    DataTypePtr const_escape_type;
+
     if (const auto * func = node->as<ASTFunction>())
     {
         const ASTs & args = func->arguments->children;
@@ -1254,7 +1488,7 @@ bool KeyCondition::tryParseAtomFromAST(const ASTPtr & node, ContextPtr context, 
             if (key_column_num == static_cast<size_t>(-1))
                 throw Exception("`key_column_num` wasn't initialized. It is a bug.", ErrorCodes::LOGICAL_ERROR);
         }
-        else if (args.size() == 2)
+        else if (args.size() == 2 || (args.size() == 3 && functionIsEscapeLikeOperator(func_name)))
         {
             size_t key_arg_pos;           /// Position of argument with key column (non-const argument)
             bool is_set_const = false;
@@ -1336,6 +1570,12 @@ bool KeyCondition::tryParseAtomFromAST(const ASTPtr & node, ContextPtr context, 
             else
                 return false;
 
+            if (args.size() == 3 && functionIsEscapeLikeOperator(func_name))
+            {
+                if (!getConstant(args[2], block_with_constants, const_escape_value, const_escape_type))
+                    return false;
+            }
+
             if (key_column_num == static_cast<size_t>(-1))
                 throw Exception("`key_column_num` wasn't initialized. It is a bug.", ErrorCodes::LOGICAL_ERROR);
 
@@ -1360,34 +1600,53 @@ bool KeyCondition::tryParseAtomFromAST(const ASTPtr & node, ContextPtr context, 
                 }
             }
 
-            bool cast_not_needed = is_set_const /// Set args are already casted inside Set::createFromAST
-                || ((isNativeNumber(key_expr_type) || isDateTime(key_expr_type))
-                    && (isNativeNumber(const_type) || isDateTime(const_type))); /// Numbers and DateTime are accurately compared without cast.
+            key_expr_type = recursiveRemoveLowCardinality(key_expr_type);
+            DataTypePtr key_expr_type_not_null;
+            bool key_expr_type_is_nullable = false;
+            if (const auto * nullable_type = typeid_cast<const DataTypeNullable *>(key_expr_type.get()))
+            {
+                key_expr_type_is_nullable = true;
+                key_expr_type_not_null = nullable_type->getNestedType();
+            }
+            else
+                key_expr_type_not_null = key_expr_type;
 
-            if (!cast_not_needed && !key_expr_type->equals(*const_type))
+            bool cast_not_needed = is_set_const /// Set args are already casted inside Set::createFromAST
+                || ((isNativeInteger(key_expr_type_not_null) || isDateTime(key_expr_type_not_null))
+                    && (isNativeInteger(const_type) || isDateTime(const_type))); /// Numbers and DateTime are accurately compared without cast.
+
+            if (!cast_not_needed && !key_expr_type_not_null->equals(*const_type))
             {
                 if (const_value.getType() == Field::Types::String)
                 {
-                    const_value = convertFieldToType(const_value, *key_expr_type);
+                    const_value = convertFieldToType(const_value, *key_expr_type_not_null);
                     if (const_value.isNull())
                         return false;
                     // No need to set is_constant_transformed because we're doing exact conversion
                 }
                 else
                 {
-                    DataTypePtr common_type = getLeastSupertype({key_expr_type, const_type});
+                    DataTypePtr common_type = tryGetLeastSupertype(DataTypes{key_expr_type_not_null, const_type});
+
+                    if (!common_type)
+                        return false;
+
                     if (!const_type->equals(*common_type))
                     {
                         castValueToType(common_type, const_value, const_type, node);
 
                         // Need to set is_constant_transformed unless we're doing exact conversion
-                        if (!key_expr_type->equals(*common_type))
+                        if (!key_expr_type_not_null->equals(*common_type))
                             is_constant_transformed = true;
                     }
-                    if (!key_expr_type->equals(*common_type))
+                    if (!key_expr_type_not_null->equals(*common_type))
                     {
+                        auto common_type_maybe_nullable = (key_expr_type_is_nullable && !common_type->isNullable())
+                            ? DataTypePtr(std::make_shared<DataTypeNullable>(common_type))
+                            : common_type;
                         ColumnsWithTypeAndName arguments{
-                            {nullptr, key_expr_type, ""}, {DataTypeString().createColumnConst(1, common_type->getName()), common_type, ""}};
+                            {nullptr, key_expr_type, ""},
+                            {DataTypeString().createColumnConst(1, common_type_maybe_nullable->getName()), common_type_maybe_nullable, ""}};
                         FunctionOverloadResolverPtr func_builder_cast = CastOverloadResolver<CastType::nonAccurate>::createImpl(false);
                         auto func_cast = func_builder_cast->build(arguments);
 
@@ -1416,6 +1675,14 @@ bool KeyCondition::tryParseAtomFromAST(const ASTPtr & node, ContextPtr context, 
 
         out.key_column = key_column_num;
         out.monotonic_functions_chain = std::move(chain);
+
+        if (args.size() == 3 && functionIsEscapeLikeOperator(func_name))
+        {
+            if (func_name == "escapeLike")
+                return like_with_escape(out, const_value, const_escape_value);
+            else if (func_name == "escapeNotLike")
+                return not_like_with_escape(out, const_value, const_escape_value);
+        }
 
         return atom_it->second(out, const_value);
     }
@@ -1761,6 +2028,7 @@ static BoolMask forAnyHyperrectangle(
     bool left_bounded,
     bool right_bounded,
     std::vector<Range> & hyperrectangle,
+    const DataTypes & data_types,
     size_t prefix_size,
     BoolMask initial_mask,
     F && callback)
@@ -1804,12 +2072,17 @@ static BoolMask forAnyHyperrectangle(
     if (left_bounded && right_bounded)
         hyperrectangle[prefix_size] = Range(left_keys[prefix_size], false, right_keys[prefix_size], false);
     else if (left_bounded)
-        hyperrectangle[prefix_size] = Range::createLeftBounded(left_keys[prefix_size], false);
+        hyperrectangle[prefix_size] = Range::createLeftBounded(left_keys[prefix_size], false, data_types[prefix_size]->isNullable());
     else if (right_bounded)
-        hyperrectangle[prefix_size] = Range::createRightBounded(right_keys[prefix_size], false);
+        hyperrectangle[prefix_size] = Range::createRightBounded(right_keys[prefix_size], false, data_types[prefix_size]->isNullable());
 
     for (size_t i = prefix_size + 1; i < key_size; ++i)
-        hyperrectangle[i] = Range();
+    {
+        if (data_types[i]->isNullable())
+            hyperrectangle[i] = Range::createWholeUniverse();
+        else
+            hyperrectangle[i] = Range::createWholeUniverseWithoutNull();
+    }
 
 
     BoolMask result = initial_mask;
@@ -1827,7 +2100,9 @@ static BoolMask forAnyHyperrectangle(
     if (left_bounded)
     {
         hyperrectangle[prefix_size] = Range(left_keys[prefix_size]);
-        result = result | forAnyHyperrectangle(key_size, left_keys, right_keys, true, false, hyperrectangle, prefix_size + 1, initial_mask, callback);
+        result = result
+            | forAnyHyperrectangle(
+                     key_size, left_keys, right_keys, true, false, hyperrectangle, data_types, prefix_size + 1, initial_mask, callback);
         if (result.isComplete())
             return result;
     }
@@ -1837,7 +2112,9 @@ static BoolMask forAnyHyperrectangle(
     if (right_bounded)
     {
         hyperrectangle[prefix_size] = Range(right_keys[prefix_size]);
-        result = result | forAnyHyperrectangle(key_size, left_keys, right_keys, false, true, hyperrectangle, prefix_size + 1, initial_mask, callback);
+        result = result
+            | forAnyHyperrectangle(
+                     key_size, left_keys, right_keys, false, true, hyperrectangle, data_types, prefix_size + 1, initial_mask, callback);
         if (result.isComplete())
             return result;
     }
@@ -1853,7 +2130,16 @@ BoolMask KeyCondition::checkInRange(
     const DataTypes & data_types,
     BoolMask initial_mask) const
 {
-    std::vector<Range> key_ranges(used_key_size, Range());
+    std::vector<Range> key_ranges;
+
+    key_ranges.reserve(used_key_size);
+    for (size_t i = 0; i < used_key_size; ++i)
+    {
+        if (data_types[i]->isNullable())
+            key_ranges.push_back(Range::createWholeUniverse());
+        else
+            key_ranges.push_back(Range::createWholeUniverseWithoutNull());
+    }
 
     // std::cerr << "Checking for: [";
     // for (size_t i = 0; i != used_key_size; ++i)
@@ -1864,7 +2150,7 @@ BoolMask KeyCondition::checkInRange(
     //     std::cerr << (i != 0 ? ", " : "") << applyVisitor(FieldVisitorToString(), right_keys[i]);
     // std::cerr << "]\n";
 
-    return forAnyHyperrectangle(used_key_size, left_keys, right_keys, true, true, key_ranges, 0, initial_mask,
+    return forAnyHyperrectangle(used_key_size, left_keys, right_keys, true, true, key_ranges, data_types, 0, initial_mask,
         [&] (const std::vector<Range> & key_ranges_hyperrectangle)
     {
         auto res = checkInHyperrectangle(key_ranges_hyperrectangle, data_types);
@@ -2039,7 +2325,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             const Range * key_range = &hyperrectangle[element.key_column];
 
             /// The case when the column is wrapped in a chain of possibly monotonic functions.
-            Range transformed_range;
+            Range transformed_range = Range::createWholeUniverse();
             if (!element.monotonic_functions_chain.empty())
             {
                 std::optional<Range> new_range = applyMonotonicFunctionsChainToRange(
@@ -2075,6 +2361,8 @@ BoolMask KeyCondition::checkInHyperrectangle(
             bool intersects = element.range.intersectsRange(*key_range);
             bool contains = element.range.containsRange(*key_range);
             rpn_stack.emplace_back(intersects, !contains);
+            if (element.function == RPNElement::FUNCTION_IS_NULL)
+                rpn_stack.back() = !rpn_stack.back();
         }
         else if (
             element.function == RPNElement::FUNCTION_IN_SET

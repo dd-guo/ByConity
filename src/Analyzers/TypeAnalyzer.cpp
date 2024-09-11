@@ -20,12 +20,12 @@
 namespace DB
 {
 
-DataTypePtr TypeAnalyzer::getType(const ConstASTPtr & expr, ContextMutablePtr context, const NamesAndTypes & input_types)
+DataTypePtr TypeAnalyzer::getType(const ConstASTPtr & expr, ContextPtr context, const NamesAndTypes & input_types)
 {
     return TypeAnalyzer::create(context, input_types).getType(expr);
 }
 
-TypeAnalyzer TypeAnalyzer::create(ContextMutablePtr context, const NameToType & input_types)
+TypeAnalyzer TypeAnalyzer::create(ContextPtr context, const NameToType & input_types)
 {
     NamesAndTypes names_and_types;
 
@@ -35,7 +35,7 @@ TypeAnalyzer TypeAnalyzer::create(ContextMutablePtr context, const NameToType & 
     return create(context, names_and_types);
 }
 
-TypeAnalyzer TypeAnalyzer::create(ContextMutablePtr context, const NamesAndTypes & input_types)
+TypeAnalyzer TypeAnalyzer::create(ContextPtr context, const NamesAndTypes & input_types)
 {
     FieldDescriptions fields;
     for(const auto & input : input_types) {
@@ -51,14 +51,28 @@ TypeAnalyzer TypeAnalyzer::create(ContextMutablePtr context, const NamesAndTypes
 DataTypePtr TypeAnalyzer::getType(const ConstASTPtr & expr) const
 {
     Analysis analysis;
-    return ExprAnalyzer::analyze(REMOVE_CONST(expr), &scope, context, analysis);
+    ExprAnalyzerOptions options;
+    options.expandUntuple(false);
+    return ExprAnalyzer::analyze(REMOVE_CONST(expr), &scope, context, analysis, options);
+}
+
+DataTypePtr TypeAnalyzer::getTypeWithoutCheck(const ConstASTPtr & expr) const
+{
+    Analysis analysis;
+    ExprAnalyzerOptions options;
+    options.expandUntuple(false);
+    options.aggregateSupport(ExprAnalyzerOptions::AggregateSupport::ALLOWED);
+    options.windowSupport(ExprAnalyzerOptions::WindowSupport::ALLOWED);
+    return ExprAnalyzer::analyze(REMOVE_CONST(expr), &scope, context, analysis, options);
 }
 
 ExpressionTypes TypeAnalyzer::getExpressionTypes(const ConstASTPtr & expr) const
 {
     Analysis analysis;
-    ExprAnalyzer::analyze(REMOVE_CONST(expr), &scope, context, analysis);
-    return std::move(analysis.expression_types);
+    ExprAnalyzerOptions options;
+    options.expandUntuple(false);
+    ExprAnalyzer::analyze(REMOVE_CONST(expr), &scope, context, analysis, options);
+    return analysis.getExpressionTypes();
 }
 
 }

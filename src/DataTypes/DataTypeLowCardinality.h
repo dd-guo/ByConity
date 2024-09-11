@@ -73,14 +73,20 @@ public:
     bool isNullable() const override { return false; }
     bool onlyNull() const override { return false; }
     bool lowCardinality() const override { return true; }
+    bool isLowCardinalityNullable() const override { return dictionary_type->isNullable(); }
 
     static MutableColumnUniquePtr createColumnUnique(const IDataType & keys_type);
     static MutableColumnUniquePtr createColumnUnique(const IDataType & keys_type, MutableColumnPtr && keys);
 
     /// Key can not be null because it's meaningless
     bool canBeMapKeyType() const override { return dictionary_type->canBeMapKeyType(); }
-    /// Due to LowCardinality can not be inside nullable, so if dictionary_type is not nullable, ColumnByteMap can not insert Null field for missing key when handling each row. You can see more information in method ColumnByteMap::getValueColumnByKey.
-    bool canBeMapValueType() const override;
+    /// Due to LowCardinality can not be inside nullable, so if dictionary_type is not nullable, 
+    /// ColumnMap can not insert Null field for missing key when handling each row. 
+    /// You can see more information in method ColumnMap::getValueColumnByKey.
+    bool canBeByteMapValueType() const override;
+
+    Field stringToVisitorField(const String & ins) const override;
+    String stringToVisitorString(const String & ins) const override;
 
 protected:
     SerializationPtr doGetDefaultSerialization() const override;
@@ -130,4 +136,10 @@ ColumnPtr recursiveRemoveLowCardinality(const ColumnPtr & column);
 /// Convert column of type from_type to type to_type by converting nested LowCardinality columns.
 ColumnPtr recursiveTypeConversion(const ColumnPtr & column, const DataTypePtr & from_type, const DataTypePtr & to_type);
 
+/// Convert column of type from_type to type to_type by converting nested LowCardinality columns.
+ColumnPtr recursiveLowCardinalityTypeConversion(const ColumnPtr & column, const DataTypePtr & from_type, const DataTypePtr & to_type);
+
+/// Removes LowCardinality and Nullable in a correct order and returns T
+/// if the type is LowCardinality(T) or LowCardinality(Nullable(T)); type otherwise
+DataTypePtr removeLowCardinalityAndNullable(const DataTypePtr & type);
 }

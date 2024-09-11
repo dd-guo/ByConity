@@ -13,19 +13,20 @@
  * limitations under the License.
  */
 
-#include <Storages/System/StorageSystemCnchPartsInfo.h>
-#include <Interpreters/Context.h>
-#include <Interpreters/ClusterProxy/SelectStreamFactory.h>
-#include <Interpreters/ClusterProxy/executeQuery.h>
-#include <Interpreters/InterpreterSelectQuery.h>
+#include <DataStreams/materializeBlock.h>
+#include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Interpreters/ClusterProxy/SelectStreamFactory.h>
+#include <Interpreters/ClusterProxy/executeQuery.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/InterpreterSelectQuery.h>
 #include <Parsers/ParserSelectQuery.h>
 #include <Parsers/parseQuery.h>
-#include <DataStreams/materializeBlock.h>
-#include <boost/algorithm/string/join.hpp>
-#include <QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <QueryPlan/BuildQueryPipelineSettings.h>
+#include <QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Storages/System/StorageSystemCnchPartsInfo.h>
+#include <boost/algorithm/string/join.hpp>
 
 namespace DB
 {
@@ -34,24 +35,36 @@ StorageSystemCnchPartsInfo::StorageSystemCnchPartsInfo(const StorageID & table_i
     : IStorage(table_id_)
 {
     StorageInMemoryMetadata storage_metadata;
-    storage_metadata.setColumns(ColumnsDescription(
-        {
-            {"database", std::make_shared<DataTypeString>()},
-            {"table", std::make_shared<DataTypeString>()},
-            {"partition_id", std::make_shared<DataTypeString>()},
-            {"partition", std::make_shared<DataTypeString>()},
-            {"first_partition", std::make_shared<DataTypeString>()},
-            {"total_parts_number", std::make_shared<DataTypeUInt64>()},
-            {"total_parts_size", std::make_shared<DataTypeUInt64>()},
-            {"total_rows_count", std::make_shared<DataTypeUInt64>()},
-            {"last_update_time", std::make_shared<DataTypeUInt64>()}
-        }));
+    auto ready_state = std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
+        {"Unloaded", static_cast<Int8>(StorageSystemCnchPartsInfoLocal::ReadyState::Unloaded)},
+        {"Loading", static_cast<Int8>(StorageSystemCnchPartsInfoLocal::ReadyState::Loading)},
+        {"Loaded", static_cast<Int8>(StorageSystemCnchPartsInfoLocal::ReadyState::Loaded)},
+        {"Recalculated", static_cast<Int8>(StorageSystemCnchPartsInfoLocal::ReadyState::Recalculated)},
+    });
+
+    storage_metadata.setColumns(ColumnsDescription({
+        {"uuid", std::make_shared<DataTypeString>()},
+        {"database", std::make_shared<DataTypeString>()},
+        {"table", std::make_shared<DataTypeString>()},
+        {"partition_id", std::make_shared<DataTypeString>()},
+        {"partition", std::make_shared<DataTypeString>()},
+        {"first_partition", std::make_shared<DataTypeString>()},
+        {"total_parts_number", std::make_shared<DataTypeUInt64>()},
+        {"total_parts_size", std::make_shared<DataTypeUInt64>()},
+        {"total_rows_count", std::make_shared<DataTypeUInt64>()},
+        {"ready_state", std::move(ready_state)},
+        /// Boolean
+        {"recalculating", std::make_shared<DataTypeUInt8>()},
+        {"last_update_time", std::make_shared<DataTypeUInt64>()},
+        {"last_snapshot_time", std::make_shared<DataTypeUInt64>()},
+        {"last_modification_time", std::make_shared<DataTypeDateTime>()},
+    }));
     setInMemoryMetadata(storage_metadata);
 }
 
 Pipe StorageSystemCnchPartsInfo::read(
     const Names & column_names,
-    const StorageMetadataPtr & /*metadata_snapshot*/,
+    const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum /*processed_stage*/,
@@ -76,8 +89,16 @@ Pipe StorageSystemCnchPartsInfo::read(
     Block header = materializeBlock(InterpreterSelectQuery(ast, context, QueryProcessingStage::Complete).getSampleBlock());
     QueryPlan query_plan;
     Poco::Logger * log = &Poco::Logger::get("SystemPartsInfo");
+
     ClusterProxy::SelectStreamFactory stream_factory = ClusterProxy::SelectStreamFactory(
-        header, QueryProcessingStage::Complete, StorageID{"system", "cnch_parts_info_local"}, Scalars{}, false, {});
+        header,
+        {},
+        storage_snapshot,
+        QueryProcessingStage::Complete,
+        StorageID{"system", "cnch_parts_info_local"},
+        Scalars{},
+        false,
+        {});
 
     //set cluster in query_info
     query_info.cluster = context->mockCnchServersCluster();

@@ -104,6 +104,7 @@ public:
     void insertRangeSelective(const IColumn &, const Selector &, size_t, size_t) override { throwMustBeDecompressed(); }
     void insertData(const char *, size_t) override { throwMustBeDecompressed(); }
     void insertDefault() override { throwMustBeDecompressed(); }
+    bool isDefaultAt(size_t) const override { throwMustBeDecompressed(); }
     void popBack(size_t) override { throwMustBeDecompressed(); }
     StringRef serializeValueIntoArena(size_t, Arena &, char const *&) const override { throwMustBeDecompressed(); }
     const char * deserializeAndInsertFromArena(const char *) override { throwMustBeDecompressed(); }
@@ -112,6 +113,7 @@ public:
     void updateWeakHash32(WeakHash32 &) const override { throwMustBeDecompressed(); }
     void updateHashFast(SipHash &) const override { throwMustBeDecompressed(); }
     ColumnPtr filter(const Filter &, ssize_t) const override { throwMustBeDecompressed(); }
+    void expand(const Filter &, bool) override { throwMustBeDecompressed(); }
     ColumnPtr permute(const Permutation &, size_t) const override { throwMustBeDecompressed(); }
     ColumnPtr index(const IColumn &, size_t) const override { throwMustBeDecompressed(); }
     int compareAt(size_t, size_t, const IColumn &, int) const override { throwMustBeDecompressed(); }
@@ -123,13 +125,18 @@ public:
     {
         throwMustBeDecompressed();
     }
-    void getPermutation(bool, size_t, int, Permutation &) const override { throwMustBeDecompressed(); }
-    void updatePermutation(bool, size_t, int, Permutation &, EqualRanges &) const override { throwMustBeDecompressed(); }
+    void getPermutation(IColumn::PermutationSortDirection, IColumn::PermutationSortStability,
+                        size_t, int, Permutation &) const override { throwMustBeDecompressed(); }
+    void updatePermutation(IColumn::PermutationSortDirection, IColumn::PermutationSortStability,
+                        size_t, int, Permutation &, EqualRanges &) const override { throwMustBeDecompressed(); }
     ColumnPtr replicate(const Offsets &) const override { throwMustBeDecompressed(); }
     MutableColumns scatter(ColumnIndex, const Selector &) const override { throwMustBeDecompressed(); }
     void gather(ColumnGathererStream &) override { throwMustBeDecompressed(); }
     void getExtremes(Field &, Field &) const override { throwMustBeDecompressed(); }
     size_t byteSizeAt(size_t) const override { throwMustBeDecompressed(); }
+    double getRatioOfDefaultRows(double) const override { throwMustBeDecompressed(); }
+    UInt64 getNumberOfDefaultRows() const override { throwMustBeDecompressed(); }
+    void getIndicesOfNonDefaultRows(Offsets &, size_t, size_t) const override { throwMustBeDecompressed(); }
 
 protected:
     size_t rows;

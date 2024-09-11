@@ -17,6 +17,12 @@
 
 #include <Core/Block.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
+#include <Processors/QueryPipeline.h>
+#include <Processors/ResizeProcessor.h>
+#include <Processors/Sources/NullSource.h>
+#include <Processors/Transforms/ExpressionTransform.h>
+// #include <Processors/Transforms/IntersectOrExceptTransform.h>
 
 namespace DB
 {
@@ -31,17 +37,58 @@ IntersectStep::IntersectStep(
 
 QueryPipelinePtr IntersectStep::updatePipeline(QueryPipelines, const BuildQueryPipelineSettings &)
 {
-    throw Exception("IntersectStep should be rewritten into UnionStep", ErrorCodes::NOT_IMPLEMENTED);
+    throw Exception("intersect step is not implemented", ErrorCodes::NOT_IMPLEMENTED);
+    // auto pipeline = std::make_unique<QueryPipeline>();
+    // QueryPipelineProcessorsCollector collector(*pipeline, this);
+
+    // if (pipelines.empty())
+    // {
+    //     pipeline->init(Pipe(std::make_shared<NullSource>(output_stream->header)));
+    //     processors = collector.detachProcessors();
+    //     return pipeline;
+    // }
+
+    // for (auto & cur_pipeline : pipelines)
+    // {
+    //     /// Just in case.
+    //     if (!isCompatibleHeader(cur_pipeline->getHeader(), getOutputStream().header))
+    //     {
+    //         auto converting_dag = ActionsDAG::makeConvertingActions(
+    //             cur_pipeline->getHeader().getColumnsWithTypeAndName(),
+    //             getOutputStream().header.getColumnsWithTypeAndName(),
+    //             ActionsDAG::MatchColumnsMode::Position);
+
+    //         auto converting_actions = std::make_shared<ExpressionActions>(std::move(converting_dag));
+    //         cur_pipeline->addSimpleTransform(
+    //             [&](const Block & cur_header) { return std::make_shared<ExpressionTransform>(cur_header, converting_actions); });
+    //     }
+
+    //     /// For the case of union.
+    //     cur_pipeline->addTransform(std::make_shared<ResizeProcessor>(getOutputStream().header, cur_pipeline->getNumStreams(), 1));
+    // }
+
+    // *pipeline = QueryPipeline::unitePipelines(std::move(pipelines), context.context->getSettingsRef().max_threads);
+    // pipeline->addTransform(std::make_shared<IntersectOrExceptTransform>(
+    //     getOutputStream().header,
+    //     distinct ? ASTSelectIntersectExceptQuery::Operator::INTERSECT_DISTINCT : ASTSelectIntersectExceptQuery::Operator::INTERSECT_ALL));
+
+    // processors = collector.detachProcessors();
+    // return pipeline;
 }
 
-void IntersectStep::serialize(WriteBuffer &) const
+std::shared_ptr<IntersectStep> IntersectStep::fromProto(const Protos::IntersectStep & proto, ContextPtr)
 {
-    throw Exception("IntersectStep should be rewritten into UnionStep", ErrorCodes::NOT_IMPLEMENTED);
+    auto [base_input_streams, base_output_stream, output_to_inputs] = SetOperationStep::deserializeFromProtoBase(proto.query_plan_base());
+    auto distinct = proto.distinct();
+    auto step = std::make_shared<IntersectStep>(base_input_streams, base_output_stream, output_to_inputs, distinct);
+
+    return step;
 }
 
-QueryPlanStepPtr IntersectStep::deserialize(ReadBuffer &, ContextPtr)
+void IntersectStep::toProto(Protos::IntersectStep & proto, bool) const
 {
-    throw Exception("IntersectStep should be rewritten into UnionStep", ErrorCodes::NOT_IMPLEMENTED);
+    SetOperationStep::serializeToProtoBase(*proto.mutable_query_plan_base());
+    proto.set_distinct(distinct);
 }
 
 bool IntersectStep::isDistinct() const

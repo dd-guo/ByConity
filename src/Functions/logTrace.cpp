@@ -27,6 +27,8 @@ namespace
 
         size_t getNumberOfArguments() const override { return 1; }
 
+        bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
         DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
         {
             if (!isString(arguments[0]))
@@ -54,7 +56,7 @@ namespace
 
 }
 
-void registerFunctionLogTrace(FunctionFactory & factory)
+REGISTER_FUNCTION(LogTrace)
 {
     factory.registerFunction<FunctionLogTrace>();
 }

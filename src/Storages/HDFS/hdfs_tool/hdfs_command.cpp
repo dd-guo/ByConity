@@ -111,7 +111,8 @@ int main(int argc, char ** argv) {
             return 0;
         }
         std::vector<String> files;
-        hdfs_fs->list(directory, files);
+        std::vector<size_t> file_sizes;
+        hdfs_fs->list(directory, files, file_sizes);
         for (auto & f : files)
         {
             std::cout << directory << "/" << f << std::endl;
@@ -123,7 +124,7 @@ int main(int argc, char ** argv) {
 
         auto path = options["read_entire_file"].as<string>();
 //        DB::HDFSConnectionParams hdfs_params(DB::HDFSConnectionParams::CONN_NNPROXY, "clickhouse", nnproxy);
-        DB::ReadBufferFromByteHDFS reader(path, true, hdfs_params);
+        DB::ReadBufferFromByteHDFS reader(path, hdfs_params, DB::ReadSettings{ .byte_hdfs_pread = true });
 
         while (!reader.eof())
         {
@@ -160,7 +161,7 @@ int main(int argc, char ** argv) {
         std::string src_path = params[0];
         std::string dst_path = params[1];
         Stopwatch watch;
-        DB::ReadBufferFromByteHDFS reader(src_path, true, hdfs_params );
+        DB::ReadBufferFromByteHDFS reader(src_path, hdfs_params, DB::ReadSettings{ .byte_hdfs_pread = true });
         DB::WriteBufferFromFile wb(dst_path);
         DB::copyData(reader, wb);
         wb.next();

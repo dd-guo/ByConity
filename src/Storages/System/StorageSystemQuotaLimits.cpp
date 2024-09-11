@@ -71,8 +71,11 @@ NamesAndTypesList StorageSystemQuotaLimits::getNamesAndTypes()
 
 void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
 {
-    context->checkAccess(AccessType::SHOW_QUOTAS);
+    /// If "select_from_system_db_requires_grant" is enabled the access rights were already checked in InterpreterSelectQuery.
     const auto & access_control = context->getAccessControlManager();
+    if (!access_control.doesSelectFromSystemDatabaseRequireGrant())
+        context->checkAccess(AccessType::SHOW_QUOTAS);
+
     std::vector<UUID> ids = access_control.findAll<Quota>();
 
     size_t column_index = 0;
@@ -84,7 +87,11 @@ void StorageSystemQuotaLimits::fillData(MutableColumns & res_columns, ContextPtr
     NullMap * column_max_null_map[MAX_RESOURCE_TYPE];
     for (auto resource_type : collections::range(MAX_RESOURCE_TYPE))
     {
+        // collections::range is end exclusive
+        // coverity[overrun-local]
         column_max[resource_type] = &assert_cast<ColumnNullable &>(*res_columns[column_index]).getNestedColumn();
+        // collections::range is end exclusive
+        // coverity[overrun-local]
         column_max_null_map[resource_type] = &assert_cast<ColumnNullable &>(*res_columns[column_index++]).getNullMapData();
     }
 

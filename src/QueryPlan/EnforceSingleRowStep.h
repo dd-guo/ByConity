@@ -27,10 +27,14 @@ public:
     Type getType() const override { return Type::EnforceSingleRow; }
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings & settings) override;
-    void serialize(WriteBuffer & buffer) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buffer, ContextPtr context);
+    void toProto(Protos::EnforceSingleRowStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<EnforceSingleRowStep> fromProto(const Protos::EnforceSingleRowStep & proto, ContextPtr);
+
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
+    
+    /// make output columns nullable, we should generate a null output value when subquery return empty results
+    void makeOutputNullable();
 };
 
 }

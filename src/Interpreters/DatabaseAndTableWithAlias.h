@@ -1,14 +1,15 @@
 #pragma once
 
 #include <Core/Names.h>
-#include <common/types.h>
 #include <Core/NamesAndTypes.h>
 #include <Parsers/IAST_fwd.h>
+#include <Common/DefaultCatalogName.h>
+#include <common/types.h>
+#include "Interpreters/StorageID.h"
 
 #include <memory>
 #include <optional>
 #include <Core/UUID.h>
-
 
 namespace DB
 {
@@ -38,6 +39,7 @@ struct DatabaseAndTableWithAlias
     /// Check if it satisfies another db_table name. @note opterion is not symmetric.
     bool satisfies(const DatabaseAndTableWithAlias & table, bool table_may_be_an_alias) const;
 
+    StorageID getStorageID() const;
     /// Exactly the same table name
     bool same(const DatabaseAndTableWithAlias & db_table) const
     {
@@ -61,7 +63,9 @@ struct TableWithColumnNamesAndTypes
             names.insert(col.name);
     }
 
-    bool hasColumn(const String & name) const { return names.contains(name); }
+    //bool hasColumn(const String & name) const { return names.contains(name); }
+
+    bool hasColumn(const String & name) const;
 
     void addHiddenColumns(const NamesAndTypesList & addition)
     {

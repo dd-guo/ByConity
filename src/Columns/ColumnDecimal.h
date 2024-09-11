@@ -160,19 +160,23 @@ public:
                        PaddedPODArray<UInt64> * row_indexes, PaddedPODArray<Int8> & compare_results,
                        int direction, int nan_direction_hint) const override;
     bool hasEqualValues() const override;
-    void getPermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res) const override;
-    void updatePermutation(bool reverse, size_t limit, int, IColumn::Permutation & res, EqualRanges& equal_range) const override;
+    void getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int nan_direction_hint, IColumn::Permutation & res) const override;
+    void updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                        size_t limit, int, IColumn::Permutation & res, EqualRanges& equal_ranges) const override;
 
     MutableColumnPtr cloneResized(size_t size) const override;
 
     Field operator[](size_t n) const override { return DecimalField(data[n], scale); }
     void get(size_t n, Field & res) const override { res = (*this)[n]; }
     bool getBool(size_t n) const override { return bool(data[n].value); }
-    Int64 getInt(size_t n) const override { return Int64(data[n].value) * scale; }
+    Int64 getInt(size_t n) const override { return Int64(data[n].value); }
     UInt64 get64(size_t n) const override;
     bool isDefaultAt(size_t n) const override { return data[n].value == 0; }
 
     ColumnPtr filter(const IColumn::Filter & filt, ssize_t result_size_hint) const override;
+    void expand(const IColumn::Filter & mask, bool inverted) override;
+
     ColumnPtr permute(const IColumn::Permutation & perm, size_t limit) const override;
     ColumnPtr index(const IColumn & indexes, size_t limit) const override;
 
@@ -196,6 +200,21 @@ public:
         return false;
     }
 
+    double getRatioOfDefaultRows(double sample_ratio) const override
+    {
+        return this->template getRatioOfDefaultRowsImpl<Self>(sample_ratio);
+    }
+
+    UInt64 getNumberOfDefaultRows() const override
+    {
+        return this->template getNumberOfDefaultRowsImpl<Self>();
+    }
+
+    void getIndicesOfNonDefaultRows(IColumn::Offsets & indices, size_t from, size_t limit) const override
+    {
+        return this->template getIndicesOfNonDefaultRowsImpl<Self>(indices, from, limit);
+    }
+
     ColumnPtr compress() const override;
 
 
@@ -210,25 +229,20 @@ public:
 protected:
     Container data;
     UInt32 scale;
-
-    template <typename U>
-    void permutation(bool reverse, size_t limit, PaddedPODArray<U> & res) const
-    {
-        size_t s = data.size();
-        res.resize(s);
-        for (U i = 0; i < s; ++i)
-            res[i] = i;
-
-        auto sort_end = res.end();
-        if (limit && limit < s)
-            sort_end = res.begin() + limit;
-
-        if (reverse)
-            partial_sort(res.begin(), sort_end, res.end(), [this](size_t a, size_t b) { return data[a] > data[b]; });
-        else
-            partial_sort(res.begin(), sort_end, res.end(), [this](size_t a, size_t b) { return data[a] < data[b]; });
-    }
 };
+
+template <class TCol>
+concept is_col_over_big_decimal = std::is_same_v<TCol, ColumnDecimal<typename TCol::ValueType>>
+    && is_decimal<typename TCol::ValueType> && is_over_big_int<typename TCol::NativeT>;
+
+template <class TCol>
+concept is_col_int_decimal = std::is_same_v<TCol, ColumnDecimal<typename TCol::ValueType>>
+    && is_decimal<typename TCol::ValueType> && std::is_integral_v<typename TCol::NativeT>;
+
+template <class, bool> class ColumnVector;
+template <class T> struct ColumnVectorOrDecimalT { using Col = ColumnVector<T, false>; };
+template <is_decimal T> struct ColumnVectorOrDecimalT<T> { using Col = ColumnDecimal<T>; };
+template <class T> using ColumnVectorOrDecimal = typename ColumnVectorOrDecimalT<T>::Col;
 
 template <typename T>
 template <typename Type>

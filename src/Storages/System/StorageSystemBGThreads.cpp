@@ -37,14 +37,15 @@ NamesAndTypesList StorageSystemBGThreads::getNamesAndTypes()
         {"last_wakeup_interval", std::make_shared<DataTypeInt64>()},
         {"last_wakeup_time", std::make_shared<DataTypeDateTime>()},
         {"num_wakeup", std::make_shared<DataTypeUInt64>()},
+        {"server_vw_name", std::make_shared<DataTypeString>()},
     };
 }
 
 void StorageSystemBGThreads::fillData(MutableColumns & res_columns, ContextPtr context, const SelectQueryInfo &) const
 {
-    for (auto i = CnchBGThreadType::ServerMinType; i <= CnchBGThreadType::ServerMaxType; i = CnchBGThreadType(size_t(i) + 1))
+    for (auto i = CnchBGThread::ServerMinType; i <= CnchBGThread::ServerMaxType; ++i)
     {
-        for (auto && [_, t] : context->getCnchBGThreadsMap(i)->getAll())
+        for (auto && [_, t] : context->getCnchBGThreadsMap(static_cast<CnchBGThreadType>(i))->getAll())
         {
             size_t c = 0;
             res_columns[c++]->insert(toString(t->getType()));
@@ -57,6 +58,7 @@ void StorageSystemBGThreads::fillData(MutableColumns & res_columns, ContextPtr c
             res_columns[c++]->insert(t->getLastWakeupInterval());
             res_columns[c++]->insert(t->getLastWakeupTime());
             res_columns[c++]->insert(t->getNumWakeup());
+            res_columns[c++]->insert(storage_id.server_vw_name);
         }
     }
 }

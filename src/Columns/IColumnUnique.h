@@ -164,6 +164,11 @@ public:
         throw Exception("Method filter is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
     }
 
+    void expand(const IColumn::Filter &, bool) override
+    {
+        throw Exception("Method expand is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
     ColumnPtr permute(const IColumn::Permutation &, size_t) const override
     {
         throw Exception("Method permute is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
@@ -174,7 +179,14 @@ public:
         throw Exception("Method replicate is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
     }
 
-    void getPermutation(bool, size_t, int, IColumn::Permutation &) const override
+    void getPermutation(IColumn::PermutationSortDirection, IColumn::PermutationSortStability,
+                    size_t, int, IColumn::Permutation &) const override
+    {
+        throw Exception("Method getPermutation is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    void updatePermutation(PermutationSortDirection, PermutationSortStability,
+                    size_t, int, Permutation &, EqualRanges &) const override
     {
         throw Exception("Method getPermutation is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
     }
@@ -202,6 +214,21 @@ public:
     bool hasEqualValues() const override
     {
         throw Exception("Method hasEqualValues is not supported for ColumnUnique.", ErrorCodes::NOT_IMPLEMENTED);
+    }
+
+    double getRatioOfDefaultRows(double) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method 'getRatioOfDefaultRows' not implemented for ColumnUnique");
+    }
+
+    UInt64 getNumberOfDefaultRows() const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method 'getNumberOfDefaultRows' not implemented for ColumnUnique");
+    }
+
+    void getIndicesOfNonDefaultRows(IColumn::Offsets &, size_t, size_t) const override
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method 'getIndicesOfNonDefaultRows' not implemented for ColumnUnique");
     }
 };
 

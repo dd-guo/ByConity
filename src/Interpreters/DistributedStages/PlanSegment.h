@@ -15,31 +15,45 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <optional>
-#include <Core/Types.h>
 #include <Core/Block.h>
-#include <QueryPlan/QueryPlan.h>
+#include <Core/Types.h>
 #include <Interpreters/Context_fwd.h>
-#include <Interpreters/StorageID.h>
 #include <Interpreters/DistributedStages/AddressInfo.h>
 #include <Interpreters/DistributedStages/ExchangeMode.h>
+#include <Interpreters/DistributedStages/PlanSegmentInstance.h>
+#include <Interpreters/StorageID.h>
+#include <Protos/EnumMacros.h>
+#include <Protos/enum.pb.h>
+#include <Protos/plan_node_utils.pb.h>
+#include <Protos/plan_segment_manager.pb.h>
+#include <QueryPlan/QueryPlan.h>
+#include <Storages/MergeTree/IMergeTreeDataPart_fwd.h>
 
 namespace DB
 {
-using DynamicFilterId = UInt32;
+using RuntimeFilterId = UInt32;
 
 /**
  * SOURCE means the plan is the leaf of a plan segment tree, i.g. TableScan Node.
  * EXCHANGE always marking the plan that need to repartiton the data.
  * OUTPUT is only used in PlanSegmentOutput and its output is client, which means we should output the results.
  */
-enum class PlanSegmentType : UInt8
+ENUM_WITH_PROTO_CONVERTER(
+    PlanSegmentType, // enum name
+    Protos::PlanSegmentType, // proto enum message
+    (UNKNOWN, 0),
+    (SOURCE),
+    (EXCHANGE),
+    (OUTPUT));
+
+namespace Protos
 {
-    UNKNOWN = 0,
-    SOURCE,
-    EXCHANGE,
-    OUTPUT
-};
+    class IPlanSegment;
+    class PlanSegmentInput;
+}
 
 String planSegmentTypeToString(const PlanSegmentType & type);
 
@@ -75,6 +89,10 @@ public:
 
     void setExchangeMode(const ExchangeMode & mode_) { exchange_mode = mode_; }
 
+    size_t getExchangeId() const {return exchange_id; }
+
+    void setExchangeId(size_t exchange_id_) { exchange_id = exchange_id_; }
+
     size_t getExchangeParallelSize() const { return exchange_parallel_size; }
 
     void setExchangeParallelSize(size_t exchange_parallel_size_) { exchange_parallel_size = exchange_parallel_size_;}
@@ -97,15 +115,21 @@ public:
 
     virtual String toString(size_t indent = 0) const;
 
+    void toProtoBase(Protos::IPlanSegment & proto) const;
+    void fromProtoBase(const Protos::IPlanSegment & proto);
+
 protected:
     Block header;
     PlanSegmentType type = PlanSegmentType::UNKNOWN;
     ExchangeMode exchange_mode = ExchangeMode::UNKNOWN;
+    size_t exchange_id = 0;
     size_t exchange_parallel_size = 0;
     String name;
     size_t segment_id = std::numeric_limits<size_t>::max();
     Names shuffle_keys;
 };
+
+using PlanSegmentSet = std::unordered_set<PlanSegmentInstanceId>;
 
 class PlanSegmentInput : public IPlanSegment
 {
@@ -113,8 +137,9 @@ public:
     PlanSegmentInput(const Block & header_, const PlanSegmentType & type_)
     : IPlanSegment(header_, type_) {}
 
-    PlanSegmentInput(const PlanSegmentType & type_)
-    : IPlanSegment(type_) {}
+    explicit PlanSegmentInput(const PlanSegmentType & type_) : IPlanSegment(type_)
+    {
+    }
 
     PlanSegmentInput() = default;
 
@@ -124,13 +149,12 @@ public:
 
     void insertSourceAddress(const AddressInfo & address_info) { source_addresses.push_back(address_info); }
 
-    void insertSourceAddress(const AddressInfos & address_infos) { source_addresses.insert(source_addresses.end(), address_infos.begin(), address_infos.end()); }
+    void insertSourceAddresses(AddressInfos & address_infos)
+    {
+        source_addresses.insert(source_addresses.end(), address_infos.begin(), address_infos.end());
+    }
 
     const AddressInfos & getSourceAddress() const { return source_addresses; }
-
-    size_t getParallelIndex() const { return parallel_index; }
-
-    void setParallelIndex(size_t parallel_index_) { parallel_index = parallel_index_;}
 
     bool needKeepOrder() const { return keep_order; }
 
@@ -140,17 +164,34 @@ public:
 
     void deserialize(ReadBuffer & buf, ContextPtr context) override;
 
+    void toProto(Protos::PlanSegmentInput & proto) const;
+    void fillFromProto(const Protos::PlanSegmentInput & proto, ContextPtr context);
+
     String toString(size_t indent = 0) const override;
 
     std::optional<StorageID> getStorageID() const { return storage_id; }
 
     void setStorageID(const StorageID & storage_id_) { storage_id = storage_id_;}
 
+    void setStable(bool stable_) { stable = stable_; }
+    bool isStable() const { return stable; }
+
+    void setNumOfBuckets(Int64 bucket_number_)
+    {
+        bucket_number = bucket_number_;
+    }
+    Int64 getNumOfBuckets() const
+    {
+        return bucket_number;
+    }
+
 private:
-    size_t parallel_index = 0;
+    size_t parallel_index = std::numeric_limits<size_t>::max(); ///  no longer used
     bool keep_order = false;
     AddressInfos source_addresses;
     std::optional<StorageID> storage_id;
+    bool stable = false;
+    Int64 bucket_number = kInvalidBucketNumber;
 };
 
 using PlanSegmentInputPtr = std::shared_ptr<PlanSegmentInput>;
@@ -179,15 +220,27 @@ public:
 
     void deserialize(ReadBuffer & buf, ContextPtr) override;
 
+    void toProto(Protos::PlanSegmentOutput & proto);
+    void fillFromProto(const Protos::PlanSegmentOutput & proto);
+
     String toString(size_t indent = 0) const override;
+
+    void setShuffleFunctionName(const String & shuffle_function_name_) { shuffle_function_name = shuffle_function_name_; }
+
+    const String & getShuffleFunctionName() { return shuffle_function_name; }
+
+    void setShuffleFunctionParams(const Array & shuffle_func_params_) { shuffle_func_params = shuffle_func_params_; }
+    const Array & getShuffleFunctionParams() { return shuffle_func_params; }
 
 private:
     String shuffle_function_name = "cityHash64";
     size_t parallel_size;
     bool keep_order = false;
+    Array shuffle_func_params;
 };
 
 using PlanSegmentOutputPtr = std::shared_ptr<PlanSegmentOutput>;
+using PlanSegmentOutputs = std::vector<PlanSegmentOutputPtr>;
 
 /**
  * PlanSegment is a object that cannot be copy since queryPlan is only move-able.
@@ -202,7 +255,6 @@ class PlanSegment
 public:
 
     PlanSegment() = default;
-    PlanSegment(const ContextPtr & context_);
     PlanSegment(PlanSegment && ) = default;
     PlanSegment & operator=(PlanSegment &&) = default;
 
@@ -223,9 +275,13 @@ public:
 
     void serialize(WriteBuffer & buf) const;
 
-    void deserialize(ReadBuffer & buf);
+    void deserialize(ReadBuffer & buf, ContextMutablePtr context);
 
-    static PlanSegmentPtr deserializePlanSegment(ReadBuffer & buf, ContextPtr context);
+    void toProto(Protos::PlanSegment & proto);
+
+    void fillFromProto(const Protos::PlanSegment & proto, ContextMutablePtr context);
+
+    static PlanSegmentPtr deserializePlanSegment(ReadBuffer & buf, ContextMutablePtr context);
 
     size_t getPlanSegmentId() const { return segment_id; }
 
@@ -241,25 +297,22 @@ public:
 
     void appendPlanSegmentInputs(const PlanSegmentInputs & inputs_) { inputs.insert(inputs.end(), inputs_.begin(), inputs_.end()); }
 
-    void setPlanSegmentOutput(const PlanSegmentOutputPtr & output_) { output = output_; }
+    void appendPlanSegmentOutput(const PlanSegmentOutputPtr & output_) { outputs.push_back(output_); }
 
-    PlanSegmentOutputPtr getPlanSegmentOutput() const { return output; }
+    void appendPlanSegmentOutputs(const PlanSegmentOutputs & outputs_) { outputs.insert(outputs.end(), outputs_.begin(), outputs_.end()); }
+
+    PlanSegmentOutputPtr getPlanSegmentOutput() const { return outputs.size() > 0 ? outputs[0] : std::make_shared<PlanSegmentOutput>(); }
+
+    PlanSegmentOutputs getPlanSegmentOutputs() const { return outputs; }
 
     AddressInfo getCoordinatorAddress() const { return coordinator_address; }
-
-    AddressInfo getCurrentAddress() const { return current_address; }
+    const AddressInfo & getCoordinatorAddressRef() const { return coordinator_address; }
 
     void setCoordinatorAddress(const AddressInfo & coordinator_address_) { coordinator_address = coordinator_address_; }
 
-    void setCurrentAddress(const AddressInfo & current_address_) { current_address = current_address_; }
-
-    void setPlanSegmentToQueryPlan(QueryPlan::Node * node);
+    void setPlanSegmentToQueryPlan(QueryPlan::Node * node, ContextPtr & context);
 
     PlanSegmentPtr clone();
-
-    void setContext(const ContextPtr & context_);
-
-    ContextMutablePtr getContext() const { return context;}
 
     String toString() const;
 
@@ -273,29 +326,28 @@ public:
 
     void setParallelSize(size_t parallel_size_) { parallel = parallel_size_; }
 
-    void update();
+    void update(ContextPtr context);
 
-    void addRuntimeFilter(DynamicFilterId id) { runtime_filters.emplace_back(id); }
+    // register runtime filters for resource release
+    void addRuntimeFilter(RuntimeFilterId id) { runtime_filters.emplace(id); }
+    const std::unordered_set<RuntimeFilterId> & getRuntimeFilters() const { return runtime_filters; }
 
-    std::vector<DynamicFilterId> & getRuntimeFilters() { return runtime_filters; }
-
+    static void getRemoteSegmentId(const QueryPlan::Node * node, std::unordered_map<PlanNodeId, size_t> & exchange_to_segment);
 private:
     size_t segment_id;
     String query_id;
+    size_t parallel_index = 0;
     QueryPlan query_plan;
 
     PlanSegmentInputs inputs;
-    PlanSegmentOutputPtr output;
+    PlanSegmentOutputs outputs;
 
     AddressInfo coordinator_address;
-    AddressInfo current_address;
     String cluster_name;
     size_t parallel;
     size_t exchange_parallel_size;
 
-    std::vector<DynamicFilterId> runtime_filters;
-
-    ContextMutablePtr context;
+    std::unordered_set<RuntimeFilterId> runtime_filters;
 };
 
 class PlanSegmentTree
@@ -329,6 +381,11 @@ public:
     void setRoot(Node && node_) {
         nodes.push_front(std::move(node_));
         root = &nodes.front();
+    }
+
+    void replaceRoot(Node && node_) {
+        nodes.pop_back();
+        nodes.push_front(std::move(node_));
     }
 
     void setRoot(Node * root_) { root = root_; }

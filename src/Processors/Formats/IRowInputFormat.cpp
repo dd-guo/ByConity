@@ -32,9 +32,11 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int CANNOT_PARSE_INPUT_ASSERTION_FAILED;
     extern const int CANNOT_PARSE_QUOTED_STRING;
+    extern const int CANNOT_PARSE_ESCAPE_SEQUENCE;
     extern const int CANNOT_PARSE_DATE;
     extern const int CANNOT_PARSE_DATETIME;
     extern const int CANNOT_READ_ARRAY_FROM_TEXT;
+    extern const int CANNOT_READ_MAP_FROM_TEXT;
     extern const int CANNOT_READ_ALL_DATA;
     extern const int CANNOT_PARSE_NUMBER;
     extern const int CANNOT_PARSE_UUID;
@@ -42,6 +44,10 @@ namespace ErrorCodes
     extern const int INCORRECT_NUMBER_OF_COLUMNS;
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int INCORRECT_DATA;
+    extern const int PROTOBUF_BAD_CAST;
+    extern const int UNKNOWN_PROTOBUF_FORMAT;
+    extern const int CANNOT_PARSE_IPV4;
+    extern const int CANNOT_PARSE_IPV6;
 }
 
 
@@ -49,15 +55,21 @@ bool isParseError(int code)
 {
     return code == ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED
         || code == ErrorCodes::CANNOT_PARSE_QUOTED_STRING
+        || code == ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE
         || code == ErrorCodes::CANNOT_PARSE_DATE
         || code == ErrorCodes::CANNOT_PARSE_DATETIME
         || code == ErrorCodes::CANNOT_READ_ARRAY_FROM_TEXT
         || code == ErrorCodes::CANNOT_PARSE_NUMBER
         || code == ErrorCodes::CANNOT_PARSE_UUID
         || code == ErrorCodes::CANNOT_READ_ALL_DATA
+        || code == ErrorCodes::CANNOT_READ_MAP_FROM_TEXT
+        || code == ErrorCodes::UNKNOWN_PROTOBUF_FORMAT
+        || code == ErrorCodes::PROTOBUF_BAD_CAST
         || code == ErrorCodes::TOO_LARGE_STRING_SIZE
         || code == ErrorCodes::ARGUMENT_OUT_OF_BOUND       /// For Decimals
-        || code == ErrorCodes::INCORRECT_DATA;             /// For some ReadHelpers
+        || code == ErrorCodes::INCORRECT_DATA              /// For some ReadHelpers
+        || code == ErrorCodes::CANNOT_PARSE_IPV4
+        || code == ErrorCodes::CANNOT_PARSE_IPV6;
 }
 
 IRowInputFormat::IRowInputFormat(Block header, ReadBuffer & in_, Params params_)
@@ -229,6 +241,9 @@ Chunk IRowInputFormat::generate()
         readSuffix();
         return {};
     }
+
+    for (const auto & column : columns)
+        column->finalize();
 
     Chunk chunk(std::move(columns), num_rows);
     //chunk.setChunkInfo(std::move(chunk_missing_values));

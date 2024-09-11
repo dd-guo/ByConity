@@ -23,11 +23,11 @@ class EnabledQuota;
 class EnabledSettings;
 struct QuotaUsage;
 struct Settings;
-class SettingsConstraints;
+struct SettingsProfilesInfo;
+class SettingsChanges;
 class AccessControlManager;
 class IAST;
 using ASTPtr = std::shared_ptr<IAST>;
-
 
 struct ContextAccessParams
 {
@@ -37,6 +37,9 @@ struct ContextAccessParams
     UInt64 readonly = 0;
     bool allow_ddl = false;
     bool allow_introspection = false;
+    bool has_tenant_id_in_username = false;
+    bool enable_sensitive_permission = false;
+    bool load_roles = false;
     String current_database;
     ClientInfo::Interface interface = ClientInfo::Interface::TCP;
     ClientInfo::HTTPMethod http_method = ClientInfo::HTTPMethod::UNKNOWN;
@@ -57,10 +60,12 @@ struct ContextAccessParams
     friend bool operator >(const ContextAccessParams & lhs, const ContextAccessParams & rhs) { return rhs < lhs; }
     friend bool operator <=(const ContextAccessParams & lhs, const ContextAccessParams & rhs) { return !(rhs < lhs); }
     friend bool operator >=(const ContextAccessParams & lhs, const ContextAccessParams & rhs) { return !(lhs < rhs); }
+
+    static bool dependsOnSettingName(std::string_view setting_name);
 };
 
 
-class ContextAccess
+class ContextAccess : public std::enable_shared_from_this<ContextAccess>
 {
 public:
     using Params = ContextAccessParams;
@@ -85,14 +90,13 @@ public:
     std::optional<QuotaUsage> getQuotaUsage() const;
 
     /// Returns the default settings, i.e. the settings to apply on user's login.
-    std::shared_ptr<const Settings> getDefaultSettings() const;
-
-    /// Returns the settings' constraints.
-    std::shared_ptr<const SettingsConstraints> getSettingsConstraints() const;
+    class SettingsChanges getDefaultSettings() const;
+    std::shared_ptr<const SettingsProfilesInfo> getDefaultProfileInfo() const;
 
     /// Returns the current access rights.
     std::shared_ptr<const AccessRights> getAccessRights() const;
     std::shared_ptr<const AccessRights> getAccessRightsWithImplicit() const;
+    std::shared_ptr<const SensitiveAccessRights> getSensitiveAccessRights() const;
 
     /// Checks if a specified access is granted, and throws an exception if not.
     /// Empty database means the current database.
@@ -113,6 +117,14 @@ public:
     void checkGrantOption(const AccessFlags & flags, const std::string_view & database, const std::string_view & table, const Strings & columns) const;
     void checkGrantOption(const AccessRightsElement & element) const;
     void checkGrantOption(const AccessRightsElements & elements) const;
+
+    int isSensitiveImpl(std::unordered_set<std::string_view> & cols, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) const;
+    static int isSensitive(std::unordered_set<std::string_view> & cols);
+    int isSensitive(std::unordered_set<std::string_view> & cols, const std::string_view & database) const;
+    int isSensitive(std::unordered_set<std::string_view> & cols, const std::string_view & database, const std::string_view & table) const;
+    int isSensitive(std::unordered_set<std::string_view> & cols, const std::string_view & database, const std::string_view & table, const std::string_view & column) const;
+    int isSensitive(std::unordered_set<std::string_view> & cols, const std::string_view & database, const std::string_view & table, const std::vector<std::string_view> & columns) const;
+    int isSensitive(std::unordered_set<std::string_view> & cols, const std::string_view & database, const std::string_view & table, const Strings & columns) const;
 
     /// Checks if a specified access is granted, and returns false if not.
     /// Empty database means the current database.
@@ -154,11 +166,16 @@ public:
     /// without any limitations. This is used for the global context.
     static std::shared_ptr<const ContextAccess> getFullAccess();
 
+    bool isAlwaysAccessibleTableInSystem(const std::string_view & table) const;
+
+    void loadRoles(const UserPtr & user_) const;
+
 private:
     friend class AccessControlManager;
     ContextAccess() {}
     ContextAccess(const AccessControlManager & manager_, const Params & params_);
 
+    void initialize(bool load_roles);
     void setUser(const UserPtr & user_) const;
     void setRolesInfo(const std::shared_ptr<const EnabledRolesInfo> & roles_info_) const;
     void setSettingsAndConstraints() const;
@@ -215,6 +232,7 @@ private:
     mutable std::shared_ptr<const EnabledRolesInfo> roles_info;
     mutable std::shared_ptr<const AccessRights> access;
     mutable std::shared_ptr<const AccessRights> access_with_implicit;
+    mutable std::shared_ptr<const SensitiveAccessRights> sensitive_access;
     mutable std::shared_ptr<const EnabledRowPolicies> enabled_row_policies;
     mutable std::shared_ptr<const EnabledQuota> enabled_quota;
     mutable std::shared_ptr<const EnabledSettings> enabled_settings;

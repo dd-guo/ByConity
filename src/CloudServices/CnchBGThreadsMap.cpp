@@ -15,14 +15,20 @@
 
 #include <CloudServices/CnchBGThreadsMap.h>
 
+#include <CloudServices/CnchRefreshMaterializedViewThread.h>
 #include <CloudServices/CnchMergeMutateThread.h>
 #include <CloudServices/CnchPartGCThread.h>
+#include <CloudServices/CnchManifestCheckpointThread.h>
 #include <Interpreters/Context.h>
 #include <ResourceManagement/ResourceReporter.h>
 #include <Storages/Kafka/CnchKafkaConsumeManager.h>
 #include <CloudServices/CnchPartGCThread.h>
 #include <CloudServices/DedupWorkerManager.h>
 #include <CloudServices/ReclusteringManagerThread.h>
+#include <CloudServices/CnchObjectColumnSchemaAssembleThread.h>
+
+#include <Databases/MySQL/MaterializedMySQLSyncThreadManager.h>
+#include <CloudServices/CnchPartMoverThread.h>
 
 #include <regex>
 
@@ -70,6 +76,26 @@ CnchBGThreadPtr CnchBGThreadsMap::createThread(const StorageID & storage_id)
     {
         return std::make_shared<ReclusteringManagerThread>(getContext(), storage_id);
     }
+    else if (type == CnchBGThreadType::ObjectSchemaAssemble)
+    {
+        return std::make_shared<CnchObjectColumnSchemaAssembleThread>(getContext(), storage_id);
+    }
+    else if (type == CnchBGThreadType::MaterializedMySQL)
+    {
+        return std::make_shared<MaterializedMySQLSyncThreadManager>(getContext(), storage_id);
+    }
+    else if (type == CnchBGThreadType::CnchRefreshMaterializedView)
+    {
+        return std::make_shared<CnchRefreshMaterializedViewThread>(getContext(), storage_id);
+    }
+    else if (type == CnchBGThreadType::PartMover)
+    {
+        return std::make_shared<CnchPartMoverThread>(getContext(), storage_id);
+    }
+    else if (type == CnchBGThreadType::ManifestCheckpoint)
+    {
+        return std::make_shared<CnchManifestCheckpointThread>(getContext(), storage_id);
+    }
     else
     {
         throw Exception(String("Not supported background thread ") + toString(type), ErrorCodes::NOT_IMPLEMENTED);
@@ -78,6 +104,16 @@ CnchBGThreadPtr CnchBGThreadsMap::createThread(const StorageID & storage_id)
 
 void CnchBGThreadsMap::controlThread(const StorageID & storage_id, CnchBGThreadAction action)
 {
+    if (storage_id.empty())
+    {
+        if (action == CnchBGThreadAction::Remove)
+        {
+            stopAll();
+            clear();
+        }
+        return;
+    }
+
     switch (action)
     {
         case CnchBGThreadAction::Start:
@@ -201,8 +237,8 @@ void CnchBGThreadsMap::cleanup()
 
 CnchBGThreadsMapArray::CnchBGThreadsMapArray(ContextPtr global_context_) : WithContext(global_context_)
 {
-    for (auto i = size_t(CnchBGThreadType::ServerMinType); i <= size_t(CnchBGThreadType::ServerMaxType); ++i)
-        threads_array[i] = std::make_unique<CnchBGThreadsMap>(global_context_, CnchBGThreadType(i));
+    for (auto i = CnchBGThread::ServerMinType; i <= CnchBGThread::ServerMaxType; ++i)
+        threads_array[i] = std::make_unique<CnchBGThreadsMap>(global_context_, static_cast<CnchBGThreadType>(i));
 
     if (global_context_->getServerType() == ServerType::cnch_worker && global_context_->getResourceManagerClient())
     {
@@ -217,7 +253,7 @@ CnchBGThreadsMapArray::~CnchBGThreadsMapArray()
 {
     try
     {
-        destroy();
+        shutdown();
     }
     catch (...)
     {
@@ -225,24 +261,31 @@ CnchBGThreadsMapArray::~CnchBGThreadsMapArray()
     }
 }
 
-void CnchBGThreadsMapArray::destroy()
+void CnchBGThreadsMapArray::shutdown()
 {
-    ThreadPool pool(size_t(CnchBGThreadType::ServerMaxType) - size_t(CnchBGThreadType::ServerMinType) + 1);
+    ThreadPool pool(CnchBGThread::ServerMaxType - CnchBGThread::ServerMinType + 1);
 
-    for (auto i = size_t(CnchBGThreadType::ServerMinType); i <= size_t(CnchBGThreadType::ServerMaxType); ++i)
+    for (auto i = CnchBGThread::ServerMinType; i <= CnchBGThread::ServerMaxType; ++i)
     {
         if (auto * t = threads_array[i].get())
             pool.scheduleOrThrowOnError([t] { t->stopAll(); });
     }
 
     pool.wait();
+
+    if (resource_reporter_task)
+        resource_reporter_task.reset();
+
+    /// `cleaner` must be stopped as well
+    if (cleaner)
+        cleaner->deactivate();
 }
 
 void CnchBGThreadsMapArray::cleanThread()
 {
     try
     {
-        for (auto i = size_t(CnchBGThreadType::ServerMinType); i <= size_t(CnchBGThreadType::ServerMaxType); ++i)
+        for (auto i = CnchBGThread::ServerMinType; i <= CnchBGThread::ServerMaxType; ++i)
             threads_array[i]->cleanup();
     }
     catch (...)
@@ -250,6 +293,21 @@ void CnchBGThreadsMapArray::cleanThread()
         tryLogCurrentException(__PRETTY_FUNCTION__);
     }
     cleaner->scheduleAfter(30 * 1000);
+}
+
+void CnchBGThreadsMapArray::startResourceReport()
+{
+    resource_reporter_task->start();
+}
+
+void CnchBGThreadsMapArray::stopResourceReport()
+{
+    resource_reporter_task->stop();
+}
+
+bool CnchBGThreadsMapArray::isResourceReportRegistered()
+{
+    return resource_reporter_task->registered();
 }
 
 }

@@ -1,8 +1,6 @@
 set (SRCS
     argsToConfig.cpp
     coverage.cpp
-    DateLUT.cpp
-    DateLUTImpl.cpp
     demangle.cpp
     getFQDNOrHostName.cpp
     getMemoryAmount.cpp
@@ -20,6 +18,7 @@ set (SRCS
     errnoToString.cpp
     getResource.cpp
     StringRef.cpp
+    bthread_exception.cpp
 )
 
 if (ENABLE_REPLXX)
@@ -46,10 +45,20 @@ if (USE_INTERNAL_CCTZ)
 endif()
 
 target_include_directories(common PUBLIC .. "${CMAKE_CURRENT_BINARY_DIR}/..")
+target_include_directories(common PUBLIC .. "${ClickHouse_BINARY_DIR}/src")
+if(NOT (MAKE_STATIC_LIBRARIES OR SPLIT_SHARED_LIBRARIES))
+    target_link_libraries(common PUBLIC brpc-shared)
+else()
+    target_link_libraries(common PUBLIC brpc-static)
+endif()
 
 if (OS_DARWIN AND NOT MAKE_STATIC_LIBRARIES)
     target_link_libraries(common PUBLIC -Wl,-U,_inside_main)
 endif()
+
+target_include_directories(common PRIVATE "${ClickHouse_SOURCE_DIR}/src")
+
+target_link_libraries(common PUBLIC jemalloc)
 
 # Allow explicit fallback to readline
 if (NOT ENABLE_REPLXX AND ENABLE_READLINE)
@@ -85,8 +94,5 @@ target_link_libraries (common
         replxx
         cctz
         fmt
+        ch_contrib::magic_enum
 )
-
-if (ENABLE_TESTS)
-    add_subdirectory (tests)
-endif ()

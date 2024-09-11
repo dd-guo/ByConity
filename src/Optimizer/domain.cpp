@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 
+#include <optional>
 #include <Optimizer/domain.h>
 
 namespace DB::Predicate
@@ -119,7 +120,7 @@ Domain Domain::unionn(const Domain & other) const
     return {std::move(res_value_set), res_null_allowed};
 }
 
-Domain Domain::complement()
+Domain Domain::complement() const
 {
     auto caller = [](const auto & v)->ValueSet
     {
@@ -173,7 +174,14 @@ bool Domain::operator==(const Domain & other) const
                            }, other.getValueSet());
 }
 
-TupleDomain::TupleDomain(DomainMap domains_) : is_none(false), domains(std::move(domains_))
+String Domain::toString() const
+{
+    auto value_set_to_str = std::visit([](const auto & v) -> String { return v.toString(); }, value_set);
+    return value_set_to_str + (null_allowed ? " NULL" : " NOTNULL");
+}
+
+template <typename T, typename Hash, typename Equal>
+TupleDomainImpl<T, Hash, Equal>::TupleDomainImpl(DomainMap domains_) : is_none(false), domains(std::move(domains_))
 {
     for (auto it = domains.begin(); it != domains.end();)
     {
@@ -196,13 +204,14 @@ TupleDomain::TupleDomain(DomainMap domains_) : is_none(false), domains(std::move
 
 ///Extract all column constraints that require exactly one value or only null in their respective Domains.
 ///Returns an empty Optional if the Domain is none or all.
-std::optional<FieldWithTypeMap> TupleDomain::extractFixedValues() const
+template <typename T, typename Hash, typename Equal>
+std::optional<typename TupleDomainImpl<T, Hash, Equal>::FieldWithTypeMap> TupleDomainImpl<T, Hash, Equal>::extractFixedValues() const
 {
     //if tuple_domain is "none" or is "all"
     if (domainsIsEmpty())
         return std::nullopt;
 
-    FieldWithTypeMap single_values;
+    TupleDomainImpl<T, Hash, Equal>::FieldWithTypeMap single_values;
     for (const auto & domain : domains)
     {
         if (domain.second.isNullableSingleValue())
@@ -215,13 +224,14 @@ std::optional<FieldWithTypeMap> TupleDomain::extractFixedValues() const
 
 ///Extract all column constraints that define a non-empty set of discrete values allowed for the columns in their respective Domains.
 ///Returns an empty Optional if the Domain is none or all.
-std::optional<std::unordered_map<String, Array>> TupleDomain::extractDiscreteValues() const
+template <typename T, typename Hash, typename Equal>
+std::optional<LinkedHashMap<T, Array, Hash, Equal>> TupleDomainImpl<T, Hash, Equal>::extractDiscreteValues() const
 {
     //if tuple_domain is "none" or is "all"
     if (domainsIsEmpty())
         return std::nullopt;
 
-    std::unordered_map<String, Array> discrete_values_map;
+    LinkedHashMap<T, Array, Hash, Equal> discrete_values_map;
     for (const auto & domain : domains)
     {
         if (domain.second.isNullableDiscreteSet())
@@ -234,28 +244,31 @@ std::optional<std::unordered_map<String, Array>> TupleDomain::extractDiscreteVal
 
 ///Convert a map of columns to values into the TupleDomain which requires
 ///those columns to be fixed to those values. Null is allowed as a fixed value.
-TupleDomain TupleDomain::fromFixedValues(const FieldWithTypeMap & fixed_values)
+template <typename T, typename Hash, typename Equal>
+TupleDomainImpl<T, Hash, Equal>
+TupleDomainImpl<T, Hash, Equal>::fromFixedValues(const TupleDomainImpl<T, Hash, Equal>::FieldWithTypeMap & fixed_values)
 {
-    std::unordered_map<String, Domain> domains;
+    DomainMap domains;
     for (const auto & item : fixed_values)
     {
         const FieldWithType & type_and_field = item.second;
         domains.emplace(item.first,
                         type_and_field.value.isNull() ? Domain::onlyNull(type_and_field.type) : Domain::singleValue(type_and_field.type, type_and_field.value));
     }
-    return TupleDomain(domains);
+    return TupleDomainImpl(domains);
 }
 
 ///Returns the strict intersection of the TupleDomains.
 ///The resulting TupleDomain represents the set of tuples that would be valid in both TupleDomains.
-TupleDomain TupleDomain::intersect(const std::vector<TupleDomain> & others)
+template <typename T, typename Hash, typename Equal>
+TupleDomainImpl<T, Hash, Equal> TupleDomainImpl<T, Hash, Equal>::intersect(const std::vector<TupleDomainImpl<T, Hash, Equal>> & others)
 {
     if (others.empty())
         return all();
     if (others.size() == 1)
         return others[0];
 
-    std::vector<TupleDomain> candidate;
+    std::vector<TupleDomainImpl<T, Hash, Equal>> candidate;
     bool all_equals = true;
     for (const auto & tuple_domain : others)
     {
@@ -280,7 +293,7 @@ TupleDomain TupleDomain::intersect(const std::vector<TupleDomain> & others)
     {
         for (const auto & domains_ref : candidate[i].getDomains())
         {
-            if (root_domains.find(domains_ref.first) == root_domains.end())
+            if (!root_domains.count(domains_ref.first))
             {
                 root_domains.emplace(domains_ref.first, domains_ref.second);
             }
@@ -293,11 +306,59 @@ TupleDomain TupleDomain::intersect(const std::vector<TupleDomain> & others)
             }
         }
     }
-    return TupleDomain(root_domains);
+    return TupleDomainImpl(root_domains);
+}
+
+/**
+  * Returns a TupleDomain which contains values in self set but not in other,
+  * it looks like difference of two set in mathematics, or std::set_difference in c++.
+  *
+  * <p>
+  * eg, input: Tuple(Domain[A] ∩ Domain[B]), other: Tuple(Domain'[B] ∩ Domain[C])
+  * result: Tuple(Domain[A] ∩ Domain[B]) - Tuple(Domain[A] ∩ Domain[B])
+  *       = Domain[A] ∩ Domain[B] ∩ (^Domain'[B] ∪ ^Domain[C])
+  *
+  * <p>
+  * Return std::nullopt if the result is dnf, as dnf is useless for pruning.
+  *
+  * <p>
+  * In this case, if we assume ^Domain'[B] is subset of Domain[B], the result is TupleDomain(Domain[A] ∩ Domain[B] ∩ ^Domain[C]).
+  */
+template <typename T, typename Hash, typename Equal>
+std::optional<TupleDomainImpl<T, Hash, Equal>>
+TupleDomainImpl<T, Hash, Equal>::subtract(const TupleDomainImpl<T, Hash, Equal> & other) const
+{
+    if (this->isNone())
+        return none();
+    if (other.isAll())
+        return none();
+    if (other.isNone())
+        return {*this};
+
+    DomainMap domain_map;
+    for (const auto & other_domain : other.getDomains())
+    {
+        auto complement = other_domain.second.complement();
+        if (this->getDomains().contains(other_domain.first))
+        {
+            const auto & self_domain = this->getDomains().at(other_domain.first);
+            complement = self_domain.intersect(complement);
+            if (complement.isNone())
+                continue;
+        }
+
+        if (!domain_map.empty())
+            return std::nullopt;
+
+        domain_map.emplace(other_domain.first, complement);
+    }
+    return TupleDomainImpl{domain_map};
 }
 
 /// Returns the tuple domain that contains all other tuple domains, or {@code std::nullopt} if they are not supersets of each other.
-std::optional<TupleDomain> TupleDomain::maximal(const std::vector<TupleDomain> & domains)
+template <typename T, typename Hash, typename Equal>
+std::optional<TupleDomainImpl<T, Hash, Equal>>
+TupleDomainImpl<T, Hash, Equal>::maximal(const std::vector<TupleDomainImpl<T, Hash, Equal>> & domains)
 {
     if (domains.empty())
         return std::nullopt;
@@ -322,7 +383,8 @@ std::optional<TupleDomain> TupleDomain::maximal(const std::vector<TupleDomain> &
 }
 
 ///Returns true only if the this TupleDomain contains all possible tuples that would be allowable by the other TupleDomain.
-bool TupleDomain::contains(const TupleDomain & other) const
+template <typename T, typename Hash, typename Equal>
+bool TupleDomainImpl<T, Hash, Equal>::contains(const TupleDomainImpl<T, Hash, Equal> & other) const
 {
     if (other.isNone())
         return true;
@@ -367,7 +429,9 @@ bool TupleDomain::contains(const TupleDomain & other) const
      * not be valid for either TupleDomain X or TupleDomain Y.
      * However, this result is guaranteed to be a superset of the strict union.
      */
-TupleDomain TupleDomain::columnWiseUnion(const std::vector<TupleDomain> & tuple_domains)
+template <typename T, typename Hash, typename Equal>
+TupleDomainImpl<T, Hash, Equal>
+TupleDomainImpl<T, Hash, Equal>::columnWiseUnion(const std::vector<TupleDomainImpl<T, Hash, Equal>> & tuple_domains)
 {
     if (tuple_domains.empty()) {
         throw Exception("tuple_domains must have at least one element", DB::ErrorCodes::LOGICAL_ERROR);
@@ -378,14 +442,14 @@ TupleDomain TupleDomain::columnWiseUnion(const std::vector<TupleDomain> & tuple_
     }
 
     // gather all common columns
-    std::unordered_set<String> common_columns;
+    std::unordered_set<T, Hash, Equal> common_columns;
 
     // first, find a non-none domain
     bool found = false;
     size_t index = 0;
     for (; index < tuple_domains.size(); index++)
     {
-        const TupleDomain & temp =tuple_domains[index];
+        const TupleDomainImpl<T, Hash, Equal> & temp = tuple_domains[index];
         if (temp.isAll())
             return all();
 
@@ -423,7 +487,7 @@ TupleDomain TupleDomain::columnWiseUnion(const std::vector<TupleDomain> & tuple_
         }
     }
     // group domains by column (only for common columns)
-    std::unordered_map<String, std::vector<Domain>> domains_by_column;
+    std::unordered_map<T, std::vector<Domain>, Hash, Equal> domains_by_column;
     for (const auto & tuple_domain_ref : tuple_domains)
     {
         if (!tuple_domain_ref.isNone())
@@ -443,18 +507,19 @@ TupleDomain TupleDomain::columnWiseUnion(const std::vector<TupleDomain> & tuple_
         }
     }
     // finally, do the column-wise union
-    std::unordered_map<String, Domain> result;
+    DomainMap result;
     for (const auto & multiple_domains : domains_by_column) {
-        result.insert(std::make_pair(multiple_domains.first, Domain::unionDomains((multiple_domains.second))));
+        result.emplace_back(std::make_pair(multiple_domains.first, Domain::unionDomains((multiple_domains.second))));
     }
-    return TupleDomain(result);
+    return TupleDomainImpl(result);
 }
 
 /**
      * Returns true only if there exists a strict intersection between the TupleDomains.
      * i.e. there exists some potential tuple that would be allowable in both TupleDomains.
      */
-bool TupleDomain::overlaps(const TupleDomain & other) const
+template <typename T, typename Hash, typename Equal>
+bool TupleDomainImpl<T, Hash, Equal>::overlaps(const TupleDomainImpl<T, Hash, Equal> & other) const
 {
     if (isNone() || other.isNone()) {
         return false;
@@ -475,4 +540,6 @@ bool TupleDomain::overlaps(const TupleDomain & other) const
     return true;
 }
 
+template class TupleDomainImpl<String, std::hash<String>, std::equal_to<String>>;
+template class TupleDomainImpl<ASTPtr, ASTEquality::ASTHash, ASTEquality::ASTEquals>;
 }

@@ -77,13 +77,13 @@ IMergeSelector::PartsRange DanceMergeSelector::select(const PartsRanges & partit
         return {};
     }
 
-    for (auto & partition : partitions)
+    for (const auto & partition : partitions)
     {
         if (partition.size() >= 2)
             num_parts_of_partitions[toPart(partition.front().data)->info.partition_id] += partition.size();
     }
 
-    for (auto & partition : partitions)
+    for (const auto & partition : partitions)
     {
         if (partition.size() >= 2)
             selectWithinPartition(partition, max_total_size_to_merge, merge_scheduler);
@@ -94,7 +94,7 @@ IMergeSelector::PartsRange DanceMergeSelector::select(const PartsRanges & partit
     {
         if (!ranges_in_partition.empty())
         {
-            auto & range = ranges_in_partition.front();
+            const auto & range = ranges_in_partition.front();
             res.update(range.min_score, range.best_begin, range.best_end);
         }
     }
@@ -106,16 +106,15 @@ IMergeSelector::PartsRange DanceMergeSelector::select(const PartsRanges & partit
 
 IMergeSelector::PartsRanges DanceMergeSelector::selectMulti(const PartsRanges & partitions, const size_t max_total_size_to_merge, MergeScheduler * merge_scheduler)
 {
-    for (auto & partition : partitions)
+    for (const auto & partition : partitions)
     {
         if (partition.size() >= 2)
             num_parts_of_partitions[toPart(partition.front().data)->info.partition_id] += partition.size();
     }
 
-    for (auto & partition : partitions)
+    for (const auto & partition : partitions)
     {
-        if (partition.size() >= 2)
-            selectWithinPartition(partition, max_total_size_to_merge, merge_scheduler);
+        selectWithinPartition(partition, max_total_size_to_merge, merge_scheduler);
     }
 
     std::vector<BestRangeWithScore *> range_vec;
@@ -132,6 +131,9 @@ IMergeSelector::PartsRanges DanceMergeSelector::selectMulti(const PartsRanges & 
     PartsRanges res;
     for (auto & range : range_vec)
         res.push_back(PartsRange(range->best_begin, range->best_end));
+
+    for (const auto & range : single_part_ranges)
+        res.push_back(range);
 
     return res;
 }
@@ -195,8 +197,16 @@ void DanceMergeSelector::selectRangesFromScoreTable(
 
 void DanceMergeSelector::selectWithinPartition(const PartsRange & parts, const size_t max_total_size_to_merge, [[maybe_unused]] MergeScheduler * merge_scheduler)
 {
-    if (parts.size() <= 1)
+    if (parts.empty())
         return;
+
+    if (parts.size() == 1
+        && parts.front().chain_depth > 0
+        && static_cast<UInt64>(parts.front().age) >= settings.max_age_for_single_part_chain)
+    {
+        single_part_ranges.push_back(PartsRange(parts.begin(), parts.end()));
+        return;
+    }
 
     BestRangeWithScore best_range;
 
@@ -253,7 +263,31 @@ void DanceMergeSelector::selectWithinPartition(const PartsRange & parts, const s
             if (max_total_size_to_merge && sum_size > max_total_size_to_merge)
                 break;
 
-            if (!allow(sum_size, max_size, min_age, end - begin))
+            bool need_check = true;
+            if (begin == 0 && end == max_end)
+            {
+                /// We should give a chance to skip allow() check for the range [0, max_end), to avoid not able to merge some small partition forever.
+                /// Consider this case: there are only three parts: p1, p2, p3.
+                /// The allow() function returns false for all ranges: [p1, p2], [p1, p2, p3], [p2, p3].
+                /// If we only use allow() as the judgement, then the partition can not be merged anymore.
+                /// So here we skip allow() check for [0, max_end) when:
+                /// 1. settings.final is true - OPTIMIZE FINAL will set this.
+                /// 2. the newest part (max_end)'s age over 1 hour.
+
+                /// In addition, we can't do this in every merge selection. Consider this case:
+                /// T1 insert p1, insert p2.
+                /// T2 merge select: [p1, p2] -> merged p10, as we always scoring the [0, max_end).
+                /// T3 insert p3.
+                /// T4 merge select: [p10, p3] -> merged p11 ...
+                /// T5 insert p4.
+                /// T6 merge select: [p11, p4] -> merged p12 ...
+                /// The overall merge cost become O(N^2) but not O(logN).
+                /// So we only give it a chance when the parts are old enough.
+
+                need_check = !(settings.final || cur_age >= 3600);
+            }
+
+            if (need_check && !allow(sum_size, max_size, min_age, end - begin))
                 continue;
 
             double current_score = score(end - begin, sum_size, settings.size_fixed_cost_to_add, settings.score_count_exp);

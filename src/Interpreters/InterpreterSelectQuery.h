@@ -29,11 +29,11 @@
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/IInterpreterUnionOrSelectQuery.h>
 #include <Interpreters/StorageID.h>
-#include <Interpreters/MaterializedViewSubstitutionOptimizer.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Storages/ReadInOrderOptimizer.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/TableLockHolder.h>
+#include <Parsers/ASTOrderByElement.h>
 
 #include <Columns/FilterDescription.h>
 
@@ -105,6 +105,8 @@ public:
     /// Execute a query. Get the stream of blocks to read.
     BlockIO execute() override;
 
+    BlockIO execute(bool dry_run);
+
     /// Builds QueryPlan for current query.
     virtual void buildQueryPlan(QueryPlan & query_plan) override;
 
@@ -135,10 +137,13 @@ public:
 
     Names getRequiredColumns() { return required_columns; }
 
-    MaterializedViewOptimizerResultPtr getMaterializeViewMatchResult() { return mv_optimizer_result; }
+    static FillColumnDescription getWithFillDescription(const ASTOrderByElement & order_by_elem, ContextPtr context);
+
+    TreeRewriterResultPtr getSyntaxAnalyzerResult() { return syntax_analyzer_result; }
 
 private:
     friend class InterpreterPerfectShard;
+    friend struct SelectQueryInfo;
 
     InterpreterSelectQuery(
         const ASTPtr & query_ptr_,
@@ -154,6 +159,7 @@ private:
 
     void addPrewhereAliasActions();
     bool shouldMoveToPrewhere();
+    bool storageSupportsLateMaterialize();
 
     Block getSampleBlockImpl();
 
@@ -209,6 +215,7 @@ private:
     TreeRewriterResultPtr syntax_analyzer_result;
     std::unique_ptr<SelectQueryExpressionAnalyzer> query_analyzer;
     SelectQueryInfo query_info;
+    ASTPtr query_for_perfect_shard;
 
     /// Is calculated in getSampleBlock. Is used later in readImpl.
     ExpressionAnalysisResult analysis_result;
@@ -240,8 +247,11 @@ private:
 
     Poco::Logger * log;
     StorageMetadataPtr metadata_snapshot;
+    bool has_join = false;
+    StorageSnapshotPtr storage_snapshot;
 
-    MaterializedViewOptimizerResultPtr mv_optimizer_result;
+    /// (column, predicate ast) already sorted by column size
+    std::vector<ASTPtr> atomic_predicates_expr;
 };
 
 }

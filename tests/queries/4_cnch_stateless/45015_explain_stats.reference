@@ -1,0 +1,183 @@
+test_explain_stats	20	4
+Projection Est. 57 rows, cost 7.958000e+01
+└─ Gather Exchange Est. 57 rows, cost 7.536200e+01
+   └─ Union Est. 57 rows, cost 6.608200e+01
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      └─ Projection Est. 3 rows, cost 3.478000e+00
+         └─ Filter Est. 3 rows, cost 3.256000e+00
+            └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+test_explain_stats	20	4
+Projection Est. 57 rows, cost 7.958000e+01
+└─ Gather Exchange Est. 57 rows, cost 7.536200e+01
+   └─ Union Est. 57 rows, cost 6.608200e+01
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      └─ Projection Est. 3 rows, cost 3.478000e+00
+         └─ Filter Est. 3 rows, cost 3.256000e+00
+            └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+test_explain_stats	20	4
+Projection Est. 57 rows, cost 7.958000e+01
+└─ Gather Exchange Est. 57 rows, cost 7.536200e+01
+   └─ Union Est. 57 rows, cost 6.608200e+01
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      ├─ Projection Est. 3 rows, cost 3.478000e+00
+      │  └─ Filter Est. 3 rows, cost 3.256000e+00
+      │     └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00
+      └─ Projection Est. 3 rows, cost 3.478000e+00
+         └─ Filter Est. 3 rows, cost 3.256000e+00
+            └─ TableScan default.test_explain_stats Est. 4 rows, cost 2.960000e+00

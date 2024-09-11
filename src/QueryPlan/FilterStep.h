@@ -15,6 +15,7 @@
 
 #pragma once
 #include <QueryPlan/ITransformingStep.h>
+#include <Parsers/IAST_fwd.h>
 
 namespace DB
 {
@@ -47,23 +48,28 @@ public:
 
     const ActionsDAGPtr & getExpression() const { return actions_dag; }
     const ConstASTPtr & getFilter() const { return filter; }
+    void setFilter(ConstASTPtr new_filter) { filter = std::move(new_filter);}
     const String & getFilterColumnName() const { return filter_column_name; }
     bool removesFilterColumn() const { return remove_filter_column; }
 
-    ActionsDAGPtr createActions(ContextPtr context, const ASTPtr & rewrite_filter) const;
+    void toProto(Protos::FilterStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<FilterStep> fromProto(const Protos::FilterStep & proto, ContextPtr context);
 
-    void serialize(WriteBuffer & buf) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer & buf, ContextPtr);
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 
+    static ConstASTPtr rewriteRuntimeFilter(const ConstASTPtr & filter, QueryPipeline & pipeline, const BuildQueryPipelineSettings & build_context);
+
+    void prepare(const PreparedStatementContext & prepared_context) override;
+
+    static std::pair<ConstASTPtr, ConstASTPtr> splitLargeInValueList(const ConstASTPtr & filter, UInt64 limit);
+    static std::vector<ConstASTPtr> removeLargeInValueList(const std::vector<ConstASTPtr> & filters, UInt64 limit);
 private:
     ActionsDAGPtr actions_dag;
     ConstASTPtr filter;
     String filter_column_name;
     bool remove_filter_column;
 
-    static ConstASTPtr rewriteDynamicFilter(const ConstASTPtr & filter, QueryPipeline & pipeline, const BuildQueryPipelineSettings & build_context);
 };
 
 }

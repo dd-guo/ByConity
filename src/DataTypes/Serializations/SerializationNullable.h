@@ -11,11 +11,18 @@ private:
     SerializationPtr nested;
 
 public:
-    SerializationNullable(const SerializationPtr & nested_) : nested(nested_) {}
+    SerializationNullable(const SerializationPtr & nested_) : nested(nested_)
+    {
+        const_cast<ISerialization *>(nested.get())->setInSerializationNullable();
+    }
 
-    void enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const override;
+    void enumerateStreams(
+        EnumerateStreamsSettings & settings,
+        const StreamCallback & callback,
+        const SubstreamData & data) const override;
 
     void serializeBinaryBulkStatePrefix(
+            const IColumn & column,
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
@@ -34,7 +41,7 @@ public:
             SerializeBinaryBulkSettings & settings,
             SerializeBinaryBulkStatePtr & state) const override;
 
-    void deserializeBinaryBulkWithMultipleStreams(
+    size_t deserializeBinaryBulkWithMultipleStreams(
             ColumnPtr & column,
             size_t limit,
             DeserializeBinaryBulkSettings & settings,
@@ -80,6 +87,20 @@ public:
     static ReturnType deserializeTextCSVImpl(IColumn & column, ReadBuffer & istr, const FormatSettings & settings, const SerializationPtr & nested);
     template <typename ReturnType = bool>
     static ReturnType deserializeTextJSONImpl(IColumn & column, ReadBuffer & istr, const FormatSettings &, const SerializationPtr & nested);
+
+private:
+    static void convertOverflowDataToNull(IColumn & column, const FormatSettings & settings);
+
+    struct SubcolumnCreator : public ISubcolumnCreator
+    {
+        const ColumnPtr null_map;
+
+        explicit SubcolumnCreator(const ColumnPtr & null_map_) : null_map(null_map_) {}
+
+        DataTypePtr create(const DataTypePtr & prev) const override;
+        SerializationPtr create(const SerializationPtr & prev) const override;
+        ColumnPtr create(const ColumnPtr & prev) const override;
+    };
 };
 
 }

@@ -66,7 +66,6 @@ std::optional<MutationCommand> MutationCommand::parse(ASTAlterCommand * command,
         res.type = FAST_DELETE;
         res.predicate = command->predicate;
         res.partition = command->partition;
-        res.columns = command->columns;
         return res;
     }
     else if (command->type == ASTAlterCommand::UPDATE)
@@ -193,7 +192,16 @@ std::optional<MutationCommand> MutationCommand::parse(ASTAlterCommand * command,
     {
         MutationCommand res;
         res.ast = command->ptr();
+        res.type = MutationCommand::Type::MODIFY_CLUSTER_BY;
+        return res;
+    }
+    else if (command->type == ASTAlterCommand::RECLUSTER_PARTITION_WHERE)
+    {
+        MutationCommand res;
+        res.ast = command->ptr();
         res.type = MutationCommand::Type::RECLUSTER;
+        res.predicate = command->predicate;
+        res.partition = command->partition;
         return res;
     }
 
@@ -211,7 +219,7 @@ std::shared_ptr<ASTExpressionList> MutationCommands::ast() const
 
 bool MutationCommands::willMutateData() const
 {
-    for (auto & c : *this)
+    for (const auto & c : *this)
         if (c.type != MutationCommand::Type::ADD_COLUMN)
             return true;
     return false;

@@ -59,6 +59,9 @@ private:
 template <typename Matcher, bool top_to_bottom>
 using ConstInDepthNodeVisitor = InDepthNodeVisitor<Matcher, top_to_bottom, const ASTPtr>;
 
+template <typename Matcher, bool top_to_bottom>
+using MutableInDepthNodeVisitor = InDepthNodeVisitor<Matcher, top_to_bottom, ASTPtr>;
+
 struct NeedChild
 {
     using Condition = bool (*)(const ASTPtr & node, const ASTPtr & child);
@@ -86,5 +89,34 @@ public:
 
 template <typename Data, NeedChild::Condition need_child = NeedChild::all>
 using ConstOneTypeMatcher = OneTypeMatcher<Data, need_child, const ASTPtr>;
+
+template <typename Visitor, typename T = ASTPtr>
+struct InDepthNodeVisitorWithChildInfo : Visitor
+{
+    using ChildInfo = typename Visitor::ChildInfo;
+
+    ChildInfo visit(T & ast, const T & parent = {})
+    {
+        ChildInfo all_children_info;
+        for (auto & child : ast->children)
+        {
+            if (Visitor::needVisitChild(ast, child))
+            {
+                ChildInfo child_info = visit(child, ast);
+                all_children_info.update(child_info);
+            }
+        }
+
+        try
+        {
+            return Visitor::visitNode(ast, parent, all_children_info);
+        }
+        catch (Exception & e)
+        {
+            e.addMessage("While processing {}", ast->formatForErrorMessage());
+            throw;
+        }
+    }
+};
 
 }

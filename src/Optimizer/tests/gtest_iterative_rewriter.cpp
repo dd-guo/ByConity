@@ -37,7 +37,12 @@ struct MergeRule : public Rule
 
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override { return filter()->withSingle(filter()->capturedAs(subNodeCap)); }
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
+    {
+        static auto pattern = filter().withSingle(filter().capturedAs(subNodeCap)).result();
+        return pattern;
+    }
     TransformResult transformImpl(PlanNodePtr node, const Captures & captures, RuleContext &) override
     {
         auto subNode = captures.at<PlanNodePtr>(subNodeCap);
@@ -59,7 +64,12 @@ struct RemoveRule : public Rule
     RemoveRule(int target_) : target(target_) { }
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override { return filter(); }
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
+    {
+        static auto pattern = filter().result();
+        return pattern;
+    }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext &) override
     {
         if (node->getChildren().size() == 1 && dynamic_cast<const MockedStepForRewriterTest *>(node->getStep().get())->i == target)
@@ -75,7 +85,12 @@ struct RecorderRule : public Rule
     std::unordered_set<PlanNodePtr> seen;
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override { return DB::Patterns::any(); }
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
+    {
+        static auto pattern = DB::Patterns::any().result();
+        return pattern;
+    }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext &) override
     {
         ++calls;
@@ -88,15 +103,23 @@ struct AddExchangeRule : public Rule
 {
     const static Capture subNodeCap;
 
+    AddExchangeRule()
+    {
+        pattern
+            = join()
+                  .withAny(DB::Patterns::any()
+                               .capturedAs(subNodeCap))
+                  .result();
+    }
+    bool excludeIfTransformSuccess() const override { return true; }
+    bool excludeIfTransformFailure() const override { return true; }
+
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
     {
-        static PatternPtr pat = join()->withAny(
-            DB::Patterns::any()
-                ->matchingStep<IQueryPlanStep>([](auto & step) { return step.getType() != IQueryPlanStep::Type::Exchange; })
-                ->capturedAs(subNodeCap));
-        return pat;
+        return pattern;
     }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext & context) override
     {
@@ -125,25 +148,29 @@ struct AddExchangeRule : public Rule
         node->setStep(new_step);
         return node;
     }
+private:
+    PatternPtr pattern;
 };
-const Capture AddExchangeRule::subNodeCap;
+const Capture AddExchangeRule::subNodeCap{"subNodeCap"};
 
 struct FillDbNameRule : public Rule
 {
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
     {
-        static PatternPtr pat = tableScan()->matchingStep<MockedTableScanStep>([](auto & step) { return step.database == ""; });
-        return pat;
+        static auto pattern = tableScan().matchingStep<MockedTableScanStep>([](auto & step) { return step.database == ""; }).result();
+        return pattern;
     }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext &) override
     {
-        auto step = std::make_shared<MockedTableScanStep>(
+        QueryPlanStepPtr new_step = std::make_shared<MockedTableScanStep>(
             "db1",
             (dynamic_cast<const MockedTableScanStep *>(node->getStep().get()))->table,
             (dynamic_cast<const MockedTableScanStep *>(node->getStep().get()))->getOutputStream());
-        return PlanNodeBase::createPlanNode(node->getId(), step, {});
+        node->setStep(new_step);
+        return node;
     }
 };
 
@@ -151,7 +178,12 @@ struct RemoveFilterNodeRule : public Rule
 {
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override { return filter(); }
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
+    {
+        static auto pattern = filter().result();
+        return pattern;
+    }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext &) override
     {
         return node->getChildren().empty() ? nullptr : node->getChildren()[0];
@@ -162,18 +194,21 @@ struct RemoveFilterNodeRule : public Rule
 struct SortRule : public Rule
 {
     RuleType getType() const override { return RuleType::NUM_RULES; }
-
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
     {
-        static Capture outerValCap;
-        static Capture innerValCap;
+        static Capture outerValCap{"outerValCap"};
+        static Capture innerValCap{"innerValCap"};
 
-        static PatternPtr pattern
-            = filter()
-                  ->capturedStepAs<MockedStepForRewriterTest>(outerValCap, &MockedStepForRewriterTest::i)
-                  ->withSingle(filter()->capturedStepAs<MockedStepForRewriterTest>(innerValCap, &MockedStepForRewriterTest::i))
-                  ->matchingCapture([](const Captures & caps) { return caps.at<int>(outerValCap) > caps.at<int>(innerValCap); });
+        static auto pattern = filter()
+                                  .capturedStepAs<MockedStepForRewriterTest>(outerValCap, &MockedStepForRewriterTest::i)
+                                  .withSingle(filter()
+                                                  .capturedStepAs<MockedStepForRewriterTest>(innerValCap, &MockedStepForRewriterTest::i)
+                                                  .matchingCapture([](const Captures & caps) {
+                                                      return caps.at<int>(outerValCap) > caps.at<int>(innerValCap);
+                                                  }))
+                                  .result();
         return pattern;
     }
 
@@ -190,7 +225,12 @@ struct NeverEndRule : public Rule
 {
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override { return DB::Patterns::any(); }
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
+    {
+        static auto pattern = DB::Patterns::any().result();
+        return pattern;
+    }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext &) override { return node; }
 };
 
@@ -202,25 +242,40 @@ struct SleepRule : public Rule
     int64_t sleep;
     RuleType getType() const override { return RuleType::NUM_RULES; }
     String getName() const override { return "NUM_RULES"; }
-    PatternPtr getPattern() const override { return DB::Patterns::any(); }
+    bool isEnabled(ContextPtr) const override { return true; }
+    ConstRefPatternPtr getPattern() const override
+    {
+        static auto pattern = DB::Patterns::any().result();
+        return pattern;
+    }
     TransformResult transformImpl(PlanNodePtr node, const Captures &, RuleContext &) override
     {
         ++runs;
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep));
+        Stopwatch watch{CLOCK_THREAD_CPUTIME_ID};
+        while (true)
+        {
+            double duration = watch.elapsedMilliseconds();
+            if (duration >= sleep)
+                break;
+        }
         return node;
     }
 };
 
-void check_continuous_nodes(PlanNodePtr node, int index, std::string testname)
+void check_continuous_nodes(PlanNodePtr node, int index, int max_index, std::string testname)
 {
     ASSERT_EQ(dynamic_cast<const MockedStepForRewriterTest *>(node->getStep().get())->i, index)
         << testname << " fails, index: " + std::to_string(index) << ", reason: "
         << "not expected number";
-    if (node->getChildren().size() > 0)
+    if (index < max_index)
     {
         ASSERT_EQ(node->getChildren().size(), 1) << testname << " fails, index: " + std::to_string(index) << ", reason: "
                                                    << "not single child";
-        check_continuous_nodes(node->getChildren()[0], index + 1, testname);
+        check_continuous_nodes(node->getChildren()[0], index + 1, max_index, testname);
+    }
+    else
+    {
+        ASSERT_EQ(node->getChildren().size(), 0);
     }
 }
 
@@ -232,7 +287,7 @@ TEST(OptimizerIterativeRewriterTest, Coerce)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
     PlanNodePtr result = query_plan.getPlanNode();
 
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result->getStep().get())->i == 2);
@@ -250,7 +305,7 @@ TEST(OptimizerIterativeRewriterTest, SingleRuleRecursivelyApplication)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
     PlanNodePtr result = query_plan.getPlanNode();
 
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result->getStep().get())->i == 16);
@@ -266,7 +321,7 @@ TEST(OptimizerIterativeRewriterTest, CollaborativeRulesApplication)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
     PlanNodePtr result = query_plan.getPlanNode();
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result->getStep().get())->i == 1);
     ASSERT_TRUE(result->getChildren().empty());
@@ -282,13 +337,13 @@ TEST(OptimizerIterativeRewriterTest, CollaborativeRulesOrder)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter1.rewrite(query_plan, context);
+    rewriter1.rewritePlan(query_plan, context);
     PlanNodePtr result1 = query_plan.getPlanNode();
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result1->getStep().get())->i == 2);
     ASSERT_TRUE(result1->getChildren().empty());
 
     QueryPlan query_plan2 = createQueryPlan(plan);
-    rewriter2.rewrite(query_plan2, context);
+    rewriter2.rewritePlan(query_plan2, context);
     PlanNodePtr result2 = query_plan2.getPlanNode();
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result2->getStep().get())->i == 1);
     ASSERT_TRUE(result2->getChildren().empty());
@@ -307,7 +362,7 @@ TEST(OptimizerIterativeRewriterTest, RuleForArbitraryNodeType)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
     PlanNodePtr result = query_plan.getPlanNode();
 
     ASSERT_TRUE(result == plan);
@@ -318,7 +373,7 @@ TEST(OptimizerIterativeRewriterTest, RuleForArbitraryNodeType)
     ASSERT_TRUE(rule->seen.contains(plan->getChildren()[0]->getChildren()[1]));
 }
 
-TEST(OptimizerIterativeRewriterTest, DISABLED_RuleApplication)
+TEST(OptimizerIterativeRewriterTest, RuleApplication)
 {
     RulePtr fillDBNameRule = std::make_shared<FillDbNameRule>();
     RulePtr addExchangeRule = std::make_shared<AddExchangeRule>();
@@ -333,7 +388,7 @@ TEST(OptimizerIterativeRewriterTest, DISABLED_RuleApplication)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
     PlanNodePtr result = query_plan.getPlanNode();
 
     ASSERT_TRUE(result == plan);
@@ -381,12 +436,12 @@ TEST(OptimizerIterativeRewriterTest, DISABLED_RemoveNodeRule)
 
     QueryPlan query_plan1 = createQueryPlan(plan1);
     auto context = Context::createCopy(getContext().context);
-    removeNodeRewriter.rewrite(query_plan1, context);
+    removeNodeRewriter.rewritePlan(query_plan1, context);
     PlanNodePtr res1 = query_plan1.getPlanNode();
     ASSERT_TRUE(res1 == nullptr);
 
     QueryPlan query_plan2 = createQueryPlan(plan2);
-    removeNodeRewriter.rewrite(query_plan2, context);
+    removeNodeRewriter.rewritePlan(query_plan2, context);
     PlanNodePtr res2 = query_plan2.getPlanNode();
     ASSERT_TRUE(res2 == plan2);
     check_input_stream(res2);
@@ -407,12 +462,12 @@ TEST(OptimizerIterativeRewriterTest, TimeoutExhaust)
     PlanNodePtr plan1 = createFilterNode("", "", {});
     QueryPlan query_plan1 = createQueryPlan(plan1);
 
-    ASSERT_THROW_DB_EXCEPTION_WITH_ERROR_CODE(neverEndRewriter.rewrite(query_plan1, context), ErrorCodes::OPTIMIZER_TIMEOUT);
+    ASSERT_THROW_DB_EXCEPTION_WITH_ERROR_CODE(neverEndRewriter.rewritePlan(query_plan1, context), ErrorCodes::OPTIMIZER_TIMEOUT);
 
     std::shared_ptr<SleepRule> sleepRule = std::make_shared<SleepRule>(2500);
     IterativeRewriter sleepRewriter{{sleepRule}, "test"};
 
-    ASSERT_THROW_DB_EXCEPTION_WITH_ERROR_CODE(sleepRewriter.rewrite(query_plan1, context), ErrorCodes::OPTIMIZER_TIMEOUT);
+    ASSERT_THROW_DB_EXCEPTION_WITH_ERROR_CODE(sleepRewriter.rewritePlan(query_plan1, context), ErrorCodes::OPTIMIZER_TIMEOUT);
     ASSERT_TRUE(sleepRule->runs > 0 && sleepRule->runs < 5);
 }
 
@@ -424,7 +479,7 @@ TEST(OptimizerIterativeRewriterTest, ChildrenRewrite)
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
 
     PlanNodePtr result = query_plan.getPlanNode();
 
@@ -441,7 +496,7 @@ TEST(OptimizerIterativeRewriterTest, ChildrenRewriteLeadToNodeRewrite)
     PlanNodePtr plan1 = createRewriteTestNode(2, {createRewriteTestNode(1, {createRewriteTestNode(1, {})})});
     QueryPlan query_plan1 = createQueryPlan(plan1);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan1, context);
+    rewriter.rewritePlan(query_plan1, context);
     PlanNodePtr result1 = query_plan1.getPlanNode();
 
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result1->getStep().get())->i == 4);
@@ -452,7 +507,7 @@ TEST(OptimizerIterativeRewriterTest, ChildrenRewriteLeadToNodeRewrite)
         8, {createRewriteTestNode(4, {createRewriteTestNode(2, {createRewriteTestNode(1, {createRewriteTestNode(1, {})})})})});
 
     QueryPlan query_plan2 = createQueryPlan(plan2);
-    rewriter.rewrite(query_plan2, context);
+    rewriter.rewritePlan(query_plan2, context);
     PlanNodePtr result2 = query_plan2.getPlanNode();
 
     ASSERT_TRUE(dynamic_cast<const MockedStepForRewriterTest *>(result2->getStep().get())->i == 16);
@@ -467,9 +522,9 @@ TEST(OptimizerIterativeRewriterTest, ChildrenRewriteLeadToNodeRewriteLeadToChild
 
     QueryPlan query_plan = createQueryPlan(plan);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan, context);
+    rewriter.rewritePlan(query_plan, context);
 
-    check_continuous_nodes(query_plan.getPlanNode(), 1, "test 4 nodes sorting");
+    check_continuous_nodes(query_plan.getPlanNode(), 1, 4, "test 4 nodes sorting");
 }
 
 TEST(OptimizerIterativeRewriterTest, SortRule)
@@ -489,9 +544,9 @@ TEST(OptimizerIterativeRewriterTest, SortRule)
 
     QueryPlan query_plan1 = createQueryPlan(plan1);
     auto context = Context::createCopy(getContext().context);
-    rewriter.rewrite(query_plan1, context);
+    rewriter.rewritePlan(query_plan1, context);
 
-    check_continuous_nodes(query_plan1.getPlanNode(), 1, "test 8 nodes sorting case 1");
+    check_continuous_nodes(query_plan1.getPlanNode(), 1, 8, "test 8 nodes sorting case 1");
 
     PlanNodePtr plan2 = createRewriteTestNode(
         4,
@@ -505,7 +560,7 @@ TEST(OptimizerIterativeRewriterTest, SortRule)
                         6, {createRewriteTestNode(7, {createRewriteTestNode(1, {createRewriteTestNode(3, {})})})})})})})});
 
     QueryPlan query_plan2 = createQueryPlan(plan2);
-    rewriter.rewrite(query_plan2, context);
+    rewriter.rewritePlan(query_plan2, context);
 
-    check_continuous_nodes(query_plan2.getPlanNode(), 1, "test 8 nodes sorting case 2");
+    check_continuous_nodes(query_plan2.getPlanNode(), 1, 8, "test 8 nodes sorting case 2");
 }

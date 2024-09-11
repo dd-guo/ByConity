@@ -141,6 +141,8 @@ namespace DB
             return true;
         }
 
+        bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     private:
         DataTypes argument_types;
         DataTypePtr return_type;
@@ -241,7 +243,7 @@ namespace DB
         static constexpr auto name = "runningConcurrency";
     };
 
-    void registerFunctionRunningConcurrency(FunctionFactory & factory)
+    REGISTER_FUNCTION(RunningConcurrency)
     {
         factory.registerFunction<RunningConcurrencyOverloadResolver<NameRunningConcurrency, DataTypeUInt32>>();
     }

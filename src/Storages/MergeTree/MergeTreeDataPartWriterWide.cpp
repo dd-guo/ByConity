@@ -19,7 +19,6 @@
  * All Bytedance's Modifications are Copyright (2023) Bytedance Ltd. and/or its affiliates.
  */
 
-#include <Columns/ColumnByteMap.h>
 #include <Compression/CompressedReadBufferFromFile.h>
 #include <Compression/CompressionFactory.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -28,6 +27,7 @@
 #include <DataTypes/Serializations/SerializationNullable.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/sortBlock.h>
+#include <Interpreters/CnchSystemLog.h>
 #include <Storages/IndexFile/FilterPolicy.h>
 #include <Storages/MergeTree/MergeTreeDataPartWriterWide.h>
 #include <Storages/MergeTree/MergeTreeSuffix.h>
@@ -45,6 +45,7 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int CANNOT_OPEN_FILE;
+    extern const int UNIQUE_TABLE_DUPLICATE_KEY_FOUND;
 }
 
 namespace
@@ -109,7 +110,8 @@ MergeTreeDataPartWriterWide::MergeTreeDataPartWriterWide(
     const String & marks_file_extension_,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & settings_,
-    const MergeTreeIndexGranularity & index_granularity_)
+    const MergeTreeIndexGranularity & index_granularity_,
+    const BitmapBuildInfo & bitmap_build_info_)
     : MergeTreeDataPartWriterOnDisk(
         data_part_,
         columns_list_,
@@ -118,16 +120,20 @@ MergeTreeDataPartWriterWide::MergeTreeDataPartWriterWide(
         marks_file_extension_,
         default_codec_,
         settings_,
-        index_granularity_)
+        index_granularity_,
+        bitmap_build_info_)
     , log(&Poco::Logger::get(storage.getLogName() + " (WriterWide)"))
 {
     const auto & columns = metadata_snapshot->getColumns();
     for (const auto & it : columns_list)
     {
-        if (it.type->isMap() && !it.type->isMapKVStore())
+        if (it.type->isByteMap())
             continue;
-        else if (isMapImplicitKeyNotKV(it.name))
-            addByteMapStreams({it}, parseMapNameFromImplicitColName(it.name), default_codec->getFullCodecDesc());
+        else if (isMapImplicitKey(it.name))
+        {
+            auto map_name = parseMapNameFromImplicitColName(it.name);
+            addByteMapStreams({it}, map_name, columns.getCodecDescOrDefault(map_name, default_codec));
+        }
         else
             addStreams(it, columns.getCodecDescOrDefault(it.name, default_codec));
     }
@@ -215,6 +221,7 @@ void MergeTreeDataPartWriterWide::write(const Block & block, const IColumn::Perm
 
     /// Fill permuted underlying columns for unique key
     Block unique_key_block;
+    Block bitmap_index_block;
     NameSet unique_key_underlying_columns;
     String version_column_name;
     if (settings.enable_disk_based_key_index)
@@ -230,6 +237,20 @@ void MergeTreeDataPartWriterWide::write(const Block & block, const IColumn::Perm
         const ColumnWithTypeAndName & column = block.getByName(it->name);
         const bool part_of_unique_key = unique_key_underlying_columns.count(column.name) > 0;
         const bool is_extra_column = !version_column_name.empty() && (column.name == version_column_name);
+        const bool is_bitmap_index_column = column_bitmap_indexes.count(ISerialization::getFileNameForStream(column.name, {}));
+
+        if (!rows_count && column.column->lowCardinality())
+        {
+            // check lc switch at the very beginning
+            auto const *lc = typeid_cast<const ColumnLowCardinality *>(column.column.get());
+            if (lc->isFullState())
+            {
+                auto const *lc_type = typeid_cast<const DataTypeLowCardinality *>(column.type.get());
+                // lc full column need switch type
+                NameAndTypePair pair(column.name,  lc_type->getFullLowCardinalityTypePtr());
+                updateWriterStream(pair);
+            }
+        }
 
         if (permutation)
         {
@@ -238,6 +259,8 @@ void MergeTreeDataPartWriterWide::write(const Block & block, const IColumn::Perm
                 const auto & primary_column = primary_key_block.getByName(it->name);
                 if (part_of_unique_key || is_extra_column)
                     unique_key_block.insert(primary_column);
+                if (is_bitmap_index_column)
+                    bitmap_index_block.insert(primary_column);
                 writeColumn(*it, *primary_column.column, offset_columns, granules_to_write);
             }
             else if (skip_indexes_block.has(it->name))
@@ -245,6 +268,8 @@ void MergeTreeDataPartWriterWide::write(const Block & block, const IColumn::Perm
                 const auto & index_column = skip_indexes_block.getByName(it->name);
                 if (part_of_unique_key || is_extra_column)
                     unique_key_block.insert(index_column);
+                if (is_bitmap_index_column)
+                    bitmap_index_block.insert(index_column);
                 writeColumn(*it, *index_column.column, offset_columns, granules_to_write);
             }
             else
@@ -253,6 +278,8 @@ void MergeTreeDataPartWriterWide::write(const Block & block, const IColumn::Perm
                 ColumnPtr permuted_column = column.column->permute(*permutation, 0);
                 if (part_of_unique_key || is_extra_column)
                     unique_key_block.insert(ColumnWithTypeAndName(permuted_column, column.type, column.name));
+                if (is_bitmap_index_column)
+                    bitmap_index_block.insert(ColumnWithTypeAndName(permuted_column, column.type, column.name));
                 writeColumn(*it, *permuted_column, offset_columns, granules_to_write);
             }
         }
@@ -260,9 +287,15 @@ void MergeTreeDataPartWriterWide::write(const Block & block, const IColumn::Perm
         {
             if (part_of_unique_key || is_extra_column)
                 unique_key_block.insert(column);
+            bitmap_index_block.insert(column);
             writeColumn(*it, *column.column, offset_columns, granules_to_write);
         }
     }
+
+    if (!bitmap_index_block && (!column_bitmap_indexes.empty() || !column_segment_bitmap_indexes.empty()))
+        bitmap_index_block = block;
+    writeBitmapIndexColumns(bitmap_index_block);
+    writeSegmentBitmapIndexColumns(bitmap_index_block);
 
     if (settings.rewrite_primary_key)
         calculateAndSerializePrimaryIndex(primary_key_block, granules_to_write);
@@ -360,6 +393,9 @@ void MergeTreeDataPartWriterWide::writeFinalUniqueKeyIndexFile(IndexFile::IndexF
     if (!settings.enable_disk_based_key_index || rows_count == 0)
         return;
 
+    if (rows_count > std::numeric_limits<UInt32>::max())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "rows count {} doesn't fit in 32-bits", rows_count);
+
     /// write unique_key -> rowid mappings to key index file
     String unique_key_index_file = fullPath(data_part->volume->getDisk(), part_path + UKI_FILE_NAME);
     IndexFile::Options options;
@@ -369,6 +405,7 @@ void MergeTreeDataPartWriterWide::writeFinalUniqueKeyIndexFile(IndexFile::IndexF
     if (!status.ok())
         throw Exception(ErrorCodes::CANNOT_OPEN_FILE, "Error while opening file {}: {}", unique_key_index_file, status.ToString());
 
+    size_t keys_count = 0; /// number of unique keys
     if (!temp_unique_key_index)
     {
         /// normal insert case : create index file from buffered block
@@ -405,6 +442,7 @@ void MergeTreeDataPartWriterWide::writeFinalUniqueKeyIndexFile(IndexFile::IndexF
         if (data_part->storage.merging_params.hasExplicitVersionColumn())
             version_column = buffered_unique_key_block.getByName(data_part->storage.merging_params.version_column).column;
 
+        Stopwatch timer;
         for (UInt32 rid = 0, size = buffered_unique_key_block.rows(); rid < size; ++rid)
         {
             size_t idx = unique_key_perm_ptr ? unique_key_perm[rid] : rid;
@@ -422,7 +460,9 @@ void MergeTreeDataPartWriterWide::writeFinalUniqueKeyIndexFile(IndexFile::IndexF
             if (!status.ok())
                 throw Exception("Error while adding key to " + unique_key_index_file + ": " + status.ToString(), ErrorCodes::LOGICAL_ERROR);
         }
+        LOG_DEBUG(storage.getLogger(), "Write data into unique key index file cost {} ms", timer.elapsedMilliseconds());
 
+        keys_count = buffered_unique_key_block.rows();
         buffered_unique_key_block.clear();
     }
     else
@@ -436,6 +476,7 @@ void MergeTreeDataPartWriterWide::writeFinalUniqueKeyIndexFile(IndexFile::IndexF
             status = index_writer.Add(Slice(key.data(), key.size()), Slice(val.data(), val.size()));
             if (!status.ok())
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Error while adding key to {}: {}", unique_key_index_file, status.ToString());
+            keys_count++;
         }
         if (!iter->status().ok())
             throw Exception(
@@ -445,6 +486,24 @@ void MergeTreeDataPartWriterWide::writeFinalUniqueKeyIndexFile(IndexFile::IndexF
                 iter->status().ToString());
         iter.reset();
         closeTempUniqueKeyIndex();
+    }
+
+    /// Prevent merge task from creating merged part with duplicated keys
+    if (rows_count != keys_count)
+    {
+        if (auto unique_table_log = storage.getContext()->getCloudUniqueTableLog())
+        {
+            auto current_log = UniqueTable::createUniqueTableLog(UniqueTableLogElement::ERROR, storage.getCnchStorageID());
+            current_log.metric = ErrorCodes::UNIQUE_TABLE_DUPLICATE_KEY_FOUND;
+            current_log.event_msg = fmt::format("rows count {} doesn't match unique keys count {}", rows_count, keys_count);
+            TaskInfo log_entry_task_info;
+            log_entry_task_info.task_type = TaskInfo::MERGE_TASK;
+            log_entry_task_info.dedup_gran.partition_id = !storage.getSettings()->partition_level_unique_keys ? ALL_DEDUP_GRAN_PARTITION_ID : data_part->get_info().partition_id;
+            log_entry_task_info.dedup_gran.bucket_number = storage.getSettings()->enable_bucket_level_unique_keys ? data_part->bucket_number : -1;
+            current_log.task_info = std::move(log_entry_task_info);
+            unique_table_log->add(current_log);
+        }
+        throw Exception(ErrorCodes::UNIQUE_TABLE_DUPLICATE_KEY_FOUND, "rows count {} doesn't match unique keys count {}", rows_count, keys_count);
     }
 
     status = index_writer.Finish(&file_info);
@@ -527,7 +586,7 @@ void MergeTreeDataPartWriterWide::validateColumnOfFixedSize(const String & name,
         {
             auto column = type.createColumn();
 
-            serialization->deserializeBinaryBulk(*column, bin_in, 1000000000, 0.0);
+            serialization->deserializeBinaryBulk(*column, bin_in, 1000000000, 0.0, false, nullptr);
 
             throw Exception(
                 ErrorCodes::LOGICAL_ERROR,
@@ -564,7 +623,7 @@ void MergeTreeDataPartWriterWide::validateColumnOfFixedSize(const String & name,
 
         auto column = type.createColumn();
 
-        serialization->deserializeBinaryBulk(*column, bin_in, index_granularity_rows, 0.0);
+        serialization->deserializeBinaryBulk(*column, bin_in, index_granularity_rows, 0.0, false, nullptr);
 
         if (bin_in.eof())
         {
@@ -613,7 +672,7 @@ void MergeTreeDataPartWriterWide::validateColumnOfFixedSize(const String & name,
     {
         auto column = type.createColumn();
 
-        serialization->deserializeBinaryBulk(*column, bin_in, 1000000000, 0.0);
+        serialization->deserializeBinaryBulk(*column, bin_in, 1000000000, 0.0, false, nullptr);
 
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
@@ -653,7 +712,7 @@ void MergeTreeDataPartWriterWide::finishDataSerialization(IMergeTreeDataPart::Ch
         auto it = columns_list.begin();
         for (size_t i = 0; i < columns_list.size(); ++i, ++it)
         {
-            if (it->type->isMap() && !it->type->isMapKVStore())
+            if (it->type->isByteMap())
             {
                 continue;
             }
@@ -715,6 +774,10 @@ void MergeTreeDataPartWriterWide::finish(IMergeTreeDataPart::Checksums & checksu
         finishPrimaryIndexSerialization(checksums, sync);
 
     finishSkipIndicesSerialization(checksums, sync);
+
+    finishBitmapIndexSerialization(checksums);
+
+    finishSegmentBitmapIndexSerialization(checksums);
 
     if (settings.enable_disk_based_key_index)
     {

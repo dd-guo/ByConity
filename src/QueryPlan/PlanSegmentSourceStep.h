@@ -42,15 +42,12 @@ public:
 
     void initializePipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
 
-    void serialize(WriteBuffer &) const override;
 
-    static QueryPlanStepPtr deserialize(ReadBuffer &, ContextPtr context_ = nullptr);
 
     QueryPlanStepPtr generateStep();
 
     StorageID getStorageID() const { return storage_id; }
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
-
 private:
 
     StorageID storage_id;

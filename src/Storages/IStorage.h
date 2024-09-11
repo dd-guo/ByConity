@@ -25,22 +25,29 @@
 #include <Core/QueryProcessingStage.h>
 #include <DataStreams/IBlockStream_fwd.h>
 #include <Databases/IDatabase.h>
+#include <Disks/IDisk.h>
 #include <Interpreters/CancellationCode.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
 #include <Processors/QueryPipeline.h>
+#include <ResourceManagement/CommonData.h>
 #include <Storages/CheckResults.h>
 #include <Storages/ColumnDependency.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/SelectQueryDescription.h>
 #include <Storages/StorageInMemoryMetadata.h>
+#include <Storages/TableDefinitionHash.h>
 #include <Storages/TableLockHolder.h>
-#include <Disks/IDisk.h>
+#include <Storages/TableStatistics.h>
+#include <Transaction/TxnTimestamp.h>
 #include <Common/ActionLock.h>
 #include <Common/Exception.h>
+#include <Common/HostWithPorts.h>
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <Common/HostWithPorts.h>
+#include <ResourceManagement/CommonData.h>
+#include <Storages/StorageSnapshot.h>
 #include <Transaction/TxnTimestamp.h>
 
 #include <optional>
@@ -98,6 +105,8 @@ using NameDependencies = std::unordered_map<String, std::vector<String>>;
 using PartNamesWithDisks = std::vector<std::pair<String, DiskPtr>>;
 using PartNamesWithDiskNames = std::vector<std::pair<String, String>>;
 
+class PlanNodeStatistics;
+using PlanNodeStatisticsPtr = std::shared_ptr<PlanNodeStatistics>;
 struct ColumnSize
 {
     size_t marks = 0;
@@ -136,9 +145,11 @@ public:
 
     /// The name of the table.
     StorageID getStorageID() const;
+    virtual StorageID getCnchStorageID() const { return getStorageID(); }
     std::string getTableName() const { return storage_id.table_name; }
     std::string getDatabaseName() const { return storage_id.database_name; }
     UUID getStorageUUID() const { return storage_id.uuid; }
+    std::string getServerVwName() const { return storage_id.server_vw_name; }
 
     /// Returns true if the storage receives data from a remote server or servers.
     virtual bool isRemote() const { return false; }
@@ -184,10 +195,16 @@ public:
     /// Support trivial count optimization for high level storage, only TRUE for StorageCnchMergeTree
     virtual bool supportsTrivialCount() const { return false; }
 
+    /// Returns true if the storage supports storing of dynamic subcolumns.
+    /// For now it makes sense only for data type Object.
+    virtual bool supportsDynamicSubcolumns() const { return false; }
+
     /// Requires squashing small blocks to large for optimal storage.
     /// This is true for most storages that store data on disk.
     virtual bool prefersLargeBlocks() const { return true; }
 
+    /// Returns true if the storage is for system, which cannot be target of SHOW CREATE TABLE.
+    virtual bool isSystemStorage() const { return false; }
 
     /// Optional size information of each physical column.
     /// Currently it's only used by the MergeTree family for query optimizations.
@@ -197,6 +214,9 @@ public:
     /// Get mutable version (snapshot) of storage metadata. Metadata object is
     /// multiversion, so it can be concurrently changed, but returned copy can be
     /// used without any locks.
+    /// NOTE: this function has significantly higher overhead than getInMemoryMetadataPtr()
+    /// due to the need to copy StorageInMemoryMetadata.
+    /// Prefer use getInMemoryMetadataPtr() if only read access is needed.
     StorageInMemoryMetadata getInMemoryMetadata() const { return *metadata.get(); }
 
     /// Get immutable version (snapshot) of storage metadata. Metadata object is
@@ -230,18 +250,51 @@ public:
     NameDependencies getDependentViewsByColumn(ContextPtr context) const;
 
     /// Check whether column names and data types are valid. If not, throw Exception.
-    virtual void checkColumnsValidity([[maybe_unused]] const ColumnsDescription & columns) const {}
+    virtual void checkColumnsValidity(const ColumnsDescription &, [[maybe_unused]] const ASTPtr & new_settings = nullptr) const {}
 
     void setCreateTableSql(String sql) { create_table_sql = std::move(sql); }
     String getCreateTableSql() const { return create_table_sql; }
 
     virtual bool isBucketTable() const {return false;}
-    virtual UInt64 getTableHashForClusterBy() const {return 0;}
+    virtual TableDefinitionHash getTableHashForClusterBy() const {return {};}
+    virtual bool isTableClustered(ContextPtr /*context*/) const { return false; }
+
+    /// Return true if there is at least one part containing lightweight deleted mask.
+    virtual bool hasLightweightDeletedMask() const { return false; }
+
+    /// Return true if storage can execute lightweight delete.
+    virtual bool supportsLightweightDelete() const { return false; }
+
+    virtual std::optional<String> getVirtualWarehouseName(VirtualWarehouseType /*vw_type*/) const { return {}; }
+
+    /// Whether storage is supported by optimier
+    virtual bool supportsOptimizer() const { return false; }
+
+    /// Get table stats for estimates, used in optimizer
+    virtual std::optional<TableStatistics> getTableStats(const Strings & /*columns*/, ContextPtr /*local_context*/) { return {}; }
+
+    /// Determine plan segment dispatch, used in optimizer
+    virtual bool supportsDistributedRead() const { return false; }
+
+    /// Prepare storeage read in plan segment and return allocated table storage id, used in optimizer
+    /// if nothing to do, return origin storage id.
+    virtual StorageID prepareTableRead(const Names & /*columns*/, SelectQueryInfo & /*query_info*/, ContextPtr /*context*/)
+    {
+        return getStorageID();
+    }
+
+    /// Prepare storeage write in plan segment and return allocated table storage id, used in optimizer
+    virtual StorageID prepareTableWrite(ContextPtr /*context*/) { return getStorageID(); }
+
+        /// Supports part-level intermedicate result cache for aggregating
+    virtual bool supportIntermedicateResultCache() const { return false; }
 
 protected:
     /// Returns whether the column is virtual - by default all columns are real.
     /// Initially reserved virtual column name may be shadowed by real column.
     bool isVirtualColumn(const String & column_name, const StorageMetadataPtr & metadata_snapshot) const;
+
+    void setServerVwName(const std::string & server_vw_name) { storage_id.server_vw_name = server_vw_name; }
 
 private:
 
@@ -293,7 +346,7 @@ public:
       * since it cannot return Complete for intermediate queries never.
       */
     virtual QueryProcessingStage::Enum
-    getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageMetadataPtr &, SelectQueryInfo &) const
+    getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const
     {
         return QueryProcessingStage::FetchColumns;
     }
@@ -354,7 +407,7 @@ public:
       */
     virtual Pipe read(
         const Names & /*column_names*/,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & /*query_info*/,
         ContextPtr /*context*/,
         QueryProcessingStage::Enum /*processed_stage*/,
@@ -366,7 +419,7 @@ public:
     virtual void read(
         QueryPlan & query_plan,
         const Names & /*column_names*/,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & /*query_info*/,
         ContextPtr /*context*/,
         QueryProcessingStage::Enum /*processed_stage*/,
@@ -377,7 +430,7 @@ public:
     virtual void read(
         QueryPlan & query_plan,
         const Names & /*column_names*/,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
+        const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & /*query_info*/,
         ContextPtr /*context*/,
         QueryProcessingStage::Enum /*processed_stage*/,
@@ -478,11 +531,15 @@ public:
 
     /** ALTER tables with regard to its partitions.
       * Should handle locks for each command on its own.
+      *
+      * Use the last `query` argument to keep the alter query ast since in some case we need to forward the
+      * query to workers
       */
     virtual Pipe alterPartition(
         const StorageMetadataPtr & /* metadata_snapshot */,
         const PartitionCommands & /* commands */,
-        ContextPtr /* context */);
+        ContextPtr /* context */,
+        const ASTPtr & query = nullptr);
 
     /// Checks that partition commands can be applied to storage.
     virtual void checkAlterPartitionIsPossible(const PartitionCommands & commands, const StorageMetadataPtr & metadata_snapshot, const Settings & settings) const;
@@ -584,6 +641,9 @@ public:
     /// Checks validity of the data
     virtual CheckResults checkData(const ASTPtr & /* query */, ContextPtr /* context */) { throw Exception("Check query is not supported for " + getName() + " storage", ErrorCodes::NOT_IMPLEMENTED); }
 
+    /// Checks validity of the data and auto remove invailid metadata
+    virtual CheckResults autoRemoveData(const ASTPtr & /* query */, ContextPtr /* context */) { throw Exception("Check query with auto remove is not supported for " + getName() + " storage", ErrorCodes::NOT_IMPLEMENTED); }
+
     /// Checks that table could be dropped right now
     /// Otherwise - throws an exception with detailed information.
     /// We do not use mutex because it is not very important that the size could change during the operation.
@@ -656,17 +716,35 @@ public:
     /// Does not takes underlying Storage (if any) into account.
     virtual std::optional<UInt64> lifetimeBytes() const { return {}; }
 
-    void serialize(WriteBuffer & buf) const;
-    static StoragePtr deserialize(ReadBuffer & buf, const ContextPtr & context);
+    /// Creates a storage snapshot from given metadata.
+    virtual StorageSnapshotPtr getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr /*query_context*/) const
+    {
+        return std::make_shared<StorageSnapshot>(*this, metadata_snapshot);
+    }
+
+    /// Creates a storage snapshot from given metadata and columns, which are used in query.
+    virtual StorageSnapshotPtr getStorageSnapshotForQuery(const StorageMetadataPtr & metadata_snapshot, const ASTPtr & /*query*/, ContextPtr query_context) const
+    {
+        return getStorageSnapshot(metadata_snapshot, query_context);
+    }
 
     bool is_detached{false};
 
     TxnTimestamp commit_time;
+    TxnTimestamp latest_version;
     /// Parts metadata columns mapping related
     NamesAndTypesListPtr part_columns = std::make_shared<NamesAndTypesList>();
     std::map<UInt64, NamesAndTypesListPtr> previous_versions_part_columns;
     NamesAndTypesListPtr getPartColumns(const UInt64 & columns_commit_time) const;
     UInt64 getPartColumnsCommitTime(const NamesAndTypesList & search_part_columns) const;
+
+    // Apply filter for IStorage::read. Application results are stored in SelectQueryInfo, typically are:
+    //  - query.where(), the full filter used for generic purposes(e.g. partition pruning/index pruning...)
+    //  - partition_filter, filters used for partition pruning
+    //  - query.prewhere(), filters used in data reading
+    // Returns a remaining filter which consists of criteria that can not be evaluated completely in storage,
+    // and it will be evaluated again in the query pipeline.
+    virtual ASTPtr applyFilter(ASTPtr query_filter, SelectQueryInfo & query_info, ContextPtr, PlanNodeStatisticsPtr) const;
 
 private:
     std::atomic<UInt64> update_time{0};

@@ -15,11 +15,13 @@
 
 #pragma once
 
+#include <unordered_map>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context_fwd.h>
 #include <Parsers/IAST_fwd.h>
 #include <ResourceManagement/WorkerGroupType.h>
 #include <ResourceManagement/VWScheduleAlgo.h>
+#include "Common/HostWithPorts.h"
 #include <Common/ConsistentHashUtils/ConsistentHashRing.h>
 
 #include <ResourceManagement/CommonData.h>
@@ -87,6 +89,8 @@ public:
     auto getQualifiedName() const { return backQuoteIfNeed(vw_name) + '.' + backQuoteIfNeed(id); }
     auto & getHostWithPortsVec() const { return hosts; }
     auto empty() const { return hosts.empty(); }
+    auto size() const { return hosts.size(); }
+    auto workerNum() const { return worker_num; }
 
     /// TODO: (zuochuang.zema) consider reduce the size of WorkerGroupMetrics.
     auto getMetrics() const
@@ -101,12 +105,19 @@ public:
         metrics = metrics_;
     }
 
-    const auto & getWorkerClients() const { return worker_clients; }
+    auto getPriority() const
+    {
+        std::lock_guard lock(state_mutex);
+        return priority;
+    }
+
+    std::vector<CnchWorkerClientPtr> getWorkerClients() const;
     const ShardsInfo & getShardsInfo() const { return shards_info; }
 
-    CnchWorkerClientPtr getWorkerClient() const;
-    CnchWorkerClientPtr getWorkerClientByHash(const String & key) const;
+    CnchWorkerClientPtr getWorkerClient(bool skip_busy_worker = true) const;
+    std::pair<UInt64, CnchWorkerClientPtr> getWorkerClient(UInt64 sequence, bool skip_busy_worker = true) const;
     CnchWorkerClientPtr getWorkerClient(const HostWithPorts & host_ports) const;
+    CnchWorkerClientPtr doGetWorkerClient(const HostWithPorts & host_ports) const;
 
     std::optional<size_t> indexOf(const HostWithPorts & host_ports) const
     {
@@ -130,6 +141,15 @@ public:
     bool hasRing() const { return ring != nullptr; }
     const DB::ConsistentHashRing & getRing() const { return *ring; }
 
+    std::unordered_map<String, HostWithPorts> getIdHostPortsMap() const;
+
+    static WorkerGroupHandle mockWorkerGroupHandle(const String & worker_id_prefix_, UInt64 worker_number_, const ContextPtr & context_);
+
+    void addHostWithPorts(const HostWithPorts & host_with_ports)
+    {
+        hosts.push_back(host_with_ports);
+        worker_num++;
+    }
 private:
     /// Note: updating mutable fields (like `metrics`) should be guarded with lock.
     mutable std::mutex state_mutex;
@@ -140,8 +160,9 @@ private:
     String vw_name;
     HostWithPortsVec hosts;
     WorkerGroupMetrics metrics;
-
-    std::vector<CnchWorkerClientPtr> worker_clients;
+    /// the specified number of workers in current worker group.
+    UInt64 worker_num;
+    Int64 priority{0};
 
     /// Description of the cluster shards.
     ShardsInfo shards_info;
@@ -149,7 +170,7 @@ private:
     /// Hash Map for part allocation
     std::unique_ptr<DB::ConsistentHashRing> ring;
 
-    static std::unique_ptr<DB::ConsistentHashRing> buildRing(const ShardsInfo & shards_info, const ContextPtr global_context);
+    void buildRing();
 };
 
 }

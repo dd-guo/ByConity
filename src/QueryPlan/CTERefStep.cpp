@@ -13,34 +13,53 @@
  * limitations under the License.
  */
 
-#include <QueryPlan/CTERefStep.h>
+#include <unordered_map>
 
+#include <IO/ReadHelpers.h>
+#include <IO/VarInt.h>
+#include <Optimizer/Utils.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTSerDerHelper.h>
 #include <QueryPlan/CTEInfo.h>
-#include <QueryPlan/FilterStep.h>
-#include <QueryPlan/PlanCopier.h>
-#include <QueryPlan/PlanNode.h>
+#include <QueryPlan/CTERefStep.h>
+#include <QueryPlan/PlanSymbolReallocator.h>
+
 
 namespace DB
 {
-std::shared_ptr<IQueryPlanStep> CTERefStep::copy(ContextPtr) const
+
+CTERefStep::CTERefStep(DataStream output_, CTEId id_, std::unordered_map<String, String> output_columns_, bool has_filter_)
+    : ISourceStep(std::move(output_)), id(id_), output_columns(std::move(output_columns_)), has_filter(has_filter_)
 {
-    return std::make_shared<CTERefStep>(output_stream.value(), id, output_columns, filter);
 }
 
-void CTERefStep::serialize(WriteBuffer & buffer) const
+CTERefStep::CTERefStep(Block header_, CTEId id_, std::unordered_map<String, String> output_columns_, bool has_filter_)
+    : ISourceStep(DataStream{.header = header_}), id(id_), output_columns(std::move(output_columns_)), has_filter(has_filter_)
 {
-    writeBinary(id, buffer);
+}
 
-    writeVarUInt(output_columns.size(), buffer);
-    for (const auto & item : output_columns)
-    {
-        writeStringBinary(item.first, buffer);
-        writeStringBinary(item.second, buffer);
-    }
+std::shared_ptr<IQueryPlanStep> CTERefStep::copy(ContextPtr) const
+{
+    return std::make_shared<CTERefStep>(output_stream.value(), id, output_columns, has_filter);
+}
 
-    serializeAST(filter->clone(), buffer);
+std::shared_ptr<CTERefStep> CTERefStep::fromProto(const Protos::CTERefStep & proto, ContextPtr)
+{
+    auto base_output_header = ISourceStep::deserializeFromProtoBase(proto.query_plan_base());
+    auto id = proto.id();
+    auto output_columns = deserializeMapFromProto<String, String>(proto.output_columns());
+    auto has_filter = proto.has_filter();
+    auto step = std::make_shared<CTERefStep>(base_output_header, id, output_columns, has_filter);
+
+    return step;
+}
+
+void CTERefStep::toProto(Protos::CTERefStep & proto, bool) const
+{
+    ISourceStep::serializeToProtoBase(*proto.mutable_query_plan_base());
+    proto.set_id(id);
+    serializeMapToProto(output_columns, *proto.mutable_output_columns());
+    proto.set_has_filter(has_filter);
 }
 
 std::shared_ptr<ProjectionStep> CTERefStep::toProjectionStep() const
@@ -48,25 +67,37 @@ std::shared_ptr<ProjectionStep> CTERefStep::toProjectionStep() const
     NamesAndTypes inputs;
     Assignments assignments;
     NameToType name_to_type;
-    for (auto & item : output_columns)
-        assignments.emplace_back(item.first, std::make_shared<ASTIdentifier>(item.second));
-    for (auto & item : output_stream.value().header)
+    for (const auto & item : output_stream.value().header)
     {
-        name_to_type.emplace(item.name, item.type);
-        inputs.emplace_back(NameAndTypePair{output_columns.at(item.name), item.type});
+        if (output_columns.contains(item.name))
+        {
+            assignments.emplace_back(item.name, std::make_shared<ASTIdentifier>(output_columns.at(item.name)));
+            name_to_type.emplace(item.name, item.type);
+            inputs.emplace_back(NameAndTypePair{output_columns.at(item.name), item.type});
+        }
     }
     return std::make_shared<ProjectionStep>(DataStream{inputs}, assignments, name_to_type);
 }
 
-PlanNodePtr CTERefStep::toInlinedPlanNode(CTEInfo & cte_info, ContextMutablePtr & context, bool with_filter) const
+PlanNodePtr CTERefStep::toInlinedPlanNode(CTEInfo & cte_info, ContextMutablePtr & context) const
 {
-    auto with_clause_plan = PlanCopier::copy(cte_info.getCTEDef(id), context);
-    if (with_filter)
+    auto rewrite = PlanSymbolReallocator::reallocate(cte_info.getCTEDef(id), context);
+
+    // create projection step to guarante output symbols
+    NamesAndTypes inputs;
+    Assignments assignments;
+    NameToType name_to_type;
+    for (const auto & item : output_stream.value().header)
     {
-        auto filter_step = std::make_shared<FilterStep>(with_clause_plan->getStep()->getOutputStream(), filter);
-        with_clause_plan = PlanNodeBase::createPlanNode(context->nextNodeId(), filter_step, {with_clause_plan});
+        if (output_columns.contains(item.name))
+        {
+            assignments.emplace_back(item.name, std::make_shared<ASTIdentifier>(rewrite.mappings.at(output_columns.at(item.name))));
+            name_to_type.emplace(item.name, item.type);
+            inputs.emplace_back(NameAndTypePair{output_columns.at(item.name), item.type});
+        }
     }
-    return PlanNodeBase::createPlanNode(context->nextNodeId(), toProjectionStep(), {with_clause_plan});
+    return PlanNodeBase::createPlanNode(
+        context->nextNodeId(), std::make_shared<ProjectionStep>(DataStream{inputs}, assignments, name_to_type), {rewrite.plan_node});
 }
 
 std::unordered_map<String, String> CTERefStep::getReverseOutputColumns() const

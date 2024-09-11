@@ -32,3 +32,79 @@ CREATE TABLE q5_t1
     b Float64
 ) ENGINE = CnchMergeTree()
 ORDER BY a;
+
+CREATE TABLE q6_t1
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q6_t2
+(
+    a UInt64,
+    c UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q6_t3
+(
+    a UInt64,
+    d UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q6_t4
+(
+    a UInt64,
+    e UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q6_t5
+(
+    a UInt64,
+    f UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q15_t1
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q15_t2
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q16_t1
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q16_t2
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q17_t1
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q17_t2
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE q17_t3
+(
+    a UInt64,
+    b UInt64
+) ENGINE = Memory();
+
+CREATE TABLE cust(  sk Int32,  c_customer_id String,  item Nullable(Int64)) ENGINE = CnchMergeTree ORDER BY sk;
+
+CREATE TABLE web(  ws_item_sk Int64,  sk Nullable(Int64),  price Nullable(Float)) ENGINE = CnchMergeTree order by ws_item_sk;

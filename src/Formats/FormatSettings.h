@@ -24,10 +24,15 @@
 #include <common/types.h>
 #include <unordered_set>
 #include <map>
+#include <vector>
+#include <Core/Defines.h>
+
+#if !defined(ARCADIA_BUILD)
+#    include <Common/config.h>
+#endif
 
 namespace DB
 {
-
 /**
   * Various tweaks for input/output formats. Text serialization/deserialization
   * of data types also depend on some of these settings. It is different from
@@ -50,11 +55,20 @@ struct FormatSettings
     bool write_statistics = true;
     bool import_nested_json = false;
     bool null_as_default = true;
+    bool defaults_for_omitted_fields = true;
+    bool decimal_trailing_zeros = false;
+    bool check_data_overflow = false;
 
+    bool seekable_read = true;
+    UInt64 max_rows_to_read_for_schema_inference = 100;
+    UInt64 max_bytes_to_read_for_schema_inference = 32 * 1024 * 1024;
+
+    bool avoid_buffering = true;
     enum class DateTimeInputFormat
     {
         Basic,      /// Default format for fast parsing: YYYY-MM-DD hh:mm:ss (ISO-8601 without fractional part and timezone) or NNNNNNNNNN unix timestamp.
-        BestEffort  /// Use sophisticated rules to parse whatever possible.
+        BestEffort,  /// Use sophisticated rules to parse whatever possible.
+        BestEffortUS  /// Use sophisticated rules to parse American style: mm/dd/yyyy
     };
 
     DateTimeInputFormat date_time_input_format = DateTimeInputFormat::Basic;
@@ -68,14 +82,33 @@ struct FormatSettings
 
     DateTimeOutputFormat date_time_output_format = DateTimeOutputFormat::Simple;
 
+    enum class DateTimeOverflowBehavior
+    {
+        Ignore,
+        Throw,
+        Saturate
+    };
+
+    DateTimeOverflowBehavior date_time_overflow_behavior = DateTimeOverflowBehavior::Ignore;
+
+
     UInt64 input_allow_errors_num = 0;
     Float32 input_allow_errors_ratio = 0;
+
+    bool schema_inference_make_columns_nullable = true;
+
+    UInt64 max_parser_depth = DBMS_DEFAULT_MAX_PARSER_DEPTH;
 
     struct
     {
         UInt64 row_group_size = 1000000;
         bool low_cardinality_as_dictionary = false;
+        bool import_nested = false;
         bool allow_missing_columns = false;
+        bool skip_columns_with_unsupported_types_in_schema_inference = false;
+        bool case_insensitive_column_matching = false;
+        bool output_string_as_string = false;
+        bool output_fixed_string_as_fixed_byte_array = true;
     } arrow;
 
     struct
@@ -86,11 +119,15 @@ struct FormatSettings
         bool allow_missing_fields = false;
     } avro;
 
+    String bool_true_representation = "true";
+    String bool_false_representation = "false";
+
     struct CSV
     {
         char delimiter = ',';
         bool allow_single_quotes = true;
         bool allow_double_quotes = true;
+        bool write_utf8_with_bom = false;
         bool unquoted_null_literal_as_null = false;
         bool empty_as_default = false;
         bool crlf_end_of_line = false;
@@ -115,25 +152,54 @@ struct FormatSettings
         bool quote_64bit_integers = false;
         bool quote_denormals = true;
         bool escape_forward_slashes = true;
-        bool named_tuples_as_objects = false;
+        bool read_named_tuples_as_objects = false;
+        bool write_named_tuples_as_objects = false;
+        bool defaults_for_missing_elements_in_named_tuple = false;
         bool serialize_as_strings = false;
+        bool read_bools_as_numbers = true;
+        bool read_numbers_as_strings = true;
+        bool quota_json_string = true;
+        bool read_objects_as_strings = false;
+        bool allow_object_type = false;
+        bool try_infer_numbers_from_strings = false;
     } json;
 
     struct
     {
         UInt64 row_group_size = 1000000;
+        bool import_nested = false;
         bool allow_missing_columns = false;
-        std::map<String, String> partition_kv = {};
-        std::unordered_set<Int64> skip_row_groups = {};
-        UInt64 current_row_group = 0;
-        bool read_one_group = false;
+        bool skip_columns_with_unsupported_types_in_schema_inference = false;
+        std::unordered_set<int> skip_row_groups;
+        bool output_string_as_string = false;
+        bool output_fixed_string_as_fixed_byte_array = true;
+        bool preserve_order = false;
+        bool coalesce_read = false;
+        bool case_insensitive_column_matching = false;
+        UInt64 max_block_size = 8192;
+        size_t max_download_threads = 1;
+        size_t min_bytes_for_seek = 8192;
+        size_t max_buffer_size = 8 * 1024 * 1024;
+        bool use_lazy_io_cache = true;
+        bool filter_push_down = true;
+        bool use_footer_cache = false;
+        bool use_native_reader = false;
     } parquet;
 
     struct Orc
     {
         bool allow_missing_columns = false;
-        std::map<String, String> partition_kv = {};
-        std::unordered_set<Int64> skip_stripes = {};
+        int64_t row_batch_size = 100000;
+        bool case_insensitive_column_matching = false;
+        bool import_nested = false;
+        std::unordered_set<int> skip_stripes = {};
+        bool output_string_as_string = false;
+        size_t use_fast_decoder = 0;
+        bool allow_out_of_range = false;
+        size_t current_file_offset = 0;
+        size_t range_bytes = 0;
+        bool filter_push_down = true;
+        bool use_footer_cache = false;
     } orc;
 
     struct Pretty
@@ -164,6 +230,18 @@ struct FormatSettings
          * because Protobuf without delimiters is not generally useful.
          */
         bool allow_multiple_rows_without_delimiter = false;
+        /**
+         * Some buffers like kafka only has one row each message without length
+         *  delimiter. To be compatible with previous version, add this setting
+         * to force ProtobufReader only consume one row in each buffer.
+         */
+        bool enable_multiple_message = false;
+        /**
+         * Only has meaning when enable_multiple_message is set to true.
+         * When set to true, parse a varint header as message length. Otherwise, a 8 bytes fixed length header
+         * will be read before each message.
+         */
+        bool default_length_parser = false;
     } protobuf;
 
     struct
@@ -171,6 +249,14 @@ struct FormatSettings
         uint32_t client_capabilities = 0;
         size_t max_packet_size = 0;
         uint8_t * sequence_id = nullptr; /// Not null if it's MySQLWire output format used to handle MySQL protocol connections.
+        /**
+         * COM_QUERY uses Text ResultSet
+         * https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
+         * COM_STMT_EXECUTE uses Binary Protocol ResultSet
+         * https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute_response.html
+         * By default, use Text ResultSet.
+         */
+        bool binary_protocol = false;
     } mysql_wire;
 
     struct
@@ -179,6 +265,20 @@ struct FormatSettings
         std::string escaping_rule;
         bool skip_unmatched = false;
     } regexp;
+
+    struct
+    {
+        bool parse_null_map_as_empty = true;
+        bool skip_null_map_value = true;
+        /**
+         *  Because of the maximum filename length limit (255) of ext4 filesystem and the HTTP encode of map key.
+         *  The maximum key length is approximately 255/3 ~= 85, which, in fact is not abosultely safe after
+         *  accounting the map name and some auxiliary symbols.
+         *
+         *  Pick up a smaller and lucky number, hopes it work at most time.
+         */
+        uint64_t max_map_key_length = 80;
+    } map;
 
     struct
     {
@@ -208,7 +308,21 @@ struct FormatSettings
         bool deduce_templates_of_expressions = true;
         bool accurate_types_of_literals = true;
     } values;
+
+    /// For capnProto format we should determine how to
+    /// compare ClickHouse Enum and Enum from schema.
+    enum class EnumComparingMode
+    {
+        BY_NAMES, // Names in enums should be the same, values can be different.
+        BY_NAMES_CASE_INSENSITIVE, // Case-insensitive name comparison.
+        BY_VALUES, // Values should be the same, names can be different.
+    };
+
+    struct
+    {
+        EnumComparingMode enum_comparing_mode = EnumComparingMode::BY_VALUES;
+        bool skip_fields_with_unsupported_types_in_schema_inference = false;
+    } capn_proto;
 };
 
 }
-

@@ -20,8 +20,11 @@
  */
 
 #include <Parsers/ASTColumnDeclaration.h>
+#include <Parsers/ASTDataType.h>
 #include <Common/quoteString.h>
 #include <IO/Operators.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeNullable.h>
 
 
 namespace DB
@@ -82,6 +85,18 @@ void ASTColumnDeclaration::formatImpl(const FormatSettings & settings, FormatSta
         type_frame.indent = 0;
 
         type->formatImpl(settings, state, type_frame);
+
+        if (unsigned_modifier)
+        {
+            settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "")
+                        << (*unsigned_modifier ? "UNSIGNED" : "SIGNED ") << (settings.hilite ? hilite_none : "");
+        }
+
+        if ((settings.dialect_type != DialectType::CLICKHOUSE) && !null_modifier && !type->as<ASTDataType>())
+        {
+            settings.ostr << (settings.hilite ? hilite_keyword : "")
+                          << " NOT NULL" << (settings.hilite ? hilite_none : "");
+        }
     }
 
     if (null_modifier)
@@ -104,6 +119,31 @@ void ASTColumnDeclaration::formatImpl(const FormatSettings & settings, FormatSta
     if (flags & TYPE_MAP_KV_STORE_FLAG)
     {
         settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "KV"  << (settings.hilite ? hilite_none : "");
+    }
+
+    if (flags & TYPE_MAP_BYTE_STORE_FLAG)
+    {
+        settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "BYTE"  << (settings.hilite ? hilite_none : "");
+    }
+
+    if (flags & TYPE_BITENGINE_ENCODE_FLAG)
+    {
+        settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "BitEngineEncode"  << (settings.hilite ? hilite_none : "");
+    }   
+
+    if (flags & TYPE_BLOOM_FLAG)
+    {
+        settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "BLOOM"  << (settings.hilite ? hilite_none : "");
+    } 
+
+    if (flags & TYPE_BITMAP_INDEX_FLAG)
+    {
+        settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "BitmapIndex"  << (settings.hilite ? hilite_none : "");
+    }
+    
+    if (flags & TYPE_SEGMENT_BITMAP_INDEX_FLAG)
+    {
+        settings.ostr << ' ' << (settings.hilite ? hilite_keyword : "") << "SegmentBitmapIndex"  << (settings.hilite ? hilite_none : "");
     }
 
     if (comment)

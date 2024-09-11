@@ -21,6 +21,7 @@
 
 #include <Common/quoteString.h>
 #include <Common/typeid_cast.h>
+#include "Core/SettingsEnums.h"
 
 #include <Functions/grouping.h>
 #include <Functions/FunctionFactory.h>
@@ -28,13 +29,19 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 
-#include <DataTypes/DataTypeSet.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeBitMap64.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeFunction.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeSet.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/FieldToDataType.h>
 
 #include <Columns/ColumnSet.h>
@@ -77,6 +84,15 @@ namespace ErrorCodes
     extern const int DUPLICATE_COLUMN;
     extern const int TOO_FEW_ARGUMENTS_FOR_FUNCTION;
     extern const int TOO_MANY_ARGUMENTS_FOR_FUNCTION;
+}
+
+static std::unordered_set<String> array_set_functions = {
+    {"arraySetCheck", "arraySetGet", "arraySetGetAny"}
+};
+
+bool isArraySetFunctions(const String & name)
+{
+    return array_set_functions.count(name);
 }
 
 static NamesAndTypesList::iterator findColumn(const String & name, NamesAndTypesList & cols)
@@ -374,8 +390,39 @@ SetPtr makeExplicitSet(
     const ASTPtr & right_arg = args.children.at(1);
 
     auto column_name = left_arg->getColumnName();
-    const auto & dag_node = actions.findInIndex(column_name);
+    const auto & dag_node = actions.findInOutputs(column_name);
     DataTypePtr left_arg_type = dag_node.result_type;
+
+    // Special handling bitmap function case
+    if (BitmapIndexHelper::isBitmapFunctions(node->name))
+    {
+        /// TODO: support them when add BitMap32 type and support BitMapIndex for BitMap32/BitMap64
+
+        // if (const auto *const null_type_ptr = typeid_cast<const DataTypeNullable *>(left_arg_type.get()))
+        //     left_arg_type = null_type_ptr->getNestedType();        
+        // if (typeid_cast<const DataTypeBitmap32 *>(left_arg_type.get()))
+        // {
+        //     left_arg_type = std::make_shared<DataTypeUInt32>();
+        // }
+        // else if (typeid_cast<const DataTypeBitmap64 *>(left_arg_type.get()))
+        // {
+        //     left_arg_type = std::make_shared<DataTypeUInt64>();
+        // }
+        // else
+            throw Exception("Invalid argument of function bitmap related functions", ErrorCodes::LOGICAL_ERROR);
+    }
+    // Special handling arraySetCheck/arraySetGet/arraySetGetAny(array, tuple) case
+    else if (BitmapIndexHelper::isArraySetFunctions(node->name))
+    {
+        if (const auto *const null_type_ptr = typeid_cast<const DataTypeNullable *>(left_arg_type.get()))
+            left_arg_type = null_type_ptr->getNestedType();
+
+        const auto *const arg_type_ptr = typeid_cast<const DataTypeArray *>(left_arg_type.get());
+        if (arg_type_ptr)
+            left_arg_type = arg_type_ptr->getNestedType();
+        else
+            throw Exception("Invalid argument of function arraySet related functions", ErrorCodes::LOGICAL_ERROR);
+    }
 
     DataTypes set_element_types = {left_arg_type};
     const auto * left_tuple_type = typeid_cast<const DataTypeTuple *>(left_arg_type.get());
@@ -453,6 +500,15 @@ public:
     }
 
     bool contains(const std::string & name) const { return map.count(name) > 0; }
+
+    std::vector<std::string_view> getAllNames() const
+    {
+        std::vector<std::string_view> result;
+        result.reserve(map.size());
+        for (auto const & e : map)
+            result.emplace_back(e.first);
+        return result;
+    }
 };
 
 ActionsMatcher::Data::Data(
@@ -467,7 +523,10 @@ ActionsMatcher::Data::Data(
     bool no_makeset_,
     bool only_consts_,
     bool create_source_for_in_,
-    AggregationKeysInfo aggregation_keys_info_)
+    AggregationKeysInfo aggregation_keys_info_,
+    bool build_expression_with_window_functions_,
+    MergeTreeIndexContextPtr index_context_,
+    StorageMetadataPtr metadata_snapshot_)
     : WithContext(context_)
     , set_size_limit(set_size_limit_)
     , subquery_depth(subquery_depth_)
@@ -481,7 +540,10 @@ ActionsMatcher::Data::Data(
     , visit_depth(0)
     , actions_stack(std::move(actions_dag), context_)
     , aggregation_keys_info(aggregation_keys_info_)
-    , next_unique_suffix(actions_stack.getLastActions().getIndex().size() + 1)
+    , build_expression_with_window_functions(build_expression_with_window_functions_)
+    , index_context(index_context_)
+    , metadata_snapshot(metadata_snapshot_)
+    , next_unique_suffix(actions_stack.getLastActions().getOutputs().size() + 1)
 {
 }
 
@@ -490,13 +552,19 @@ bool ActionsMatcher::Data::hasColumn(const String & column_name) const
     return actions_stack.getLastActionsIndex().contains(column_name);
 }
 
+std::vector<std::string_view> ActionsMatcher::Data::getAllColumnNames() const
+{
+    const auto & index = actions_stack.getLastActionsIndex();
+    return index.getAllNames();
+}
+
 ScopeStack::ScopeStack(ActionsDAGPtr actions_dag, ContextPtr context_) : WithContext(context_)
 {
     auto & level = stack.emplace_back();
     level.actions_dag = std::move(actions_dag);
-    level.index = std::make_unique<ScopeStack::Index>(level.actions_dag->getIndex());
+    level.index = std::make_unique<ScopeStack::Index>(level.actions_dag->getOutputs());
 
-    for (const auto & node : level.actions_dag->getIndex())
+    for (const auto & node : level.actions_dag->getOutputs())
         if (node->type == ActionsDAG::ActionType::INPUT)
             level.inputs.emplace(node->result_name);
 }
@@ -505,7 +573,7 @@ void ScopeStack::pushLevel(const NamesAndTypesList & input_columns)
 {
     auto & level = stack.emplace_back();
     level.actions_dag = std::make_shared<ActionsDAG>();
-    level.index = std::make_unique<ScopeStack::Index>(level.actions_dag->getIndex());
+    level.index = std::make_unique<ScopeStack::Index>(level.actions_dag->getOutputs());
     const auto & prev = stack[stack.size() - 2];
 
     for (const auto & input_column : input_columns)
@@ -515,7 +583,7 @@ void ScopeStack::pushLevel(const NamesAndTypesList & input_columns)
         level.inputs.emplace(input_column.name);
     }
 
-    for (const auto & node : prev.actions_dag->getIndex())
+    for (const auto & node : prev.actions_dag->getOutputs())
     {
         if (!level.index->contains(node->result_name))
         {
@@ -663,6 +731,8 @@ void ActionsMatcher::visit(const ASTPtr & ast, Data & data)
         visit(*literal, ast, data);
     else if (auto * expression_list = ast->as<ASTExpressionList>())
         visit(*expression_list, ast, data);
+    else if (auto * prepared_param = ast->as<ASTPreparedParameter>())
+        visit(*prepared_param, ast, data);
     else
     {
         for (auto & child : ast->children)
@@ -783,8 +853,9 @@ void ActionsMatcher::visit(const ASTIdentifier & identifier, const ASTPtr &, Dat
         {
             if (column_name_type.name == column_name)
             {
-                throw Exception("Column " + backQuote(column_name) + " is not under aggregate function and not in GROUP BY",
-                                ErrorCodes::NOT_AN_AGGREGATE);
+                throw Exception(ErrorCodes::NOT_AN_AGGREGATE,
+                                "Column {} is not under aggregate function and not in GROUP BY. Have columns: {}",
+                                backQuote(column_name), toString(data.getAllColumnNames()));
             }
         }
 
@@ -792,6 +863,19 @@ void ActionsMatcher::visit(const ASTIdentifier & identifier, const ASTPtr &, Dat
         if (identifier.prefer_alias_to_column_name && !identifier.alias.empty())
             data.addAlias(identifier.name(), identifier.alias);
     }
+}
+
+void ActionsMatcher::visit(const ASTPreparedParameter & prepared_param, const ASTPtr &, Data & data)
+{
+    auto column_name = prepared_param.getColumnName();
+
+    if (data.hasColumn(column_name))
+        return;
+
+    auto column_type = DataTypeFactory::instance().get(prepared_param.type);
+    auto & level = data.actions_stack.stack.back();
+    const auto & node = level.actions_dag->addPreparedColumn(column_name, column_type);
+    level.index->addNode(&node);
 }
 
 static bool checkIdentifier(const ASTPtr & node)
@@ -856,31 +940,34 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
             arguments_indexes.push_back(pos);
         }
 
-        const bool ansi_mode = data.getContext()->getSettingsRef().dialect_type == DialectType::ANSI;
+        bool force_grouping_standard_compatibility = data.getContext()->getSettingsRef().force_grouping_standard_compatibility;
+        if (data.getContext()->getSettingsRef().dialect_type != DialectType::CLICKHOUSE)
+            force_grouping_standard_compatibility = true;
+
         switch (keys_info.group_by_kind)
         {
             case GroupByKind::GROUPING_SETS: {
                 data.addFunction(std::make_shared<FunctionToOverloadResolverAdaptor>(
                                          std::make_shared<FunctionGroupingForGroupingSets>(std::move(arguments_indexes),
-                                                                                           keys_info.grouping_set_keys, ansi_mode)),
+                                                                                           keys_info.grouping_set_keys, force_grouping_standard_compatibility)),
                                  {"__grouping_set"}, column_name);
                 break;
             }
             case GroupByKind::ROLLUP:
                 data.addFunction(std::make_shared<FunctionToOverloadResolverAdaptor>(
                                          std::make_shared<FunctionGroupingForRollup>(std::move(arguments_indexes),
-                                                                                     aggregation_keys_number, ansi_mode)),
+                                                                                     aggregation_keys_number, force_grouping_standard_compatibility)),
                                  {"__grouping_set"}, column_name);
                 break;
             case GroupByKind::CUBE: {
                 data.addFunction(std::make_shared<FunctionToOverloadResolverAdaptor>(
                         std::make_shared<FunctionGroupingForCube>(std::move(arguments_indexes), aggregation_keys_number,
-                                                                  ansi_mode)), {"__grouping_set"}, column_name);
+                                                                  force_grouping_standard_compatibility)), {"__grouping_set"}, column_name);
                 break;
             }
             case GroupByKind::ORDINARY: {
                 data.addFunction(std::make_shared<FunctionToOverloadResolverAdaptor>(
-                                         std::make_shared<FunctionGroupingOrdinary>(std::move(arguments_indexes), ansi_mode)), {},
+                                         std::make_shared<FunctionGroupingOrdinary>(std::move(arguments_indexes), force_grouping_standard_compatibility)), {},
                                  column_name);
                 break;
             }
@@ -892,6 +979,14 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
     }
 
     SetPtr prepared_set;
+    std::vector<SetPtr> prepared_sets_vec;
+
+    bool has_null_argument = BitmapIndexHelper::hasNullArgument(ast);
+    if (BitmapIndexHelper::isNarrowArraySetFunctions(node.name) && has_null_argument && data.getContext()->getSettingsRef().throw_exception_when_has_null)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "ArraySetCheck/Get/GetAny do not support calculating null values in the set");
+    bool can_use_bitmap_index = (BitmapIndexHelper::isArraySetFunctions(node.name) && !has_null_argument) ? BitmapIndexHelper::checkConstArguments(ast) : false;
+    bool need_make_set_for_func = can_use_bitmap_index && (BitmapIndexHelper::isNarrowArraySetFunctions(node.name) || BitmapIndexHelper::isBitmapFunctions(node.name));
+    
     if (checkFunctionIsInOrGlobalInOperator(node))
     {
         /// Let's find the type of the first argument (then getActionsImpl will be called again and will not affect anything).
@@ -918,6 +1013,74 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
             return;
         }
     }
+    else if (can_use_bitmap_index)
+    {
+        auto * bitmap_index_info = data.index_context ? 
+            dynamic_cast<BitmapIndexInfo *>(data.index_context->get(MergeTreeIndexInfo::Type::BITMAP).get()) : nullptr;
+        bool should_update_bitmap_index_info = bitmap_index_info && !bitmap_index_info->index_names.count(node.getColumnName());
+        
+        size_t arg_size = node.arguments->children.size();
+        if (arg_size % 2 != 0)
+            throw Exception("The number of arguments is wrong in arraySet function", ErrorCodes::LOGICAL_ERROR);
+
+        // to check const arguments. if the only_consts is true, arraySetCheck should make set if and only if the i and i + 2 is const literal
+        bool make_set = true;
+        for (size_t i = 0; i < arg_size; i += 2)
+        {
+            ASTPtr arg_col = node.arguments->children.at(i);
+            if (data.only_consts
+                && checkIdentifier(arg_col))
+            {
+                make_set = false;
+                break;
+            }
+        }
+
+        if (make_set)
+        {
+            // check if current column type really has bitmap index
+            for (size_t i = 0; i < arg_size; i += 2)
+            {
+                ASTPtr arg_col = node.arguments->children.at(i);
+                if (auto * identifier = arg_col->as<ASTIdentifier>())
+                {
+                    const auto & index_column_name = identifier->getColumnName();
+                    if (data.metadata_snapshot && data.metadata_snapshot->getColumns().has(index_column_name))
+                    {
+                        if (!data.metadata_snapshot->getColumns().get(index_column_name).type->isBitmapIndex())
+                        {
+                            should_update_bitmap_index_info = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            auto col_name = node.getColumnName();
+            if (should_update_bitmap_index_info)
+                bitmap_index_info->return_types.emplace(col_name, BitmapIndexHelper::getBitmapIndexReturnType(node.name));
+
+            for (size_t i = 0; i < arg_size; i += 2)
+            {
+                ASTPtr arg_col = node.arguments->children.at(i);
+                ASTPtr arg_set = node.arguments->children.at(i + 1);
+                visit(arg_col, data);
+                // Just try to make set for bitmap index reader, if failed, rollback to normal reader
+                SetPtr arg_prepared_set = tryMakeSet(node, data, data.no_subqueries, true);
+                prepared_sets_vec.push_back(arg_prepared_set);
+                if (arg_prepared_set && should_update_bitmap_index_info)
+                {
+                    if (auto * identifier = arg_col->as<ASTIdentifier>())
+                    {
+                        bitmap_index_info->index_names[col_name].push_back(identifier->getColumnName());
+                        bitmap_index_info->set_args[col_name].push_back(arg_prepared_set);
+                        // collect all col names
+                        bitmap_index_info->index_column_name_set.emplace(identifier->getColumnName());
+                    }
+                }
+            }
+        }
+    }
 
     /// A special function `indexHint`. Everything that is inside it is not calculated
     if (node.name == "indexHint")
@@ -927,6 +1090,13 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
         return;
     }
 
+    if (node.name == "textSearch")
+    {
+        data.addFunction(FunctionFactory::instance().get("textSearch", data.getContext()), {}, column_name);
+        return;
+    }
+
+    // Now we need to correctly process window functions and any expression which depend on them.
     if (node.is_window_function)
     {
         // Also add columns from PARTITION BY and ORDER BY of window functions.
@@ -934,7 +1104,6 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
         {
             visit(node.window_definition, data);
         }
-
         // Also manually add columns for arguments of the window function itself.
         // ActionVisitor is written in such a way that this method must itself
         // descend into all needed function children. Window functions can't have
@@ -953,10 +1122,27 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
         // aggregate functions.
         return;
     }
+    else if (node.compute_after_window_functions)
+    {
+        if (!data.build_expression_with_window_functions)
+        {
+            for (const auto & arg : node.arguments->children)
+            {
+                if (auto const * function = arg->as<ASTFunction>();
+                    function && function->name == "lambda")
+                {
+                    // Lambda function is a special case. It shouldn't be visited here.
+                    continue;
+                }
+                visit(arg, data);
+            }
+            return;
+        }
+    }
 
     // An aggregate function can also be calculated as a window function, but we
     // checked for it above, so no need to do anything more.
-    if (AggregateFunctionFactory::instance().isAggregateFunctionName(node.name))
+    if (AggregateUtils::isAggregateFunction(node))
         return;
 
     FunctionOverloadResolverPtr function_builder;
@@ -1048,6 +1234,37 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
                         column.column = ColumnConst::create(std::move(column_set), 1);
                     else
                         column.column = std::move(column_set);
+                    data.addColumn(column);
+                }
+
+                argument_types.push_back(column.type);
+                argument_names.push_back(column.name);
+            }
+            // When it is narrow arrayset func, need to make set for the func
+            else if (((need_make_set_for_func) && (arg % 2)) && !prepared_sets_vec.empty())
+            {
+                ColumnWithTypeAndName column;
+                column.type = std::make_shared<DataTypeSet>();
+
+                bool has_set = prepared_sets_vec.size() > arg / 2;
+                /// If the argument is a set given by an enumeration of values (so, the set was already built), give it a unique name,
+                ///  so that sets with the same literal representation do not fuse together (they can have different types).
+                if (has_set && prepared_sets_vec[arg / 2])
+                    column.name = data.getUniqueName("__set");
+                else
+                    column.name = child->getColumnName();
+
+                if (!data.hasColumn(column.name))
+                {
+                    if (has_set && prepared_sets_vec[arg / 2])
+                        column.column = ColumnSet::create(1, prepared_sets_vec[arg / 2]);
+                    else
+                    {
+                        auto column_set = ColumnSet::create(1, prepared_set);
+                        /// If prepared_set is not empty, we have a set made with literals.
+                        /// Create a const ColumnSet to make constant folding work
+                        column.column = std::move(column_set);
+                    }
                     data.addColumn(column);
                 }
 
@@ -1214,6 +1431,25 @@ void ActionsMatcher::visit(const ASTLiteral & literal, const ASTPtr & /* ast */,
     column.type = type;
 
     data.addColumn(std::move(column));
+}
+
+SetPtr ActionsMatcher::tryMakeSet(const ASTFunction & node, Data & data, bool no_subqueries, bool create_ordered_set)
+{
+    SetPtr return_set = nullptr;
+    try 
+    {
+        return_set = makeSet(node, data, no_subqueries, create_ordered_set);
+    }
+    catch (const Exception &)
+    {
+        // if it is narrow array set Functions, we must make set and throw exception if it can't be made successfully
+        if (BitmapIndexHelper::isNarrowArraySetFunctions(node.name))
+            throw;
+
+        LOG_DEBUG(&Poco::Logger::get("ActionsMatcher"), "Cannot make set for bitmap_index_funcs, fallback to normal reader");
+        return nullptr;
+    }
+    return return_set;
 }
 
 SetPtr ActionsMatcher::makeSet(const ASTFunction & node, Data & data, bool no_subqueries, bool create_ordered_set)

@@ -13,9 +13,11 @@
  * limitations under the License.
  */
 
-#include <Optimizer/Dump/Json2Pb.h>
+#include <sstream>
+#include <Optimizer/Dump/ProtoEnumUtils.h>
 #include <Statistics/BucketBoundsImpl.h>
 #include <Statistics/StatsKllSketchImpl.h>
+#include <Poco/JSON/Parser.h>
 
 namespace DB::Statistics
 {
@@ -52,22 +54,25 @@ String BucketBoundsImpl<T>::serializeToJson() const
     checkValid();
     Poco::JSON::Object object_json;
     auto type_id = SerdeDataTypeFrom<T>;
-    String type_string = SerdeDataTypeToString(type_id);
+    String type_string = ProtoEnumUtils::serdeDataTypeToString(type_id);
     Poco::JSON::Array array_json;
+    object_json.set("type_id", type_string);
     if constexpr (!std::is_same_v<T, UInt128> && !std::is_same_v<T, Int128> && !std::is_same_v<T, UInt256> && !std::is_same_v<T, Int256>)
     {
-        object_json.set("type_id", type_string);
         for (auto ptr : bounds_)
         {
-            array_json.add(ptr);
+            if constexpr (std::is_same_v<T, UInt8>)
+                array_json.add(static_cast<uint8_t>(ptr));
+            else
+                array_json.add(ptr);
         }
     }
     else if constexpr (std::is_same_v<T, UInt128> || std::is_same_v<T, Int128> || std::is_same_v<T, UInt256> || std::is_same_v<T, Int256>)
     {
-        for (auto ptr : bounds_)
+        for (auto value : bounds_)
         {
             std::ostringstream out_str;
-            out_str << ptr;
+            out_str << value;
             array_json.add(out_str.str());
         }
     }
@@ -88,43 +93,36 @@ template <typename T>
 void BucketBoundsImpl<T>::deserializeFromJson(std::string_view blob)
 {
     Poco::JSON::Parser json_parse;
-    Poco::JSON::Object object;
-    Poco::Dynamic::Var var = json_parse.parse({blob.data(), blob.size()});
-    object = *var.extract<Poco::JSON::Object::Ptr>();
-    String type_id = object.get("type_id");
-    var = object.get("bounds_");
-    if (var.isArray())
+    Poco::JSON::Object::Ptr object = json_parse.parse({blob.data(), blob.size()}).extract<Poco::JSON::Object::Ptr>();
+    String type_id = object->getValue<String>("type_id");
+    SerdeDataType serde_data_type = ProtoEnumUtils::serdeDataTypeFromString(type_id);
+    checkSerdeDataType<T>(serde_data_type);
+
+    Poco::JSON::Array::Ptr array = object->getArray("bounds_");
+    if (array)
     {
         bounds_.clear();
-        Poco::JSON::Array array = *var.extract<Poco::JSON::Array::Ptr>();
-        num_buckets_ = array.size() - 1;
-        for (size_t j = 0; j < array.size(); ++j)
+        num_buckets_ = array->size() - 1;
+        for (size_t j = 0; j < array->size(); ++j)
         {
             if constexpr (
                 !std::is_same_v<
                     EmbeddedType,
                     UInt8> && !std::is_same_v<T, UInt128> && !std::is_same_v<T, Int128> && !std::is_same_v<T, UInt256> && !std::is_same_v<T, Int256>)
             {
-                bounds_.push_back(array.get(j).convert<EmbeddedType>());
+                bounds_.push_back(array->getElement<EmbeddedType>(j));
             }
             else if constexpr (std::is_same_v<EmbeddedType, UInt8>)
             {
-                bounds_.push_back(array.get(j).convert<Poco::UInt8>());
+                bounds_.push_back(array->getElement<Poco::UInt8>(j));
             }
             else if constexpr (
                 std::is_same_v<T, UInt128> || std::is_same_v<T, Int128> || std::is_same_v<T, UInt256> || std::is_same_v<T, Int256>)
             {
-                String ele = array.get(j).toString();
-                int len = ele.length();
-                char * data;
-                data = static_cast<char *>(malloc((len + 1) * sizeof(char)));
-                ele.copy(data, len, 0);
-                ReadBuffer buffers(data, ele.size());
-                EmbeddedType type_ele;
-                buffers.readStrict(reinterpret_cast<char *>(&type_ele), sizeof(type_ele));
-                bounds_.push_back(type_ele);
-                throw Exception(
-                    "when load stats from json to bound, not sure 128 or 256 is correct, so throw error", ErrorCodes::LOGICAL_ERROR);
+                String text = array->getElement<String>(j);
+                T ele;
+                wideIntFromString(ele, text);
+                bounds_.push_back(ele);
             }
         }
     }

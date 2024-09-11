@@ -73,6 +73,7 @@ def run_docker_image_with_env(
     ch_root,
     ccache_dir,
     docker_image_version,
+    dind_mode,
 ):
     env_part = " -e ".join(env_variables)
     if env_part:
@@ -88,11 +89,21 @@ def run_docker_image_with_env(
     else:
         user = f"{os.geteuid()}:{os.getegid()}"
 
-    cmd = (
-        f"docker run --network=host --user={user} --rm --volume={output}:/output "
-        f"--volume={ch_root}:/build --volume={ccache_dir}:/ccache {env_part} "
-        f"{interactive} {image_name}:{docker_image_version}"
-    )
+    if dind_mode:
+        output = os.environ["OUTPUT_VOL"]
+        ch_root = os.environ["SRC_VOL"]
+        logging.info("Use volume %s and %s in DinD mode.", output, ch_root)
+        cmd = (
+            f"docker run  --network=host --user={user} --rm --volume={output}:/output "
+            f"--volume={ch_root}:/build --volume={ccache_dir}:/ccache {env_part} "
+            f"{interactive} {image_name}:{docker_image_version}"
+        )
+    else:
+        cmd = (
+            f"docker run  --network=host --user={user} --rm --volume={output}:/output "
+            f"--volume={ch_root}:/build --volume={ccache_dir}:/ccache {env_part} "
+            f"{interactive} {image_name}:{docker_image_version}"
+        )
 
     logging.info("Will build ClickHouse pkg with cmd: '%s'", cmd)
 
@@ -137,7 +148,7 @@ def parse_env_variables(
     result.append(f"CXX={cxx}")
     cmake_flags.append(f"-DCMAKE_C_COMPILER={cc}")
     cmake_flags.append(f"-DCMAKE_CXX_COMPILER={cxx}")
-
+    cmake_flags.append(f"-DENABLE_CHECK_HEAVY_BUILDS=OFF")
     if build_type:
         result.append(f"BUILD_TYPE={build_type.capitalize()}")
     else:
@@ -160,10 +171,8 @@ def parse_env_variables(
 
     if official:
         cmake_flags.append("-DCLICKHOUSE_OFFICIAL_BUILD=1")
-
     result.append('CMAKE_FLAGS="' + " ".join(cmake_flags) + '"')
     result.append(f"BUILD_TARGET={build_target}")
-
     return result
 
 
@@ -191,7 +200,7 @@ if __name__ == "__main__":
         help="ClickHouse git repository",
     )
     parser.add_argument("--output-dir", type=dir_name, required=True)
-    parser.add_argument("--build-type", choices=("debug", ""), default="")
+    parser.add_argument("--build-type", choices=("debug", "release"), default="")
     parser.add_argument(
         "--ccache_dir",
         default=os.getenv("HOME", "") + "/.ccache",
@@ -211,6 +220,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--as-root", action="store_true", help="if the container should run as root"
+    )
+    parser.add_argument(
+        "--dind-mode", action="store_true", help="if the container will be run in side a docker container."
     )
 
     args = parser.parse_args()
@@ -252,5 +264,8 @@ if __name__ == "__main__":
         ch_root,
         args.ccache_dir,
         args.docker_image_version,
+        args.dind_mode,
     )
-    logging.info("Output placed into %s", args.output_dir)
+    
+    if not args.dind_mode:
+        logging.info("Output placed into %s", args.output_dir)

@@ -34,6 +34,8 @@
 namespace DB
 {
 
+ASTPtr getCreateQueryFromStorage(const StoragePtr & storage, const ASTPtr & ast_storage, bool only_ordinary, uint32_t max_parser_depth, bool throw_on_error);
+
 class Context;
 
 String getTableDefinitionFromCreateQuery(const ASTPtr & query, bool attach);
@@ -77,5 +79,7 @@ protected:
 };
 
 std::vector<StoragePtr> getViews(const StorageID & storage_id, const ContextPtr & context);
+
+String generateInnerTableName(const StorageID & view_id);
 
 }

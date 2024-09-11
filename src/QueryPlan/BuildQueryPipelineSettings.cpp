@@ -17,6 +17,7 @@
 #include <Core/Settings.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DistributedStages/PlanSegmentInstance.h>
 
 namespace DB
 {
@@ -25,6 +26,9 @@ BuildQueryPipelineSettings BuildQueryPipelineSettings::fromSettings(const Settin
 {
     BuildQueryPipelineSettings settings;
     settings.actions_settings = ExpressionActionsSettings::fromSettings(from, CompileExpressions::yes);
+    //In all of its usage, there is no use of an uninitialized variable
+    //settings.distributed_settings.coordinator_address.port will be initialized when it's used
+    //coverity[uninit_use]
     return settings;
 }
 
@@ -35,10 +39,11 @@ BuildQueryPipelineSettings BuildQueryPipelineSettings::fromContext(ContextPtr fr
     return settings;
 }
 
-BuildQueryPipelineSettings BuildQueryPipelineSettings::fromPlanSegment(PlanSegment * plan_segment, ContextPtr context)
+BuildQueryPipelineSettings BuildQueryPipelineSettings::fromPlanSegment(PlanSegment * plan_segment, const PlanSegmentExecutionInfo & info, ContextPtr context, bool is_explain)
 {
     auto settings = fromContext(context);
-    settings.distributed_settings = DistributedPipelineSettings::fromPlanSegment(plan_segment);
+    settings.distributed_settings = DistributedPipelineSettings::fromPlanSegment(plan_segment, info);
+    settings.distributed_settings.is_explain = is_explain;
     settings.context = context;
     return settings;
 }

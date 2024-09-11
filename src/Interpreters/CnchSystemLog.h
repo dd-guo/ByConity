@@ -17,25 +17,26 @@
 
 #include <Interpreters/SystemLog.h>
 #include <Interpreters/KafkaLog.h>
+#include <Interpreters/QueryLog.h>
+#include <Interpreters/MaterializedMySQLLog.h>
+#include <Interpreters/UniqueTableLog.h>
+#include <Storages/MaterializedView/ViewRefreshTaskLog.h>
+#include "Interpreters/AutoStatsTaskLog.h"
 
 
 namespace DB
 {
 
-class QueryMetricLog;
-class QueryWorkerMetricLog;
+class CnchQueryLog;
+class CnchAutoStatsTaskLog;
 
 // Query metrics definitions
-constexpr auto CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME = "query_metrics";
-constexpr auto CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME = "query_worker_metrics";
 constexpr auto CNCH_SYSTEM_LOG_KAFKA_LOG_TABLE_NAME = "cnch_kafka_log";
-
-static inline bool isQueryMetricsTable(const String & database, const String & table)
-{
-    return (database == CNCH_SYSTEM_LOG_DB_NAME || database == DatabaseCatalog::SYSTEM_DATABASE) &&
-            (table == CNCH_SYSTEM_LOG_QUERY_METRICS_TABLE_NAME ||
-            table == CNCH_SYSTEM_LOG_QUERY_WORKER_METRICS_TABLE_NAME);
-}
+constexpr auto CNCH_SYSTEM_LOG_QUERY_LOG_TABLE_NAME = "cnch_query_log";
+constexpr auto CNCH_SYSTEM_LOG_MATERIALIZED_MYSQL_LOG_TABLE_NAME = "cnch_materialized_mysql_log";
+constexpr auto CNCH_SYSTEM_LOG_UNIQUE_TABLE_LOG_TABLE_NAME = "cnch_unique_table_log";
+constexpr auto CNCH_SYSTEM_LOG_VIEW_REFRESH_TASK_LOG_TABLE_NAME = "cnch_view_refresh_task_log";
+constexpr auto CNCH_SYSTEM_LOG_AUTO_STATS_TASK_LOG_TABLE_NAME = "cnch_auto_stats_task_log";
 
 /** Modified version of SystemLog that flushes data to a CnchMergeTree table.
   * Altering of schema is also possible for columns that are not part of primary/partition keys.
@@ -53,30 +54,58 @@ public:
         return cloud_kafka_log;
     }
 
-    std::shared_ptr<QueryMetricLog> getQueryMetricLog() const
+    std::shared_ptr<CloudMaterializedMySQLLog> getMaterializedMySQLLog() const
     {
         std::lock_guard<std::mutex> g(mutex);
-        return query_metrics;
+        return cloud_materialized_mysql_log;
     }
 
-    std::shared_ptr<QueryWorkerMetricLog> getQueryWorkerMetricLog() const
+    std::shared_ptr<CloudUniqueTableLog> getUniqueTableLog() const
     {
         std::lock_guard<std::mutex> g(mutex);
-        return query_worker_metrics;
+        return cloud_unique_table_log;
+    }
+
+    std::shared_ptr<CnchQueryLog> getCnchQueryLog() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cnch_query_log;
+    }
+
+    std::shared_ptr<ViewRefreshTaskLog> getViewRefreshTaskLog() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cnch_view_refresh_task_log;
+    }
+
+    std::shared_ptr<CnchAutoStatsTaskLog> getCnchAutoStatsTaskLog() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cnch_auto_stats_task_log;
     }
 
     void shutdown();
 
 private:
     std::shared_ptr<CloudKafkaLog> cloud_kafka_log;
-    std::shared_ptr<QueryMetricLog> query_metrics;                /// Used to log query metrics.
-    std::shared_ptr<QueryWorkerMetricLog> query_worker_metrics;   /// Used to log query worker metrics.
+    std::shared_ptr<CloudMaterializedMySQLLog> cloud_materialized_mysql_log;
+    std::shared_ptr<CloudUniqueTableLog> cloud_unique_table_log;
+    std::shared_ptr<CnchQueryLog> cnch_query_log;
+    std::shared_ptr<ViewRefreshTaskLog> cnch_view_refresh_task_log;
+    std::shared_ptr<CnchAutoStatsTaskLog> cnch_auto_stats_task_log;
 
     int init_time_in_worker{};
     int init_time_in_server{};
     mutable std::mutex mutex;
     template<typename CloudLog>
     bool initInServerForSingleLog(ContextPtr & global_context,
+        const String & db,
+        const String & tb,
+        const String & config_prefix,
+        const Poco::Util::AbstractConfiguration & config,
+        std::shared_ptr<CloudLog> & cloud_log);
+    template<typename CloudLog>
+    bool initInWorkerForSingleLog(ContextPtr & global_context,
         const String & db,
         const String & tb,
         const String & config_prefix,
@@ -92,9 +121,12 @@ private:
     std::vector<ISystemLog *> logs;
 };
 
-constexpr auto QUERY_METRICS_CONFIG_PREFIX = "query_metrics";
-constexpr auto QUERY_WORKER_METRICS_CONFIG_PREFIX = "query_worker_metrics";
 constexpr auto CNCH_KAFKA_LOG_CONFIG_PREFIX = "cnch_kafka_log";
+constexpr auto CNCH_QUERY_LOG_CONFIG_PREFIX = "cnch_query_log";
+constexpr auto CNCH_MATERIALIZED_MYSQL_LOG_CONFIG_PREFIX = "cnch_materialized_mysql_log";
+constexpr auto CNCH_UNIQUE_TABLE_LOG_CONFIG_PREFIX = "cnch_unique_table_log";
+constexpr auto CNCH_VIEW_REFRESH_TASK_PREFIX = "cnch_view_refresh_task_log";
+constexpr auto CNCH_AUTO_STATS_TASK_LOG_CONFIG_PREFIX = "cnch_auto_stats_task_log";
 
 /// Instead of typedef - to allow forward declaration.
 class CloudKafkaLog : public CnchSystemLog<KafkaLogElement>
@@ -102,6 +134,20 @@ class CloudKafkaLog : public CnchSystemLog<KafkaLogElement>
 public:
     using CnchSystemLog<KafkaLogElement>::CnchSystemLog;
     void logException(const StorageID & storage_id, String msg, String consumer_id = "");
+};
+
+/// Instead of typedef - to allow forward declaration.
+class CloudMaterializedMySQLLog : public CnchSystemLog<MaterializedMySQLLogElement>
+{
+public:
+    using CnchSystemLog<MaterializedMySQLLogElement>::CnchSystemLog;
+};
+
+/// Instead of typedef - to allow forward declaration.
+class CloudUniqueTableLog : public CnchSystemLog<UniqueTableLogElement>
+{
+public:
+    using CnchSystemLog<UniqueTableLogElement>::CnchSystemLog;
 };
 
 } // end namespace

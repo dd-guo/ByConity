@@ -34,12 +34,24 @@
 #include <Storages/StorageMergeTree.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/ChecksumsCache.h>
+#include <Storages/PartCacheManager.h>
+#include <Storages/MergeTree/CloudTableDefinitionCache.h>
+#include <Storages/MergeTree/DeleteBitmapCache.h>
+#include <Storages/MergeTree/PrimaryIndexCache.h>
+#include <Storages/UniqueKeyIndexCache.h>
 #include <IO/UncompressedCache.h>
 #include <IO/MMappedFileCache.h>
 #include <IO/ReadHelpers.h>
 #include <Databases/IDatabase.h>
 #include <chrono>
+#include <Storages/DiskCache/DiskCacheFactory.h>
+#include <Storages/DiskCache/IDiskCache.h>
 
+#include <common/logger_useful.h>
+#include <fmt/format.h>
+#include <common/errnoToString.h>
+#include <Common/HuAllocator.h>
+#include <Processors/IntermediateResult/CacheManager.h>
 
 #if !defined(ARCADIA_BUILD)
 #    include "config_core.h"
@@ -94,11 +106,13 @@ AsynchronousMetrics::AsynchronousMetrics(
     ContextPtr global_context_,
     int update_period_seconds,
     std::shared_ptr<std::vector<ProtocolServerAdapter>> servers_to_start_before_tables_,
-    std::shared_ptr<std::vector<ProtocolServerAdapter>> servers_)
+    std::shared_ptr<std::vector<ProtocolServerAdapter>> servers_,
+    Poco::Logger * logger_)
     : WithContext(global_context_)
     , update_period(update_period_seconds)
     , servers_to_start_before_tables(servers_to_start_before_tables_)
     , servers(servers_)
+    , logger(logger_)
 {
 #if defined(OS_LINUX)
     openFileIfExists("/proc/meminfo", meminfo);
@@ -109,6 +123,18 @@ AsynchronousMetrics::AsynchronousMetrics(
     openFileIfExists("/proc/uptime", uptime);
     openFileIfExists("/proc/net/dev", net_dev);
 
+    openSensors();
+    openBlockDevices();
+    openEDAC();
+    openSensorsChips();
+#endif
+}
+
+#if defined(OS_LINUX)
+void AsynchronousMetrics::openSensors()
+{
+    LOG_TRACE(logger, "Scanning /sys/class/thermal");
+    thermal.clear();
     for (size_t thermal_device_index = 0;; ++thermal_device_index)
     {
         std::unique_ptr<ReadBufferFromFile> file = openFileIfExists(fmt::format("/sys/class/thermal/thermal_zone{}/temp", thermal_device_index));
@@ -120,8 +146,72 @@ AsynchronousMetrics::AsynchronousMetrics(
             else
                 break;
         }
+        file->rewind();
+        Int64 temperature = 0;
+        try
+        {
+            readText(temperature, *file);
+        }
+        catch (const ErrnoException &)
+        {
+            const auto log_message = fmt::format("Thermal monitor '{}' exists but could not be read", thermal_device_index);
+            tryLogCurrentException("AsynchronousMetrics", log_message);
+            continue;
+        }
         thermal.emplace_back(std::move(file));
     }
+}
+
+void AsynchronousMetrics::openBlockDevices()
+{
+    LOG_TRACE(logger, "Scanning /sys/block");
+    if (!std::filesystem::exists("/sys/block"))
+        return;
+    block_devices_rescan_delay.restart();
+    block_devs.clear();
+    for (const auto & device_dir : std::filesystem::directory_iterator("/sys/block"))
+    {
+        String device_name = device_dir.path().filename();
+        /// We are not interested in loopback devices.
+        if (device_name.starts_with("loop"))
+            continue;
+        std::unique_ptr<ReadBufferFromFile> file = openFileIfExists(device_dir.path() / "stat");
+        if (!file)
+            continue;
+        block_devs[device_name] = std::move(file);
+    }
+}
+
+void AsynchronousMetrics::openEDAC()
+{
+    LOG_TRACE(logger, "Scanning /sys/devices/system/edac");
+    edac.clear();
+    for (size_t edac_index = 0;; ++edac_index)
+    {
+        String edac_correctable_file = fmt::format("/sys/devices/system/edac/mc/mc{}/ce_count", edac_index);
+        String edac_uncorrectable_file = fmt::format("/sys/devices/system/edac/mc/mc{}/ue_count", edac_index);
+        bool edac_correctable_file_exists = std::filesystem::exists(edac_correctable_file);
+        bool edac_uncorrectable_file_exists = std::filesystem::exists(edac_uncorrectable_file);
+        if (!edac_correctable_file_exists && !edac_uncorrectable_file_exists)
+        {
+            if (edac_index == 0)
+                continue;
+            else
+                break;
+        }
+        edac.emplace_back();
+        if (edac_correctable_file_exists)
+            edac.back().first = openFileIfExists(edac_correctable_file);
+        if (edac_uncorrectable_file_exists)
+            edac.back().second = openFileIfExists(edac_uncorrectable_file);
+    }
+}
+
+void AsynchronousMetrics::openSensorsChips()
+{
+    LOG_TRACE(logger, "Scanning /sys/class/hwmon");
+
+    hwmon_devices.clear();
 
     for (size_t hwmon_index = 0;; ++hwmon_index)
     {
@@ -160,61 +250,32 @@ AsynchronousMetrics::AsynchronousMetrics(
             if (!file)
                 continue;
 
-            String sensor_name;
-            if (sensor_name_file_exists)
+            String sensor_name{};
+            try
             {
-                ReadBufferFromFile sensor_name_in(sensor_name_file, small_buffer_size);
-                readText(sensor_name, sensor_name_in);
-                std::replace(sensor_name.begin(), sensor_name.end(), ' ', '_');
+                if (sensor_name_file_exists)
+                {
+                    ReadBufferFromFile sensor_name_in(sensor_name_file, small_buffer_size);
+                    readText(sensor_name, sensor_name_in);
+                    std::replace(sensor_name.begin(), sensor_name.end(), ' ', '_');
+                }
+
+                file->rewind();
+                Int64 temperature = 0;
+                readText(temperature, *file);
+            }
+            catch (const ErrnoException &)
+            {
+                const auto log_message = fmt::format("Hardware monitor '{}', sensor '{}' exists but could not be read", hwmon_name, sensor_index);
+                tryLogCurrentException("AsynchronousMetrics", log_message);
+                continue;
             }
 
             hwmon_devices[hwmon_name][sensor_name] = std::move(file);
         }
     }
-
-    for (size_t edac_index = 0;; ++edac_index)
-    {
-        String edac_correctable_file = fmt::format("/sys/devices/system/edac/mc/mc{}/ce_count", edac_index);
-        String edac_uncorrectable_file = fmt::format("/sys/devices/system/edac/mc/mc{}/ue_count", edac_index);
-
-        bool edac_correctable_file_exists = std::filesystem::exists(edac_correctable_file);
-        bool edac_uncorrectable_file_exists = std::filesystem::exists(edac_uncorrectable_file);
-
-        if (!edac_correctable_file_exists && !edac_uncorrectable_file_exists)
-        {
-            if (edac_index == 0)
-                continue;
-            else
-                break;
-        }
-
-        edac.emplace_back();
-
-        if (edac_correctable_file_exists)
-            edac.back().first = openFileIfExists(edac_correctable_file);
-        if (edac_uncorrectable_file_exists)
-            edac.back().second = openFileIfExists(edac_uncorrectable_file);
-    }
-
-    if (std::filesystem::exists("/sys/block"))
-    {
-        for (const auto & device_dir : std::filesystem::directory_iterator("/sys/block"))
-        {
-            String device_name = device_dir.path().filename();
-
-            /// We are not interested in loopback devices.
-            if (device_name.starts_with("loop"))
-                continue;
-
-            std::unique_ptr<ReadBufferFromFile> file = openFileIfExists(device_dir.path() / "stat");
-            if (!file)
-                continue;
-
-            block_devs[device_name] = std::move(file);
-        }
-    }
-#endif
 }
+#endif
 
 void AsynchronousMetrics::start()
 {
@@ -515,6 +576,13 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
     new_values["Jitter"] = std::chrono::duration_cast<std::chrono::nanoseconds>(current_time - update_time).count() / 1e9;
 
     {
+        if (auto cloud_table_definition_cache = getContext()->tryGetCloudTableDefinitionCache())
+        {
+            new_values["CloudTableDefinitionCacheCells"] = cloud_table_definition_cache->count();
+        }
+    }
+
+    {
         if (auto mark_cache = getContext()->getMarkCache())
         {
             new_values["MarkCacheBytes"] = mark_cache->weight();
@@ -531,6 +599,14 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
     }
 
     {
+        if (auto intermediate_result_cache = getContext()->getIntermediateResultCache())
+        {
+            new_values["IntermediateResultCacheBytes"] = intermediate_result_cache->weight();
+            new_values["IntermediateResultCacheCells"] = intermediate_result_cache->count();
+        }
+    }
+
+    {
         if (auto mmap_cache = getContext()->getMMappedFileCache())
         {
             new_values["MMapCacheCells"] = mmap_cache->count();
@@ -540,8 +616,116 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
     {
         if (auto checksum_cache = getContext()->getChecksumsCache())
         {
-            new_values["ChecksumsCacheCells"] = checksum_cache->weight();
-            new_values["ChecksumsCacheBytes"] = checksum_cache->count();
+            new_values["ChecksumsCacheBytes"] = checksum_cache->weight();
+            new_values["ChecksumsCacheFiles"] = checksum_cache->count();
+        }
+    }
+
+    {
+        if (auto primary_index_cache = getContext()->getPrimaryIndexCache())
+        {
+            new_values["PrimaryIndexCacheBytes"] = primary_index_cache->weight();
+            new_values["PrimaryIndexCacheFiles"] = primary_index_cache->count();
+        }
+    }
+
+    {
+        if (auto cache_manager = getContext()->getPartCacheManager())
+        {
+            auto part_cache_metrics = cache_manager->dumpPartCache();
+            auto storage_cache_metrics = cache_manager->dumpStorageCache();
+            auto delete_bitmap_cache_metrics = cache_manager->dumpDeleteBitmapCache();
+            new_values["CnchPartCachePartitions"] = std::get<0>(part_cache_metrics);
+            new_values["CnchPartCacheParts"] = std::get<1>(part_cache_metrics);
+            new_values["CnchPartCacheInnerContainerSize"] = std::get<2>(part_cache_metrics);
+            new_values["CnchStorageCacheTables"] = std::get<0>(storage_cache_metrics);
+            new_values["CnchStorageCacheBytes"] = std::get<1>(storage_cache_metrics);
+            new_values["CnchStorageCacheInnerContainerSize"] = std::get<2>(storage_cache_metrics);
+            new_values["CnchStorageCacheMappingSize"] = std::get<3>(storage_cache_metrics);
+            new_values["CnchDeleteBitmapCacheParitions"] = std::get<0>(delete_bitmap_cache_metrics);
+            new_values["CnchDeleteBitmapCacheBitmaps"] = std::get<1>(delete_bitmap_cache_metrics);
+            new_values["CnchDeleteBitmapCacheInnerContainerSize"] = std::get<2>(delete_bitmap_cache_metrics);
+        }
+    }
+
+    {
+        if (auto delete_bitmap_cache = getContext()->getDeleteBitmapCache())
+        {
+            new_values["DeleteBitmapCapacityBytes"] = delete_bitmap_cache->totalCapacity();
+            new_values["DeleteBitmapCacheBytes"] = delete_bitmap_cache->totalCharge();
+        }
+    }
+
+    {
+        if (auto uniquekey_index_cache = getContext()->getUniqueKeyIndexCache())
+        {
+            new_values["UniqueKeyIndexMetaCacheBytes"] = uniquekey_index_cache->weight();
+            new_values["UniqueKeyIndexMetaCacheFiles"] = uniquekey_index_cache->count();
+        }
+    }
+
+    {
+        if (auto uniquekey_index_block_cache = getContext()->getUniqueKeyIndexBlockCache())
+        {
+            new_values["UniqueKeyIndexBlockCapacityBytes"] = uniquekey_index_block_cache->TotalCapacity();
+            new_values["UniqueKeyIndexBlockCacheBytes"] = uniquekey_index_block_cache->TotalCharge();
+        }
+    }
+
+    {
+        auto merge_tree_disk_cache = DiskCacheFactory::instance().get(DiskCacheType::MergeTree);
+        if (!merge_tree_disk_cache->supportMultiDiskCache())
+        {
+            new_values["MergeTreeDiskCacheFiles"] = merge_tree_disk_cache->getKeyCount();
+            new_values["MergeTreeDiskCacheBytes"] = merge_tree_disk_cache->getCachedSize();
+        }
+        else
+        {
+            new_values["MergeTreeDiskCacheMetaFiles"] = merge_tree_disk_cache->getMetaCache()->getKeyCount();
+            new_values["MergeTreeDiskCacheMetaBytes"] = merge_tree_disk_cache->getMetaCache()->getCachedSize();
+            new_values["MergeTreeDiskCacheDataFiles"] = merge_tree_disk_cache->getDataCache()->getKeyCount();
+            new_values["MergeTreeDiskCacheDataBytes"] = merge_tree_disk_cache->getDataCache()->getCachedSize();
+        }
+
+        auto hive_disk_cache = DiskCacheFactory::instance().tryGet(DiskCacheType::Hive);
+        if (hive_disk_cache)
+        {
+            if (!hive_disk_cache->supportMultiDiskCache())
+            {
+                new_values["HiveDiskCacheFiles"] = hive_disk_cache->getKeyCount();
+                new_values["HiveDiskCacheBytes"] = hive_disk_cache->getCachedSize();
+            }
+            else
+            {
+                new_values["HiveDiskCacheMetaFiles"] = hive_disk_cache->getMetaCache()->getKeyCount();
+                new_values["HiveDiskCacheMetaBytes"] = hive_disk_cache->getMetaCache()->getCachedSize();
+                new_values["HiveDiskCacheDataFiles"] = hive_disk_cache->getDataCache()->getKeyCount();
+                new_values["HiveDiskCacheDataBytes"] = hive_disk_cache->getDataCache()->getCachedSize();
+            }
+        }
+
+        auto file_disk_cache = DiskCacheFactory::instance().tryGet(DiskCacheType::File);
+        if (file_disk_cache)
+        {
+            if (file_disk_cache->supportMultiDiskCache())
+            {
+                new_values["FileDiskCacheFiles"] = file_disk_cache->getKeyCount();
+                new_values["FileDiskCacheBytes"] = file_disk_cache->getCachedSize();
+            }
+            else
+            {
+                new_values["FileDiskCacheMetaFiles"] = file_disk_cache->getMetaCache()->getKeyCount();
+                new_values["FileDiskCacheMetaBytes"] = file_disk_cache->getMetaCache()->getCachedSize();
+                new_values["FileDiskCacheDataFiles"] = file_disk_cache->getDataCache()->getKeyCount();
+                new_values["FileDiskCacheDataBytes"] = file_disk_cache->getDataCache()->getCachedSize();
+            }
+        }
+    }
+
+    {
+        if (auto gin_store_cache = getContext()->getGinIndexStoreFactory())
+        {
+            new_values["GinStoreCacheWeight"] = gin_store_cache->cacheWeight();
         }
     }
 
@@ -556,14 +740,6 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
 #endif
 
     new_values["Uptime"] = getContext()->getUptimeSeconds();
-
-    if (const auto stats = getHashTablesCacheStatistics())
-    {
-        new_values["HashTableStatsCacheEntries"] = stats->entries;
-        new_values["HashTableStatsCacheHits"] = stats->hits;
-        new_values["HashTableStatsCacheMisses"] = stats->misses;
-    }
-
 
     /// Process process memory usage according to OS
 #if defined(OS_LINUX)
@@ -583,17 +759,37 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
             Int64 amount = total_memory_tracker.get();
             Int64 peak = total_memory_tracker.getPeak();
             Int64 new_amount = data.resident;
+            [[maybe_unused]]Int64 free_memory_in_allocator_arenas = 0;
 
+#if USE_HUALLOC
+            /// During hualloc, the cached memory should be treat as free memory, for safety keep 0.2 as buffer for concurrent alloc
+            /// Which assume the alloc size shoule be less than cached_memory * 1.2
+            Int64 hualloc_cache = (SegmentCached() + LargeCached()) * 0.8;
+            new_amount -= hualloc_cache;
             Int64 difference = new_amount - amount;
-
+            /// Log only if difference is high. This is for convenience. The threshold is arbitrary.
+            // if (difference >= 1048576 || difference <= -1048576)
+            LOG_DEBUG(&Poco::Logger::get("AsynchronousMetrics"),
+                "MemoryTracking: was {}, peak {}, free memory in arenas {}, hard limit will set to {}, RSS: {}, difference: {}, hualloc cache:{}",
+                ReadableSize(amount),
+                ReadableSize(peak),
+                ReadableSize(free_memory_in_allocator_arenas),
+                ReadableSize(new_amount),
+                ReadableSize(new_amount + hualloc_cache),
+                ReadableSize(difference),
+                ReadableSize(hualloc_cache));
+#else
+            Int64 difference = new_amount - amount;
             /// Log only if difference is high. This is for convenience. The threshold is arbitrary.
             if (difference >= 1048576 || difference <= -1048576)
-                LOG_TRACE(&Poco::Logger::get("AsynchronousMetrics"),
-                    "MemoryTracking: was {}, peak {}, will set to {} (RSS), difference: {}",
-                    ReadableSize(amount),
-                    ReadableSize(peak),
-                    ReadableSize(new_amount),
-                    ReadableSize(difference));
+                LOG_DEBUG(&Poco::Logger::get("AsynchronousMetrics"),
+                        "MemoryTracking: was {}, peak {}, will set to {} (RSS), difference: {}",
+                        ReadableSize(amount),
+                        ReadableSize(peak),
+                        ReadableSize(new_amount),
+                        ReadableSize(difference));
+
+#endif
 
             total_memory_tracker.set(new_amount);
             CurrentMetrics::set(CurrentMetrics::MemoryTracking, new_amount);
@@ -932,15 +1128,29 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
         }
     }
 
-    for (auto & [name, device] : block_devs)
+    /// Update list of block devices periodically
+    /// (i.e. someone may add new disk to RAID array)
+    if (block_devices_rescan_delay.elapsedSeconds() >= 300)
+        openBlockDevices();
+
+    try
     {
-        try
+        for (auto & [name, device] : block_devs)
         {
             device->rewind();
 
             BlockDeviceStatValues current_values{};
             BlockDeviceStatValues & prev_values = block_device_stats[name];
-            current_values.read(*device);
+            try
+            {
+                current_values.read(*device);
+            }
+            catch (const ErrnoException & e)
+            {
+                LOG_DEBUG(logger, "Cannot read statistics about the block device '{}': {}.",
+                    name, errnoToString(e.getErrno()));
+                continue;
+            }
 
             BlockDeviceStatValues delta_values = current_values - prev_values;
             prev_values = current_values;
@@ -982,6 +1192,15 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
                 new_values["BlockActiveTimePerOp_" + name] = delta_values.io_ticks * time_multiplier / delta_values.in_flight_ios;
                 new_values["BlockQueueTimePerOp_" + name] = delta_values.time_in_queue * time_multiplier / delta_values.in_flight_ios;
             }
+        }
+    }
+    catch (...)
+    {
+        /// Try to reopen block devices in case of error
+        /// (i.e. ENOENT or ENODEV means that some disk had been replaced, and it may appear with a new name)
+        try
+        {
+            openBlockDevices();
         }
         catch (...)
         {
@@ -1075,9 +1294,9 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
         }
     }
 
-    for (size_t i = 0, size = thermal.size(); i < size; ++i)
+    try
     {
-        try
+        for (size_t i = 0, size = thermal.size(); i < size; ++i)
         {
             ReadBufferFromFile & in = *thermal[i];
 
@@ -1086,15 +1305,26 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
             readText(temperature, in);
             new_values[fmt::format("Temperature{}", i)] = temperature * 0.001;
         }
+    }
+    catch (...)
+    {
+        if (errno != ENODATA)   /// Ok for thermal sensors.
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+
+        /// Files maybe re-created on module load/unload
+        try
+        {
+            openSensors();
+        }
         catch (...)
         {
             tryLogCurrentException(__PRETTY_FUNCTION__);
         }
     }
 
-    for (const auto & [hwmon_name, sensors] : hwmon_devices)
+    try
     {
-        try
+        for (const auto & [hwmon_name, sensors] : hwmon_devices)
         {
             for (const auto & [sensor_name, sensor_file] : sensors)
             {
@@ -1108,19 +1338,33 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
                     new_values[fmt::format("Temperature_{}_{}", hwmon_name, sensor_name)] = temperature * 0.001;
             }
         }
+    }
+    catch (...)
+    {
+        if (errno != ENODATA)   /// Ok for thermal sensors.
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+
+        /// Files can be re-created on:
+        /// - module load/unload
+        /// - suspend/resume cycle
+        /// So file descriptors should be reopened.
+        try
+        {
+            openSensorsChips();
+        }
         catch (...)
         {
             tryLogCurrentException(__PRETTY_FUNCTION__);
         }
     }
 
-    for (size_t i = 0, size = edac.size(); i < size; ++i)
+    try
     {
-        /// NOTE maybe we need to take difference with previous values.
-        /// But these metrics should be exceptionally rare, so it's ok to keep them accumulated.
-
-        try
+        for (size_t i = 0, size = edac.size(); i < size; ++i)
         {
+            /// NOTE maybe we need to take difference with previous values.
+            /// But these metrics should be exceptionally rare, so it's ok to keep them accumulated.
+
             if (edac[i].first)
             {
                 ReadBufferFromFile & in = *edac[i].first;
@@ -1138,6 +1382,16 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
                 readText(errors, in);
                 new_values[fmt::format("EDAC{}_Uncorrectable", i)] = errors;
             }
+        }
+    }
+    catch (...)
+    {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+
+        /// EDAC files can be re-created on module load/unload
+        try
+        {
+            openEDAC();
         }
         catch (...)
         {
@@ -1175,14 +1429,14 @@ void AsynchronousMetrics::update(std::chrono::system_clock::time_point update_ti
         DisksMap disks_map = getContext()->getDisksMap();
         for (const auto & [name, disk] : disks_map)
         {
-            auto total = disk->getTotalSpace();
+            auto total = disk->getTotalSpace().bytes;
 
             /// Some disks don't support information about the space.
             if (!total)
                 continue;
 
-            auto available = disk->getAvailableSpace();
-            auto unreserved = disk->getUnreservedSpace();
+            auto available = disk->getAvailableSpace().bytes;
+            auto unreserved = disk->getUnreservedSpace().bytes;
 
             new_values[fmt::format("DiskTotal_{}", name)] = total;
             new_values[fmt::format("DiskUsed_{}", name)] = total - available;

@@ -44,6 +44,21 @@ public:
 
     ASTPtr clone() const override { return std::make_shared<ASTQueryParameter>(*this); }
 
+    void toLowerCase() override 
+    { 
+        ASTWithAlias::toLowerCase();
+        boost::to_lower(name);
+    }
+
+    void toUpperCase() override 
+    { 
+        ASTWithAlias::toUpperCase();
+        boost::to_upper(name);
+    }
+
+    void serialize(WriteBuffer & buf) const override;
+    static ASTPtr deserialize(ReadBuffer & buf);
+
 protected:
     void formatImplWithoutAlias(const FormatSettings & settings, FormatState &, FormatStateStacked) const override;
     void appendColumnNameImpl(WriteBuffer & ostr) const override;

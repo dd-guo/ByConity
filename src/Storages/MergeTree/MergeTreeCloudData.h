@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <MergeTreeCommon/MergeTreeMetaBase.h>
 
 #include <boost/multi_index/global_fun.hpp>
@@ -30,22 +31,33 @@ class MergeTreeCloudData : public MergeTreeMetaBase
 public:
     std::string getName() const override { return "MergeTreeCloudData"; }
 
-    DataPartPtr getPartIfExists(const MergeTreePartInfo & part_info);
-
-    /// Add preared parts
+    /// Add prepared parts
     void addDataParts(MutableDataPartsVector & parts, UInt64 worker_topology_hash = 0);
 
     /// XXX:
     void removeDataParts(const DataPartsVector & parts, DataPartsVector * parts_not_found = nullptr);
     void removeDataParts(const Names & names, Names * names_not_found = nullptr);
 
-    /// Load prepared parts, deactivate outdated parts and construct coverage link
-    /// [Preallocate Mode] if worker_topology_hash is not empty, need to check whether the given topology is matched with worker's topology
-    void loadDataParts(MutableDataPartsVector & parts, UInt64 worker_topology_hash = 0);
-
     /// Remove Outdated parts of which timestamp is less than expired ts from container.
     /// DO NOT check reference count of parts.
     void unloadOldPartsByTimestamp(Int64 expired_ts);
+
+    ////////// Receive and load data parts before reading data //////////
+
+    /// Load parts, deactivate outdated parts and construct coverage link
+    /// [Preallocate Mode] if worker_topology_hash is not empty, need to check whether the given topology is matched with worker's topology
+    void loadDataParts(MutableDataPartsVector & parts, UInt64 worker_topology_hash = 0);
+
+    /// Receive parts from server.
+    void receiveDataParts(MutableDataPartsVector && parts, UInt64 worker_topology_hash = 0);
+    /// Receive virtual parts from server.
+    void receiveVirtualDataParts(MutableDataPartsVector && parts, UInt64 worker_topology_hash = 0);
+    /// Load all (virtual) data parts (build part index and load part checksums from vfs).
+    void prepareDataPartsForRead();
+
+    /// set data description in sendResource stage if query with table version
+    void setDataDescription(WGWorkerInfoPtr && worker_info_, UInt64 data_version_);
+    void prepareVersionedPartsForRead(ContextPtr local_context, SelectQueryInfo & query_info, const Names & column_names);
 
 protected:
     void addPreparedPart(MutableDataPartPtr & part, DataPartsLock &);
@@ -60,6 +72,8 @@ protected:
 
     void deactivateOutdatedParts();
 
+    size_t loadFromServerPartsInPartition(const Strings & required_partitions, std::unordered_map<String, ServerDataPartsWithDBM> & server_parts_by_partition);
+
     void loadDataPartsInParallel(MutableDataPartsVector & parts);
 
     static void runOverPartsInParallel(MutableDataPartsVector & parts, size_t threads, const std::function<void(MutableDataPartPtr &)> & op);
@@ -68,7 +82,6 @@ protected:
 
     MergeTreeCloudData(
         const StorageID & table_id_,
-        const String & relative_data_path_,
         const StorageInMemoryMetadata & metadata_,
         ContextMutablePtr context_,
         const String & date_column_name_,
@@ -76,6 +89,16 @@ protected:
         std::unique_ptr<MergeTreeSettings> settings_);
 
     ~MergeTreeCloudData() override = default;
+
+    /// guard for loading received data_parts and virtual_data_parts.
+    std::mutex load_data_parts_mutex;
+    bool data_parts_loaded{false};
+    MutableDataPartsVector received_data_parts;
+    MutableDataPartsVector received_virtual_data_parts;
+
+    // data description for query with table version;
+    WGWorkerInfoPtr worker_info;
+    UInt64 data_version {0};
 };
 
 }

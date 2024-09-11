@@ -113,7 +113,7 @@ public:
     /// Creates a new session with the same parameters. This method can be used for reconnecting
     /// after the session has expired.
     /// This object remains unchanged, and the new session is returned.
-    Ptr startNewSession() const;
+    Ptr startNewSession(const DB::ServiceEndpoints & endpoints = {}) const;
 
     bool configChanged(const Poco::Util::AbstractConfiguration & config, const std::string & config_name, const DB::ServiceEndpoints & endpoints) const;
 
@@ -310,6 +310,8 @@ public:
 
     void finalize();
 
+    UInt32 getSessionUptime() const { return static_cast<UInt32>(session_uptime.elapsedSeconds()); }
+
 private:
     friend class EphemeralNodeHolder;
 
@@ -344,6 +346,8 @@ private:
 
     Poco::Logger * log = nullptr;
     std::shared_ptr<DB::ZooKeeperLog> zk_log;
+
+    AtomicStopwatch session_uptime;
 };
 
 

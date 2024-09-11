@@ -67,6 +67,8 @@ PlanNodePtr join(const PlanNodePtr & left, const PlanNodePtr & right, const Name
         output,
         ASTTableJoin::Kind::Inner,
         ASTTableJoin::Strictness::All,
+        1,
+        false,
         left_keys,
         right_keys,
         PredicateConst::TRUE_VALUE);
@@ -128,7 +130,7 @@ TEST(OptimizerCascadesTest, DISABLED_Timeout)
         auto start = std::chrono::high_resolution_clock::now();
         std::cout << "Size " << table_size << '\n';
         QueryPlan plan = createQueryPlan(cyclic(table_size));
-        optimizer.rewrite(plan, context);
+        optimizer.rewritePlan(plan, context);
         auto end = std::chrono::high_resolution_clock::now();
         auto ms_int = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         std::cout << "Used " << ms_int.count() << " ms\n\n";

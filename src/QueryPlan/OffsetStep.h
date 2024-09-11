@@ -31,12 +31,13 @@ public:
     Type getType() const override { return Type::Offset; }
 
     void transformPipeline(QueryPipeline & pipeline, const BuildQueryPipelineSettings &) override;
-
+    size_t getOffset() const { return offset; }
     void describeActions(JSONBuilder::JSONMap & map) const override;
     void describeActions(FormatSettings & settings) const override;
 
-    void serialize(WriteBuffer &) const override;
-    static QueryPlanStepPtr deserialize(ReadBuffer &, ContextPtr context_ = nullptr);
+    void toProto(Protos::OffsetStep & proto, bool for_hash_equals = false) const;
+    static std::shared_ptr<OffsetStep> fromProto(const Protos::OffsetStep & proto, ContextPtr);
+
     std::shared_ptr<IQueryPlanStep> copy(ContextPtr ptr) const override;
     void setInputStreams(const DataStreams & input_streams_) override;
 
