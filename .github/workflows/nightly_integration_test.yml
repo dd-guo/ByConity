@@ -1,9 +1,8 @@
 name: Nightly integration test 
 on:
-  schedule:
-    # * is a special character in YAML so you have to quote this string, run at 19:00 utc (3 am Singapore time)
-    - cron: '0 19 * * *'
-  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
